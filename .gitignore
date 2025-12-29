@@ -6,10 +6,6 @@ __pycache__/
 Logs/
 *.log
 
-# Binary files (Installers)
-*.exe
-*.whl
-
 # Virtual environments
 .venv/
 venv/
