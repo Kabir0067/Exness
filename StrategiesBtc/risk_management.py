@@ -1,4 +1,3 @@
-# Strategies/risk_management.py  (PRODUCTION-GRADE, TOP, FIXED)
 from __future__ import annotations
 
 import csv
@@ -25,23 +24,23 @@ try:
 except Exception:
     talib = None  # type: ignore
 
-from config import EngineConfig, SymbolParams, GOLD_MARKET_END_MINUTES, GOLD_MARKET_START_MINUTES
-from DataFeed.market_feed import MicroZones, TickStats
+from config_btc import EngineConfig, SymbolParams
+from DataFeed.btc_feed import MicroZones, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # ============================================================
 # ERROR-only logging (isolated) + rotation
 # ============================================================
-LOG_DIR = (Path(__file__).resolve().parent.parent / "Logs")
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = LOG_ROOT
 
-log_risk = logging.getLogger("risk_manager")
+log_risk = logging.getLogger("risk_manager_btc")
 log_risk.setLevel(logging.ERROR)
 log_risk.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
-        filename=str(LOG_DIR / "risk_manager.log"),
+        filename=str(get_log_path("risk_manager_btc.log")),
         maxBytes=int(os.getenv("RISK_LOG_MAX_BYTES", "5242880")),  # 5MB
         backupCount=int(os.getenv("RISK_LOG_BACKUPS", "5")),
         encoding="utf-8",
@@ -52,6 +51,11 @@ if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     log_risk.addHandler(fh)
 
 _FILE_LOCK = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    """Naive UTC datetime without deprecated utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def percentile_rank(series: np.ndarray, value: float) -> float:
@@ -91,9 +95,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _atr_fallback(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
-    """
-    Wilder ATR fallback (no TA-Lib).
-    """
+    """Wilder ATR fallback (no TA-Lib)."""
     h = np.asarray(high, dtype=np.float64)
     l = np.asarray(low, dtype=np.float64)
     c = np.asarray(close, dtype=np.float64)
@@ -109,6 +111,9 @@ def _atr_fallback(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: 
     return out
 
 
+# ============================================================
+# Execution quality monitor (breaker input)
+# ============================================================
 @dataclass(slots=True)
 class ExecSample:
     ts: float
@@ -135,15 +140,15 @@ class ExecSample:
 class ExecutionQualityMonitor:
     """
     Rolling monitor for execution + quote anomalies.
-    Делает только защиту: детект -> пауза/ужесточение.
+    Protective only: detect -> pause / tighten.
     """
 
     def __init__(self, *, window: int = 300) -> None:
         self.window = int(window)
 
         self.samples: Deque[ExecSample] = deque(maxlen=self.window)
-        self.spreads: Deque[float] = deque(maxlen=self.window)      # points
-        self.mid_moves: Deque[float] = deque(maxlen=self.window)    # points per tick
+        self.spreads: Deque[float] = deque(maxlen=self.window)  # points
+        self.mid_moves: Deque[float] = deque(maxlen=self.window)  # points per tick
 
         self._last_mid: Optional[float] = None
 
@@ -195,19 +200,21 @@ class ExecutionQualityMonitor:
             "p95_latency_ms": p95(lat),
             "p95_spread_points": p95(spr) if spr else 0.0,
             "max_spread_points": float(max(spr)) if spr else 0.0,
-            "p95_mid_move_points": float(np.percentile(np.array(self.mid_moves, dtype=np.float64), 95)) if self.mid_moves else 0.0,
+            "p95_mid_move_points": float(np.percentile(np.array(self.mid_moves, dtype=np.float64), 95))
+            if self.mid_moves
+            else 0.0,
         }
 
     def anomaly_reasons(self, *, cfg: Any) -> List[str]:
         """
-        Пороги берём из cfg, если есть. Если отсутствуют — используем безопасные дефолты мониторинга.
+        Thresholds are config-driven; safe defaults if missing.
         """
         s = self.snapshot()
 
-        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 450.0))
-        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 6.0))
-        max_spread = float(getattr(cfg, "exec_max_spread_points", 25.0))
-        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 4.0))
+        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 650.0))
+        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 30.0))
+        max_spread = float(getattr(cfg, "exec_max_spread_points", 120.0))
+        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 18.0))
 
         reasons: List[str] = []
         if s["p95_latency_ms"] > max_p95_lat:
@@ -228,7 +235,7 @@ class RiskDecision:
 
 
 # ============================================================
-# Signal survival: NO CSV rewrites (fixed performance defect)
+# Signal survival (append-only)
 # ============================================================
 @dataclass(slots=True)
 class SignalSurvivalState:
@@ -263,14 +270,12 @@ class SignalSurvivalState:
         self.bars_held = int(self.bars_held) + 1
 
 
+# ============================================================
+# RiskManager (BTC)
+# ============================================================
 class RiskManager:
     """
-    Risk management for XAUUSDm scalping on Exness MT5.
-
-    Единственный серьёзный недостаток (CSV rewrite в update_signal_survival) ИСПРАВЛЕН:
-      - CSV теперь append-only (финальные записи).
-      - Активные сигналы хранятся в памяти + периодически сохраняются в JSON (атомарно).
-      - Частые апдейты не переписывают большие файлы.
+    Risk management for BTC scalping on Exness MT5.
     """
 
     _REQUIRED_CFG_FIELDS = (
@@ -317,7 +322,13 @@ class RiskManager:
         self._last_fill_ts: float = 0.0
         self._latency_bad_since: Optional[float] = None
 
-        # Signal throttling (production: real rolling hour + per-day)
+        # Account snapshot cache (prevents MT5 temporary 0.0 glitches)
+        self._acc_cache_ts: float = 0.0
+        self._acc_cache_balance: float = 0.0
+        self._acc_cache_equity: float = 0.0
+        self._acc_cache_margin_free: float = 0.0
+
+        # Signal throttling (rolling hour + per-day)
         self._daily_signal_count: int = 0
         self._hour_window_start_ts: float = time.time()
         self._hour_window_count: int = 0
@@ -337,13 +348,13 @@ class RiskManager:
         self._freeze_level_points: int = 0
 
         # Execution quality breaker
-        self.execmon = ExecutionQualityMonitor(window=int(getattr(self.cfg, "exec_window", 300)))
+        self.execmon = ExecutionQualityMonitor(window=int(getattr(self.cfg, "exec_window", 300) or 300))
         self._exec_breaker_until: float = 0.0
 
         # Reconcile tracking (detect flat/open transitions)
         self._last_open_positions: int = 0
 
-        # Signal survival (fixed)
+        # Signal survival
         self._survival: Dict[str, SignalSurvivalState] = {}
         self._survival_last_flush_ts: float = 0.0
         self._survival_last_update_emit: Dict[str, float] = {}
@@ -386,14 +397,14 @@ class RiskManager:
     # ------------------- time / daily -------------------
     @staticmethod
     def _utc_date():
-        return datetime.utcnow().date()
+        return _utcnow().date()
 
     @staticmethod
     def _utc_now() -> datetime:
         return datetime.now(timezone.utc)
 
     def _seconds_until_next_utc_day(self) -> float:
-        now = datetime.utcnow()
+        now = _utcnow()
         nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return max(0.0, (nxt - now).total_seconds())
 
@@ -438,8 +449,7 @@ class RiskManager:
     def _reset_daily_state(self) -> None:
         self.daily_date = self._utc_date()
 
-        bal = self._get_balance()
-        eq = self._get_equity()
+        bal, eq = self._account_snapshot()
         base = bal if bal > 0 else eq
 
         self.daily_start_balance = float(base if base > 0 else 0.0)
@@ -525,6 +535,91 @@ class RiskManager:
         v = math.floor(v / step) * step
         return float(round(v, 8))
 
+    # ------------------- BTC session: trade_mode + blackout -------------------
+    def _minutes_utc(self) -> Tuple[int, int]:
+        now = self._utc_now()
+        return int(now.weekday()), int(now.hour * 60 + now.minute)
+
+    def _in_maintenance_blackout(self) -> bool:
+        """
+        Optional config-driven blackout windows in UTC.
+        cfg.crypto_blackout_windows_utc = [
+            {"weekday": 6, "start_min": 0, "end_min": 30},   # Sun 00:00-00:30 UTC
+            {"weekday": 2, "start_min": 1430, "end_min": 10} # Wed 23:50-00:10 (wrap)
+        ]
+        """
+        try:
+            windows = getattr(self.cfg, "crypto_blackout_windows_utc", None)
+            if not windows:
+                return False
+
+            wd, m = self._minutes_utc()
+            for w in windows:
+                if int(w.get("weekday", -1)) != wd:
+                    continue
+                start = int(w.get("start_min", -1))
+                end = int(w.get("end_min", -1))
+                if start < 0 or end < 0:
+                    continue
+
+                if start <= end:
+                    if start <= m <= end:
+                        return True
+                else:
+                    if (m >= start) or (m <= end):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _trade_mode_state(self) -> Tuple[bool, str]:
+        """
+        Returns (can_open_new_orders, reason_if_blocked).
+        Blocks on CLOSEONLY / DISABLED.
+        """
+        if not self._ensure_ready():
+            return True, ""
+
+        try:
+            with MT5_LOCK:
+                info = mt5.symbol_info(self.symbol)
+            if not info:
+                return True, ""
+
+            tm = int(getattr(info, "trade_mode", mt5.SYMBOL_TRADE_MODE_FULL) or mt5.SYMBOL_TRADE_MODE_FULL)
+
+            if tm == mt5.SYMBOL_TRADE_MODE_DISABLED:
+                return False, "trade_mode_disabled"
+            if tm == mt5.SYMBOL_TRADE_MODE_CLOSEONLY:
+                return False, "trade_mode_close_only"
+
+            return True, ""
+        except Exception:
+            return True, ""
+
+    def market_open_24_5(self) -> bool:
+        """
+        BTC/crypto: 24/7 but can be blocked by maintenance blackout or trade_mode.
+        Kept name for compatibility with existing engine.
+        """
+        if self._in_maintenance_blackout():
+            return False
+        ok, _ = self._trade_mode_state()
+        return bool(ok)
+
+    def rollover_blackout(self) -> bool:
+        """
+        Optional daily blackout around UTC midnight (broker swaps/rollover/maintenance).
+        cfg.rollover_blackout_sec, default 0 => disabled.
+        """
+        sec = float(getattr(self.cfg, "rollover_blackout_sec", 0.0) or 0.0)
+        if sec <= 0:
+            return False
+        now = _utcnow()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        delta = abs((now - midnight).total_seconds())
+        return delta <= sec
+
     # ------------------- quote/execution hooks -------------------
     def on_quote(self, bid: float, ask: float) -> None:
         try:
@@ -566,28 +661,55 @@ class RiskManager:
         self._hour_window_count += 1
         self._daily_signal_count += 1
 
-    # ------------------- account values -------------------
-    def _get_balance(self) -> float:
+    # ------------------- account snapshot (cached) -------------------
+    def _account_snapshot(self) -> Tuple[float, float]:
+        """
+        Single MT5 account_info() snapshot with short cache.
+        Also caches margin_free for BTC margin safety.
+        """
+        cache_sec = float(getattr(self.cfg, "account_snapshot_cache_sec", 0.5) or 0.5)
+        now = time.time()
+
+        if (now - float(self._acc_cache_ts)) < cache_sec:
+            return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
+        if not self._ensure_ready():
+            return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
         try:
-            if not self._ensure_ready():
-                return 0.0
             with MT5_LOCK:
                 acc = mt5.account_info()
-            return float(acc.balance) if acc else 0.0
+
+            if acc:
+                bal = float(getattr(acc, "balance", 0.0) or 0.0)
+                eq = float(getattr(acc, "equity", 0.0) or 0.0)
+                mf = float(getattr(acc, "margin_free", 0.0) or 0.0)
+
+                if bal > 0:
+                    self._acc_cache_balance = bal
+                if eq > 0:
+                    self._acc_cache_equity = eq
+                if mf > 0:
+                    self._acc_cache_margin_free = mf
+
+                self._acc_cache_ts = now
+
         except Exception as exc:
-            log_risk.error("_get_balance error: %s | tb=%s", exc, traceback.format_exc())
-            return 0.0
+            log_risk.error("_account_snapshot error: %s | tb=%s", exc, traceback.format_exc())
+
+        return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
+    def _get_balance(self) -> float:
+        bal, _ = self._account_snapshot()
+        return float(bal)
 
     def _get_equity(self) -> float:
-        try:
-            if not self._ensure_ready():
-                return 0.0
-            with MT5_LOCK:
-                acc = mt5.account_info()
-            return float(acc.equity) if acc else 0.0
-        except Exception as exc:
-            log_risk.error("_get_equity error: %s | tb=%s", exc, traceback.format_exc())
-            return 0.0
+        _, eq = self._account_snapshot()
+        return float(eq)
+
+    def _get_margin_free(self) -> float:
+        _ = self._account_snapshot()
+        return float(self._acc_cache_margin_free)
 
     # ------------------- state evaluation -------------------
     def evaluate_account_state(self) -> None:
@@ -595,8 +717,7 @@ class RiskManager:
             if self._utc_date() != self.daily_date:
                 self._reset_daily_state()
 
-            eq = self._get_equity()
-            bal = self._get_balance()
+            bal, eq = self._account_snapshot()
 
             if bal > 0:
                 self._current_drawdown = max(0.0, float((bal - eq) / bal))
@@ -625,32 +746,6 @@ class RiskManager:
 
     def update_phase(self) -> None:
         self.evaluate_account_state()
-
-    # ------------------- market hours -------------------
-    def market_open_24_5(self) -> bool:
-        try:
-            now = datetime.utcnow()
-            wd = now.weekday()
-            minutes = now.hour * 60 + now.minute
-            if wd == 0:
-                return minutes >= GOLD_MARKET_START_MINUTES
-            if wd in (1, 2, 3):
-                return True
-            if wd == 4:
-                return minutes <= GOLD_MARKET_END_MINUTES
-            return False
-        except Exception as exc:
-            log_risk.error("market_open_24_5 error: %s | tb=%s", exc, traceback.format_exc())
-            return True
-
-    def rollover_blackout(self) -> bool:
-        sec = float(getattr(self.cfg, "rollover_blackout_sec", 0.0) or 0.0)
-        if sec <= 0:
-            return False
-        now = datetime.utcnow()
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        delta = abs((now - midnight).total_seconds())
-        return delta <= sec
 
     # ------------------- latency -------------------
     def latency_cooldown(self) -> bool:
@@ -681,7 +776,7 @@ class RiskManager:
             atr_rel_series = atr_series / np.maximum(1e-9, c)
 
             look = max(30, min(len(atr_rel_series) - 2, int(lookback)))
-            return percentile_rank(atr_rel_series[-look - 2: -2], float(atr_rel_series[-2]))
+            return percentile_rank(atr_rel_series[-look - 2 : -2], float(atr_rel_series[-2]))
         except Exception as exc:
             log_risk.error("atr_percentile error: %s | tb=%s", exc, traceback.format_exc())
             return 50.0
@@ -711,13 +806,16 @@ class RiskManager:
         in_session: bool,
         drawdown_exceeded: bool,
         latency_cooldown: bool,
-        tz,
+        tz: Any,
     ) -> RiskDecision:
+        """
+        Compatibility guard for the engine.
+        in_session is expected from engine; for BTC you should pass RiskManager.market_open_24_5().
+        """
         try:
             _ = (ingest_ms, last_bar_age, tz)
 
             self.evaluate_account_state()
-
             reasons: List[str] = []
 
             if self.requires_hard_stop():
@@ -727,13 +825,15 @@ class RiskManager:
                 reasons.append("max_drawdown")
 
             if spread_pct > float(self.sp.spread_limit_pct):
-                reasons.append("spread")
+                reasons.append("spread_pct")
 
             if not tick_ok and tick_reason not in ("tps_low", "no_rates"):
                 reasons.append(f"micro:{tick_reason}")
 
+            # BTC session: engine should pass market_open_24_5()
             if not in_session:
-                reasons.append("session")
+                ok, r = self._trade_mode_state()
+                reasons.append(r or "maintenance_blackout" if not ok else "session_blocked")
 
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
@@ -751,10 +851,10 @@ class RiskManager:
                 reasons.append("hourly_signal_limit")
 
             if spread_pct > float(self.sp.spread_limit_pct) * 1.5:
-                reasons.append("excessive_spread")
+                reasons.append("excessive_spread_pct")
 
             if not latency_cooldown:
-                reasons.append("latency")
+                reasons.append("latency_cooldown")
 
             return RiskDecision(allowed=(len(reasons) == 0), reasons=reasons)
         except Exception as exc:
@@ -762,6 +862,9 @@ class RiskManager:
             return RiskDecision(allowed=False, reasons=["guard_error"])
 
     def can_trade(self, confidence: float, signal_type: str) -> RiskDecision:
+        """
+        Decision gate for opening a new BTC position.
+        """
         try:
             _ = signal_type
 
@@ -772,11 +875,11 @@ class RiskManager:
                 reasons.append(self.hard_stop_reason() or "hard_stop")
                 return RiskDecision(False, reasons)
 
-            if self.current_phase == "C":
-                reasons.append("phase_c_protect")
-
+            # BTC: close-only/disabled/maintenance blackout
             if not self.market_open_24_5():
-                reasons.append("session_closed")
+                ok, r = self._trade_mode_state()
+                reasons.append(r or "maintenance_blackout")
+                return RiskDecision(False, reasons)
 
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
@@ -811,7 +914,7 @@ class RiskManager:
 
             anoms = self.execmon.anomaly_reasons(cfg=self.cfg)
             if anoms:
-                sec = float(getattr(self.cfg, "exec_breaker_sec", 90.0))
+                sec = float(getattr(self.cfg, "exec_breaker_sec", 120.0) or 120.0)
                 self._exec_breaker_until = time.time() + sec
                 reasons.extend(anoms)
                 reasons.append("exec_breaker_triggered")
@@ -823,13 +926,19 @@ class RiskManager:
             log_risk.error("can_trade error: %s | tb=%s", exc, traceback.format_exc())
             return RiskDecision(allowed=False, reasons=["can_trade_error"])
 
-    def can_emit_signal(self, confidence: int, tz) -> Tuple[bool, List[str]]:
+    def can_emit_signal(self, confidence: int, tz: Any) -> Tuple[bool, List[str]]:
+        """
+        Gate for signal emission (before plan_order).
+        confidence can be 0..100 or 0..1; engine uses int in some builds.
+        """
         try:
             _ = tz
             self.evaluate_account_state()
 
             reasons: List[str] = []
-            conf_f = float(confidence) / 100.0
+            conf_f = float(confidence)
+            if conf_f > 1.5:
+                conf_f = conf_f / 100.0
 
             if conf_f < float(self.cfg.min_confidence_signal):
                 reasons.append("low_confidence")
@@ -846,6 +955,11 @@ class RiskManager:
 
             if time.time() < self._exec_breaker_until:
                 reasons.append("exec_breaker_active")
+
+            # BTC: if cannot open trades now, do not emit
+            if not self.market_open_24_5():
+                ok, r = self._trade_mode_state()
+                reasons.append(r or "maintenance_blackout")
 
             allowed = (len(reasons) == 0)
             return allowed, reasons
@@ -882,6 +996,7 @@ class RiskManager:
 
         side_n = _side_norm(side)
         min_dist = self._min_stop_distance()
+
         if min_dist > 0:
             if side_n == "Buy":
                 sl = min(sl, entry - min_dist)
@@ -906,6 +1021,13 @@ class RiskManager:
         take_profit: float,
         confidence: float,
     ) -> float:
+        """
+        Broker-true sizing:
+          - risk_money = equity * max_risk_per_trade (with phase/DD multipliers)
+          - convert to lots via order_calc_profit on 1.0 lot to SL
+          - cap by max_position_percentage (optional)
+          - cap by margin_free safety (critical for BTC/HMR spikes)
+        """
         try:
             side_n = _side_norm(side)
             if side_n not in ("Buy", "Sell"):
@@ -923,7 +1045,7 @@ class RiskManager:
                 if rr_ratio < float(min_rr):
                     return 0.0
 
-            eq = self._get_equity()
+            _, eq = self._account_snapshot()
             if eq <= 0:
                 return float(self.cfg.fixed_volume)
 
@@ -940,6 +1062,7 @@ class RiskManager:
 
             raw_lot = risk_money / risk_1lot
 
+            # Optional cap by equity margin %
             if hasattr(self.cfg, "max_position_percentage"):
                 cap_pct = float(getattr(self.cfg, "max_position_percentage")) / 100.0
                 if cap_pct > 0:
@@ -947,6 +1070,15 @@ class RiskManager:
                     margin_1lot = self._order_calc_margin(side_n, 1.0, entry_price)
                     if margin_1lot > 0:
                         raw_lot = min(raw_lot, margin_cap / margin_1lot)
+
+            # BTC critical: margin_free safety (HMR/news spikes)
+            margin_free = self._get_margin_free()
+            mf_mult = float(getattr(self.cfg, "margin_free_safety_mult", 1.25) or 1.25)
+            if margin_free > 0 and mf_mult > 1.0:
+                margin_1lot = self._order_calc_margin(side_n, 1.0, entry_price)
+                if margin_1lot > 0:
+                    cap_by_mf = (margin_free / mf_mult) / margin_1lot
+                    raw_lot = min(raw_lot, cap_by_mf)
 
             lot = self._normalize_volume_floor(raw_lot)
             return float(lot) if lot > 0 else 0.0
@@ -962,28 +1094,43 @@ class RiskManager:
         zones: Optional[MicroZones],
         tick_volatility: float,
     ) -> Tuple[float, float]:
+        """
+        BTC micro SL/TP:
+          - base buffer in % of price (cfg.micro_buffer_pct)
+          - add microstructure volatility buffer (cfg.micro_vol_mult)
+          - RR uses cfg.micro_rr
+          - optionally anchor to orderbook extremes if provided by feed
+        """
         try:
             if not _is_finite(entry) or entry <= 0:
                 return entry, entry
 
-            base_pct = float(getattr(self.cfg, "micro_buffer_pct", 0.0005) or 0.0005)
+            base_pct = float(getattr(self.cfg, "micro_buffer_pct", 0.0008) or 0.0008)
             base_buffer = entry * base_pct
 
-            vol_buffer = float(max(0.0, tick_volatility)) * 2.0
-            micro_buffer = base_buffer + vol_buffer
+            tv = float(max(0.0, tick_volatility))
+            # if feed provides volatility in "points", auto-convert when clearly too large in price units
+            if self._symbol_meta() and tv > entry * 0.02:
+                tv = tv * float(self._point)
+
+            vol_mult = float(getattr(self.cfg, "micro_vol_mult", 2.0) or 2.0)
+            vol_buffer = tv * vol_mult
+
+            micro_buffer = float(base_buffer + vol_buffer)
 
             z = zones
             bid_floor = float(getattr(z, "bid_floor", 0.0) or 0.0) if z else 0.0
             ask_ceil = float(getattr(z, "ask_ceiling", 0.0) or 0.0) if z else 0.0
 
             side_n = _side_norm(side)
+            rr_micro = float(getattr(self.cfg, "micro_rr", 2.2) or 2.2)
 
             if side_n == "Buy":
                 sl = min(bid_floor, entry - micro_buffer) if bid_floor > 0 else (entry - micro_buffer)
-                tp = max(ask_ceil, entry + micro_buffer * 2.0) if ask_ceil > 0 else (entry + micro_buffer * 2.5)
+                tp = max(ask_ceil, entry + micro_buffer * rr_micro) if ask_ceil > 0 else (entry + micro_buffer * rr_micro)
             else:
                 sl = max(ask_ceil, entry + micro_buffer) if ask_ceil > 0 else (entry + micro_buffer)
-                tp = min(bid_floor, entry - micro_buffer * 2.0) if bid_floor > 0 else (entry - micro_buffer * 2.5)
+                tp = min(bid_floor, entry - micro_buffer * rr_micro) if bid_floor > 0 else (entry - micro_buffer * rr_micro)
 
             return float(sl), float(tp)
         except Exception as exc:
@@ -991,6 +1138,9 @@ class RiskManager:
             return entry, entry
 
     def _fallback_atr_sl_tp(self, side: str, entry: float, adapt: Dict[str, Any]) -> Tuple[float, float]:
+        """
+        Fallback SL/TP based on ATR from indicators/feature-engine adapt dict.
+        """
         try:
             atr = float(adapt.get("atr", 0.0) or 0.0)
             if atr <= 0 and hasattr(self.cfg, "fallback_atr_abs"):
@@ -1029,6 +1179,9 @@ class RiskManager:
         max_positions: int = 3,
         unrealized_pl: float = 0.0,
     ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """
+        Returns (entry_price, sl, tp, lot) or (None,...).
+        """
         try:
             _ = (ind, ticks)
 
@@ -1036,6 +1189,14 @@ class RiskManager:
             if side_n not in ("Buy", "Sell"):
                 return None, None, None, None
             if not self._ensure_ready():
+                return None, None, None, None
+
+            # BTC: close-only/disabled/maintenance block
+            ok, reason = self._trade_mode_state()
+            if not ok:
+                log_risk.error("plan_order blocked: %s", reason)
+                return None, None, None, None
+            if self._in_maintenance_blackout():
                 return None, None, None, None
 
             if entry is None:
@@ -1051,9 +1212,12 @@ class RiskManager:
 
             sl, tp = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
 
+            # Hard minimum distances (pct + broker stops)
             min_dist = self._min_stop_distance()
-            min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.0002) or 0.0002)
-            min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.0003) or 0.0003)
+
+            min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.0008) or 0.0008)
+            min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.0012) or 0.0012)
+
             min_sl = max(min_dist, entry_price * min_sl_pct)
             min_tp = max(min_dist, entry_price * min_tp_pct)
 
@@ -1070,6 +1234,7 @@ class RiskManager:
             if side_n == "Sell" and not (tp < entry_price < sl):
                 return None, None, None, None
 
+            # Enforce RR if configured
             min_rr = getattr(self.cfg, "min_rr", None)
             if min_rr is not None:
                 rr = self._rr(entry_price, sl, tp)
@@ -1086,6 +1251,7 @@ class RiskManager:
             if lot <= 0 or not _is_finite(lot):
                 return None, None, None, None
 
+            # Multi-position scaling (pyramiding): only if profitable + ultra confidence
             if (
                 int(open_positions) > 0
                 and int(open_positions) < int(max_positions)
@@ -1113,7 +1279,7 @@ class RiskManager:
             log_risk.error("plan_order error: %s | tb=%s", exc, traceback.format_exc())
             return None, None, None, None
 
-    # ------------------- trade recording -------------------
+    # ------------------- trade recording (engine hooks) -------------------
     def record_trade(self, *args, **kwargs) -> None:
         try:
             positions_open = 0
@@ -1134,12 +1300,12 @@ class RiskManager:
 
     def update_market_conditions(self, spread: float, slippage: float) -> None:
         try:
-            _ = spread
+            _ = float(spread)
             _ = float(slippage)
         except Exception as exc:
             log_risk.error("update_market_conditions error: %s | tb=%s", exc, traceback.format_exc())
 
-    # ------------------- execution metrics -------------------
+    # ------------------- execution metrics (analytics + breaker input) -------------------
     def record_execution_metrics(
         self,
         order_id: str,
@@ -1176,7 +1342,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "execution_quality.csv"
+                csv_file = LOG_DIR / "execution_quality_btc.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
@@ -1184,10 +1350,11 @@ class RiskManager:
                         writer.writeheader()
                     writer.writerow(metrics)
 
-                jsonl_file = LOG_DIR / "execution_metrics.jsonl"
+                jsonl_file = LOG_DIR / "execution_metrics_btc.jsonl"
                 with open(jsonl_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
+            # Feed execmon (breaker)
             try:
                 if self._symbol_meta():
                     spread_points = 0.0
@@ -1227,7 +1394,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "execution_failures.csv"
+                csv_file = LOG_DIR / "execution_failures_btc.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
@@ -1242,8 +1409,8 @@ class RiskManager:
     def _update_execution_analysis(self, metrics: dict) -> None:
         try:
             with _FILE_LOCK:
-                slippage_file = LOG_DIR / "slippage_histogram.csv"
-                bins = [-float("inf"), -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, float("inf")]
+                slippage_file = LOG_DIR / "slippage_histogram_btc.csv"
+                bins = [-float("inf"), -50, -30, -20, -10, -5, 0, 5, 10, 20, 30, 50, float("inf")]
 
                 if slippage_file.exists():
                     slippage_df = pd.read_csv(slippage_file)
@@ -1260,8 +1427,8 @@ class RiskManager:
                         break
                 slippage_df.to_csv(slippage_file, index=False)
 
-                delay_file = LOG_DIR / "fill_delay_histogram.csv"
-                dbins = [0, 50, 100, 150, 200, 250, 300, 400, 500, 1000, float("inf")]
+                delay_file = LOG_DIR / "fill_delay_histogram_btc.csv"
+                dbins = [0, 50, 100, 150, 200, 250, 300, 400, 500, 750, 1000, float("inf")]
 
                 if delay_file.exists():
                     delay_df = pd.read_csv(delay_file)
@@ -1283,7 +1450,7 @@ class RiskManager:
 
     def _update_rejection_analysis(self, reason: str) -> None:
         try:
-            reject_file = LOG_DIR / "reject_rate_analysis.csv"
+            reject_file = LOG_DIR / "reject_rate_analysis_btc.csv"
 
             with _FILE_LOCK:
                 if reject_file.exists():
@@ -1295,7 +1462,10 @@ class RiskManager:
                     reject_df.loc[reject_df["reason"] == reason, "count"] += 1
                 else:
                     reject_df = pd.concat(
-                        [reject_df, pd.DataFrame([{"reason": reason, "count": 1, "total_attempts": 0, "reject_rate": 0.0}])],
+                        [
+                            reject_df,
+                            pd.DataFrame([{"reason": reason, "count": 1, "total_attempts": 0, "reject_rate": 0.0}]),
+                        ],
                         ignore_index=True,
                     )
 
@@ -1307,11 +1477,15 @@ class RiskManager:
         except Exception as exc:
             log_risk.error("_update_rejection_analysis error: %s | tb=%s", exc, traceback.format_exc())
 
-    # ------------------- signal survival (FIXED: no CSV rewrites) -------------------
+    # ------------------- signal survival (append-only, atomic active) -------------------
     def _survival_paths(self) -> Tuple[Path, Path, Path]:
-        final_csv = Path(getattr(self.cfg, "signal_survival_log_file", str(LOG_DIR / "signal_survival_final.csv")))
-        active_json = Path(getattr(self.cfg, "signal_survival_active_file", str(LOG_DIR / "signal_survival_active.json")))
-        updates_jsonl = Path(getattr(self.cfg, "signal_survival_updates_jsonl_file", str(LOG_DIR / "signal_survival_updates.jsonl")))
+        final_csv = Path(getattr(self.cfg, "signal_survival_log_file", str(LOG_DIR / "signal_survival_final_btc.csv")))
+        active_json = Path(
+            getattr(self.cfg, "signal_survival_active_file", str(LOG_DIR / "signal_survival_active_btc.json"))
+        )
+        updates_jsonl = Path(
+            getattr(self.cfg, "signal_survival_updates_jsonl_file", str(LOG_DIR / "signal_survival_updates_btc.jsonl"))
+        )
         return final_csv, active_json, updates_jsonl
 
     def _init_signal_survival(self) -> None:
@@ -1440,37 +1614,22 @@ class RiskManager:
             with _FILE_LOCK:
                 raw = active_json.read_text(encoding="utf-8")
 
-            data: Dict[str, Any]
             if not raw.strip():
                 data = {"ts": time.time(), "active": {}}
             else:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
-                    log_risk.warning(
-                        "_load_survival_active invalid JSON -> resetting active cache",
-                    )
+                    log_risk.error("_load_survival_active invalid JSON -> resetting active cache")
                     data = {"ts": time.time(), "active": {}}
 
             if "active" not in data or not isinstance(data["active"], dict):
-                log_risk.warning(
-                    "_load_survival_active missing active map -> resetting",
-                )
+                log_risk.error("_load_survival_active missing active map -> resetting")
                 data["active"] = {}
 
-            if data.get("active") and not isinstance(data["active"], dict):
-                data["active"] = {}
-
-            if data.get("active") == {}:
-                # rewrite sanitized payload to avoid repeated warnings
-                try:
-                    with _FILE_LOCK:
-                        _atomic_write_text(active_json, json.dumps(data, ensure_ascii=False))
-                except Exception:
-                    pass
             active = data.get("active") or {}
-
             restored: Dict[str, SignalSurvivalState] = {}
+
             for oid, x in active.items():
                 restored[str(oid)] = SignalSurvivalState(
                     order_id=str(x.get("order_id", oid)),
@@ -1505,10 +1664,15 @@ class RiskManager:
     ) -> None:
         """
         Register active signal in memory + flush active json (throttled) + emit JSONL entry.
-        NO CSV writes here.
         """
         try:
             oid = str(order_id)
+
+            conf = float(confidence)
+            if conf > 1.5:
+                conf = conf / 100.0
+            conf = max(0.0, min(1.0, conf))
+
             st = SignalSurvivalState(
                 order_id=oid,
                 direction=_side_norm(signal),
@@ -1516,7 +1680,7 @@ class RiskManager:
                 sl_price=float(sl),
                 tp_price=float(tp),
                 entry_time=float(entry_time),
-                confidence=float(confidence),
+                confidence=float(conf),
                 mfe=0.0,
                 mae=0.0,
                 bars_held=0,
@@ -1534,10 +1698,7 @@ class RiskManager:
 
     def update_signal_survival(self, order_id: str, current_price: float, current_time: float, tick_count: int) -> None:
         """
-        FIXED: no CSV rewrite.
-        - Updates only in memory.
-        - Periodically flushes ACTIVE JSON (small).
-        - Optionally emits JSONL updates throttled per order.
+        Updates only in memory + periodic active flush + throttled JSONL updates.
         """
         try:
             _ = (current_time, tick_count)
@@ -1549,7 +1710,6 @@ class RiskManager:
             st.update(current_price=float(current_price))
             st.last_update_ts = time.time()
 
-            # Mark SL/TP hits (best-effort, purely analytic)
             px = float(current_price)
             if _side_norm(st.direction) == "Buy":
                 if st.sl_price > 0 and px <= float(st.sl_price):
@@ -1576,7 +1736,7 @@ class RiskManager:
     ) -> None:
         """
         Append-only final row to CSV + remove from active + flush active json.
-        Call this once on close.
+        Call once on close.
         """
         try:
             oid = str(order_id)
@@ -1609,7 +1769,6 @@ class RiskManager:
 
             self._emit_survival_update(oid, st, kind="exit")
 
-            # remove active
             self._survival.pop(oid, None)
             self._survival_last_update_emit.pop(oid, None)
 
@@ -1634,18 +1793,18 @@ class RiskManager:
             confidence = float(confidence)
 
             spread_slippage = spread * 0.5
-            vol_factor = min(2.0, max(0.5, volatility / 20.0))
-            latency_factor = min(1.5, max(0.1, latency_ms / 100.0))
+            vol_factor = min(2.5, max(0.4, volatility / 25.0))
+            latency_factor = min(1.8, max(0.1, latency_ms / 120.0))
 
             total_slippage = spread_slippage + spread_slippage * vol_factor + spread_slippage * latency_factor
-            partial_fill_prob = min(0.3, max(0.05, (volatility / 50.0) + (latency_ms / 200.0)))
+            partial_fill_prob = min(0.35, max(0.05, (volatility / 60.0) + (latency_ms / 250.0)))
 
             if is_backtest:
-                total_slippage *= 1.2
-                partial_fill_prob *= 1.1
+                total_slippage *= 1.25
+                partial_fill_prob *= 1.10
             elif is_dry_run:
-                total_slippage *= 0.8
-                partial_fill_prob *= 0.9
+                total_slippage *= 0.85
+                partial_fill_prob *= 0.95
 
             confidence_factor = max(0.7, min(1.3, 1.0 - (confidence - 0.5) * 0.2))
             total_slippage *= confidence_factor
@@ -1662,7 +1821,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "slippage_model.csv"
+                csv_file = LOG_DIR / "slippage_model_btc.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(data.keys()))
@@ -1677,7 +1836,7 @@ class RiskManager:
 
     # ------------------- state persistence (critical for 24/7) -------------------
     def _state_path(self) -> Path:
-        return Path(getattr(self.cfg, "risk_state_file", str(LOG_DIR / "risk_state.json")))
+        return Path(getattr(self.cfg, "risk_state_file", str(LOG_DIR / "risk_state_btc.json")))
 
     def save_state(self) -> None:
         p = self._state_path()
@@ -1721,6 +1880,7 @@ class RiskManager:
 
         saved_date = str(st.get("daily_date", "")).strip()
         if saved_date and saved_date != str(self._utc_date()):
+            # carry only breaker stats across days
             self._exec_breaker_until = float(st.get("_exec_breaker_until", 0.0) or 0.0)
             em = st.get("execmon") or {}
             self.execmon.ewma_slip = float(em.get("ewma_slip", 0.0) or 0.0)
@@ -1751,4 +1911,11 @@ class RiskManager:
         self.execmon.ewma_spread = float(em.get("ewma_spread", 0.0) or 0.0)
 
 
-__all__ = ["RiskManager", "RiskDecision", "ExecutionQualityMonitor", "ExecSample", "percentile_rank", "SignalSurvivalState"]
+__all__ = [
+    "RiskManager",
+    "RiskDecision",
+    "ExecutionQualityMonitor",
+    "ExecSample",
+    "percentile_rank",
+    "SignalSurvivalState",
+]

@@ -24,7 +24,7 @@ from telebot import apihelper, types
 from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-from config import get_config_from_env
+from config_xau import get_config_from_env
 from DataFeed.market_feed import MarketFeed
 from ExnessAPI.history import (
     view_all_history_dict,
@@ -44,17 +44,17 @@ from ExnessAPI.orders import (
     close_order,
 )
 from Bot.engine import engine
-from Strategies.indicators import Classic_FeatureEngine
-from Strategies.risk_management import RiskManager
-from Strategies.signal_engine import SignalEngine
+from StrategiesXau.indicators import Classic_FeatureEngine
+from StrategiesXau.risk_management import RiskManager
+from StrategiesXau.signal_engine import SignalEngine
 from mt5_client import ensure_mt5, MT5_LOCK
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 
 # =============================================================================
 # Logging (production-grade: rotate + no dup handlers)
 # =============================================================================
-LOG_DIR = "Logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR = LOG_ROOT
 
 log = logging.getLogger("telegram.bot")
 log.setLevel(logging.INFO)
@@ -64,7 +64,7 @@ if not log.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     fh = RotatingFileHandler(
-        os.path.join(LOG_DIR, "telegram.log"),
+        str(get_log_path("telegram.log")),
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -488,34 +488,23 @@ def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
 
 def build_health_ribbon(status: Any, compact: bool = True) -> str:
     try:
+        # Portfolio engine status fields
         segments: list[str] = [
             f"DD {float(getattr(status, 'dd_pct', 0.0)) * 100:.1f}%",
             f"PnL {float(getattr(status, 'today_pnl', 0.0)):+.2f}",
-            f"Open {int(getattr(status, 'open_trades', 0) or 0)}",
-            f"Lat {float(getattr(status, 'latency_ms', 0.0)):.1f}ms",
-            f"Phase {str(getattr(status, 'phase', ''))}",
-            f"Last {str(getattr(status, 'last_signal', ''))}",
+            f"Active {str(getattr(status, 'active_asset', 'NONE'))}",
+            f"XAU {int(getattr(status, 'open_trades_xau', 0))}",
+            f"BTC {int(getattr(status, 'open_trades_btc', 0))}",
+            f"LastSel {str(getattr(status, 'last_selected_asset', 'NONE'))}",
         ]
 
-        risk = getattr(engine, "_risk", None)
-        if risk:
-            try:
-                segments.append(f"Cooldown {'OFF' if risk.can_analyze() else 'ON'}")
-            except Exception:
-                pass
-            try:
-                segments.append(f"HardStop {'ON' if risk.requires_hard_stop() else 'OFF'}")
-            except Exception:
-                pass
+        # Add last signals for both assets
+        last_xau = str(getattr(status, 'last_signal_xau', 'Neutral'))
+        last_btc = str(getattr(status, 'last_signal_btc', 'Neutral'))
+        segments.append(f"Sig XAU:{last_xau} BTC:{last_btc}")
 
-        feed = getattr(engine, "_feed", None)
-        if feed:
-            try:
-                tick_stats = feed.tick_stats()
-                segments.append(f"Micro {getattr(tick_stats, 'reason', '-')}")
-                segments.append(f"TPS {float(getattr(tick_stats, 'tps', 0.0)):.1f}")
-            except Exception:
-                pass
+        # Portfolio engine doesn't expose _risk/_feed directly
+        # These are internal to each asset pipeline
 
         corr = fetch_external_correlation(cfg)
         if corr is not None:
@@ -531,18 +520,22 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
 
 def _format_status_message(status: Any) -> str:
     return (
-        "⚙️ Статуси Бот\n"
+        "⚙️ Статуси Portfolio Bot (XAU + BTC)\n"
         f"- 🔗 Пайваст ба MT5: {'✅' if getattr(status, 'connected', False) else '❌'}\n"
         f"- 📈 Тиҷорат фаъол аст: {'✅' if getattr(status, 'trading', False) else '❌'}\n"
         f"- ⛔ Реҷаи дастӣ: {'✅' if getattr(status, 'manual_stop', False) else '❌'}\n"
+        f"- 🎯 Активи ҷорӣ: {str(getattr(status, 'active_asset', 'NONE'))}\n"
         f"- 💰 Баланс: {float(getattr(status, 'balance', 0.0)):.2f}$\n"
         f"- 📊 Арзиш: {float(getattr(status, 'equity', 0.0)):.2f}$\n"
         f"- 📉 Коҳиш: {float(getattr(status, 'dd_pct', 0.0)):.2%}\n"
         f"- 📆 Фоида/Зарари Имрӯза: {float(getattr(status, 'today_pnl', 0.0)):+.2f}$\n"
-        f"- 📂 Ордерҳои Кушода: {int(getattr(status, 'open_trades', 0) or 0)}\n"
-        f"- 🛎 Сигнали Охирон: {str(getattr(status, 'last_signal', ''))}\n"
-        f"- ⚡ Таъхир: {float(getattr(status, 'latency_ms', 0.0)):.1f} мс\n"
-        f"- 📊 Фазаи Имрӯза: {str(getattr(status, 'phase', 'N/A'))}\n"
+        f"- 📂 Позицияҳои XAU: {int(getattr(status, 'open_trades_xau', 0))}\n"
+        f"- 📂 Позицияҳои BTC: {int(getattr(status, 'open_trades_btc', 0))}\n"
+        f"- 📊 Ҷамъи позицияҳо: {int(getattr(status, 'open_trades_total', 0))}\n"
+        f"- 🛎 Сигнали XAU: {str(getattr(status, 'last_signal_xau', 'Neutral'))}\n"
+        f"- 🛎 Сигнали BTC: {str(getattr(status, 'last_signal_btc', 'Neutral'))}\n"
+        f"- 🎲 Охирин интихоб: {str(getattr(status, 'last_selected_asset', 'NONE'))}\n"
+        f"- 📥 Навбати иҷро: {int(getattr(status, 'exec_queue_size', 0))}\n"
     )
 
 
@@ -897,7 +890,26 @@ def handle_open_orders(message: types.Message) -> None:
     start_view_open_orders(message)
 
 def handle_close_all(message: types.Message) -> None:
-    bot.send_message(message.chat.id, str(close_all_position()))
+    res = close_all_position()
+    lines = [
+        "🧹 <b>Натиҷаи «Ҳамаи ордерҳоро бастан»</b>",
+        f"✅ Муваффақ: <b>{'ҳа' if res.get('ok') else 'не'}</b>",
+        f"🔒 Ордерҳои баста: <b>{int(res.get('closed', 0) or 0)}</b>",
+        f"🗑️ Ордерҳои бекоршуда: <b>{int(res.get('canceled', 0) or 0)}</b>",
+    ]
+
+    errs = list(res.get('errors') or [])
+    if errs:
+        err_lines = '\n'.join(f"• {e}" for e in errs)
+        lines.append(f"⚠️ Хатогиҳо:\n{err_lines}")
+    else:
+        lines.append("⚠️ Хатогиҳо: <b>нест</b>")
+
+    last_err = res.get('last_error')
+    if last_err:
+        lines.append(f"🛠️ last_error: <code>{last_err}</code>")
+
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
 
 def handle_positions_summary(message: types.Message) -> None:
     summary = get_positions_summary()
@@ -942,8 +954,13 @@ def handle_engine_check(message: types.Message) -> None:
             "———————————————\n"
             f"🔗 Пайваст шудааст: {'✅' if status.connected else '❌'}\n"
             f"📈 Тиҷорат фаъол аст: {'✅' if status.trading else '❌'}\n"
-            f"⚡ Таъхир: {status.latency_ms:.1f} мс\n"
-            f"📊 Фазаи Имрӯза: {status.phase if hasattr(status, 'phase') else 'N/A'}\n"
+            f"⛔ Реҷаи дастӣ: {'✅' if status.manual_stop else '❌'}\n"
+            f"🎯 Активи ҷорӣ: {status.active_asset}\n"
+            f"📉 Коҳиш: {status.dd_pct * 100:.2f}%\n"
+            f"📆 PnL Имрӯза: {status.today_pnl:+.2f}$\n"
+            f"📂 Позицияҳо → XAU: {status.open_trades_xau} | BTC: {status.open_trades_btc}\n"
+            f"🛎 Сигналҳо → XAU: {status.last_signal_xau} | BTC: {status.last_signal_btc}\n"
+            f"📥 Навбати иҷро: {status.exec_queue_size}\n"
         ),
         parse_mode="HTML",
     )

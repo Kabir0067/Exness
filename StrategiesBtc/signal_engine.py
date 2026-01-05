@@ -1,52 +1,108 @@
-# Strategies/signal_engine.py  (PRODUCTION-GRADE, planner-only)
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import time
 import traceback
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
-import talib
 
-from config import EngineConfig, SymbolParams
-from DataFeed.market_feed import MarketFeed, TickStats
-from mt5_client import MT5_LOCK
-from Strategies.indicators import Classic_FeatureEngine, safe_last
-from Strategies.risk_management import RiskManager
+try:
+    import talib  # type: ignore
+except Exception:  # pragma: no cover
+    talib = None  # type: ignore
+
+from config_btc import EngineConfig, SymbolParams
+from DataFeed.btc_feed import MarketFeed, TickStats
+from mt5_client import MT5_LOCK, ensure_mt5
+from StrategiesBtc.indicators import Classic_FeatureEngine, safe_last
+from StrategiesBtc.risk_management import RiskManager
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # ============================================================
-# ERROR-only logging (isolated file, no collision)
+# ERROR-only rotating logging (isolated)
 # ============================================================
-os.makedirs("Logs", exist_ok=True)
+LOG_DIR = LOG_ROOT
 
-log = logging.getLogger("signal_engine")
+log = logging.getLogger("signal_engine_btc")
 log.setLevel(logging.ERROR)
 log.propagate = False
 
-if not log.handlers:
-    fh = logging.FileHandler("Logs/signal_engine.log", encoding="utf-8")
+if not any(isinstance(h, RotatingFileHandler) for h in log.handlers):
+    fh = RotatingFileHandler(
+        filename=str(get_log_path("signal_engine_btc.log")),
+        maxBytes=int(5_242_880),  # 5MB
+        backupCount=int(5),
+        encoding="utf-8",
+        delay=True,
+    )
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     log.addHandler(fh)
 
 
+# ============================================================
+# helpers
+# ============================================================
 def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
 
-def _finite(x: float) -> bool:
-    try:
-        return bool(np.isfinite(x))
-    except Exception:
-        return False
+def _atr_np(h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int = 14) -> np.ndarray:
+    """
+    Wilder ATR fallback without TA-Lib.
+    Returns len(c) array with NaNs until period-1 where possible.
+    """
+    n = int(len(c))
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    if n == 1:
+        out[0] = float(h[0] - l[0])
+        return out
+
+    period = max(1, int(period))
+
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+
+    if n < period:
+        out[-1] = float(np.mean(tr))
+        return out
+
+    out[period - 1] = float(np.mean(tr[:period]))
+    for i in range(period, n):
+        out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+    return out
 
 
+def _atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int = 14) -> np.ndarray:
+    if talib is not None:
+        try:
+            return talib.ATR(h, l, c, int(period))  # type: ignore[attr-defined]
+        except Exception:
+            return _atr_np(h, l, c, int(period))
+    return _atr_np(h, l, c, int(period))
+
+
+def _side_norm(side: str) -> str:
+    s = str(side or "").strip().lower()
+    if s in ("buy", "long", "b", "1"):
+        return "Buy"
+    if s in ("sell", "short", "s", "-1"):
+        return "Sell"
+    return "Buy" if "buy" in s else "Sell" if "sell" in s else str(side)
+
+
+# ============================================================
+# result
+# ============================================================
 @dataclass(frozen=True, slots=True)
 class SignalResult:
     symbol: str
@@ -69,14 +125,14 @@ class SignalResult:
     trade_blocked: bool = False
 
 
+# ============================================================
+# engine
+# ============================================================
 class SignalEngine:
     """
-    Production-grade SignalEngine (planner-only):
-      - execute=True => attaches (entry/sl/tp/lot) via RiskManager.plan_order, NEVER sends orders
-      - ERROR-only logging for real exceptions only
-      - debounce + stability gating (monotonic time)
-      - deterministic signal_id (bar-time based)
-      - robust compatibility with different FeatureEngine outputs
+    Planner-only SignalEngine:
+      - execute=True -> fills entry/sl/tp/lot using RiskManager.plan_order()
+      - never sends orders itself
     """
 
     def __init__(
@@ -96,10 +152,8 @@ class SignalEngine:
         self._last_decision_ms = 0.0
         self._last_net_norm = 0.0
         self._last_signal = "Neutral"
-
         self._current_drawdown = 0.0
 
-        # throttle defaults (safe)
         self._debounce_ms = float(getattr(self.cfg, "decision_debounce_ms", 150.0) or 150.0)
         self._stable_eps = float(getattr(self.cfg, "signal_stability_eps", 0.03) or 0.03)
 
@@ -114,16 +168,19 @@ class SignalEngine:
     # --------------------------- public
     def compute(self, execute: bool = False) -> SignalResult:
         """
-        execute=False: signal only
-        execute=True : signal + plan (entry/sl/tp/lot) via RiskManager.plan_order
-        NOTE: execute NEVER means order_send.
+        execute=False: returns signal only
+        execute=True : returns signal + (entry/sl/tp/lot) plan via RiskManager.plan_order
         """
         t0 = time.perf_counter()
         sym = self._symbol()
 
-        dfp: Optional[pd.DataFrame] = None
         try:
-            # 1) Fetch MTF rates (fast fallbacks)
+            # MT5 quote -> feed risk exec monitor (breaker)
+            bid, ask = self._tick_bid_ask(sym)
+            if bid and ask:
+                self.risk.on_quote(bid, ask)
+
+            # 1) Rates (MTF)
             dfp = self.feed.get_rates(sym, self.sp.tf_primary)
             if dfp is None or dfp.empty:
                 return self._neutral(sym, ["no_rates_primary"], t0)
@@ -138,7 +195,7 @@ class SignalEngine:
 
             bar_key = self._bar_key(dfp)
 
-            # 2) Quick context
+            # 2) Context
             spread_pct = float(self.feed.spread_pct() or 0.0)
             last_age = float(self.feed.last_bar_age(dfp) or 0.0)
             atr_lb = int(getattr(self.cfg, "atr_percentile_lookback", 400) or 400)
@@ -146,11 +203,19 @@ class SignalEngine:
             tick_stats: TickStats = self.feed.tick_stats(dfp)
             ingest_ms = (time.perf_counter() - t0) * 1000.0
 
-            # 3) Guards (NO error logs for normal blocks)
+            # 3) Hard market gate (BTC is 24/7, but can be close-only/disabled/maintenance)
             if not self.risk.market_open_24_5():
-                return self._neutral(sym, ["market_closed"], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["market_blocked"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
 
-            in_session = self._in_active_session()
+            # 4) Guards (risk-level)
+            in_session = self._in_active_session()  # optional policy gate (cfg.active_sessions)
             drawdown_exceeded = self._check_drawdown()
             latency_ok = bool(self.risk.latency_cooldown())
 
@@ -167,15 +232,28 @@ class SignalEngine:
             )
             if not getattr(decision, "allowed", False):
                 reasons = list(getattr(decision, "reasons", []) or ["guard_block"])
-                return self._neutral(sym, reasons, t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    reasons[:25],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
 
-            # 4) Indicators (MTF)
+            # 5) Indicators (MTF)
             tf_data = {self.sp.tf_primary: dfp, self.sp.tf_confirm: dfc, self.sp.tf_long: dfl}
             indicators = self.features.compute_indicators(tf_data)
             if not indicators:
-                return self._neutral(sym, ["no_indicators"], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["no_indicators"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
 
-            # Global anomaly block support (if present)
             if bool(indicators.get("trade_blocked", False)):
                 reasons = ["anomaly_block"] + list(indicators.get("anomaly_reasons", []) or [])
                 return self._neutral(sym, reasons[:25], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
@@ -184,50 +262,69 @@ class SignalEngine:
             indc = indicators.get(self.sp.tf_confirm) or indp
             indl = indicators.get(self.sp.tf_long) or indp
             if not indp:
-                return self._neutral(sym, ["no_primary_indicators"], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["no_primary_indicators"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
 
-            # Per-TF anomaly block support (if present)
             if bool(indp.get("trade_blocked", False)):
                 reasons = ["anomaly_block_primary"] + list(indp.get("anomaly_reasons", []) or [])
                 return self._neutral(sym, reasons[:25], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
 
-            # Optional squeeze filter (only if feature engine outputs it)
             if bool(getattr(self.cfg, "use_squeeze_filter", False)) and bool(indp.get("squeeze_on", False)):
-                return self._neutral(sym, ["squeeze_wait"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(indp.get("regime") or None))
+                return self._neutral(
+                    sym,
+                    ["squeeze_wait"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(indp.get("regime") or None),
+                )
 
-            # 5) Adaptive params
+            # 6) Adaptive params
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
-            # 6) HTF alignment (trend filter)
+            # 7) HTF alignment
             close_p = float(indp.get("close", 0.0) or 0.0)
             ema50_l = float(indl.get("ema50", close_p) or close_p)
-
             adx_l = float(indl.get("adx", 0.0) or 0.0)
             adx_lo = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
 
-            trend_ok_buy = (adx_l >= adx_lo and close_p > ema50_l * 0.999)
-            trend_ok_sell = (adx_l >= adx_lo and close_p < ema50_l * 1.001)
+            trend_ok_buy = (adx_l >= adx_lo) and (close_p > ema50_l * 0.999)
+            trend_ok_sell = (adx_l >= adx_lo) and (close_p < ema50_l * 1.001)
 
-            # 7) Ensemble score
+            # 8) Ensemble score
             book = self.feed.fetch_book() or {}
             net_norm, conf = self._ensemble_score(indp, indc, indl, book, adapt, spread_pct, tick_stats)
 
-            # 8) Confluence layer (veto / boost) - compatible calls
+            # 9) Confluence layer
             ext = self._extreme_flag(dfp, indp)
             sweep = self._liquidity_sweep(dfp, indp)
-            div = self._divergence(dfp)
+            div = self._divergence(dfp, indp)
             near_rn = self._near_round(close_p, indp)
 
             ok, why = self._confirm_layer(ext, sweep, div, near_rn)
             if not ok:
-                return self._neutral(sym, ["extreme_guard"] + why, t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")), trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["extreme_guard"] + why,
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                    trade_blocked=True,
+                )
 
             if sweep or div != "none":
                 conf = min(100, int(conf * 1.15))
             if near_rn and not (sweep or div != "none"):
                 conf = max(0, int(conf * 0.75))
 
-            # 9) Decide signal
+            # 10) Decide signal
             signal = "Neutral"
             blocked_by_htf = False
             conf_min = int(adapt.get("conf_min", 98) or 98)
@@ -240,19 +337,48 @@ class SignalEngine:
                 else:
                     blocked_by_htf = True
 
-            # 10) Advanced filters
+            # 11) Advanced filters
             if signal != "Neutral" and not self._conformal_ok(dfp):
-                return self._neutral(sym, ["conformal_abstain"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")), trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["conformal_abstain"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                    trade_blocked=True,
+                )
 
             if signal in ("Buy", "Sell") and not self._gate_meta(signal, indp, dfp):
-                return self._neutral(sym, ["meta_gate_block"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")), trade_blocked=True)
+                return self._neutral(
+                    sym,
+                    ["meta_gate_block"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                    trade_blocked=True,
+                )
 
             signal, conf = self._apply_filters(signal, conf, indp)
 
             if signal == "Neutral" and blocked_by_htf:
                 conf = min(conf, max(0, conf_min - 1))
 
-            # 11) Debounce + stability
+            # 12) Risk-level emission gate (after we have confidence)
+            ok_emit, emit_reasons = self.risk.can_emit_signal(conf, getattr(self.feed, "tz", None))
+            if (signal in ("Buy", "Sell")) and (not ok_emit):
+                return self._neutral(
+                    sym,
+                    ["risk_emit_block"] + (emit_reasons[:20] if emit_reasons else []),
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                    trade_blocked=True,
+                )
+
+            # 13) Debounce + stability
             now_ms = time.monotonic() * 1000.0
             if (now_ms - self._last_decision_ms) < self._debounce_ms:
                 return self._neutral(sym, ["debounce"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
@@ -264,7 +390,7 @@ class SignalEngine:
             self._last_net_norm = float(net_norm)
             self._last_signal = str(signal)
 
-            # 12) Finalize (plan only)
+            # 14) Finalize (plan only)
             reasons: List[str] = []
             if sweep:
                 reasons.append(f"sweep:{sweep}")
@@ -293,17 +419,30 @@ class SignalEngine:
             log.error("compute crash: %s | tb=%s", exc, traceback.format_exc())
             return self._neutral(sym, ["compute_error"], t0, trade_blocked=True)
 
-    # --------------------------- helpers
+    # --------------------------- core helpers
     def _symbol(self) -> str:
         return self.sp.resolved or self.sp.base
 
+    def _tick_bid_ask(self, sym: str) -> Tuple[float, float]:
+        try:
+            ensure_mt5()
+            with MT5_LOCK:
+                t = mt5.symbol_info_tick(sym)
+            if not t:
+                return 0.0, 0.0
+            bid = float(getattr(t, "bid", 0.0) or 0.0)
+            ask = float(getattr(t, "ask", 0.0) or 0.0)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                return 0.0, 0.0
+            return bid, ask
+        except Exception:
+            return 0.0, 0.0
+
     def _bar_key(self, df: pd.DataFrame) -> str:
-        """
-        Stable bar key for signal_id (time-based).
-        """
         try:
             if df is None or df.empty:
                 return "no_bar"
+
             if "time" in df.columns:
                 t = df["time"].iloc[-1]
             elif "datetime" in df.columns:
@@ -313,10 +452,9 @@ class SignalEngine:
             else:
                 t = df.index[-1]
 
-            # normalize to string
             if isinstance(t, (pd.Timestamp, np.datetime64)):
-                t = pd.to_datetime(t)
-                return t.isoformat()
+                tt = pd.to_datetime(t)
+                return tt.isoformat()
             return str(t)
         except Exception:
             return "bar_err"
@@ -344,7 +482,7 @@ class SignalEngine:
             signal="Neutral",
             confidence=0,
             regime=regime,
-            reasons=reasons[:25],
+            reasons=(reasons or ["neutral"])[:25],
             spread_bps=None if spread_pct is None else float(spread_pct) * 10000.0,
             latency_ms=float(comp_ms),
             timestamp=self.feed.now_local().isoformat(),
@@ -353,15 +491,33 @@ class SignalEngine:
         )
 
     def _in_active_session(self) -> bool:
+        """
+        Optional policy gate: cfg.active_sessions = [(start_hour, end_hour), ...] in LOCAL time.
+        If absent -> always True (BTC is 24/7).
+        """
         try:
-            h = int(self.feed.now_local().hour)
             sessions = list(getattr(self.cfg, "active_sessions", []) or [])
+            if not sessions:
+                return True
+            h = int(self.feed.now_local().hour)
             return any(int(s) <= h < int(e) for s, e in sessions)
         except Exception:
             return True
 
     def _check_drawdown(self) -> bool:
+        """
+        Prefer RiskManager cached drawdown; fallback to direct MT5 query if needed.
+        """
         try:
+            self.risk.evaluate_account_state()
+            dd = float(getattr(self.risk, "_current_drawdown", 0.0) or 0.0)
+            self._current_drawdown = dd
+            return dd >= float(getattr(self.cfg, "max_drawdown", 0.09) or 0.09)
+        except Exception:
+            pass
+
+        try:
+            ensure_mt5()
             with MT5_LOCK:
                 acc = mt5.account_info()
             if not acc:
@@ -395,13 +551,8 @@ class SignalEngine:
             "phase": phase,
         }
 
-    # -------- compatibility wrappers (different FeatureEngine variants)
+    # --------------------------- confluence helpers
     def _extreme_flag(self, dfp: pd.DataFrame, indp: Dict[str, Any]) -> bool:
-        """
-        FIX: previous code used bool(dict) => always True.
-        Here: if feature provides extreme_zone dict -> use near_top/near_bot/exhausted.
-        If missing -> False (no extreme gating).
-        """
         try:
             if hasattr(self.features, "extreme_zone"):
                 z = self.features.extreme_zone(dfp, indp)  # type: ignore[attr-defined]
@@ -415,36 +566,54 @@ class SignalEngine:
     def _liquidity_sweep(self, dfp: pd.DataFrame, indp: Dict[str, Any]) -> str:
         try:
             if hasattr(self.features, "liquidity_sweep"):
-                s = self.features.liquidity_sweep(dfp, indp)  # type: ignore[attr-defined]
-                return str(s or "")
-            # fallback: already computed in indicators
-            return str(indp.get("liquidity_sweep", "") or "")
+                s: Any = self.features.liquidity_sweep(dfp, indp)  # type: ignore[attr-defined]
+            else:
+                s = indp.get("liquidity_sweep", "")
+            s = str(s or "").strip().lower()
+            return s if s in ("bull", "bear") else ""
         except Exception:
             return ""
 
-    def _divergence(self, dfp: pd.DataFrame) -> str:
+    def _divergence(self, dfp: pd.DataFrame, indp: Dict[str, Any]) -> str:
         try:
             if hasattr(self.features, "hidden_divergence"):
                 d = self.features.hidden_divergence(dfp)  # type: ignore[attr-defined]
-                return "bullish" if d == "bull" else "bearish" if d == "bear" else "none"
-            # fallback: use indicator field if exists
-            d = str((dfp is not None) and "" or "")
-            _ = d
+                d = str(d or "").strip().lower()
+                if d in ("bull", "bullish"):
+                    return "bullish"
+                if d in ("bear", "bearish"):
+                    return "bearish"
+
+            d2 = str(indp.get("rsi_div", "none") or "none").strip().lower()
+            if d2 in ("bull", "bullish"):
+                return "bullish"
+            if d2 in ("bear", "bearish"):
+                return "bearish"
             return "none"
         except Exception:
             return "none"
 
     def _near_round(self, price: float, indp: Dict[str, Any]) -> bool:
         try:
-            # if feature provides method
             if hasattr(self.features, "round_number_confluence"):
                 return bool(self.features.round_number_confluence(price))  # type: ignore[attr-defined]
-            # fallback: indicators field
             return bool(indp.get("near_round", False))
         except Exception:
             return False
 
-    # ---------------- score
+    def _confirm_layer(self, ext: bool, sweep: str, div: str, near_rn: bool) -> Tuple[bool, List[str]]:
+        try:
+            if not ext:
+                return True, []
+            has_bear = (sweep == "bear") or (div == "bearish")
+            has_bull = (sweep == "bull") or (div == "bullish")
+            if not has_bear and not has_bull and not near_rn:
+                return False, ["extreme_needs_confirmation"]
+            return True, []
+        except Exception:
+            return True, []
+
+    # --------------------------- ensemble scoring
     def _ensemble_score(
         self,
         indp: Dict[str, Any],
@@ -471,7 +640,10 @@ class SignalEngine:
                 dtype=np.float64,
             )
             s = float(np.sum(weights))
-            weights = weights / s if s > 0 else np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+            if s <= 0:
+                weights = np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+            else:
+                weights = weights / s
 
             regime = str(adapt.get("regime", "trend") or "trend")
 
@@ -493,9 +665,6 @@ class SignalEngine:
             return 0.0, 0
 
     def _ema_s_m(self, indp: Dict[str, Any], close_p: float) -> Tuple[float, float]:
-        """
-        Compatibility: different engines expose ema8/ema9/ema_short and ema21/ema_mid.
-        """
         ema_s = float(indp.get("ema9", indp.get("ema8", indp.get("ema_short", close_p))) or close_p)
         ema_m = float(indp.get("ema21", indp.get("ema_mid", close_p)) or close_p)
         return ema_s, ema_m
@@ -529,9 +698,9 @@ class SignalEngine:
         try:
             _ = indc
             sc = 0.0
-            macd_hist = float(indp.get("macd_hist", 0.0) or 0.0)
             macd = float(indp.get("macd", 0.0) or 0.0)
             macd_sig = float(indp.get("macd_sig", indp.get("macd_signal", 0.0)) or 0.0)
+            macd_hist = float(indp.get("macd_hist", macd - macd_sig) or (macd - macd_sig))
 
             if macd_hist > 0 and macd > macd_sig:
                 sc += 1.6
@@ -579,19 +748,7 @@ class SignalEngine:
         except Exception:
             return 0.0
 
-    # ---------------- confirm / filters
-    def _confirm_layer(self, ext: bool, sweep: str, div: str, near_rn: bool) -> Tuple[bool, List[str]]:
-        try:
-            if not ext:
-                return True, []
-            has_bear = (sweep == "bear" or div == "bearish")
-            has_bull = (sweep == "bull" or div == "bullish")
-            if not has_bear and not has_bull and not near_rn:
-                return False, ["extreme_needs_confirmation"]
-            return True, []
-        except Exception:
-            return True, []
-
+    # --------------------------- meta gates
     def _conformal_ok(self, dfp: pd.DataFrame) -> bool:
         try:
             W = int(getattr(self.cfg, "conformal_window", 300) or 300)
@@ -604,7 +761,7 @@ class SignalEngine:
             h = dfp["high"].to_numpy(dtype=np.float64)
             l = dfp["low"].to_numpy(dtype=np.float64)
 
-            atr = talib.ATR(h, l, c, 14)
+            atr = _atr(h, l, c, 14)
             rr = np.abs(np.diff(c)) / np.maximum(1e-9, atr[1:])
             if rr.size < 50:
                 return True
@@ -631,12 +788,13 @@ class SignalEngine:
             c = dfp["close"].to_numpy(dtype=np.float64)
             h = dfp["high"].to_numpy(dtype=np.float64)
             l = dfp["low"].to_numpy(dtype=np.float64)
-            atr = talib.ATR(h, l, c, 14)
+
+            atr = _atr(h, l, c, 14)
             atr_val = float(safe_last(atr, 1.0) or 1.0)
             if atr_val <= 0:
                 return True
 
-            sign = 1.0 if side == "Buy" else -1.0
+            sign = 1.0 if _side_norm(side) == "Buy" else -1.0
             wins = 0
             total = 0
 
@@ -664,8 +822,13 @@ class SignalEngine:
 
             atr = float(ind.get("atr", 0.0) or 0.0)
             body = float(ind.get("body", 0.0) or 0.0)
-            min_body_k = float(getattr(self.cfg, "min_body_pct_of_atr", 0.14) or 0.14)
+            if body <= 0.0:
+                try:
+                    body = abs(float(ind.get("close", 0.0) or 0.0) - float(ind.get("open", 0.0) or 0.0))
+                except Exception:
+                    body = 0.0
 
+            min_body_k = float(getattr(self.cfg, "min_body_pct_of_atr", 0.14) or 0.14)
             if atr > 0 and body < (min_body_k * atr):
                 conf = max(0, conf - 25)
 
@@ -677,10 +840,13 @@ class SignalEngine:
             if signal == "Sell" and close_p < ema_s < ema_m:
                 conf = min(100, conf + 10)
 
-            return signal, int(conf)
+            conf = int(_clamp(float(conf), 0.0, 100.0))
+            return signal, conf
         except Exception:
-            return signal, int(conf)
+            conf = int(_clamp(float(conf), 0.0, 100.0))
+            return signal, conf
 
+    # --------------------------- finalize / planning
     def _finalize(
         self,
         *,
@@ -702,20 +868,33 @@ class SignalEngine:
 
         try:
             regime = str(adapt.get("regime") or None)
-
             entry_val = sl_val = tp_val = lot_val = None
 
             if signal in ("Buy", "Sell") and execute:
+                # Final trade gate (includes exec breaker / hard stops / confidence rules)
+                trade_dec = self.risk.can_trade(float(conf) / 100.0, signal)
+                if not trade_dec.allowed:
+                    return self._neutral(
+                        sym,
+                        ["risk_trade_block"] + (trade_dec.reasons[:20] if trade_dec.reasons else []),
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=regime,
+                        trade_blocked=True,
+                    )
+
                 zones = self.feed.micro_price_zones(book)
                 tick_vol = float(getattr(tick_stats, "volatility", 0.0) or 0.0)
                 open_pos, unreal_pl = self._position_context(sym)
 
+                # IMPORTANT: do NOT pass candle close as entry; let RiskManager use bid/ask tick
                 entry_val, sl_val, tp_val, lot_val = self.risk.plan_order(
                     signal,
                     float(conf) / 100.0,
                     indp,
                     adapt,
-                    entry=float(indp.get("close", 0.0) or 0.0),
+                    entry=None,
                     ticks=tick_stats,
                     zones=zones,
                     tick_volatility=tick_vol,
@@ -725,25 +904,25 @@ class SignalEngine:
                 )
 
                 if entry_val is None or sl_val is None or tp_val is None or lot_val is None:
-                    return SignalResult(
-                        symbol=sym,
-                        signal="Neutral",
-                        confidence=0,
+                    return self._neutral(
+                        sym,
+                        ["plan_order_failed"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
                         regime=regime,
-                        reasons=["plan_order_failed"],
-                        spread_bps=float(spread_pct) * 10000.0,
-                        latency_ms=float(comp_ms),
-                        timestamp=self.feed.now_local().isoformat(),
-                        signal_id=self._signal_id(sym, str(self.sp.tf_primary), bar_key, "Neutral"),
                         trade_blocked=True,
                     )
+
+                # Count only when we actually produced a tradeable plan
+                self.risk.register_signal_emitted()
 
             return SignalResult(
                 symbol=sym,
                 signal=signal,
-                confidence=int(conf),
+                confidence=int(_clamp(float(conf), 0.0, 100.0)),
                 regime=regime,
-                reasons=reasons[:25],
+                reasons=(reasons or ["signal"])[:25],
                 spread_bps=float(spread_pct) * 10000.0,
                 latency_ms=float(comp_ms),
                 timestamp=self.feed.now_local().isoformat(),
@@ -756,21 +935,11 @@ class SignalEngine:
             )
         except Exception as exc:
             log.error("_finalize crash: %s | tb=%s", exc, traceback.format_exc())
-            return SignalResult(
-                symbol=sym,
-                signal="Neutral",
-                confidence=0,
-                regime=str(adapt.get("regime") or None),
-                reasons=["finalize_error"],
-                spread_bps=float(spread_pct) * 10000.0,
-                latency_ms=float(comp_ms),
-                timestamp=self.feed.now_local().isoformat(),
-                signal_id=self._signal_id(sym, str(self.sp.tf_primary), bar_key, "Neutral"),
-                trade_blocked=True,
-            )
+            return self._neutral(sym, ["finalize_error"], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
 
     def _position_context(self, sym: str) -> Tuple[int, float]:
         try:
+            ensure_mt5()
             with MT5_LOCK:
                 positions = mt5.positions_get(symbol=sym) or []
             open_pos = int(len(positions))

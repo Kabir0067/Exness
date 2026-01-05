@@ -2,16 +2,24 @@ from typing import Literal, Dict, Any, List
 from datetime import datetime, timedelta
 import MetaTrader5 as mt5
 
+from mt5_client import ensure_mt5, MT5_LOCK
+
 
 _cache = None
 _cache_time = None
 
 
 def _connect() -> bool:
-    if not mt5.terminal_info() or not mt5.terminal_info().trade_allowed:
-        print("АвтоТорговля дар MT5 хомӯш аст! Лутфан онро фаъол кунед.")
+    try:
+        ensure_mt5()
+        with MT5_LOCK:
+            term = mt5.terminal_info()
+            if not term or not term.trade_allowed:
+                print("АвтоТорговля дар MT5 хомӯш аст! Лутфан онро фаъол кунед.")
+                return False
+        return True
+    except Exception:
         return False
-    return True
 
 def get_profit_period(period: Literal["day", "week", "month"]) -> dict:
     if not _connect():
@@ -29,7 +37,8 @@ def get_profit_period(period: Literal["day", "week", "month"]) -> dict:
     else:
         return {"profit": 0.0, "loss": 0.0, "net": 0.0}
 
-    deals = mt5.history_deals_get(from_date, datetime.utcnow() + timedelta(hours=10)) 
+    with MT5_LOCK:
+        deals = mt5.history_deals_get(from_date, datetime.utcnow() + timedelta(hours=10)) 
 
     total_profit = 0.0
     total_loss = 0.0
@@ -97,13 +106,6 @@ def format_usdt(amount: float, show_plus: bool = False) -> str:
 
 
 def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
-    """
-    Маълумоти дақиқи ҳаррӯзаро аз ҳисоби Exness (MT5) мегирад.
-    - force_refresh=True → ҳатман аз MT5 навсозӣ мекунад (барои /history).
-    - Кэш фақат 5 сония нигоҳ дошта мешавад, то маълумот ҳамеша тоза бошад.
-    - Ҳамаи ордерҳои имрӯз (кушода + баста) + P&L нореалӣ.
-    - Хатоҳо лог мешаванд, аммо функсия ҳамеша dict бармегардонад.
-    """
     global _cache, _cache_time
 
     now = datetime.now()
@@ -122,19 +124,14 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             _cache_time = now
             return empty_summary
 
-        # Диапозони имрӯз (аз нисфишаб то ҳозир + 2 соат барои ҳамаи минтақаҳо)
         today_start = datetime(now.year, now.month, now.day, 0, 0, 0)
-        from_date = today_start - timedelta(hours=3)  # Барои бехатарӣ
+        from_date = today_start - timedelta(hours=3) 
         to_date = now + timedelta(hours=2)
 
-        # Гирифтани таърих
-        deals = mt5.history_deals_get(from_date.timestamp(), to_date.timestamp())
-
-        # Ордерҳои кушода
-        open_positions = mt5.positions_get() or []
-
-        # Баланс
-        acc = mt5.account_info()
+        with MT5_LOCK:
+            deals = mt5.history_deals_get(from_date.timestamp(), to_date.timestamp())
+            open_positions = mt5.positions_get() or []
+            acc = mt5.account_info()
         balance = float(acc.balance) if acc else 0.0
 
         if not deals and not open_positions:
@@ -150,7 +147,6 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             _cache_time = now
             return empty_summary
 
-        # Гурӯҳбандии deal-ҳо аз рӯи position_id
         trades: Dict[int, Dict] = {}
         for d in deals:
             pid = d.position_id
@@ -161,7 +157,6 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             elif d.entry == mt5.DEAL_ENTRY_OUT:
                 trades[pid]["exit"] = d
 
-        # Маълумот барои ҳисобот
         wins = losses = total_closed = 0
         total_profit = total_loss = net_total = 0.0
         unrealized_pnl = sum(float(p.profit) for p in open_positions)
@@ -174,7 +169,6 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             if not entry:
                 continue
 
-            # Агар ордер кушода бошад
             open_pos = next((p for p in open_positions if p.position_id == pid), None)
             if open_pos:
                 profit = float(open_pos.profit)
@@ -182,7 +176,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
                 total_open = len(open_positions)
             else:
                 if not exit_deal:
-                    continue  # Нодуруст — набояд рӯй диҳад
+                    continue  
                 profit = float(exit_deal.profit)
                 status = "closed"
                 total_closed += 1
@@ -201,7 +195,6 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
                 "lot": float(entry.volume),
             })
 
-        # Ҷамъбаст
         summary = {
             "date": now.strftime("%Y-%m-%d"),
             "wins": wins,
@@ -213,18 +206,17 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             "loss": round(total_loss, 2),
             "net": round(net_total, 2),
             "balance": round(balance, 2),
-            "records": records[:50],  # Фақат охирин 50 барои нигоҳдорӣ
+            "records": records[:50],  
         }
 
         _cache = summary
         _cache_time = now
         return summary
 
-    # Баргардонидани кэш (фақат агар хеле тоза бошад)
     if _cache and _cache_time and (now - _cache_time).seconds < 5:
         return _cache
 
-    return view_all_history_dict(force_refresh=True)  # Агар чизе хато шавад — навсозӣ
+    return view_all_history_dict(force_refresh=True) 
 
 
 

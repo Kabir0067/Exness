@@ -7,41 +7,15 @@ from typing import Any
 
 import numpy as np
 
-
-def _project_root(max_levels: int = 6) -> Path:
-    """Resolve project root so every module writes into the same Logs/ directory.
-
-    Strategy:
-    - Walk up a few parents.
-    - If we see typical marker files (config.py/mt5_client.py) or dirs (Bot/Strategies/etc),
-      treat that folder as project root.
-    - Otherwise fallback to current working directory.
-    """
-    here = Path(__file__).resolve()
-
-    marker_files = ("config.py", "mt5_client.py")
-    marker_dirs = ("Bot", "Strategies", "ExnessAPI", "DataFeed")
-
-    parents = [here.parent] + list(here.parents)
-    for p in parents[: max(1, int(max_levels))]:
-        try:
-            if any((p / mf).is_file() for mf in marker_files):
-                return p
-            if any((p / md).is_dir() for md in marker_dirs):
-                return p
-        except Exception:
-            continue
-
-    return Path.cwd()
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 
 # ------------------------------------------------------------
 # Logging (error-only + rotation)
 # ------------------------------------------------------------
-LOG_DIR = _project_root() / "Logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = LOG_ROOT
 
-UTILS_LOG_PATH = LOG_DIR / "utils.log"
+UTILS_LOG_PATH = get_log_path("utils.log")
 
 
 def _ensure_rotating_file_handler(

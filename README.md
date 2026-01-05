@@ -1,296 +1,413 @@
-# XAUUSDm Institutional Scalping Stack
+# Dual-Asset Scalping Stack (BTCUSDm & XAUUSDm) — Exness MT5
 
-An institutional-grade, fully automated scalping system for **XAUUSDm** on Exness MetaTrader 5. The project bundles the entire live workflow—market data ingestion, ensemble-based signal generation, phase-aware risk management, asynchronous trade execution, telemetry, and Telegram supervision—behind a reproducible, configurable codebase.
+An institutional-grade, fully automated scalping system for **BTCUSDm** (crypto) and **XAUUSDm** (gold) on Exness MetaTrader 5.  
+The repository ships two production pipelines—each with market data ingestion, indicator/feature construction, signal generation, phase-aware risk management, asynchronous trade execution, telemetry, and Telegram supervision—behind one reproducible, configurable codebase.
 
-> **Mission:** capture repeatable high-probability opportunities on gold while enforcing strict Islamic-compliant risk rules (swap-free assumption, leverage ≥ 1:1000) and daily capital protection through adaptive phase gating.
+> **Mission:** capture repeatable high-probability opportunities on BTCUSDm and XAUUSDm while enforcing strict risk constraints and daily capital protection through adaptive phase gating.
+
+> **Risk Notice (mandatory):** This software does **not** guarantee returns. Trading is risky; you can lose capital. Use dry-run + backtests before live deployment.
 
 ---
 
-## 1. Quick Start
+## 1) Quick Start
+
+### 1.1 Base environment
 
 | Step | Command / Action |
-| --- | --- | --- |
-| 1 | Create `.env` with MT5 & Telegram credentials (see [Configuration](#41-environment-variables)). |
-| 2 | `python -m venv .venv && .\.venv\Scripts\activate` (Windows) or `source .venv/bin/activate` (Linux). |
-| 3 | `pip install -r requirements.txt` (install TA-Lib wheel from `Appprogram/` if required). |
-| 4 | Launch MT5 terminal with AutoTrading ON, then run `python main.py`. |
-| 5 | Open Telegram, `/start`, press **🚀 Оғози Тиҷорат** to enable live trading. |
-| 6 | Use `/status`, `/history`, and buttons for monitoring; **🛑 Қатъи Тиҷорат** closes exposure and pauses the engine. |
+| --- | --- |
+| 1 | Copy `.env.example` (if provided) → `.env` and fill MT5 + Telegram credentials (see **Configuration** below). |
+| 2 | Create/activate venv: `python -m venv .venv` then `source .venv/bin/activate` (Linux/macOS) / `.venv\Scripts\activate` (Windows). |
+| 3 | Install deps: `pip install -r requirements.txt` |
+| 4 | Launch MT5 terminal, log in, turn **AutoTrading ON** |
 
-> **Tip:** On restricted networks set `TELEGRAM_PROXY_URL` or enable offline mode via `TELEGRAM_OFFLINE=1` (details below).
+### 1.2 Running the gold (XAUUSDm) stack
 
----
+| Step | Command / Action |
+| --- | --- |
+| 1 | Ensure `.env` matches the XAUUSDm account (credentials, Telegram bot token, timezone). |
+| 2 | Start supervisors + bot: `python main.py` |
+| 3 | Telegram: `/start` → press **Оғози Тиҷорат** to enable live trading; use **Қатъи Тиҷорат** to stop |
 
-## 2. System Overview
+### 1.3 Running the bitcoin (BTCUSDm) stack
 
-```
-┌────────────┐                                        ┌─────────────┐    ┌───────────┐
-│  config.py │───┐        ┌────────────────────┐      │ RiskManager │──▶│ Trading   │
-└────────────┘   │        │ MarketFeed          │      │ (phases,    │    │ Engine    │
-                 ├──────▶ │ + FeatureEngine     │ ───▶ │ sizing, SL/ │    │ (queue +  │
-┌────────────┐   │        │ + SignalEngine      │      │ TP, logging)│    │ worker)   │
-│ mt5_client │───┘        └────────────────────┘      └────┬────────┘    └────┬──────┘
-└────────────┘                                                 │               │
-                                                               ▼               ▼
-                                                       ┌──────────────┐  ┌──────────────┐
-                                                       │ ExnessAPI/   │  │ Telegram Bot │
-                                                       │ orders.py    │  │ bot.py       │
-                                                       └──────────────┘  └──────────────┘
+The BTC engine is packaged in `Bot/btc_engine.py`. For now it is launched programmatically:
+
+```python
+from Bot.btc_engine import engine as btc_engine
+
+btc_engine.start()
+# ... trade loop runs in background thread
+# To stop gracefully:
+btc_engine.stop()
 ```
 
-The runtime loop is linear and deterministic:
+> **Note:** The Telegram bot currently controls the gold stack. To expose BTC start/stop via Telegram, wire the BTC engine into `Bot/bot.py` (see roadmap below).
 
-1. **MarketFeed** pulls fresh candles/ticks, microstructure stats, and latency metrics.
-2. **FeatureEngine** vectorizes indicators (EMA stack, ADX, ATR, Bollinger, micro-zones, etc.).
-3. **SignalEngine** guards, scores, and annotates potential trades with reasons and confidence.
-4. **RiskManager** enforces phase logic (A/B/C), adaptive cooldowns, and Islamic constraints before planning SL/TP/lot.
-5. **TradingEngine** enqueues MT5 orders asynchronously, monitors fills, and records execution quality.
-6. **Telegram Bot** surfaces health, status, and manual controls; logs persist under `Logs/` per module.
-
-Core modules live under:
-
-| Layer | Key File(s) | Highlights |
-| --- | --- | --- |
-| Configuration | `config.py` | Dataclasses with validated MT5, risk, session, and microstructure parameters. |
-| MT5 Access | `mt5_client.py` | Singleton guard that boots MT5, exposes `ensure_mt5()` and `MT5_LOCK`. |
-| Data & Features | `DataFeed/market_feed.py`, `Strategies/feature_engine.py` | Sub-second candle cache, tick stats, micro-zones; TA-Lib indicator ensemble. |
-| Decisioning | `Strategies/signal_engine.py`, `Strategies/risk_management.py` | Guard rails, ensemble scoring, phase transitions, Kelly-based sizing, signal survival metrics. |
-| Execution | `Bot/engine.py`, `ExnessAPI/orders.py` | Queue-based order pipeline, reconciliation, execution metrics feedback. |
-| Orchestration | `main.py`, `Bot/bot.py`, `ExnessAPI/history.py` | Lifecycle management, Telegram control plane, MT5 history snapshots. |
-| Research | `Strategies/backtest.py` | Offline replay with expectancy tables, regime-conditioned stats, filter ablation, latency-aware PnL simulation. |
+**Tip (restricted networks):** if Telegram is blocked, set a proxy in `Bot/bot.py` or via the `TELEGRAM_PROXY_URL` environment variable.
 
 ---
 
-## 3. Live Trading Mechanics
+## 2) Dual-Asset Architecture Overview
 
-### 3.1 Engine Loop (Bot/engine.py)
+| Layer | BTC Files | XAU Files | Notes |
+| --- | --- | --- | --- |
+| Configuration | `config_btc.py` | `config_xau.py` | Each defines tuned `EngineConfig`/`SymbolParams` for its asset. |
+| Market Feed | `DataFeed/btc_feed.py` | `DataFeed/market_feed.py` | Both enforce MT5 symbol readiness, cache bars, compute microstructure stats. |
+| Feature Engine | `StrategiesBtc/indicators.py` | `StrategiesXau/indicators.py` | Shared indicator philosophy; BTC adds crypto-specific anomaly signals. |
+| Risk Management | `StrategiesBtc/risk_management.py` | `StrategiesXau/risk_management.py` | Each enforces asset-specific drawdown, spread, execution breakers. |
+| Signal Engine | `StrategiesBtc/signal_engine.py` | `StrategiesXau/signal_engine.py` | Multitimeframe ensemble scoring with adaptive thresholds. |
+| Trading Engine | `Bot/btc_engine.py` | `Bot/xauengine.py` (via `Bot/bot.py` & `main.py`) | BTC engine launched manually; XAU engine supervised + Telegram control. |
+| Telegram Ops | _(integrate manually)_ | `Bot/bot.py` | BTC hooks can reuse notifier & command flow. |
 
-The trading engine runs a fast polling loop (default 150 ms) with the following checkpoints per iteration:
+### 2.1 Executive summary
 
-1. **Heartbeat & Telemetry** – Logs balance, equity, drawdown, last_signal, order queue length. (`engine_health.log`)
-2. **MT5 Health Gate** – Reconnects with exponential backoff if terminal disconnected.
-3. **Market Validation** – Rejects stale/empty OHLC data; triggers recovery if cache unusable.
-4. **Order Reconciliation** – Keeps open positions bounded (`max_positions`), notifies RiskManager.
-5. **Signal Evaluation** – Calls `SignalEngine.compute()`, logging repeat/blocked signals with reasons.
-6. **Risk Decision** – `RiskManager.can_trade()` logs whether the signal passed phase/risk gates.
-7. **Order Enqueue** – Enqueues `OrderIntent` with idempotency check; ExecutionWorker handles send/fill logging.
-8. **Adaptive Sleep** – Switches to slower cadence when queue congested or latency elevated.
-
-### 3.2 ExecutionWorker Highlights
-
-- Runs as daemon thread consuming the order queue.
-- Supports **dry-run** mode that logs simulated fills without touching MT5.
-- Records execution metrics (enqueue→send→fill delays, slippage) back into RiskManager for quality analytics.
-- Retries MT5 order placement (IOC/FOK) up to 3 attempts with precise retcode logging.
-
-### 3.3 Risk Phases & Islamic Compliance
-
-| Phase | Trigger | Behaviour |
-| --- | --- | --- |
-| **Phase A** | Daily return < `daily_target_pct` (default 15 %) | Base confidence threshold, standard SL/TP multipliers. |
-| **Phase B** | Daily return ≥ target | Tightens gating to `ultra_confidence_min` (default 0.97), boosts TP for runners. |
-| **Phase C** | Drawdown ≥ `max_daily_loss_pct` (default 10 %) or post-target retrace | Hard stop: close positions, pause trading until next session. |
-
-Additional protections:
-
-- Leverage check (`islamic_min_leverage`) and swap-free expectation enforced before sizing.
-- Adaptive cooldown adjusts signal cadence during drawdowns or latency breaches.
-- Microstructure-aware SL/TP derived from current order book; ATR fallback ensures minimum RR.
-- Execution breaker suspends trading if latency/slippage anomalies are detected (see `exec_breaker_until`).
-
-**Risk flow (RiskManager):**
-
-1. `evaluate_account_state()` runs every decision cycle to track balance/equity, daily P/L, drawdown, and peak equity protection.
-2. `guard_decision()` screens pre-signal conditions (session window, spread, tick quality, hourly signal limit, latency cooldown, rollover blackout, drawdown tolerances).
-3. `can_trade()` is called for actionable Buy/Sell signals and rejects trades if confidence is too low for the current phase, market is closed, cooldowns are active, or drawdown/latency/exec breaker limits are hit.
-4. `plan_order()` derives entry/SL/TP/lot using micro-price zones when available, ensures broker stop distances, enforces min risk-reward, and scales down lots when stacking toward `max_positions`.
-5. `calculate_position_size()` caps risk by equity (`max_risk_per_trade`), respects margin limits, and rounds to broker volume steps.
-6. Post-execution, `record_trade()` and `record_execution_metrics()` feed CSV/JSONL logs (`execution_quality.csv`, `signal_survival_*`) for analytics and adaptive controls.
-
-Signal survival state is persisted atomically; corrupted JSON is auto-sanitised to avoid restart loops. Multi-order scaling tightens SL and extends TP for add-on positions while keeping risk bounded.
-
-### 3.4 Signal Cadence & Order Behaviour
-
-- `max_signals_per_day` (default **30**) caps total signals; RiskManager also limits signals to roughly `⌊30 / 24⌋ = 1` new signal per hour (`_hour_window_count`).
-- Manual stop (`engine.manual_stop_active()`) pauses trading without restarting the engine; supervisor honours this idle state.
-- Engine order queue (`max_exec_queue`, default **10**) throttles concurrent intents; execution worker runs FIFO with retry-on-requote logic.
-- `max_positions` (default **3**) bounds simultaneously open trades. Additional entries scale position size (`scale_factor ≥ 0.3`) and adjust TP/SL to bank profit quicker.
-- Signals are debounced (≥150 ms) and require state change to avoid spamming identical intents; duplicates are dropped via `_seen_signals` cache.
-- RiskManager’s `_daily_signal_count` and `_exec_breaker_until` ensure that prolonged drawdowns or execution anomalies slow the cadence automatically.
-
-**Practical cadence:** In liquid sessions the engine typically emits **4 – 12 qualified signals per day** depending on volatility and guard conditions. High-vol regimes may approach the theoretical 30-signal cap, while low-vol or drawdown days can deliver only a handful of neutralised signals.
-
-### 3.5 Performance Envelope & Expectations
-
-| Metric | Default Limit / Behaviour | Notes |
-| --- | --- | --- |
-| Daily target | **+15 %** equity gain (`daily_target_pct`) | Phase B activates once exceeded; profit is protected via peak drawdown guard (3 %). |
-| Max daily loss | **−10 %** (`max_daily_loss_pct`) | Breach triggers Phase C hard stop until next session. |
-| Signals per day | ≤ **30** hard cap | Hourly limiter + guard rails typically yield 4–12 actionable trades. |
-| Orders per signal | 1 primary + up to 2 scaled adds | Adds require positive unrealized P/L and confidence ≥ `ultra_confidence_min`. |
-| Concurrent orders | ≤ **3** (`max_positions`) | Queue prevents further enqueues once limit reached. |
-| Risk per trade | ≤ **2 %** of equity (`max_risk_per_trade`) | Adjusted down during Phase B / drawdowns; respects broker margin. |
-| Order type | Market execution only | Entry price pulled from tick/bid-ask snapshot at send time. |
-| SL/TP logic | Micro-zone aware with ATR fallback | Broker minimum distances enforced; min RR maintained via `_rr` check. |
-| Execution logging | CSV/JSONL + histograms | Latency/slippage tracked for post-trade QA and breaker triggers. |
-
-> **Reality check:** These limits define the *ceiling*. Live performance depends on market structure, spreads, and guard vetoes; expect variability day-to-day. Dry-run telemetry is the recommended baseline for tuning expectations.
+1. **Common infrastructure** — `mt5_client.py`, `ExnessAPI/*`, logging, and thread orchestration are asset-agnostic.  
+2. **Asset-specific tuning** — Config, indicators, risk, and signal logic live in parallel `StrategiesBtc/*` and `StrategiesXau/*` directories.  
+3. **Operational split** — Gold stack already wired into Telegram & supervisors; BTC stack is a drop-in engine awaiting integration (roadmap section below).
 
 ---
 
-## 4. Configuration & Deployment
+## 3) System Overview
 
-### 4.1 Environment Variables
-
-| Variable | Required | Description |
+| Layer | File(s) | What it does |
 | --- | --- | --- |
-| `EXNESS_LOGIN` | ✅ | MT5 account login. |
-| `EXNESS_PASSWORD` | ✅ | MT5 password (swap-free account recommended). |
-| `EXNESS_SERVER` | ✅ | MT5 server string (e.g., `Exness-MT5Real7`). |
-| `BOT_TOKEN` | ✅ | Telegram bot token. |
-| `ADMIN_ID` | ✅ | Telegram chat ID allowed to control the bot. |
-| `TIMEZONE` | ⛔ (default `Asia/Dushanbe`) | Local timezone used for session checks. |
-| `TELEGRAM_PROXY_URL` | Optional | HTTPS/SOCKS proxy for Telegram (e.g., `socks5://127.0.0.1:9050`). |
-| `TELEGRAM_OFFLINE` | Optional | Set to `1/true/on` to disable outbound Telegram calls (avoids retry storms behind firewalls). |
-| `MT5_PATH` / `MT5_PORTABLE` | Optional | Override terminal location or run in portable mode. |
-| `DAILY_TARGET_PCT`, `MAX_DAILY_LOSS_PCT`, etc. | Optional | Override defaults defined in `EngineConfig`. |
+| Configuration | `config.py` | Loads `EngineConfig`, `SymbolParams`, risk/session/microstructure parameters. |
+| MT5 Access | `mt5_client.py` | MT5 boot + singleton guard (`ensure_mt5()`), global lock (`MT5_LOCK`). |
+| Data & Features | `DataFeed/market_feed.py`, `Strategies/indicators.py` | Market feed caching + feature/indicator construction via `Classic_FeatureEngine`. |
+| Decisioning | `Strategies/signal_engine.py`, `Strategies/risk_management.py` | Signal compute + risk gating + lot/SL/TP planning and analytics hooks. |
+| Execution | `Bot/engine.py`, `ExnessAPI/orders.py` | Queue-based order intents + MT5 execution, fills, and execution QA hooks. |
+| Orchestration | `main.py`, `Bot/bot.py`, `ExnessAPI/history.py` | App lifecycle + Telegram control plane + history/status snapshots. |
+| Research | _(not bundled)_ | Bring your own backtesting harness; production engine can be reused in research scripts. |
 
-> See `config.py` for the full catalog of tunable parameters (indicator periods, ATR multipliers, cooldown timers, microstructure thresholds, etc.). All fields are validated on load; missing required envs halt startup with explicit error messages.
+### 2.1 End-to-End Pipeline (10k foot view)
 
-### 4.2 Installation Notes
+1. **Market feed refresh** — `MarketFeed` polls MT5 rates/ticks, caches bars, and exposes helper metrics (spread %, volatility, bar age).
+2. **Feature build** — `Classic_FeatureEngine` derives multi-timeframe indicators (EMA stack, ATR, structure metrics, micro-zones, momentum scores).
+3. **Signal compute** — `SignalEngine.compute(execute=True)` fuses indicators, adaptive regime data, and guard rails into a `SignalResult` with reasons, confidence, regime, and (optionally) planned entry/SL/TP/Lot.
+4. **Risk gate** — `RiskManager.guard_decision()` runs pre-signal session/latency/drawdown checks; `can_trade()` is the last gate before enqueue, injecting sizing and cooldown logic based on account state and confidence thresholds.
+5. **Order queue** — `TradingEngine._enqueue_order()` deduplicates signals, snapshots book price, and pushes an `OrderIntent` into the bounded execution queue.
+6. **Execution worker** — `ExecutionWorker` sanitises volume/stops, retries MT5 `order_send`, and posts structured `ExecutionResult` telemetry back to the engine.
+7. **Post-trade analytics** — Risk hooks (`record_trade`, `track_signal_survival`, `record_execution_metrics`) update drawdown, daily phase, and survival analytics for monitoring.
 
-- **Python**: The project targets Python 3.11+. Ensure MT5 Python API (`MetaTrader5`) is installed in the same environment.
-- **TA-Lib**: Use platform-specific wheel located under `Appprogram/` if building from source is problematic.
-- **Dependencies**: `requirements.txt` includes `pandas`, `numpy`, `talib`, `pyTelegramBotAPI`, `python-dotenv`, etc.
-- **Logs Directory**: Created automatically; per-module log files include `engine.log`, `engine_health.log`, `market_feed.log`, `telegram.log`, etc.
+### 2.2 Boot sequence & configuration load
 
-### 4.3 Running Modes (main.py)
+1. **Environment ingestion** (`config.py`)
+   - `get_config_from_env()` parses `.env`, converts types, injects defaults (timezone, drawdown limits, queue sizes, Telegram proxy, etc.).
+   - `EngineConfig` encapsulates runtime knobs; `SymbolParams` resolves symbol name/timeframes.
+2. **Main entrypoint** (`main.py`)
+   - Sets up structured logging + log rotation.
+   - Instantiates `Notifier` (Telegram dispatcher) and supervisors.
+   - Registers POSIX signal handlers (`GracefulShutdown`) to coordinate a clean stop.
+3. **Engine supervisor** (`run_engine_supervisor`)
+   - Repeatedly tries to start the trading engine with exponential backoff until MT5 is ready.
+   - Monitors health (`engine.status()` if available) and restarts on disconnection or fatal errors.
+4. **Telegram supervisor** (`run_telegram_supervisor`)
+   - Ensures bot commands are registered.
+   - Runs infinite polling loop with bounded backoff on network failures.
 
-| Mode | Command | Purpose |
+### 2.3 TradingEngine stack build
+
+When the supervisor calls `engine.start()`:
+1. **MT5 boot** — `_init_mt5()` ensures terminal connectivity, account/terminal readiness, and logs failures with tracebacks.
+2. **Symbol ensure** — `_ensure_symbol()` guarantees the trading symbol is visible/selected before any requests.
+3. **Stack wiring** — `_build_stack()` constructs fresh instances of MarketFeed → FeatureEngine → RiskManager → SignalEngine using the same config.
+4. **RiskManager warm-up** — validates required config fields, initialises caches, loads persisted daily state, and restores survival logs (if present).
+5. **Execution thread** — `_restart_execution_worker()` starts a daemon worker consuming the order queue tied to the newly built risk manager.
+
+### 2.4 Supervisors & background services
+
+| Thread | Owner | Responsibility |
 | --- | --- | --- |
-| Default | `python main.py` | Starts both trading engine and Telegram bot with lifecycle notifications. |
-| Headless | `python main.py --headless` | Runs only the trading engine (no Telegram). Useful for dry-run or network-limited environments. |
-| Engine Only | `python main.py --engine-only` | Same as headless (alias). |
+| `engine.loop` | TradingEngine | Core trading pipeline (heartbeat, health checks, signal evaluation, queue management). |
+| `execution-worker` | TradingEngine | Sends MT5 deals, attaches SL/TP, retries on transient retcodes, records execution metrics. |
+| `engine.supervisor` | main.py | Restarts engine on MT5 disconnect/failure with exponential backoff. |
+| `telegram.supervisor` | main.py | Keeps Telegram polling alive, throttles network errors. |
+| `notifier` | main.py | Serialises Telegram notifications, enforces rate limits, drains queue on shutdown. |
 
-Graceful shutdown traps SIGINT/SIGTERM, stops the engine, and drains the order queue before exit.
+All MT5 operations are guarded by the global `MT5_LOCK` to avoid concurrent terminal access.
 
-### 4.4 Deployment Checklist
+### 2.5 Signal analysis pipeline (fine-grained)
 
-1. Deploy on a VPS close to Exness MT5 servers (low latency). Recommended 2 vCPU / 4 GB RAM.
-2. Install MT5 terminal, log in with swap-free account, enable algo trading.
-3. Run in **dry-run** (set `cfg.dry_run=True` inside config) for 2–4 weeks to gather execution quality metrics (`Logs/execution_quality.csv`, etc.).
-4. After validation, switch to live mode and use Telegram for oversight.
-5. Monitor `Logs/engine_health.log` for pipeline stages (MT5 health, market data, risk decisions) and respond to anomalies promptly.
+1. **Market data ingestion** — MarketFeed fetches rates/ticks, performing TTL caching and staleness checks.
+2. **Indicator suite** — Classic_FeatureEngine computes trend, momentum, mean-reversion, volume, structure, anomaly signals per timeframe.
+3. **Guard rails** — RiskManager.guard_decision rejects analysis when spread/latency/drawdown/session constraints fail.
+4. **Ensemble score** — SignalEngine integrates indicator families into a normalised bias + confidence metric.
+5. **Confluence filters** — Squeeze filter, liquidity sweep, divergence, round-number proximity, conformal abstention, and meta gating.
+6. **Stability gate** — Debounce + stability threshold prevents oscillating signals.
+7. **Planning** — `_finalize()` pulls adaptive parameters, risk plan (entry/sl/tp/lot via RiskManager.plan_order), micro zones, and outputs SignalResult with reasons.
 
----
+### 2.6 Risk management logic
 
-## 5. Monitoring & Observability
+- **Daily regime** — Tracks daily start balance/equity, peak, and determines phase A/B/C. Enforces hard stops (target hit, daily loss, drawdown from peak).
+- **Cooldown orchestration** — Combines analysis cooldown, post-fill cooldown, latency cooldown, and per-hour/per-day signal caps.
+- **Sizing** — `calculate_position_size` ensures R/R, broker limits, equity risk, drawdown adjustments, and optional margin percentage caps.
+- **Execution breaker** — Monitors execution anomalies via ExecutionQualityMonitor; triggers `exec_breaker` window holding off new trades.
+- **Survival analytics** — Maintains per-order state, flushes to JSON/CSV, and detects SL/TP hits.
 
-| Log File | Source | Contents |
-| --- | --- | --- |
-| `Logs/engine_health.log` | `TradingEngine` | Heartbeats, pipeline stage outcomes, risk decisions, enqueue success/failure, queue size. |
-| `Logs/engine.log` | `TradingEngine` | Error-level stack traces (MT5 failures, recovery errors). |
-| `Logs/market_feed.log` | `MarketFeed` | Data fetching errors (e.g., TTL violations, MT5 outages). |
-| `Logs/telegram.log` | `Bot` | Telegram API errors, retry exhaustions (disabled when `TELEGRAM_OFFLINE=1`). |
-| `Logs/risk_manager.log` | `RiskManager` | Critical risk/lot sizing errors. |
-| CSV outputs | `RiskManager` | `signal_survival_log.csv`, `execution_quality.csv`, etc. capture analytics for post-trade review (populated once live trades occur). |
+### 2.7 Execution & reconciliation
 
-Telegram commands/buttons mirror these metrics in real time (`/status`, “🧭 Мониторинг”). The bot also emits notifications on engine start/stop and critical exceptions (if online).
+1. **Enqueue** — TradingEngine builds `OrderIntent`, checks for duplicates, missing SL/TP, or invalid price, then pushes into queue.
+2. **Execution** — Worker normalises volume/stops, attempts MT5 order_send (with optional retry without stops), sets SL/TP via `TRADE_ACTION_SLTP` if needed.
+3. **Telemetry** — On fill, worker calls risk hooks to update survival state, account evaluation, execution metrics, and survival tracking.
+4. **Results** — Engine drains execution results and passes them to RiskManager for cooldown updates.
+5. **Reconcile** — Periodically fetches open positions, triggers `on_reconcile_positions`, updates survival analytics, and raises alarms if exceeding `max_positions`.
 
----
+### 2.8 Telemetry, notifications, and graceful shutdown
 
-## 6. Backtesting & Research
-
-The offline framework in `Strategies/backtest.py` reuses the live components to run historical data through the same signal → risk → execution planning pipeline. Key outputs:
-
-- **Expectancy Tables** – Confidence buckets with hit rate, expectancy, sample count.
-- **Regime Stats** – Trend vs. range, volatility bands, session splits.
-- **Filter Ablation** – Impact of each guard (spread, latency, drawdown) on trade count and PnL.
-- **Latency/Slippage Modelling** – Simulated execution quality based on recorded live metrics.
-
-Use it to validate parameter changes before deploying live. Further enhancement (e.g., Monte Carlo, stress tests) can be layered without touching the live engine.
-
----
-
-## 7. Troubleshooting
-
-| Symptom | Cause | Remedy |
-| --- | --- | --- |
-| `MT5 init failed` | Terminal not running / incorrect credentials | Verify `.env`, ensure MT5 terminal open with AutoTrading ON. |
-| `market_feed get_rates error: DataFrame ambiguous` | Pandas truth-value check (fixed) | Already patched to avoid `df or cached`; update repo if still occurring. |
-| `telegram.bot ConnectionResetError 10054` | Network blocks Telegram | Configure `TELEGRAM_PROXY_URL` or set `TELEGRAM_OFFLINE=1` to silence retries. Consider running `--engine-only` on firewalled servers. |
-| Engine stalls / duplicate signals | Signal idempotency disabled | Ensure `SignalEngine.signal_id` stable; engine logs `ENQUEUE_SKIP | reason=duplicate`. |
-| No trades executed | RiskManager blocking | Check `RISK_DECISION` entries in `engine_health.log` for reasons (confidence, cooldown, phase). |
+- **Logging** — Dedicated rotating logs per subsystem (`main`, `engine`, `market_feed`, `risk_manager`, `telegram`, etc.).
+- **Telegram notifier** — Non-blocking queue that serialises notifications, throttles repeated errors, and acknowledges drops.
+- **Heartbeat** — Every `engine_heartbeat_sec` logs health snapshot, updates risk account state, and feeds survival tick updater.
+- **Graceful stop** — `GracefulShutdown` sets stop event, supervisors wind down threads, bot polling stops, engine loop exits, execution worker joins, notifier drains and sends final shutdown message.
 
 ---
 
-## 8. Roadmap & Contribution
+## 3) Live Trading Mechanics
 
-Planned enhancements include:
+### 3.1 TradingEngine loop (Bot/engine.py) — exact runtime checkpoints
 
-1. **Extended Backtester** – Integrate spread/commission modelling and walk-forward parameter sweeps.
-2. **State Persistence** – Snapshot risk state to resume seamlessly after restarts.
-3. **Event Bus / State Manager** – Further decouple modules for multi-symbol expansion.
-4. **Analytics Dashboard** – Stream execution quality metrics into a lightweight web UI.
+The engine runs a fast polling loop and emits structured health logs.
 
-Contributions are welcome. Fork the repo, work off a feature branch, and open a PR referencing observed behaviour/logs. Ensure linting/tests pass and documentation updates accompany behavioural changes.
+**Loop cadence (engine defaults):**
+- `poll_seconds_fast`: **0.15s**
+- `poll_seconds_slow`: **0.9s**
+- `engine_heartbeat_sec`: **5s**
+- `market_validate_interval_sec`: **2s**
+- `reconcile_interval_sec`: **15s**
+- `signal_cooldown_sec`: **2s**
+- `max_consecutive_errors`: **10**
+- `recover_backoff_sec`: **10s**
+- `max_exec_queue`: **10** (queue size is internal to the engine; override by extending `EngineConfig` if required)
+- `max_positions`: **3**
+
+**Per iteration:**
+1. **Heartbeat**  
+   Emits current balance/equity/DD, last signal, queue length, latency metrics in `Logs/engine_health.log`.
+2. **MT5 health stage**  
+   `PIPELINE_STAGE | step=mt5_health ok=...`  
+   If MT5 disconnects, engine escalates recovery.
+3. **Market validation stage**  
+   `PIPELINE_STAGE | step=market_data ok=...`  
+   Rejects stale/empty bars (e.g., bar age > 180s, NaNs, invalid prices).
+4. **Reconcile (throttled)**  
+   Reads open positions; if open positions exceed `cfg.max_positions`, logs:
+   `RECONCILE: positions exceed max_expected | open=X max=Y`  
+   (This is an alarm; not an auto-close by default.)
+5. **Consume execution results**  
+   Pulls `ExecutionResult` from result queue and forwards to `RiskManager.on_execution_result(...)` (if implemented).
+6. **Signal evaluation**  
+   Calls `SignalEngine.compute(execute=False)`  
+   Logs a standardized step line:
+   `PIPELINE_STEP | iter=... signal=... prev=... same=... blocked=... conf_raw=... reasons=...`
+7. **Risk decision**  
+   For actionable signals (`Buy`/`Sell`), calls `RiskManager.can_trade(conf, signal)` and logs:
+   `RISK_DECISION | signal=... conf=... allowed=... lot=... phase=... reasons=...`
+8. **Order enqueue**  
+   If allowed, builds an `OrderIntent` and pushes into a bounded queue (FIFO).  
+   If queue is full: `ENQUEUE_FAIL | reason=queue_full ...`
+9. **Adaptive throttling**  
+   Sleeps fast/slow depending on queue size and measured latency.
 
 ---
 
-## 9. Appendix
+### 3.2 Order idempotency (anti-duplicate protection)
 
-### 9.1 Repository Map
+Order enqueue is idempotent via:
+- `signal_id` (from `SignalResult.signal_id`, else generated)
+- cooldown window: `signal_cooldown_sec` (default **2 seconds**)
+- 60-second cleanup window for seen signals (prevents memory growth)
+- explicit log on duplicates:
+  `ENQUEUE_SKIP | reason=duplicate signal_id=...`
 
+---
+
+### 3.3 ExecutionWorker (asynchronous MT5 execution)
+
+- Dedicated daemon thread consuming the order queue.
+- MT5 calls are protected by `MT5_LOCK` to avoid concurrent terminal access.
+- Retries up to **3 attempts** with explicit reason/retcode logging.
+- Returns a structured `ExecutionResult` to the engine’s result queue.
+- Hooks for analytics (if implemented inside RiskManager):
+  - `record_execution_metrics(...)`
+  - `record_execution_failure(...)`
+  - `record_trade(...)`
+  - `track_signal_survival(...)`
+
+### 3.4 Analysis cooldown behaviour
+
+- **Cooldown trigger:** `RiskManager.on_position_opened()` is invoked after every fill (see `record_trade` hook) and applies an analysis cooldown of `cfg.cooldown_seconds`. A larger cooldown is applied when the account returns to flat (`analysis_cooldown_sec`, scaled by drawdown severity).
+- **What continues during open positions:** by default the system **does not block fresh analysis strictly because positions remain open**. Instead, follow-on trades are gated by:
+  - `signal_cooldown_sec` (engine-level duplicate guard),
+  - drawdown/daily phase logic in `can_trade()`,
+  - the configurable `max_positions` and the scaling rules inside `plan_order` (lot trimming & SL/TP adjustments for multiple concurrent positions).
+- **Optional stricter behaviour:** if you need analytics to pause until the book is flat, add a config attribute such as `analysis_wait_for_flat` and wire it in `RiskManager.can_analyze()` (the infrastructure is already structured for this with `on_reconcile_positions`).
+
+### 3.5 Signal survival telemetry
+
+- **Entry:** every queued order calls `RiskManager.track_signal_survival(...)`, creating an in-memory snapshot and writing an `entry` event to `Logs/signal_survival_updates.jsonl`, plus persisting the active map to `Logs/signal_survival_active.json`.
+- **Live updates:**
+  - `_heartbeat()` streams the latest MT5 tick to `RiskManager.tick_signal_survival(...)`, updating MFE/MAE and marking SL/TP touches.
+  - `_reconcile_positions()` invokes `RiskManager.sync_signal_survival(...)`, refreshing prices from open MT5 positions.
+- **Exit:** when a position disappears from MT5 reconciliation, `sync_signal_survival` auto-calls `finalize_signal_survival(...)`, appending a row to `Logs/signal_survival_final.csv` (with headers), emitting an `exit` event to JSONL, and pruning the order from the active cache.
+- **Artifacts:**
+  - `signal_survival_active.json` — atomic snapshot of all live trades for dashboards/monitoring.
+  - `signal_survival_updates.jsonl` — append-only stream (entry/update/exit) suitable for replaying timelines.
+  - `signal_survival_final.csv` — append-only dataset of completed trades (entry/exit stats, MFE/MAE, SL/TP hits).
+
+
+Recommended phase model (your A/B/C design):
+- **Phase A (normal)**: base thresholds, standard sizing, standard SL/TP multipliers
+- **Phase B (after hitting target)**: tighter confidence gating, reduce risk, protect profits
+- **Phase C (daily loss / retrace)**: hard stop for the day (pause trading + close exposure)
+
+Recommended hard limits (defaults if you configured them):
+- Daily target: `daily_target_pct` (example: **15%**)
+- Max daily loss: `max_daily_loss_pct` (example: **10%**)
+- Max risk per trade: `max_risk_per_trade` (example: **2%**)
+- Max open positions: `max_positions` (default **3**)
+
+**Important:** your log error
+`RECONCILE: positions exceed max_expected | open=4 max=3`
+means you manually opened more positions than allowed. Engine flags it so RiskManager can react (or you close extras manually).
+
+---
+
+## 5) Configuration
+
+All runtime parameters are loaded through `get_config_from_env()` in `config.py`.
+
+### 5.1 `.env` (template)
+
+Use the exact variable names implemented in `config.py`. Typical keys look like:
+
+```env
+# MT5 (Exness)
+EXNESS_LOGIN=...
+EXNESS_PASSWORD=...
+EXNESS_SERVER=...
+
+# Telegram
+BOT_TOKEN=...
+ADMIN_ID=...
+
+# Runtime
+TIMEZONE=Asia/Dushanbe
+
+# Optional
+MT5_PATH=...
+TELEGRAM_PROXY_URL=socks5://127.0.0.1:9050
+
+# BTC overrides (optional)
+BTC_FIXED_VOLUME=0.02
+BTC_MAX_POSITIONS=3
+
+# XAU overrides (optional)
+XAU_MAX_POSITIONS=3
+XAU_DAILY_TARGET_PCT=0.12
 ```
-.
-├─ Bot/
-│  ├─ bot.py             # Telegram handlers, proxy/offline control, retries, status formatting
-│  └─ engine.py          # TradingEngine + ExecutionWorker + health logging
-├─ DataFeed/
-│  └─ market_feed.py     # Rates/Tick fetch, caching, microstructure stats
-├─ Strategies/
-│  ├─ feature_engine.py  # Indicator construction, adaptive parameters
-│  ├─ indicators.py      # Low-level indicator helpers
-│  ├─ risk_management.py # RiskManager, signal survival, execution quality capture
-│  ├─ signal_engine.py   # SignalEngine planner-only logic
-│  └─ backtest.py        # Offline backtesting scaffold
-├─ ExnessAPI/
-│  ├─ orders.py          # Order helpers, close_all_position
-│  └─ history.py         # Cached MT5 history queries for Telegram
-├─ config.py             # EngineConfig / SymbolParams with env loaders
-├─ mt5_client.py         # ensure_mt5(), MT5_LOCK, reconnect strategy
-├─ main.py               # CLI entrypoint, orchestrates engine + bot
-└─ requirements.txt      # Python dependencies
-```
 
-### 9.2 Operational Guidelines (Tajik)
+### 5.2 High-impact tunables
 
-- Ҳадафҳои воқеъбинона нигоҳ доред: 5–8 % дар рӯз ба ҳисоби миёна, вале рӯзҳои бефоида имкон доранд.
-- VPS наздик ба сервери Exness интихоб кунед, барои латентии паст.
-- Пеш аз маблағгузории воқеӣ **dry-run** (режими симулятсионӣ) гузаронед ва логҳои `Logs/`-ро низоман бигиред.
-- Фоидаро мунтазам бароред ва ҳаҷми lot-ро тадриҷан зиёд кунед; «scale-out» ба ҳисобҳои дигар барои кам кардани хавф тавсия мешавад.
-- Telegram-ро доимо назорат кунед; дар ҳолати хатогиҳои MT5 ё пайваст, фавран тадбир андешед.
+These directly affect stability and execution quality (all live inside `TradingEngine`; expose them via config only if you customize the engine class):
+
+- poll_seconds_fast, poll_seconds_slow
+- market_validate_interval_sec, reconcile_interval_sec, engine_heartbeat_sec
+- max_exec_queue, max_positions
+- signal_cooldown_sec
+- max_consecutive_errors, recover_backoff_sec
+
+### 5.3 Key runtime flags & environment vars
+
+- `USE_PROXY` / `TELEGRAM_PROXY_URL` — optional socks proxy for Telegram when running from restricted networks.
+- `MT5_PATH` — override default MetaTrader terminal discovery (useful for VPS automation).
+- Custom risk guard toggles can be injected through `EngineConfig` (for example, `analysis_wait_for_flat`, `max_spread_points`, `exec_breaker_sec`). Make sure every flag you depend on is surfaced in `.env` and parsed in `config.py`.
 
 ---
 
-## 10. Strengths & Limitations
+## 6) Monitoring & Observability
 
-### Strengths
+Logs (default `Logs/`):
+- `Logs/engine_health.log` (TradingEngine): pipeline stages, loop steps, risk decisions, enqueue events, queue size, latencies
+- `Logs/engine.log` (TradingEngine/Worker): error traces, recovery failures, MT5 exceptions
+- `Logs/market_feed.log` (MarketFeed): data fetching issues, cache/age violations
+- `Logs/telegram.log` (Telegram bot): API errors, retries, proxy events
+- `Logs/risk.log` or `Logs/risk_manager.log` (RiskManager): sizing failures, state persistence warnings
 
-1. **End-to-end automation** – Unified stack from data feed through execution, with Telegram supervision and health logging.
-2. **Deterministic guard rails** – RiskManager enforces Islamic-compliant leverage, drawdown locks, signal/hour caps, latency breakers, and execution analytics.
-3. **Adaptive trade planning** – Microstructure-aware SL/TP, ATR fallbacks, and multi-order scaling adjust to volatility in real time.
-4. **Operational resilience** – Supervisor avoids restart storms, manual stops persist, and all critical state (signal survival, execution metrics) is crash-safe.
-5. **Observability-first** – Rich logs, CSV telemetry, and Telegram summaries enable rapid diagnosis and performance review.
-
-### Limitations / Watch-outs
-
-1. **Market dependency** – Tight spreads and consistent liquidity are required; during news or thin markets, guard rails may block most trades.
-2. **Infrastructure sensitivity** – MT5 connectivity, VPS latency, and Telegram reachability directly influence cadence and breaker triggers.
-3. **Configuration complexity** – Numerous parameters (cooldowns, ATR multipliers, phase thresholds) demand disciplined change management.
-4. **Execution-only focus** – No in-built portfolio hedging or multi-symbol diversification; meant for single-symbol XAUUSDm scalping.
-5. **Performance variability** – Theoretical targets (15 % daily) rely on ideal conditions; actual returns should be validated via dry-run/backtests before risking capital.
+Telegram supervision (minimum):
+- `/start` + start/stop buttons
+- `/status` > engine state (connected/trading/balance/equity/DD/phase/queue)
+- `/history` > last orders + daily P/L snapshot
 
 ---
 
-**Operate scientifically. Respect phases, monitor telemetry, and let the automation do the heavy lifting.**
+## 7) Backtesting & Research
+
+There is no bundled backtesting module. Reuse the production components in your own research harness and only promote parameters after both backtest **and** dry-run confirm stability.
+
+---
+
+## 8) Troubleshooting
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| **MT5 init failed** | Terminal closed / wrong creds / AutoTrading OFF | Open MT5, verify login/server, **enable AutoTrading** (Tools → Options → Expert Advisors → Allow Algo Trading) |
+| **`mt5_health_failed:trade_not_allowed`** | AutoTrading disabled in terminal | **Critical:** Click the **AutoTrading** button in MT5 toolbar (must be green/enabled). Without this, the system cannot place orders. |
+| `PIPELINE_STAGE step=market_data ok=False` | Market closed / stale bars / feed failure | Wait for market; check feed and symbol select |
+| **`RECONCILE: positions exceed max_expected`** | Manual trades or external EA exceeded `max_positions` | **Close extra positions immediately** or increase `max_positions` in config. System logs this as ERROR but does not auto-close. |
+| `ENQUEUE_FAIL reason=queue_full` | Execution backlog | Investigate MT5 latency, reduce load |
+| Many loop errors + recovery | Unstable MT5 / network | Move VPS closer, reduce terminal load, validate MT5 health |
+| Engine restarts with `connected=False trading=True` | MT5 disconnected while engine running | Supervisor auto-restarts engine. Ensure stable internet and MT5 server connectivity. |
+
+---
+
+## 9) Repository Map
+
+- Bot/bot.py — Telegram handlers + supervision UI
+- Bot/engine.py — TradingEngine + ExecutionWorker + health logging
+- DataFeed/market_feed.py — rates/ticks fetch, caching, bar age checks
+- Strategies/indicators.py — `Classic_FeatureEngine` (feature/indicator construction)
+- Strategies/risk_management.py — `RiskManager` (phases, sizing, SL/TP, analytics hooks)
+- Strategies/signal_engine.py — `SignalEngine.compute(...)` + reasons/confidence
+- ExnessAPI/orders.py — order helpers, `close_all_position`, etc.
+- ExnessAPI/history.py — cached MT5 history queries for Telegram
+- config.py — `get_config_from_env()`, `EngineConfig` / `SymbolParams`
+- mt5_client.py — `ensure_mt5()`, `MT5_LOCK`, reconnect strategy
+- main.py — entrypoint: orchestrates engine + bot
+- requirements.txt — Python dependencies
+
+---
+
+## 10) Operational Guidelines (Tajik)
+
+- VPS-ро наздик ба сервери Exness интихоб кунед: латентӣ = сифати fill.
+- Пеш аз live, 2–4 ҳафта dry-run кунед ва engine_health + execution metrics ҷамъ кунед.
+- Ҳадафҳо ва лимитҳои рӯзона (target/loss/phase) қоидаи ҳатмӣ ҳастанд — онҳоро вайрон накунед.
+- **МУҲИМ:** Дар MT5 ҳатман **AutoTrading**-ро фаъол кунед (тугмаи сабз дар toolbar). Бе ин система ордер намефиристад.
+- Агар дастӣ тиҷорат кунед ва `max_positions`-ро зиёд намоед, reconcile ERROR мегирад. Позицияҳои зиёдро фавран пӯшед.
+- Агар `mt5_health_failed:trade_not_allowed` дидед, MT5-ро кушоед ва AutoTrading-ро фаъол намоед.
+- Ҳар тағйирот: backtest → dry-run → live. Бе ин пайдарпайӣ параметрҳоро иваз накунед.
+
+---
+
+## 11) Asset-specific checklist
+
+| Category | BTCUSDm | XAUUSDm |
+| --- | --- | --- |
+| Primary config | `config_btc.py` | `config_xau.py` |
+| Symbol guard | Hard-coded `BTCUSDm` | Hard-coded `XAUUSDm` |
+| Market feed | `DataFeed/btc_feed.py` (crypto microstructure gates) | `DataFeed/market_feed.py` (gold sessions) |
+| Spread limits | `spread_limit_pct = 0.0050` (0.50%) | `spread_limit_pct = 0.00018` (0.018%) |
+| Circuit breaker | `spread_cb_pct = 0.0075` | `spread_cb_pct = 0.0010` |
+| Position sizing | Fixed volume 0.01 lots (tunable) | Configurable via `max_risk_per_trade` + margin checks |
+| Execution worker | `BtcExecutionWorker` | `ExecutionWorker` |
+| Start/stop | Manual via Python shell (see Quick Start) | Telegram `/start` & `/stop` |
+| Logging | `Logs/btc_engine*.log` | `Logs/engine*.log` |
+
+---
+
+## 12) Roadmap / next steps
+
+1. **Telegram integration for BTC** — mirror `/start` / `/stop` commands to control `BtcTradingEngine`. Add health/status panels similar to XAU.
+2. **Unified launcher** — refactor `main.py` to accept `--asset btc` / `--asset xau` flags, or run both engines concurrently with isolated queues.
+3. **Shared notifier** — once BTC is wired into Telegram, reuse existing notifier queue so both engines report fills, risk events, and survival stats.
+4. **Backtesting hooks** — export common indicator/risk interfaces for research harnesses across both assets.
+5. **Deployment profiles** — document separate `.env` templates per asset (different accounts/lot sizing, Telegram bot IDs).

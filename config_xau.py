@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
+from log_config import get_log_path
+
 
 load_dotenv()
 
@@ -220,7 +222,7 @@ class EngineConfig:
     hedge_flip_enabled: bool = False
     pyramid_enabled: bool = False
 
-    log_csv_path: str = "Logs/signals_error_only.csv"
+    log_csv_path: str = field(default_factory=lambda: str(get_log_path("signals_error_only.csv")))
 
     extreme_lookback: int = 120
     extreme_atr_mult: float = 1.7

@@ -12,15 +12,12 @@ import MetaTrader5 as mt5
 import numpy as np
 
 from mt5_client import MT5_LOCK, ensure_mt5
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 SLTPUnits = Literal["points", "usd", "price"]
 
-# =============================================================================
-# Logging (ERROR by default, with rotation)
-# =============================================================================
-_LOG_DIR = (Path(__file__).resolve().parent.parent / "Logs")
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
-_ORDERS_LOG_PATH = _LOG_DIR / "orders.log"
+_LOG_DIR = LOG_ROOT
+_ORDERS_LOG_PATH = get_log_path("orders.log")
 
 
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
@@ -38,8 +35,8 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
 
     h = RotatingFileHandler(
         filename=str(path),
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=5,             # keep 5 backups
+        maxBytes=5 * 1024 * 1024, 
+        backupCount=5,            
         encoding="utf-8",
         delay=True,
     )
@@ -51,9 +48,8 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
 log_orders = logging.getLogger("orders")
 _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 
-# =============================================================================
-# MT5 connectivity (throttled checks)
-# =============================================================================
+
+
 @dataclass
 class _MT5HealthCache:
     ts: float = 0.0
@@ -65,9 +61,7 @@ _MT5_CACHE = _MT5HealthCache()
 
 
 def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 1.0) -> bool:
-    """
-    Fast MT5 health check with TTL to avoid spamming terminal_info/account_info.
-    """
+
     now = time.time()
     if (now - _MT5_CACHE.ts) < float(ttl_sec):
         return bool(_MT5_CACHE.ok and (not require_trade_allowed or _MT5_CACHE.trade_allowed))

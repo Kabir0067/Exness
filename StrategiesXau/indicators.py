@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import traceback
 import time
 from dataclasses import dataclass
@@ -17,19 +16,20 @@ try:
 except Exception:  # TA-Lib may be missing in some environments
     talib = None  # type: ignore
 
-from config import EngineConfig
+from config_xau import EngineConfig
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # =========================
 # Logging (ERROR only)
 # =========================
-os.makedirs("Logs", exist_ok=True)
+LOG_DIR = LOG_ROOT
 
 logger = logging.getLogger("feature_engine")
 logger.setLevel(logging.ERROR)
 logger.propagate = False
 
 if not logger.handlers:
-    fh = logging.FileHandler("Logs/feature_engine.log", encoding="utf-8")
+    fh = logging.FileHandler(str(get_log_path("feature_engine.log")), encoding="utf-8")
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(fh)
@@ -430,7 +430,7 @@ class Classic_FeatureEngine:
             rsi = self.ind.RSI(c, int(self.cfg.indicator["rsi_period"]))
             adx = self.ind.ADX(h, l, c, int(self.cfg.indicator["adx_period"]))
 
-            macd, macd_signal, _ = self.ind.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
+            macd, macd_signal, macd_hist = self.ind.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
             bb_u, bb_m, bb_l = self.ind.BBANDS(c, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
 
             # z-volume
@@ -474,6 +474,7 @@ class Classic_FeatureEngine:
                 "open": float(o[-1]),
                 "high": float(h[-1]),
                 "low": float(l[-1]),
+                "body": float(abs(float(c[-1]) - float(o[-1]))),
                 "atr": float(safe_last(atr)),
                 "ema9": float(safe_last(ema9)),
                 "ema21": float(safe_last(ema21)),
@@ -483,6 +484,7 @@ class Classic_FeatureEngine:
                 "adx": float(safe_last(adx)),
                 "macd": float(safe_last(macd)),
                 "macd_signal": float(safe_last(macd_signal)),
+                "macd_hist": float(safe_last(macd_hist)),
                 "bb_upper": float(safe_last(bb_u)),
                 "bb_mid": float(safe_last(bb_m)),
                 "bb_lower": float(safe_last(bb_l)),

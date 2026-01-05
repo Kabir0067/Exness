@@ -15,13 +15,14 @@ from threading import Event, Lock, Thread
 from typing import Optional
     
 from Bot.bot import ADMIN, bot, bot_commands
+# Portfolio engine: trades XAU and BTC, but only one at a time.
 from Bot.engine import engine
+from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # ==========================
 # Logging (production safe)
 # ==========================
-LOG_DIR = "Logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR = LOG_ROOT
 
 log = logging.getLogger("main")
 log.setLevel(logging.INFO)
@@ -31,7 +32,7 @@ if not log.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     fh = RotatingFileHandler(
-        os.path.join(LOG_DIR, "main.log"),
+        str(get_log_path("main.log")),
         maxBytes=int(os.getenv("MAIN_LOG_MAX_BYTES", "5242880")),  # 5MB
         backupCount=int(os.getenv("MAIN_LOG_BACKUPS", "5")),
         encoding="utf-8",
@@ -228,6 +229,7 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     backoff = Backoff(base=2.0, factor=2.0, max_delay=60.0)
     restart_guard = RateLimiter(20.0)  # at most one restart attempt per 20s
     manual_stop_rl = RateLimiter(60.0)  # throttle manual-stop logs
+    health_notify_rl = RateLimiter(float(os.getenv("HEALTH_NOTIFY_INTERVAL_SEC", "300.0")))  # 5 min default
     started_once = False
     attempt = 0
 
@@ -298,6 +300,29 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                 else:
                     sleep_interruptible(stop_event, 2.0)
                 continue
+
+            # Periodic health notification
+            if health_notify_rl.allow("health_status"):
+                try:
+                    st = engine.status()
+                    msg = (
+                        f"💹 Portfolio Health\n"
+                        f"Connected: {'✅' if st.connected else '❌'}\n"
+                        f"Trading: {'✅' if st.trading else '⏸️'}\n"
+                        f"Active: {st.active_asset}\n"
+                        f"Balance: {st.balance:.2f}\n"
+                        f"Equity: {st.equity:.2f}\n"
+                        f"DD: {st.dd_pct*100:.2f}%\n"
+                        f"PnL Today: {st.today_pnl:.2f}\n"
+                        f"Open XAU: {st.open_trades_xau}\n"
+                        f"Open BTC: {st.open_trades_btc}\n"
+                        f"Queue: {st.exec_queue_size}\n"
+                        f"Last Signal XAU: {st.last_signal_xau}\n"
+                        f"Last Signal BTC: {st.last_signal_btc}"
+                    )
+                    notifier.notify(msg)
+                except Exception as exc:
+                    log.warning("Health notification failed: %s", exc)
 
             sleep_interruptible(stop_event, 1.0)
 
@@ -420,13 +445,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     finally:
         shutdown.request_stop()
 
-        # Stop Telegram polling best-effort (prevents hang)
         try:
             bot.stop_polling()
         except Exception:
             pass
 
-        # Join threads with timeouts (never hang forever)
         try:
             if bot_thread and bot_thread.is_alive():
                 bot_thread.join(timeout=20.0)
@@ -440,7 +463,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
 
         notifier.notify("⏹️ System stopped")
-        sleep_interruptible(shutdown.stop_event, 0.5)  # give notifier a moment
+        sleep_interruptible(shutdown.stop_event, 0.5) 
 
 
 if __name__ == "__main__":
