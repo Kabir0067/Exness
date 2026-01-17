@@ -1,6 +1,7 @@
-# mt5_client.py  (SENIOR / PRODUCTION-GRADE)
+# mt5_client.py (PRODUCTION / IPC-TIMEOUT HARDENED / ENV-COMPAT / SINGLE-INSTANCE SAFE)
 from __future__ import annotations
 
+import atexit
 import glob
 import logging
 import os
@@ -10,22 +11,20 @@ import time
 import traceback
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional, Tuple
 
 import MetaTrader5 as mt5
-from pywinauto import Application  
 
-
-from config_xau import EngineConfig, get_config_from_env
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
-# =============================================================================
-# ERROR-only logging (rotated)
-# =============================================================================
-LOG_DIR = LOG_ROOT
 
+# =============================================================================
+# Logging (ERROR-only by default)
+# =============================================================================
+_LOG_LEVEL = (os.getenv("MT5_LOG_LEVEL", "ERROR") or "ERROR").strip().upper()
 logger = logging.getLogger("mt5")
-logger.setLevel(logging.ERROR)
+logger.setLevel(getattr(logging, _LOG_LEVEL, logging.ERROR))
 logger.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
@@ -36,30 +35,54 @@ if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
         encoding="utf-8",
         delay=True,
     )
-    fh.setLevel(logging.ERROR)
+    fh.setLevel(getattr(logging, _LOG_LEVEL, logging.ERROR))
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(fh)
 
+
 # =============================================================================
-# Locks & global state
+# Locks & state
 # =============================================================================
 MT5_LOCK = threading.RLock()   # protect every mt5.* call
 INIT_LOCK = threading.Lock()   # protect init/shutdown sequence
 
 _initialized: bool = False
-_config: Optional[EngineConfig] = None
-_mt5_process: Optional[subprocess.Popen] = None  # best-effort (Windows)
 _last_health_reason: str = "not_initialized"
-
-# UI auto-enable (OFF by default)
-_UI_ENABLE_ALGO = os.getenv("MT5_UI_ENABLE_ALGO", "0").strip() == "1"
-_UI_ENABLE_ALGO_ONCE = False
-_UI_LOCK = threading.Lock()
+_last_health_log_ts: float = 0.0
 
 
 # =============================================================================
-# Internal models
+# ENV flags
 # =============================================================================
+def _env_bool(key: str, default: bool) -> bool:
+    raw = (os.getenv(key, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+ENV_SINGLE_INSTANCE = _env_bool("MT5_SINGLE_INSTANCE_LOCK", True)
+ENV_AUTOSTART = _env_bool("MT5_AUTOSTART", True)
+ENV_TASKKILL_ON_IPC = _env_bool("MT5_TASKKILL_ON_IPC_TIMEOUT", True)
+ENV_REQUIRE_PATH = _env_bool("MT5_REQUIRE_PATH", True)
+
+ENV_TIMEOUT_MS = int(os.getenv("MT5_TIMEOUT_MS", "90000"))
+ENV_START_WAIT_SEC = float(os.getenv("MT5_START_WAIT_SEC", "10"))
+ENV_READY_TIMEOUT_SEC = float(os.getenv("MT5_READY_TIMEOUT_SEC", "60"))
+
+ENV_MT5_PATH = (os.getenv("MT5_PATH", "") or "").strip()
+
+
+# =============================================================================
+# Models
+# =============================================================================
+@dataclass(frozen=True)
+class MT5LoginCfg:
+    login: int
+    password: str
+    server: str
+
+
 @dataclass(frozen=True)
 class Health:
     ok: bool
@@ -73,11 +96,12 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _last_error_str() -> str:
+def _last_error() -> Tuple[int, str]:
     try:
-        return str(mt5.last_error())
+        code, msg = mt5.last_error()
+        return int(code), str(msg)
     except Exception:
-        return "unknown_mt5_error"
+        return -99999, "unknown_mt5_error"
 
 
 def _sleep_backoff(base: float, attempt: int, cap: float = 30.0) -> None:
@@ -85,48 +109,162 @@ def _sleep_backoff(base: float, attempt: int, cap: float = 30.0) -> None:
     time.sleep(delay)
 
 
-def _validate_cfg(cfg: EngineConfig) -> None:
-    if cfg is None:
-        raise RuntimeError("EngineConfig is None")
-
-    if getattr(cfg, "login", None) in (None, "", 0):
-        raise RuntimeError("MT5 login is missing")
-    if getattr(cfg, "password", None) in (None, ""):
-        raise RuntimeError("MT5 password is missing")
-    if getattr(cfg, "server", None) in (None, ""):
-        raise RuntimeError("MT5 server is missing")
-
-    mt5_path = str(getattr(cfg, "mt5_path", "") or "").strip()
-    if mt5_path and not os.path.exists(mt5_path):
-        raise RuntimeError(f"MT5_PATH does not exist: {mt5_path}")
+def _throttled_health_log(reason: str) -> None:
+    global _last_health_log_ts
+    now = time.time()
+    if now - _last_health_log_ts >= 15.0:
+        logger.error("Fast path health failed: %s", reason)
+        _last_health_log_ts = now
 
 
-def _resolve_symbol(cfg: EngineConfig) -> str:
-    sp = getattr(cfg, "symbol_params", None)
-    if sp is None:
+# =============================================================================
+# Single-instance lock (prevents 2 python processes calling MT5)
+# =============================================================================
+_lock_guard = threading.Lock()
+_lock_fp = None
+_lock_acquired = False
+
+def _lock_file_path() -> Path:
+    base = Path(str(LOG_ROOT)) if str(LOG_ROOT) else Path.cwd() / "Logs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "mt5_single_instance.lock"
+
+def _read_lock_file(p: Path) -> str:
+    try:
+        if p.exists():
+            return p.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    return ""
+
+def _acquire_single_instance_lock() -> None:
+    global _lock_fp, _lock_acquired
+    if not ENV_SINGLE_INSTANCE:
+        return
+    with _lock_guard:
+        if _lock_acquired and _lock_fp:
+            return
+        p = _lock_file_path()
+        try:
+            _lock_fp = open(p, "a+", encoding="utf-8")
+            _lock_fp.seek(0)
+            try:
+                _lock_fp.truncate(0)
+                _lock_fp.write(f"pid={os.getpid()} ts={int(time.time())}\n")
+                _lock_fp.flush()
+            except Exception:
+                pass
+
+            if _is_windows():
+                import msvcrt  # type: ignore
+                try:
+                    _lock_fp.seek(0)
+                    msvcrt.locking(_lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    other = _read_lock_file(p)
+                    raise RuntimeError(f"Another engine process is running (lock busy). Stop it first. lock_info={other}")
+            else:
+                import fcntl  # type: ignore
+                try:
+                    fcntl.flock(_lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    other = _read_lock_file(p)
+                    raise RuntimeError(f"Another engine process is running (lock busy). Stop it first. lock_info={other}")
+
+            _lock_acquired = True
+        except Exception as exc:
+            try:
+                if _lock_fp:
+                    _lock_fp.close()
+            except Exception:
+                pass
+            _lock_fp = None
+            _lock_acquired = False
+            raise RuntimeError(f"Failed to acquire single-instance lock: {exc}") from exc
+
+def _release_single_instance_lock() -> None:
+    global _lock_fp, _lock_acquired
+    if not ENV_SINGLE_INSTANCE:
+        return
+    with _lock_guard:
+        if not _lock_acquired or not _lock_fp:
+            return
+        try:
+            if _is_windows():
+                import msvcrt  # type: ignore
+                try:
+                    _lock_fp.seek(0)
+                    msvcrt.locking(_lock_fp.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            else:
+                import fcntl  # type: ignore
+                try:
+                    fcntl.flock(_lock_fp.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _lock_fp.close()
+            except Exception:
+                pass
+            _lock_fp = None
+            _lock_acquired = False
+
+
+# =============================================================================
+# Config extraction: env-first, then config_xau (if exists)
+# =============================================================================
+def _get_login_cfg() -> MT5LoginCfg:
+    # Accept both MT5_* and EXNESS_*
+    def _get_int(keys: list[str]) -> int:
+        for k in keys:
+            v = (os.getenv(k, "") or "").strip()
+            if v:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+        return 0
+
+    def _get_str(keys: list[str]) -> str:
+        for k in keys:
+            v = (os.getenv(k, "") or "").strip()
+            if v:
+                return v
         return ""
-    return str(getattr(sp, "resolved", "") or getattr(sp, "base", "") or "").strip()
+
+    login = _get_int(["MT5_LOGIN", "EXNESS_LOGIN"])
+    password = _get_str(["MT5_PASSWORD", "EXNESS_PASSWORD"])
+    server = _get_str(["MT5_SERVER", "EXNESS_SERVER"])
+
+    if login and password and server:
+        return MT5LoginCfg(login=login, password=password, server=server)
+
+    # fallback to config_xau.get_config_from_env if present
+    try:
+        from config_xau import get_config_from_env  # type: ignore
+        cfg = get_config_from_env()
+        login2 = int(getattr(cfg, "login", 0) or 0)
+        password2 = str(getattr(cfg, "password", "") or "")
+        server2 = str(getattr(cfg, "server", "") or "")
+        if login2 and password2 and server2:
+            return MT5LoginCfg(login=login2, password=password2, server=server2)
+    except Exception:
+        pass
+
+    raise RuntimeError("MT5 credentials missing. Set MT5_LOGIN/MT5_PASSWORD/MT5_SERVER (or EXNESS_*) in .env")
 
 
-def _resolve_mt5_path_windows(cfg: EngineConfig) -> Optional[str]:
-    """
-    Resolve terminal64.exe path on Windows.
-    Priority:
-      1) cfg.mt5_path if exists
-      2) common install locations
-      3) APPDATA / LOCALAPPDATA MetaQuotes Terminal instances
-    """
-    p = str(getattr(cfg, "mt5_path", "") or "").strip()
-    if p and os.path.exists(p):
-        return p
+def _resolve_mt5_path_windows() -> str:
+    if ENV_MT5_PATH and os.path.exists(ENV_MT5_PATH):
+        return ENV_MT5_PATH
 
     candidates: list[str] = []
     for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
         candidates += glob.glob(base + r"\MetaTrader 5*\terminal64.exe")
         candidates += glob.glob(base + r"\MetaQuotes*\terminal64.exe")
         candidates += glob.glob(base + r"\Exness*\terminal64.exe")
-        candidates += glob.glob(base + r"\*\terminal64.exe")
-
     for env_key in ("APPDATA", "LOCALAPPDATA"):
         root = os.getenv(env_key, "")
         if root:
@@ -135,11 +273,13 @@ def _resolve_mt5_path_windows(cfg: EngineConfig) -> Optional[str]:
     for x in candidates:
         if x and os.path.exists(x):
             return x
+    return ""
 
-    return None
 
-
-def _is_mt5_terminal_running_windows() -> bool:
+# =============================================================================
+# Windows process helpers (kill/restart)
+# =============================================================================
+def _is_terminal_running_windows() -> bool:
     try:
         out = subprocess.check_output(["tasklist"], text=True, errors="ignore").lower()
         return "terminal64.exe" in out
@@ -147,276 +287,208 @@ def _is_mt5_terminal_running_windows() -> bool:
         return False
 
 
-def _start_mt5_terminal_windows(path: str, portable: bool) -> bool:
-    """
-    Best-effort start MT5 terminal if not running.
-    """
-    global _mt5_process
-
-    if not path or not os.path.exists(path):
-        return False
-
+def _taskkill_terminal_windows() -> None:
     try:
-        if _mt5_process and _mt5_process.poll() is None:
-            return True
-
-        cmd = [path]
-        if portable:
-            cmd.append("/portable")
-
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags = subprocess.CREATE_NO_WINDOW
-
-        _mt5_process = subprocess.Popen(
-            cmd,
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", "terminal64.exe"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
+            check=False,
         )
-        time.sleep(2.0)
-        return _mt5_process.poll() is None
-    except Exception as exc:
-        logger.error("MT5 terminal autostart failed: %s | tb=%s", exc, traceback.format_exc())
-        return False
+    except Exception:
+        pass
+    time.sleep(1.5)
 
 
-def _enable_algo_trading_ui_once() -> bool:
-    """
-    UI automation to click AlgoTrading in MT5 terminal.
-    Runs only if:
-      - Windows
-      - MT5_UI_ENABLE_ALGO=1
-      - executed once per process
-    """
-    global _UI_ENABLE_ALGO_ONCE
+def _start_terminal_windows(path: str, portable: bool) -> None:
+    if not path or not os.path.exists(path):
+        raise RuntimeError(f"MT5_PATH invalid: {path}")
 
-    if not (_is_windows() and _UI_ENABLE_ALGO):
-        return False
+    cmd = [path]
+    if portable:
+        cmd.append("/portable")
 
-    with _UI_LOCK:
-        if _UI_ENABLE_ALGO_ONCE:
-            return False
-        _UI_ENABLE_ALGO_ONCE = True
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags = subprocess.CREATE_NO_WINDOW
 
-    try:
-        # lazy import so project does not crash if not installed
-
-        app = Application(backend="uia").connect(path="terminal64.exe")
-        main = app.window(title_re=".*MetaTrader 5.*")
-
-        # best-effort selector: MT5 versions differ
-        # Try Button first, then MenuItem
-        btn = main.child_window(title_re=".*Algo.*Trading.*", control_type="Button")
-        if btn.exists(timeout=1.0):
-            btn.click_input()
-            return True
-
-        mi = main.child_window(title_re=".*Algo.*Trading.*", control_type="MenuItem")
-        if mi.exists(timeout=1.0):
-            mi.click_input()
-            return True
-
-        return False
-    except Exception as exc:
-        logger.error("AlgoTrading UI enable failed: %s | tb=%s", exc, traceback.format_exc())
-        return False
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+    time.sleep(max(2.0, float(ENV_START_WAIT_SEC)))
 
 
-def _mt5_health_check(cfg: EngineConfig) -> Health:
-    """
-    Minimal fast health check. Must be called under MT5_LOCK.
-    """
+# =============================================================================
+# Health check
+# =============================================================================
+def _health(login_cfg: MT5LoginCfg) -> Health:
     try:
         ti = mt5.terminal_info()
         if ti is None:
             return Health(False, "terminal_info_none")
-
         if not bool(getattr(ti, "connected", False)):
             return Health(False, "terminal_not_connected")
-
-        # Terminal AlgoTrading switch
         if not bool(getattr(ti, "trade_allowed", False)):
-            _enable_algo_trading_ui_once()
-            ti2 = mt5.terminal_info()
-            if not ti2 or not bool(getattr(ti2, "trade_allowed", False)):
-                return Health(False, "algo_trading_disabled_in_terminal")
+            return Health(False, "algo_trading_disabled_in_terminal")
 
-        acc = mt5.account_info()
-        if acc is None:
+        ai = mt5.account_info()
+        if ai is None:
             return Health(False, "account_info_none")
-
-        if not bool(getattr(acc, "trade_allowed", False)):
+        if int(getattr(ai, "login", -1)) != int(login_cfg.login):
+            return Health(False, "wrong_account")
+        if not bool(getattr(ai, "trade_allowed", False)):
             return Health(False, "trading_disabled_for_account")
 
-        if int(getattr(acc, "login", -1)) != int(cfg.login):
-            return Health(False, "wrong_account")
-
-        sym = _resolve_symbol(cfg)
-        if sym:
-            info = mt5.symbol_info(sym)
-            if info is None:
-                return Health(False, f"symbol_not_found:{sym}")
-
-            if hasattr(info, "visible") and (not bool(info.visible)):
-                if not mt5.symbol_select(sym, True):
-                    return Health(False, f"symbol_select_failed:{sym}")
-
-            tick = mt5.symbol_info_tick(sym)
-            if tick is None:
-                return Health(False, f"no_tick:{sym}")
-
-            bid = float(getattr(tick, "bid", 0.0) or 0.0)
-            ask = float(getattr(tick, "ask", 0.0) or 0.0)
-            if bid <= 0.0 and ask <= 0.0:
-                return Health(False, f"bad_tick_price:{sym}")
-
         return Health(True, "ok")
-    except Exception as exc:
-        logger.error("MT5 health check exception: %s | tb=%s", exc, traceback.format_exc())
+    except Exception:
+        logger.error("health exception | tb=%s", traceback.format_exc())
         return Health(False, "health_check_exception")
 
 
-def _initialize_and_login(cfg: EngineConfig, timeout_ms: int) -> None:
-    """
-    Initialize + login. Raises RuntimeError on failure.
-    """
-    _validate_cfg(cfg)
+def _wait_ready(login_cfg: MT5LoginCfg, timeout_sec: float) -> None:
+    deadline = time.time() + float(timeout_sec)
+    last = "waiting"
+    while time.time() < deadline:
+        h = _health(login_cfg)
+        last = h.reason
+        if h.ok:
+            return
+        time.sleep(0.6)
+    raise RuntimeError(f"mt5_health_failed:{last}")
 
-    portable = bool(getattr(cfg, "mt5_portable", False))
 
-    mt5_path = str(getattr(cfg, "mt5_path", "") or "").strip()
-    if _is_windows() and not mt5_path:
-        mt5_path = _resolve_mt5_path_windows(cfg) or ""
-
-    init_kwargs: dict = {"timeout": int(timeout_ms), "portable": bool(portable)}
-    if mt5_path:
-        init_kwargs["path"] = str(mt5_path)
-
-    # reset state before init (important after crash)
+# =============================================================================
+# Initialize + login (multi-fallback)
+# =============================================================================
+def _init_and_login(login_cfg: MT5LoginCfg, mt5_path: str, portable: bool, timeout_ms: int) -> None:
+    # reset
     try:
         mt5.shutdown()
     except Exception:
         pass
-    time.sleep(0.15)
+    time.sleep(0.35)
 
-    ok = mt5.initialize(
-        login=int(cfg.login),
-        password=str(cfg.password),
-        server=str(cfg.server),
-        **init_kwargs,
+    init_kwargs = {
+        "path": str(mt5_path) if mt5_path else None,
+        "portable": bool(portable),
+        "timeout": int(timeout_ms),
+    }
+
+    # Attempt #1: initialize with creds (often more stable)
+    ok1 = mt5.initialize(
+        login=int(login_cfg.login),
+        password=str(login_cfg.password),
+        server=str(login_cfg.server),
+        **{k: v for k, v in init_kwargs.items() if v is not None},
     )
-    if ok:
+    if ok1:
         return
 
-    err1 = _last_error_str()
+    e1 = _last_error()
 
-    # fallback: initialize() then login()
+    # Attempt #2: initialize then login
     try:
         mt5.shutdown()
     except Exception:
         pass
-    time.sleep(0.20)
+    time.sleep(0.35)
 
-    ok2 = mt5.initialize(**init_kwargs)
+    ok2 = mt5.initialize(**{k: v for k, v in init_kwargs.items() if v is not None})
     if not ok2:
-        raise RuntimeError(f"mt5.initialize failed: {_last_error_str()} | first_try={err1}")
+        e2 = _last_error()
+        raise RuntimeError(f"mt5.initialize failed: {e2} | first_try={e1}")
 
     logged = mt5.login(
-        login=int(cfg.login),
-        password=str(cfg.password),
-        server=str(cfg.server),
+        login=int(login_cfg.login),
+        password=str(login_cfg.password),
+        server=str(login_cfg.server),
         timeout=int(timeout_ms),
     )
     if not logged:
-        err2 = _last_error_str()
+        e3 = _last_error()
         try:
             mt5.shutdown()
         except Exception:
             pass
-        raise RuntimeError(f"mt5.login failed: {err2} | first_try={err1}")
+        raise RuntimeError(f"mt5.login failed: {e3} | first_try={e1}")
 
 
 # =============================================================================
 # Public API
 # =============================================================================
 def ensure_mt5(max_retries: int = 6, retry_delay: float = 1.5) -> mt5:
-    """
-    Contract:
-      - returns mt5 on success
-      - raises RuntimeError on failure
-      - never returns None
-      - thread-safe
-    """
-    global _initialized, _config, _last_health_reason
+    global _initialized, _last_health_reason
+
+    _acquire_single_instance_lock()
+
+    login_cfg = _get_login_cfg()
+
+    portable = _env_bool("MT5_PORTABLE", False)
+    autostart = ENV_AUTOSTART
+
+    timeout_base = max(int(ENV_TIMEOUT_MS), 60_000)
+    timeouts = [timeout_base, max(timeout_base, 180_000)]
+
+    mt5_path = ""
+    if _is_windows():
+        mt5_path = _resolve_mt5_path_windows()
+        if ENV_REQUIRE_PATH and (not mt5_path or not os.path.exists(mt5_path)):
+            raise RuntimeError("MT5_PATH is required on Windows. Set MT5_PATH to terminal64.exe full path")
+    else:
+        mt5_path = ENV_MT5_PATH
 
     # fast path
     with MT5_LOCK:
-        if _initialized and _config is not None:
-            h = _mt5_health_check(_config)
+        if _initialized:
+            h = _health(login_cfg)
             _last_health_reason = h.reason
             if h.ok:
                 return mt5
-
-            logger.error("Fast path health failed: %s", h.reason)
+            _throttled_health_log(h.reason)
             try:
                 mt5.shutdown()
             except Exception:
                 pass
             _initialized = False
 
+    last_exc: Optional[Exception] = None
+
     with INIT_LOCK:
-        if _config is None:
-            _config = get_config_from_env()
-        _validate_cfg(_config)
-
-        # double-check health under MT5_LOCK
-        with MT5_LOCK:
-            if _initialized:
-                h2 = _mt5_health_check(_config)
-                _last_health_reason = h2.reason
-                if h2.ok:
-                    return mt5
-
-                logger.error("Double-check health failed: %s", h2.reason)
-                try:
-                    mt5.shutdown()
-                except Exception:
-                    pass
-                _initialized = False
-
-        portable = bool(getattr(_config, "mt5_portable", False))
-        autostart = bool(getattr(_config, "mt5_autostart", True))
-        timeout_ms = int(getattr(_config, "mt5_timeout_ms", 10_000) or 10_000)
-
-        last_exc: Optional[Exception] = None
-
         for attempt in range(int(max_retries)):
             try:
+                # ensure terminal running (Windows)
                 if _is_windows() and autostart:
-                    if not _is_mt5_terminal_running_windows():
-                        p = _resolve_mt5_path_windows(_config)
-                        if p:
-                            _start_mt5_terminal_windows(str(p), portable=portable)
-                        else:
-                            logger.error("Could not resolve MT5 terminal path for autostart")
+                    if not _is_terminal_running_windows():
+                        _start_terminal_windows(mt5_path, portable=portable)
+                    else:
+                        # give terminal time to become IPC-ready
+                        if attempt == 0:
+                            time.sleep(min(6.0, float(ENV_START_WAIT_SEC)))
 
                 with MT5_LOCK:
-                    _initialize_and_login(_config, timeout_ms=timeout_ms)
-                    h = _mt5_health_check(_config)
-                    _last_health_reason = h.reason
-                    if not h.ok:
-                        try:
-                            mt5.shutdown()
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"mt5_health_failed:{h.reason}")
-
+                    _init_and_login(login_cfg, mt5_path, portable, timeouts[min(attempt, len(timeouts) - 1)])
+                    _wait_ready(login_cfg, timeout_sec=float(ENV_READY_TIMEOUT_SEC))
                     _initialized = True
+                    _last_health_reason = "ok"
                     return mt5
 
             except Exception as exc:
                 last_exc = exc
+                msg = str(exc).lower()
+
+                fatal_ipc = ("ipc timeout" in msg) or ("(-10005" in msg) or ("-10005" in msg)
+
+                if _is_windows() and ENV_TASKKILL_ON_IPC and fatal_ipc:
+                    logger.error("IPC timeout -> taskkill terminal64.exe + retry | err=%s", exc)
+                    try:
+                        mt5.shutdown()
+                    except Exception:
+                        pass
+                    _taskkill_terminal_windows()
+                    if autostart:
+                        try:
+                            _start_terminal_windows(mt5_path, portable=portable)
+                        except Exception as exc2:
+                            logger.error("MT5 restart failed: %s | tb=%s", exc2, traceback.format_exc())
+
                 with MT5_LOCK:
                     try:
                         mt5.shutdown()
@@ -439,31 +511,22 @@ def ensure_mt5(max_retries: int = 6, retry_delay: float = 1.5) -> mt5:
 
 
 def shutdown_mt5() -> None:
-    """
-    Safe shutdown (idempotent).
-    """
     global _initialized
     with INIT_LOCK:
         with MT5_LOCK:
-            if not _initialized:
-                return
             try:
                 mt5.shutdown()
             except Exception as exc:
                 logger.error("MT5 shutdown error: %s | tb=%s", exc, traceback.format_exc())
-            finally:
-                _initialized = False
+            _initialized = False
+    _release_single_instance_lock()
 
 
 def mt5_status() -> Tuple[bool, str]:
-    """
-    Non-throwing status (for health logs / telegram).
-    """
-    global _initialized, _config, _last_health_reason
     with MT5_LOCK:
-        if not _initialized or _config is None:
-            return False, "not_initialized"
-        return True, _last_health_reason
+        return bool(_initialized), str(_last_health_reason)
 
+
+atexit.register(shutdown_mt5)
 
 __all__ = ["ensure_mt5", "shutdown_mt5", "mt5_status", "MT5_LOCK", "mt5"]

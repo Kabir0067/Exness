@@ -133,6 +133,7 @@ class MarketFeed:
 
         # CVD-like accumulator
         self._cumulative_delta: float = 0.0
+        self._last_tick_msc: int = 0  # dedup ticks + safe CVD accumulation
 
         # Latency
         self._last_latency: LatencyStats = LatencyStats()
@@ -325,7 +326,7 @@ class MarketFeed:
                 last_ts = float(last_t)
             else:
                 last_ts = float(pd.Timestamp(last_t).timestamp())
-            return float(time.time() - last_ts)
+            return float(max(0.0, time.time() - last_ts))
         except Exception:
             return 9999.0
 
@@ -470,10 +471,36 @@ class MarketFeed:
             with self._data_lock:
                 self._tick_cache[symbol] = arr
                 self._last_tick_sync = time.time()
-                # append only recent slice to reduce overhead
-                tail = arr[-min(len(arr), 700) :]
-                for row in tail:
-                    self._tick_deque.append(row)
+
+                # Append ONLY new ticks (dedup overlaps) to keep TPS/volatility real
+                last_msc = int(self._last_tick_msc or 0)
+                if last_msc > 0:
+                    new_arr = arr[arr[:, 0] > float(last_msc)]
+                else:
+                    new_arr = arr
+
+                if new_arr is not None and len(new_arr) > 0:
+                    tail = new_arr[-min(len(new_arr), 700):]
+                    for row in tail:
+                        self._tick_deque.append(row)
+
+                    # Update cumulative delta from NEW ticks only (prevents double counting)
+                    try:
+                        BUY_FLAG = int(getattr(mt5, "TICK_FLAG_BUY", 128))
+                        SELL_FLAG = int(getattr(mt5, "TICK_FLAG_SELL", 64))
+                        flags = new_arr[:, 5].astype(np.uint32, copy=False)
+                        vols = new_arr[:, 3].astype(np.float64, copy=False)
+                        buy_vol = float(np.sum(vols[(flags & BUY_FLAG) != 0])) if BUY_FLAG else 0.0
+                        sell_vol = float(np.sum(vols[(flags & SELL_FLAG) != 0])) if SELL_FLAG else 0.0
+                        self._cumulative_delta += (buy_vol - sell_vol)
+                    except Exception:
+                        pass
+
+                    # advance watermark
+                    try:
+                        self._last_tick_msc = max(int(self._last_tick_msc or 0), int(new_arr[-1, 0]))
+                    except Exception:
+                        self._last_tick_msc = int(self._last_tick_msc or 0)
 
             return arr
         except Exception as exc:
@@ -489,12 +516,48 @@ class MarketFeed:
           - Optional regime estimation using ATR ratio + BB width
         """
         try:
+            ignore_micro = bool(getattr(self.cfg, "ignore_microstructure", False))
             self._sync_ticks(self.symbol, n_ticks=2000)
             book = self.fetch_book(levels=20)
+
+            def _fallback_tick(reason: str) -> TickStats:
+                bid = ask = 0.0
+                try:
+                    with MT5_LOCK:
+                        t = mt5.symbol_info_tick(self.symbol)
+                    if t:
+                        bid = float(getattr(t, "bid", 0.0) or 0.0)
+                        ask = float(getattr(t, "ask", 0.0) or 0.0)
+                except Exception:
+                    pass
+                mid = 0.5 * (bid + ask) if bid and ask else 0.0
+                spread = float(abs(ask - bid)) if bid and ask else 0.0
+                spread_pct = float(spread / mid) if mid > 0 else 1.0
+                return TickStats(
+                    ok=True,
+                    reason=reason,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
+                    spread=spread,
+                    spread_pct=spread_pct,
+                    spread_ticks=self.spread_ticks(),
+                    tps=0.0,
+                    flips=0,
+                    volatility=0.0,
+                    imbalance=0.0,
+                    tick_delta=0.0,
+                    cumulative_delta=0.0,
+                    aggr_delta=0.0,
+                    micro_trend=0.0,
+                    regime="unknown",
+                )
 
             with self._data_lock:
                 min_ticks = int(max(12, float(self.sp.micro_min_tps) * float(self.sp.micro_window_sec) * 2.0))
                 if len(self._tick_deque) < min_ticks:
+                    if ignore_micro:
+                        return _fallback_tick(f"low_ticks_buf_ignored:{len(self._tick_deque)}/{min_ticks}")
                     return TickStats(ok=False, reason=f"low_ticks_buf:{len(self._tick_deque)}/{min_ticks}")
                 rows = list(self._tick_deque)
 
@@ -507,6 +570,8 @@ class MarketFeed:
 
             w = arr[arr[:, 0] >= (now_ms - win_ms)]
             if w.shape[0] < min_ticks:
+                if ignore_micro:
+                    return _fallback_tick(f"low_ticks_ignored:{int(w.shape[0])}/{min_ticks}")
                 return TickStats(ok=False, reason=f"low_ticks:{int(w.shape[0])}/{min_ticks}")
 
             times = w[:, 0] / 1000.0
@@ -553,7 +618,6 @@ class MarketFeed:
             aggr_delta = tick_delta
 
             with self._data_lock:
-                self._cumulative_delta += (buy_vol - sell_vol)
                 cumulative_delta = float(self._cumulative_delta)
 
             # Book imbalance

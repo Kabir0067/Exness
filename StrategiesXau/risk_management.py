@@ -299,7 +299,6 @@ class RiskManager:
         "tp_atr_mult_range",
         "multi_order_tp_bonus_pct",
         "multi_order_sl_tighten_pct",
-        "fixed_volume",
     )
 
     def __init__(self, cfg: EngineConfig, sp: SymbolParams) -> None:
@@ -395,6 +394,17 @@ class RiskManager:
         if float(self.cfg.min_confidence_signal) <= 0 or float(self.cfg.min_confidence_signal) > 1:
             raise RuntimeError("EngineConfig.min_confidence_signal must be in (0, 1]")
 
+        # fixed_volume is OPTIONAL (None => dynamic sizing). If provided, it must be > 0.
+        fv = getattr(self.cfg, "fixed_volume", None)
+        if fv is not None:
+            try:
+                fv_f = float(fv)
+            except Exception as exc:
+                raise RuntimeError("EngineConfig.fixed_volume must be float when provided") from exc
+            if fv_f <= 0:
+                raise RuntimeError("EngineConfig.fixed_volume must be > 0 when provided")
+
+
     # ------------------- time / daily -------------------
     @staticmethod
     def _utc_date():
@@ -438,7 +448,8 @@ class RiskManager:
         return time.time() >= self._analysis_blocked_until
 
     def on_position_opened(self) -> None:
-        self.block_analysis(float(getattr(self.cfg, "cooldown_seconds", 2.0) or 2.0))
+        if bool(getattr(self.cfg, "pause_analysis_on_position_open", False)):
+            self.block_analysis(float(getattr(self.cfg, "cooldown_seconds", 2.0) or 2.0))
 
     def on_all_flat(self) -> None:
         dd = float(self._current_drawdown)
@@ -535,6 +546,26 @@ class RiskManager:
         v = max(float(self._vol_min), min(float(vol), float(self._vol_max)))
         v = math.floor(v / step) * step
         return float(round(v, 8))
+
+    def _fallback_volume(self) -> float:
+        """
+        Safe fallback volume used when dynamic sizing cannot be computed.
+
+        Rules:
+          - If cfg.fixed_volume is set -> return normalized broker-safe volume.
+          - If cfg.fixed_volume is None -> return 0.0 (skip trade).
+
+        Rationale:
+          - Never open a position when risk inputs/account snapshot are invalid.
+          - Avoid TypeError from float(None).
+        """
+        fv = getattr(self.cfg, "fixed_volume", None)
+        if fv is None:
+            return 0.0
+        try:
+            return self._normalize_volume_floor(float(fv))
+        except Exception:
+            return 0.0
 
     # ------------------- quote/execution hooks -------------------
     def on_quote(self, bid: float, ask: float) -> None:
@@ -766,8 +797,9 @@ class RiskManager:
             if not tick_ok and tick_reason not in ("tps_low", "no_rates"):
                 reasons.append(f"micro:{tick_reason}")
 
-            if not in_session:
-                reasons.append("session")
+            if not bool(getattr(self.cfg, "ignore_sessions", False)):
+                if not in_session:
+                    reasons.append("session")
 
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
@@ -776,13 +808,15 @@ class RiskManager:
                 if spread_pct > float(self.sp.spread_limit_pct) * 1.2:
                     reasons.append("dd_strict_spread")
 
-            per_hour = max(1, int(float(self.cfg.max_signals_per_day) / 24.0))
-            now = time.time()
-            if (now - self._hour_window_start_ts) >= 3600.0:
-                self._hour_window_start_ts = now
-                self._hour_window_count = 0
-            if self._hour_window_count >= per_hour:
-                reasons.append("hourly_signal_limit")
+            max_per_day = int(getattr(self.cfg, "max_signals_per_day", 0) or 0)
+            if max_per_day > 0:
+                per_hour = max(1, int(float(max_per_day) / 24.0))
+                now = time.time()
+                if (now - self._hour_window_start_ts) >= 3600.0:
+                    self._hour_window_start_ts = now
+                    self._hour_window_count = 0
+                if self._hour_window_count >= per_hour:
+                    reasons.append("hourly_signal_limit")
 
             if spread_pct > float(self.sp.spread_limit_pct) * 1.5:
                 reasons.append("excessive_spread")
@@ -940,53 +974,73 @@ class RiskManager:
         take_profit: float,
         confidence: float,
     ) -> float:
+        """
+        Broker-true risk sizing.
+
+        IMPORTANT SAFETY CONTRACT:
+          - If cfg.fixed_volume is None -> sizing is fully dynamic.
+          - Any invalid inputs / missing broker meta / missing equity / MT5 calc failure
+            must return 0.0 (skip trade) instead of crashing or blindly opening min-lot.
+        """
         try:
             side_n = _side_norm(side)
             if side_n not in ("Buy", "Sell"):
                 return 0.0
 
-            if not _is_finite(entry_price, stop_loss, take_profit, confidence):
-                return float(self.cfg.fixed_volume)
+            ep = float(entry_price)
+            sl = float(stop_loss)
+            tp = float(take_profit)
+            conf = float(confidence)
 
+            # Invalid numbers => do NOT trade.
+            if (not _is_finite(ep, sl, tp, conf)) or ep <= 0 or sl <= 0 or tp <= 0:
+                return 0.0
+
+            # Need broker constraints for normalization and MT5 calc.
             if not self._symbol_meta():
-                return float(self.cfg.fixed_volume)
+                return self._fallback_volume()
 
             min_rr = getattr(self.cfg, "min_rr", None)
             if min_rr is not None:
-                rr_ratio = self._rr(entry_price, stop_loss, take_profit)
+                rr_ratio = self._rr(ep, sl, tp)
                 if rr_ratio < float(min_rr):
                     return 0.0
 
             _, eq = self._account_snapshot()
-            if eq <= 0:
-                return float(self.cfg.fixed_volume)
+            if float(eq) <= 0:
+                return self._fallback_volume()
 
+            # Risk budget in account currency
             risk_money = float(eq) * float(self.cfg.max_risk_per_trade)
 
+            # Phase / drawdown adjustments
             if self.current_phase == "B":
                 risk_money *= float(getattr(self.cfg, "phase_b_risk_mult", 1.0) or 1.0)
             if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
                 risk_money *= float(getattr(self.cfg, "dd_risk_mult", 1.0) or 1.0)
 
-            risk_1lot = abs(self._order_calc_profit_money(side_n, 1.0, entry_price, stop_loss))
+            # True money loss for 1.0 lot to SL using broker calc
+            risk_1lot = abs(self._order_calc_profit_money(side_n, 1.0, ep, sl))
             if risk_1lot <= 0:
-                return float(self.cfg.fixed_volume)
+                return self._fallback_volume()
 
-            raw_lot = risk_money / risk_1lot
+            raw_lot = float(risk_money) / float(risk_1lot)
 
+            # Optional margin cap
             if hasattr(self.cfg, "max_position_percentage"):
                 cap_pct = float(getattr(self.cfg, "max_position_percentage")) / 100.0
                 if cap_pct > 0:
-                    margin_cap = eq * cap_pct
-                    margin_1lot = self._order_calc_margin(side_n, 1.0, entry_price)
+                    margin_cap = float(eq) * cap_pct
+                    margin_1lot = self._order_calc_margin(side_n, 1.0, ep)
                     if margin_1lot > 0:
-                        raw_lot = min(raw_lot, margin_cap / margin_1lot)
+                        raw_lot = min(raw_lot, float(margin_cap) / float(margin_1lot))
 
             lot = self._normalize_volume_floor(raw_lot)
-            return float(lot) if lot > 0 else 0.0
+            return float(lot) if lot > 0 and _is_finite(lot) else 0.0
+
         except Exception as exc:
             log_risk.error("calculate_position_size error: %s | tb=%s", exc, traceback.format_exc())
-            return float(self.cfg.fixed_volume)
+            return self._fallback_volume()
 
     # ------------------- SL/TP planners -------------------
     def _micro_zone_sl_tp(

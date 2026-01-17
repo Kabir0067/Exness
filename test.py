@@ -1,9 +1,20 @@
-lst = list(map(int, input().split()))
-mx = -9999
+def main():
+    capital = 50
+    profit = 0.020   
+    days = 365
 
-for i in lst:
-    if i > mx:
-        mx = i
+    print(f"{'Day':>5} | {'Capital ($)':>15}")
+    print("-" * 25)
+
+    for i in range(1, days + 1):
+        if i % 30 == 0:
+            capital += 100
+        capital *= (1 + profit)
+        print(f"{i:>5} | {capital:>15.2f}$")
+    print("-" * 34)
+    print(f"FINAL: {capital:.2f}$")
 
 
-print(mx)
+if __name__ == "__main__":
+    main()
+

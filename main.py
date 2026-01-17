@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import logging
 import os
 import signal
@@ -8,6 +9,9 @@ import socket
 import sys
 import time
 import traceback
+import urllib3
+
+TG_HEALTH_NOTIFY = os.getenv("TG_HEALTH_NOTIFY", "0").strip().lower() in {"1","true","yes","on"}
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from queue import Queue, Full, Empty
@@ -16,8 +20,8 @@ from typing import Optional
     
 from Bot.bot import ADMIN, bot, bot_commands
 # Portfolio engine: trades XAU and BTC, but only one at a time.
-from Bot.engine import engine
-from log_config import LOG_DIR as LOG_ROOT, get_log_path
+from Bot.portfolio_engine import engine
+from log_config import LOG_DIR as LOG_ROOT, get_log_path, log_dir_stats
 
 # ==========================
 # Logging (production safe)
@@ -25,7 +29,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 LOG_DIR = LOG_ROOT
 
 log = logging.getLogger("main")
-log.setLevel(logging.INFO)
+log.setLevel(logging.ERROR)
 log.propagate = False
 
 if not log.handlers:
@@ -39,19 +43,39 @@ if not log.handlers:
         delay=True,
     )
     fh.setFormatter(fmt)
+    fh.setLevel(logging.ERROR)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    ch.setLevel(logging.ERROR)
+
+    log.addHandler(fh)
+    log.addHandler(ch)
+
+
+log_super = logging.getLogger("telegram.supervisor")
+log_super.setLevel(logging.INFO)  # Supervisor needs INFO to show starts/stops
+log_super.propagate = False
+
+if not log_super.handlers:
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    fh = RotatingFileHandler(
+        str(get_log_path("telegram.log")),  # Share with bot logic
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+        delay=True,
+    )
+    fh.setFormatter(fmt)
     fh.setLevel(logging.INFO)
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     ch.setLevel(logging.INFO)
 
-    log.addHandler(fh)
-    log.addHandler(ch)
-
-
-# ==========================
-# Helpers
-# ==========================
+    log_super.addHandler(fh)
+    log_super.addHandler(ch)
 def sleep_interruptible(stop_event: Event, seconds: float) -> None:
     """Sleep, but exit early if stop_event set."""
     end = time.time() + float(seconds)
@@ -95,9 +119,19 @@ class RateLimiter:
 # Network-ish exceptions (Telegram / HTTP / DNS / sockets)
 try:
     import requests  # type: ignore
-    from requests.exceptions import RequestException  # type: ignore
+    from requests.exceptions import (  # type: ignore
+        RequestException,
+        ReadTimeout,
+        ConnectTimeout,
+        ConnectionError as RequestsConnectionError,
+        ChunkedEncodingError,
+    )
 except Exception:  # pragma: no cover
     RequestException = Exception  # type: ignore
+    ReadTimeout = Exception  # type: ignore
+    ConnectTimeout = Exception  # type: ignore
+    RequestsConnectionError = Exception  # type: ignore
+    ChunkedEncodingError = Exception  # type: ignore
 
 NETWORK_EXC = (
     RequestException,
@@ -217,6 +251,52 @@ class Notifier:
 
 
 # ==========================
+# Log volume monitor
+# ==========================
+class LogMonitor:
+    """
+    Periodically checks log directory size and file count.
+    Emits warnings when thresholds are exceeded.
+    """
+
+    def __init__(self, stop_event: Event) -> None:
+        self.stop_event = stop_event
+        self._t: Optional[Thread] = None
+        self._log_rl = RateLimiter(600.0)
+
+        self.interval = float(os.getenv("LOG_MONITOR_INTERVAL_SEC", "300"))
+        self.max_mb = float(os.getenv("LOG_MAX_TOTAL_MB", "512"))
+        self.max_files = int(os.getenv("LOG_MAX_FILES", "2000"))
+
+    def start(self) -> None:
+        if self._t and self._t.is_alive():
+            return
+        self._t = Thread(target=self._worker, name="log.monitor", daemon=True)
+        self._t.start()
+
+    def _worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                total_bytes, file_count = log_dir_stats()
+                total_mb = total_bytes / (1024 * 1024)
+
+                if total_mb > self.max_mb or file_count > self.max_files:
+                    if self._log_rl.allow("log_volume"):
+                        log.warning(
+                            "Log volume high | size=%.1fMB files=%s thresholds=(%.1fMB,%s)",
+                            total_mb,
+                            file_count,
+                            self.max_mb,
+                            self.max_files,
+                        )
+            except Exception as exc:
+                if self._log_rl.allow("log_monitor_err"):
+                    log.warning("Log monitor error: %s", exc)
+
+            sleep_interruptible(self.stop_event, self.interval)
+
+
+# ==========================
 # Engine Supervisor (never crash)
 # ==========================
 def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
@@ -272,7 +352,9 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                 # restart guarded
                 if restart_guard.allow("engine_restart"):
                     log.warning("Engine unhealthy (connected=%s trading=%s) -> restarting", ok_connected, ok_trading)
-                    notifier.notify("🟠 Engine unhealthy -> restart")
+                    if TG_HEALTH_NOTIFY:
+
+                        notifier.notify("🟠 Engine unhealthy -> restart")
                     try:
                         engine.stop()
                     except Exception:
@@ -291,7 +373,9 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
 
                 if restart_guard.allow("engine_restart"):
                     log.warning("Engine unhealthy (connected=%s trading=%s) -> restarting", ok_connected, ok_trading)
-                    notifier.notify("🟠 Engine unhealthy -> restart")
+                    if TG_HEALTH_NOTIFY:
+
+                        notifier.notify("🟠 Engine unhealthy -> restart")
                     try:
                         engine.stop()
                     except Exception:
@@ -301,8 +385,8 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                     sleep_interruptible(stop_event, 2.0)
                 continue
 
-            # Periodic health notification
-            if health_notify_rl.allow("health_status"):
+            # Periodic health notification (DISABLED by default)
+            if TG_HEALTH_NOTIFY and health_notify_rl.allow("health_status"):
                 try:
                     st = engine.status()
                     msg = (
@@ -363,16 +447,36 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
     log_rl = RateLimiter(20.0)
 
     attempt = 0
+    # Common network errors to catch
+    NET_ERRS = (
+        ReadTimeout, ConnectTimeout, RequestException,
+        urllib3.exceptions.ReadTimeoutError,
+        urllib3.exceptions.ProtocolError,
+        ConnectionError,
+        RequestsConnectionError,
+        ChunkedEncodingError,
+        http.client.RemoteDisconnected,
+    )
+
     while not stop_event.is_set():
-        attempt += 1
         try:
-            # If this blocks forever, stop_event will call stop_polling() in finally of main.
-            bot.infinity_polling(timeout=20, long_polling_timeout=20)
-            attempt = 0  # reset if returned cleanly
-        except NETWORK_EXC as exc:
+            attempt += 1
+            log_super.info("Starting Telegram bot polling (attempt %s)...", attempt)
+            
+            # Increased timeouts for bad network stability
+            bot.infinity_polling(
+                timeout=75, 
+                long_polling_timeout=75, 
+                restart_on_change=False
+            )
+            
+            # If polling returns normally (unlikely), reset backoff
+            attempt = 0
+            
+        except NET_ERRS as exc:
             delay = backoff.delay(attempt)
             if log_rl.allow("tg_net"):
-                log.warning("Telegram network down (throttled): %s | retry in %.1fs", exc, delay)
+                log_super.warning("Telegram network unstable: %s | retry in %.1fs", exc, delay)
             sleep_interruptible(stop_event, delay)
         except Exception as exc:
             delay = backoff.delay(attempt)
@@ -401,6 +505,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     notifier = Notifier(shutdown.stop_event, queue_max=200)
     notifier.start()
+    log_monitor = LogMonitor(shutdown.stop_event)
+    log_monitor.start()
 
     notifier.notify("✅ System boot")
 

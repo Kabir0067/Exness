@@ -199,7 +199,7 @@ class EngineConfig:
     # Fix #2: daily loss vs drawdown ratio must be sane.
     # daily loss <= 3%, max drawdown ~ 12% (portfolio)
     # -------------------------------------------------------------------------
-    daily_target_pct: float = 0.04
+    daily_target_pct: float = 0.10
     max_daily_loss_pct: float = 0.03
     protect_drawdown_from_peak_pct: float = 0.04
     max_drawdown: float = 0.12
@@ -274,7 +274,7 @@ class EngineConfig:
 
     # Limits (24/7 BTC)
     max_trades_per_hour: int = 24
-    max_signals_per_day: int = 100
+    max_signals_per_day: int = 0
 
     # SL/TP (ATR)
     sl_atr_mult_trend: float = 1.25
@@ -352,6 +352,11 @@ class EngineConfig:
     pyramid_enabled: bool = False
 
     log_csv_path: str = field(default_factory=lambda: str(get_log_path("signals_error_only_btc.csv")))
+
+    # Policy toggles
+    ignore_sessions: bool = True
+    pause_analysis_on_position_open: bool = False
+    ignore_microstructure: bool = True
 
     def validate(self) -> None:
         if int(self.login) <= 0:
@@ -444,6 +449,17 @@ def get_config_from_env() -> EngineConfig:
         cfg.max_daily_loss_pct = _env_float("MAX_DAILY_LOSS_PCT", cfg.max_daily_loss_pct)
     if os.getenv("MAX_DRAWDOWN"):
         cfg.max_drawdown = _env_float("MAX_DRAWDOWN", cfg.max_drawdown)
+    if os.getenv("MAX_SIGNALS_PER_DAY"):
+        cfg.max_signals_per_day = _env_int("MAX_SIGNALS_PER_DAY", cfg.max_signals_per_day)
+    if os.getenv("IGNORE_SESSIONS"):
+        cfg.ignore_sessions = _env_bool("IGNORE_SESSIONS", default=cfg.ignore_sessions)
+    if os.getenv("PAUSE_ANALYSIS_ON_POSITION_OPEN"):
+        cfg.pause_analysis_on_position_open = _env_bool(
+            "PAUSE_ANALYSIS_ON_POSITION_OPEN",
+            default=cfg.pause_analysis_on_position_open,
+        )
+    if os.getenv("IGNORE_MICROSTRUCTURE"):
+        cfg.ignore_microstructure = _env_bool("IGNORE_MICROSTRUCTURE", default=cfg.ignore_microstructure)
 
     cfg.enable_debug_logging = _env_bool("ENABLE_DEBUG_LOGGING", default=cfg.enable_debug_logging)
 

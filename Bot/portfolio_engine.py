@@ -1,33 +1,17 @@
-"""Bot/portfolio_engine.py
-
-Multi-asset (XAU + BTC) portfolio engine.
-
-Goal:
-- Run BOTH pipelines continuously (data validation, signals, risk).
-- Execute trades for ONLY ONE asset at a time:
-  - If there are open positions in XAU -> only XAU is allowed to open/manage new trades.
-  - If there are open positions in BTC -> only BTC is allowed.
-  - If there are no positions -> choose the better candidate (confidence-based).
-
-This module is production-oriented:
-- Rotating logs (error + health)
-- Dedicated execution worker thread (non-blocking)
-- MT5_LOCK respected
-- Idempotency (signal cooldown) to prevent duplicate orders
-"""
-
 from __future__ import annotations
 
-import logging
-import re
-import os
 import builtins
+import json
+import logging
+import os
+import re
+import subprocess
 import queue
 import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, is_dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
@@ -39,9 +23,14 @@ try:
 except Exception:  # pragma: no cover
     pd = None  # type: ignore
 
-from ExnessAPI.order_execution import OrderExecutor, OrderRequest, OrderResult as ExecOrderResult
+from ExnessAPI.order_execution import (
+    OrderExecutor,
+    OrderRequest,
+    OrderResult as ExecOrderResult,
+    log_health as exec_health_log,
+)
 from ExnessAPI.orders import close_all_position
-from mt5_client import MT5_LOCK, ensure_mt5
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 # -------------------- XAU stack --------------------
 from config_xau import EngineConfig as XauConfig
@@ -51,7 +40,6 @@ from DataFeed.market_feed import MarketFeed as XauMarketFeed
 from StrategiesXau.indicators import Classic_FeatureEngine as XauFeatureEngine
 from StrategiesXau.risk_management import RiskManager as XauRiskManager
 from StrategiesXau.signal_engine import SignalEngine as XauSignalEngine
-from StrategiesXau.signal_engine import SignalResult as XauSignalResult
 
 # -------------------- BTC stack --------------------
 from config_btc import EngineConfig as BtcConfig
@@ -61,40 +49,46 @@ from DataFeed.btc_feed import MarketFeed as BtcMarketFeed
 from StrategiesBtc.indicators import Classic_FeatureEngine as BtcFeatureEngine
 from StrategiesBtc.risk_management import RiskManager as BtcRiskManager
 from StrategiesBtc.signal_engine import SignalEngine as BtcSignalEngine
-from StrategiesBtc.signal_engine import SignalResult as BtcSignalResult
+
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 
 # =============================================================================
 # Logging
 # =============================================================================
-LOG_DIR = LOG_ROOT
-
 
 def _rotating_file_logger(
     name: str,
     filename: str,
     level: int,
-    max_bytes_env: str,
-    backups_env: str,
+    max_bytes_env: Optional[str] = None,
+    backups_env: Optional[str] = None,
     default_max_bytes: int = 5_242_880,  # 5MB
     default_backups: int = 5,
 ) -> logging.Logger:
+    """Create a rotated file logger.
+
+    FIX vs your broken version:
+    - max_bytes_env/backups_env are optional so diag logger doesn't crash import.
+    """
+
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.propagate = False
 
     if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        max_bytes = int(os.getenv(max_bytes_env, str(default_max_bytes))) if max_bytes_env else default_max_bytes
+        backups = int(os.getenv(backups_env, str(default_backups))) if backups_env else default_backups
+
         fh = RotatingFileHandler(
             filename=str(get_log_path(filename)),
-            maxBytes=int(os.getenv(max_bytes_env, str(default_max_bytes))),
-            backupCount=int(os.getenv(backups_env, str(default_backups))),
+            maxBytes=max_bytes,
+            backupCount=backups,
             encoding="utf-8",
             delay=True,
         )
         fh.setLevel(level)
-        fmt = "%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
-        fh.setFormatter(logging.Formatter(fmt))
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
         logger.addHandler(fh)
 
     return logger
@@ -116,9 +110,69 @@ log_health = _rotating_file_logger(
     backups_env="PORTFOLIO_ENGINE_HEALTH_LOG_BACKUPS",
 )
 
+# Structured snapshots (jsonl)
+log_diag = _rotating_file_logger(
+    "portfolio.engine.diag",
+    "portfolio_engine_diag.jsonl",
+    logging.INFO,
+    max_bytes_env="PORTFOLIO_ENGINE_DIAG_MAX_BYTES",
+    backups_env="PORTFOLIO_ENGINE_DIAG_BACKUPS",
+    default_max_bytes=10_485_760,  # 10MB
+    default_backups=8,
+)
+
+_DIAG_ENABLED = os.getenv("PORTFOLIO_DIAG", "1").strip().lower() in {"1", "true", "yes", "on"}
+_DIAG_EVERY_SEC = float(os.getenv("PORTFOLIO_DIAG_SEC", "30") or 30)
+
+# =============================================================================
+# JSON encoding helper for diagnostics (dataclasses + common non-JSON types)
+# =============================================================================
+def _json_default(obj: object):
+    try:
+        if is_dataclass(obj):
+            return asdict(obj)
+    except Exception:
+        pass
+
+    try:
+        # Common containers
+        if isinstance(obj, set):
+            return list(obj)
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    try:
+        from datetime import datetime, date
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+    except Exception:
+        pass
+
+    try:
+        from pathlib import Path
+        if isinstance(obj, Path):
+            return str(obj)
+    except Exception:
+        pass
+
+    # numpy/pandas scalars (optional)
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+    except Exception:
+        pass
+
+    return str(obj)
+
+
+
 # =============================================================================
 # Timeframe helpers
 # =============================================================================
+
 _TF_SECONDS_MAP = {
     getattr(mt5, "TIMEFRAME_M1", -1): 60,
     getattr(mt5, "TIMEFRAME_M2", -1): 120,
@@ -171,16 +225,17 @@ def _tf_seconds(tf: Any) -> Optional[float]:
     return None
 
 
-
 # =============================================================================
 # Data models
 # =============================================================================
+
+
 @dataclass(frozen=True)
 class AssetCandidate:
-    asset: str              # "XAU" / "BTC"
+    asset: str  # "XAU" / "BTC"
     symbol: str
-    signal: str             # "Buy" / "Sell" / "Neutral"
-    confidence: float       # 0..1
+    signal: str  # "Buy" / "Sell" / "Neutral"
+    confidence: float  # 0..1
     lot: float
     sl: float
     tp: float
@@ -246,16 +301,10 @@ class ExecutionResult:
 # =============================================================================
 # Asset Pipeline
 # =============================================================================
+
+
 class _AssetPipeline:
-    def __init__(
-        self,
-        asset: str,
-        cfg: Any,
-        feed: Any,
-        features: Any,
-        risk: Any,
-        signal: Any,
-    ) -> None:
+    def __init__(self, asset: str, cfg: Any, feed: Any, features: Any, risk: Any, signal: Any) -> None:
         self.asset = str(asset)
         self.cfg = cfg
         self.feed = feed
@@ -263,9 +312,12 @@ class _AssetPipeline:
         self.risk = risk
         self.signal = signal
 
+        # Signal
         self.last_signal = "Neutral"
+        self.last_signal_ts = 0.0
         self.last_latency_ms = 0.0
 
+        # Market snapshot
         self.last_market_ok = True
         self.last_market_reason = "init"
         self.last_bar_age_sec = 0.0
@@ -273,12 +325,16 @@ class _AssetPipeline:
         self.last_market_close = 0.0
         self.last_market_volume = 0.0
         self.last_market_ts = "-"
-        self.last_market_tf = str(getattr(self.cfg.symbol_params, "tf_primary", "-")) if getattr(self.cfg, "symbol_params", None) else "-"
+        self.last_market_tf = (
+            str(getattr(self.cfg.symbol_params, "tf_primary", "-"))
+            if getattr(self.cfg, "symbol_params", None)
+            else "-"
+        )
 
         self._signal_log_every = float(os.getenv("PORTFOLIO_SIGNAL_LOG_SEC", "5.0"))
         self._last_signal_log_ts = 0.0
 
-        # Market data freshness thresholds
+        # Market freshness thresholds
         self._max_bar_age_mult = float(os.getenv("PORTFOLIO_MAX_BAR_AGE_MULT", "2.5"))
         self._min_bar_age_sec = float(os.getenv("PORTFOLIO_MIN_BAR_AGE_SEC", "180"))
 
@@ -301,13 +357,11 @@ class _AssetPipeline:
         with MT5_LOCK:
             info = mt5.symbol_info(symbol)
             if info is None:
-                ok = mt5.symbol_select(symbol, True)
-                if not ok:
+                if not mt5.symbol_select(symbol, True):
                     raise RuntimeError(f"{self.asset}: symbol_select failed: {symbol}")
             else:
-                if hasattr(info, "visible") and not info.visible:
-                    ok = mt5.symbol_select(symbol, True)
-                    if not ok:
+                if hasattr(info, "visible") and (not bool(info.visible)):
+                    if not mt5.symbol_select(symbol, True):
                         raise RuntimeError(f"{self.asset}: symbol_select failed (invisible): {symbol}")
 
     def _fetch_df_for_validation(self):
@@ -317,19 +371,17 @@ class _AssetPipeline:
             log_err.error("%s: tf_primary is None in config", self.asset)
             return None
 
-        # Prefer feed.fetch_rates(tf, bars) if exists; else fallback.
+        # Prefer feed.fetch_rates(tf, bars) if exists
         if hasattr(self.feed, "fetch_rates"):
             try:
                 df = self.feed.fetch_rates(tf, 240)
                 if df is not None:
                     return df
             except Exception as exc:
-                # Warning must go to health logger (error logger is ERROR-only).
                 log_health.warning("%s: fetch_rates failed: %s", self.asset, exc)
 
-        # Try common get_rates(...) signatures
+        # Try common get_rates signatures
         if hasattr(self.feed, "get_rates"):
-            # (tf, bars)
             try:
                 df = self.feed.get_rates(tf, 240)
                 if df is not None:
@@ -339,7 +391,6 @@ class _AssetPipeline:
             except Exception as exc:
                 log_health.warning("%s: get_rates(tf,bars) failed: %s", self.asset, exc)
 
-            # (symbol, tf, bars)
             try:
                 df = self.feed.get_rates(self.symbol, tf, 240)
                 if df is not None:
@@ -348,14 +399,6 @@ class _AssetPipeline:
                 pass
             except Exception as exc:
                 log_health.warning("%s: get_rates(symbol,tf,bars) failed: %s", self.asset, exc)
-
-            # (symbol, tf)
-            try:
-                df = self.feed.get_rates(self.symbol, tf)
-                if df is not None:
-                    return df
-            except Exception:
-                pass
 
         # Final fallback: MT5 copy_rates_from_pos
         if pd is None:
@@ -367,14 +410,18 @@ class _AssetPipeline:
                 return None
             return pd.DataFrame(rates)
         except Exception as exc:
-            log_err.error("%s: mt5.copy_rates_from_pos fallback failed: %s | tb=%s", self.asset, exc, traceback.format_exc())
+            log_err.error(
+                "%s: mt5.copy_rates_from_pos fallback failed: %s | tb=%s",
+                self.asset,
+                exc,
+                traceback.format_exc(),
+            )
             return None
-
 
     def validate_market_data(self) -> bool:
         now = time.time()
 
-        # Cache only SUCCESS for a short interval (prevents log spam and heavy fetch).
+        # Cache only SUCCESS for a short interval (prevents heavy fetch)
         if self.last_market_ok and (now - self._last_market_ok_ts) < self._market_validate_every:
             self.last_market_reason = "cached_ok"
             return True
@@ -398,9 +445,10 @@ class _AssetPipeline:
                 self.last_market_reason = f"df_short:{n}"
                 return False
 
-            # Age check: dynamic by timeframe (fixes M15/H1 always-failing under 180s).
+            # Age check
             age: Optional[float] = None
             last_ts: Optional[float] = None
+
             if hasattr(self.feed, "last_bar_age"):
                 try:
                     age = float(self.feed.last_bar_age(df))
@@ -422,25 +470,11 @@ class _AssetPipeline:
                             last_ts = float(last_t.timestamp())
                         else:
                             last_ts = float(last_t)
-                        # ms -> s
                         if last_ts > 1e12:
                             last_ts /= 1000.0
                         age = float(now - last_ts)
                 except Exception:
                     age = None
-
-            if last_ts is None:
-                try:
-                    if hasattr(df, "columns") and "time" in df.columns:
-                        last_t = df["time"].iloc[-1]
-                        if hasattr(last_t, "timestamp"):
-                            last_ts = float(last_t.timestamp())
-                        else:
-                            last_ts = float(last_t)
-                        if last_ts > 1e12:
-                            last_ts /= 1000.0
-                except Exception:
-                    last_ts = None
 
             self.last_bar_age_sec = float(age or 0.0)
             if age is not None and age > max_age:
@@ -448,11 +482,11 @@ class _AssetPipeline:
                 self.last_market_reason = f"stale:{age:.1f}>{max_age:.1f}"
                 return False
 
-            # Basic sanity
+            # Basic sanity on close
             if hasattr(df, "columns") and "close" in df.columns:
-                s = df["close"]
                 try:
-                    if s.isna().any():
+                    s = df["close"]
+                    if getattr(s, "isna", lambda: False)().any():
                         self.last_market_ok = False
                         self.last_market_reason = "nan_close"
                         return False
@@ -475,14 +509,13 @@ class _AssetPipeline:
 
             if last_ts is not None:
                 try:
-                    self.last_market_ts = datetime.utcfromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M:%S")
+                    self.last_market_ts = datetime.utcfromtimestamp(float(last_ts)).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     self.last_market_ts = "-"
             else:
                 self.last_market_ts = "-"
 
             self.last_market_tf = str(tf or "-")
-
             self._last_market_ok_ts = now
             self.last_market_ok = True
             self.last_market_reason = "ok"
@@ -493,7 +526,6 @@ class _AssetPipeline:
             self.last_market_reason = "exception"
             log_err.error("%s market_data_validate error: %s | tb=%s", self.asset, exc, traceback.format_exc())
             return False
-
 
     def reconcile_positions(self) -> None:
         now = time.time()
@@ -522,11 +554,12 @@ class _AssetPipeline:
 
     def compute_candidate(self) -> Optional[AssetCandidate]:
         try:
-            # IMPORTANT: execute=True to get LOT/SL/TP plan
+            # execute=True => get LOT/SL/TP plan from risk manager
             res = self.signal.compute(execute=True)
 
             signal = str(getattr(res, "signal", "Neutral") or "Neutral")
             self.last_signal = signal
+            self.last_signal_ts = time.time()
             self.last_latency_ms = float(getattr(res, "latency_ms", 0.0) or 0.0)
 
             conf_raw = float(getattr(res, "confidence", 0.0) or 0.0)
@@ -538,7 +571,7 @@ class _AssetPipeline:
             tp = float(getattr(res, "tp", 0.0) or 0.0)
 
             blocked = bool(getattr(res, "trade_blocked", False))
-            reasons = tuple(str(r) for r in (getattr(res, "reasons", []) or [])[:8])
+            reasons = tuple(str(r) for r in (getattr(res, "reasons", []) or [])[:10])
             signal_id = str(getattr(res, "signal_id", "") or f"{self.asset}_SIG_{int(time.time() * 1000)}")
 
             now_ts = time.time()
@@ -577,15 +610,12 @@ class _AssetPipeline:
 
 
 # =============================================================================
-# Execution Worker (generic, supports per-order RiskManager)
+# Execution Worker
 # =============================================================================
+
+
 class ExecutionWorker(threading.Thread):
-    def __init__(
-        self,
-        order_queue: "queue.Queue[OrderIntent]",
-        result_queue: "queue.Queue[ExecutionResult]",
-        dry_run: bool,
-    ) -> None:
+    def __init__(self, order_queue: "queue.Queue[OrderIntent]", result_queue: "queue.Queue[ExecutionResult]", dry_run: bool) -> None:
         super().__init__(daemon=True)
         self.order_queue = order_queue
         self.result_queue = result_queue
@@ -618,9 +648,7 @@ class ExecutionWorker(threading.Thread):
 
     @staticmethod
     def _get_hook(risk: Any, name: str) -> Optional[Callable[..., Any]]:
-        if not risk:
-            return None
-        fn = getattr(risk, name, None)
+        fn = getattr(risk, name, None) if risk else None
         return fn if callable(fn) else None
 
     @staticmethod
@@ -629,6 +657,7 @@ class ExecutionWorker(threading.Thread):
         sanitize_stops_fn = None
         normalize_price_fn = None
 
+        # Best-effort adapters (won't raise if missing)
         if risk and hasattr(risk, "_normalize_volume_floor"):
             normalize_volume_fn = lambda vol, info: float(risk._normalize_volume_floor(vol))  # type: ignore[attr-defined]
         if risk and hasattr(risk, "_apply_broker_constraints"):
@@ -667,17 +696,15 @@ class ExecutionWorker(threading.Thread):
                 float(intent.tp),
             )
 
-            fn = self._get_hook(risk, "record_execution_metrics")
-            if fn:
+            for hook_name in ("record_execution_metrics", "record_trade"):
+                fn = self._get_hook(risk, hook_name)
+                if not fn:
+                    continue
                 try:
-                    fn(intent.order_id, intent.signal, intent.enqueue_time, sent_ts, fill_ts, req_price, exec_price, slippage)
-                except Exception:
-                    pass
-
-            fn = self._get_hook(risk, "record_trade")
-            if fn:
-                try:
-                    fn(exec_price, float(intent.sl), float(intent.lot), float(intent.tp), 1)
+                    if hook_name == "record_execution_metrics":
+                        fn(intent.order_id, intent.signal, intent.enqueue_time, sent_ts, fill_ts, req_price, exec_price, slippage)
+                    else:
+                        fn(exec_price, float(intent.sl), float(intent.lot), float(intent.tp), 1)
                 except Exception:
                     pass
 
@@ -691,6 +718,7 @@ class ExecutionWorker(threading.Thread):
                 slippage,
                 (fill_ts - sent_ts) * 1000.0,
             )
+
             return ExecutionResult(
                 order_id=intent.order_id,
                 signal_id=intent.signal_id,
@@ -777,6 +805,8 @@ class ExecutionWorker(threading.Thread):
 # =============================================================================
 # Multi-asset Trading Engine
 # =============================================================================
+
+
 class MultiAssetTradingEngine:
     def __init__(self, dry_run: bool = False) -> None:
         self._dry_run = bool(dry_run)
@@ -785,20 +815,20 @@ class MultiAssetTradingEngine:
         self._thread: Optional[threading.Thread] = None
 
         self._mt5_ready = False
-
-        # Manual stop is a hard pause from Telegram
         self._manual_stop = False
 
         # Portfolio state
-        self._active_asset = "NONE"          # runtime lock based on open positions
+        self._active_asset = "NONE"
         self._last_selected_asset = "NONE"
         self._order_counter = 0
 
         # Idempotency
         self._seen: Deque[Tuple[str, str, float]] = deque(maxlen=8000)  # (asset, signal_id, ts)
         self._seen_index: Dict[Tuple[str, str], float] = {}
-        self._signal_cooldown_sec = float(os.getenv("PORTFOLIO_SIGNAL_COOLDOWN_SEC", "2.0"))
-
+        raw_cd = os.getenv("PORTFOLIO_SIGNAL_COOLDOWN_SEC", "").strip()
+        self._signal_cooldown_override_sec: Optional[float] = float(raw_cd) if raw_cd else None
+        # Per-asset idempotency cooldown (defaults; refreshed after pipelines build)
+        self._signal_cooldown_sec_by_asset: Dict[str, float] = {"XAU": 60.0, "BTC": 60.0}
         # Queues
         self._max_queue = int(os.getenv("PORTFOLIO_MAX_EXEC_QUEUE", "12"))
         self._order_q: "queue.Queue[OrderIntent]" = queue.Queue(maxsize=self._max_queue)
@@ -810,18 +840,20 @@ class MultiAssetTradingEngine:
         self._poll_slow = float(os.getenv("PORTFOLIO_POLL_SLOW", "1.00"))
         self._heartbeat_every = float(os.getenv("PORTFOLIO_HEARTBEAT_SEC", "5.0"))
         self._last_heartbeat_ts = 0.0
+        self._exec_health_last_ts = 0.0
 
-        # Throttle repetitive pipeline stage logs
         self._pipeline_log_every = float(os.getenv("PORTFOLIO_PIPELINE_LOG_SEC", "2.0"))
         self._last_pipeline_log_ts = 0.0
         self._last_pipeline_log_key: Tuple[Any, ...] = (None, None, None, None)
         self._last_reconcile_ts = 0.0
-        self._reconcile_interval = float(os.getenv("PORTFOLIO_RECONCILE_INTERVAL_SEC", "15.0"))
 
         # Recovery
         self._max_consecutive_errors = int(os.getenv("PORTFOLIO_MAX_CONSECUTIVE_ERRORS", "12"))
         self._recover_backoff_s = float(os.getenv("PORTFOLIO_RECOVER_BACKOFF_SEC", "10.0"))
         self._last_recover_ts = 0.0
+
+        # Diagnostics
+        self._diag_last_ts = 0.0
 
         # Pipelines
         self._xau_cfg: XauConfig = get_xau_config()
@@ -832,7 +864,6 @@ class MultiAssetTradingEngine:
         self._xau: Optional[_AssetPipeline] = None
         self._btc: Optional[_AssetPipeline] = None
 
-        # cached last candidates
         self._last_cand_xau: Optional[AssetCandidate] = None
         self._last_cand_btc: Optional[AssetCandidate] = None
 
@@ -851,8 +882,16 @@ class MultiAssetTradingEngine:
                     getattr(term, "connected", False) if term else None,
                 )
                 return False
+
             self._mt5_ready = True
-            log_health.info("MT5 initialization successful (portfolio)")
+            log_health.info(
+                "MT5_INIT_OK | login=%s server=%s term_connected=%s term_trade=%s acc_trade=%s",
+                getattr(acc, "login", "-"),
+                getattr(acc, "server", "-"),
+                getattr(term, "connected", False),
+                getattr(term, "trade_allowed", False),
+                getattr(acc, "trade_allowed", False),
+            )
             return True
         except Exception as exc:
             log_err.error("MT5 init error: %s | tb=%s", exc, traceback.format_exc())
@@ -863,7 +902,14 @@ class MultiAssetTradingEngine:
             with MT5_LOCK:
                 term = mt5.terminal_info()
                 acc = mt5.account_info()
-            return bool(term and getattr(term, "connected", False) and getattr(term, "trade_allowed", False) and acc)
+            ok = bool(
+                term
+                and getattr(term, "connected", False)
+                and getattr(term, "trade_allowed", False)
+                and acc
+                and getattr(acc, "trade_allowed", True)
+            )
+            return ok
         except Exception as exc:
             log_err.error("MT5 health error: %s | tb=%s", exc, traceback.format_exc())
             return False
@@ -889,6 +935,10 @@ class MultiAssetTradingEngine:
         # Ensure symbols are available
         self._xau.ensure_symbol_selected()
         self._btc.ensure_symbol_selected()
+
+        self._refresh_signal_cooldowns()
+
+        log_health.info("PIPELINES_BUILT | xau=%s btc=%s", self._xau.symbol, self._btc.symbol)
 
     def _restart_exec_worker(self) -> None:
         try:
@@ -923,17 +973,51 @@ class MultiAssetTradingEngine:
                 log_err.error("Recover rebuild error: %s | tb=%s", exc, traceback.format_exc())
                 return False
 
+    def _refresh_signal_cooldowns(self) -> None:
+        """Set per-asset idempotency cooldown.
+
+        Goal: prevent repeated orders within the same bar (especially M1).
+        - If PORTFOLIO_SIGNAL_COOLDOWN_SEC is set (>0), it overrides everything.
+        - Otherwise cooldown defaults to TF seconds of each asset primary timeframe.
+        """
+        try:
+            if self._signal_cooldown_override_sec is not None and self._signal_cooldown_override_sec > 0:
+                cd = float(self._signal_cooldown_override_sec)
+                self._signal_cooldown_sec_by_asset["XAU"] = cd
+                self._signal_cooldown_sec_by_asset["BTC"] = cd
+                return
+
+            def _pipe_tf_sec(pipe) -> float:
+                try:
+                    if pipe is None:
+                        return 60.0
+                    tf = getattr(getattr(pipe.cfg, "symbol_params", None), "tf_primary", None)
+                    sec = _tf_seconds(tf)
+                    return float(sec) if sec else 60.0
+                except Exception:
+                    return 60.0
+
+            # Block duplicates for at least the full bar duration
+            self._signal_cooldown_sec_by_asset["XAU"] = max(_pipe_tf_sec(self._xau), 10.0)
+            self._signal_cooldown_sec_by_asset["BTC"] = max(_pipe_tf_sec(self._btc), 10.0)
+        except Exception:
+            # Fail-safe
+            self._signal_cooldown_sec_by_asset["XAU"] = 60.0
+            self._signal_cooldown_sec_by_asset["BTC"] = 60.0
+
     # -------------------- idempotency --------------------
     def _is_duplicate(self, asset: str, signal_id: str, now: float) -> bool:
-        key = (asset, signal_id)
-        last = self._seen_index.get(key)
-        return bool(last is not None and (now - last) < self._signal_cooldown_sec)
+        last = self._seen_index.get((asset, signal_id))
+        cooldown = float(self._signal_cooldown_sec_by_asset.get(asset, 60.0))
+        return bool(last is not None and (now - last) < cooldown)
 
     def _mark_seen(self, asset: str, signal_id: str, now: float) -> None:
         key = (asset, signal_id)
         self._seen_index[key] = now
         self._seen.append((asset, signal_id, now))
-        while self._seen and (now - self._seen[0][2]) > 60.0:
+        max_cd = max(self._signal_cooldown_sec_by_asset.values(), default=60.0)
+        ttl = max(2.0 * float(max_cd), 120.0)
+        while self._seen and (now - self._seen[0][2]) > ttl:
             a, sid, ts = self._seen.popleft()
             if self._seen_index.get((a, sid)) == ts:
                 self._seen_index.pop((a, sid), None)
@@ -941,7 +1025,8 @@ class MultiAssetTradingEngine:
     # -------------------- portfolio logic --------------------
     def _next_order_id(self, asset: str) -> str:
         self._order_counter += 1
-        return f"PORD_{asset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._order_counter}"
+        return f"PORD_{asset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._order_counter}" \
+            f"_{os.getpid()}"
 
     @staticmethod
     def _candidate_is_tradeable(c: AssetCandidate) -> bool:
@@ -959,12 +1044,12 @@ class MultiAssetTradingEngine:
 
     @staticmethod
     def _score(c: AssetCandidate) -> float:
-        # Strict & stable scoring: confidence dominates.
         return float(c.confidence)
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
+        # Full Concurrent Mode: Always allow both unless hard stop
         if open_xau > 0 and open_btc > 0:
-            return "BOTH"  # unsafe state
+            return "BOTH"  # Now considered SAFE and allowed
         if open_xau > 0:
             return "XAU"
         if open_btc > 0:
@@ -984,6 +1069,7 @@ class MultiAssetTradingEngine:
         if tick is None:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=tick_missing", cand.asset)
             return False, None
+
         price = float(tick.ask if cand.signal == "Buy" else tick.bid)
         if price <= 0:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=bad_price", cand.asset)
@@ -1019,7 +1105,6 @@ class MultiAssetTradingEngine:
         try:
             self._order_q.put_nowait(intent)
         except queue.Full:
-            # record failure if available
             if risk and hasattr(risk, "record_execution_failure"):
                 try:
                     risk.record_execution_failure(order_id, now, now, "queue_backlog_drop")
@@ -1031,7 +1116,6 @@ class MultiAssetTradingEngine:
         self._mark_seen(cand.asset, cand.signal_id, now)
         self._last_selected_asset = cand.asset
 
-        # optional telemetry hook
         if risk and hasattr(risk, "track_signal_survival"):
             try:
                 risk.track_signal_survival(order_id, cand.signal, price, cand.sl, cand.tp, now, cand.confidence)
@@ -1047,17 +1131,18 @@ class MultiAssetTradingEngine:
             return
         self._last_heartbeat_ts = now
 
-        bal = 0.0
-        eq = 0.0
-        pnl = 0.0
-        dd = 0.0
+        bal = eq = pnl = dd = 0.0
         connected = False
+        term_trade = False
+        acc_trade = False
         try:
             with MT5_LOCK:
                 term = mt5.terminal_info()
                 acc = mt5.account_info()
             connected = bool(term and getattr(term, "connected", False))
+            term_trade = bool(term and getattr(term, "trade_allowed", False))
             if acc:
+                acc_trade = bool(getattr(acc, "trade_allowed", True))
                 bal = float(getattr(acc, "balance", 0.0) or 0.0)
                 eq = float(getattr(acc, "equity", 0.0) or 0.0)
                 pnl = float(getattr(acc, "profit", 0.0) or 0.0)
@@ -1067,10 +1152,12 @@ class MultiAssetTradingEngine:
             pass
 
         log_health.info(
-            "heartbeat | running=%s connected=%s active=%s last_sel=%s open_xau=%s open_btc=%s total_open=%s bal=%.2f eq=%.2f dd=%.4f pnl=%.2f "
-            "sig_xau=%s sig_btc=%s q=%s manual_stop=%s",
+            "HEARTBEAT | running=%s mt5_ready=%s connected=%s term_trade=%s acc_trade=%s active=%s last_sel=%s open_xau=%s open_btc=%s total_open=%s bal=%.2f eq=%.2f dd=%.4f pnl=%.2f sig_xau=%s sig_btc=%s q=%s manual_stop=%s",
             self._run.is_set(),
+            self._mt5_ready,
             connected,
+            term_trade,
+            acc_trade,
             self._active_asset,
             self._last_selected_asset,
             open_xau,
@@ -1086,6 +1173,315 @@ class MultiAssetTradingEngine:
             self._manual_stop,
         )
 
+        self._maybe_log_diag()
+        self._log_exec_health_snapshot(open_xau, open_btc)
+
+    def _log_exec_health_snapshot(self, open_xau: int, open_btc: int) -> None:
+        now = time.time()
+        if (now - self._exec_health_last_ts) < self._heartbeat_every:
+            return
+        self._exec_health_last_ts = now
+
+        def _symbol_snapshot(symbol: str) -> dict:
+            if not symbol:
+                return {"visible": None, "trade_mode": -1, "spread_points": 0.0}
+            with MT5_LOCK:
+                info = mt5.symbol_info(symbol)
+                tick = mt5.symbol_info_tick(symbol)
+            visible = bool(getattr(info, "visible", True)) if info else None
+            trade_mode = int(getattr(info, "trade_mode", -1) or -1) if info else -1
+            spread_points = 0.0
+            if info and tick:
+                point = float(getattr(info, "point", 0.0) or 0.0)
+                bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                if point > 0 and ask > 0 and bid > 0:
+                    spread_points = float((ask - bid) / point)
+            return {
+                "visible": visible,
+                "trade_mode": trade_mode,
+                "spread_points": spread_points,
+            }
+
+        def _asset_status(pipe: Optional[_AssetPipeline], cand: Optional[AssetCandidate]) -> dict:
+            if pipe is None:
+                return {"present": False}
+            risk = getattr(pipe, "risk", None)
+            market_open = True
+            try:
+                if risk and hasattr(risk, "market_open_24_5"):
+                    market_open = bool(risk.market_open_24_5())
+            except Exception:
+                market_open = True
+
+            phase = "-"
+            can_analyze = True
+            try:
+                if risk and hasattr(risk, "current_phase"):
+                    phase = str(getattr(risk, "current_phase", "-"))
+                if risk and hasattr(risk, "can_analyze"):
+                    can_analyze = bool(risk.can_analyze())
+            except Exception:
+                pass
+
+            conf = float(getattr(cand, "confidence", 0.0) or 0.0) if cand else 0.0
+            blocked = bool(getattr(cand, "blocked", False)) if cand else False
+            reasons = ",".join(getattr(cand, "reasons", []) or []) if cand else "-"
+
+            return {
+                "present": True,
+                "market_ok": bool(getattr(pipe, "last_market_ok", True)),
+                "market_reason": str(getattr(pipe, "last_market_reason", "-")),
+                "market_open": bool(market_open),
+                "signal": str(getattr(pipe, "last_signal", "Neutral")),
+                "conf": float(conf),
+                "blocked": bool(blocked),
+                "reasons": reasons if reasons else "-",
+                "phase": str(phase),
+                "can_analyze": bool(can_analyze),
+                "bar_age": float(getattr(pipe, "last_bar_age_sec", 0.0) or 0.0),
+                "bar_tf": str(getattr(pipe, "last_market_tf", "-")),
+                "bar_rows": int(getattr(pipe, "last_market_rows", 0) or 0),
+                "bar_ts": str(getattr(pipe, "last_market_ts", "-")),
+            }
+
+        x = _asset_status(self._xau, self._last_cand_xau)
+        b = _asset_status(self._btc, self._last_cand_btc)
+        x_sym = _symbol_snapshot(self._xau.symbol if self._xau else "")
+        b_sym = _symbol_snapshot(self._btc.symbol if self._btc else "")
+
+        exec_health_log.info(
+            "SYSTEM_STATUS | mt5_ready=%s active=%s manual_stop=%s last_sel=%s open_xau=%s open_btc=%s q=%s "
+            "xau_ok=%s xau_reason=%s xau_open=%s xau_sig=%s xau_conf=%.3f xau_blocked=%s xau_phase=%s xau_analyze=%s xau_bar_age=%.1f "
+            "btc_ok=%s btc_reason=%s btc_open=%s btc_sig=%s btc_conf=%.3f btc_blocked=%s btc_phase=%s btc_analyze=%s btc_bar_age=%.1f "
+            "xau_visible=%s xau_trade_mode=%s xau_spread_pts=%.1f "
+            "btc_visible=%s btc_trade_mode=%s btc_spread_pts=%.1f",
+            self._mt5_ready,
+            self._active_asset,
+            self._manual_stop,
+            self._last_selected_asset,
+            open_xau,
+            open_btc,
+            self._order_q.qsize(),
+            x.get("market_ok"),
+            x.get("market_reason"),
+            x.get("market_open"),
+            x.get("signal"),
+            float(x.get("conf", 0.0)),
+            x.get("blocked"),
+            x.get("phase"),
+            x.get("can_analyze"),
+            float(x.get("bar_age", 0.0)),
+            b.get("market_ok"),
+            b.get("market_reason"),
+            b.get("market_open"),
+            b.get("signal"),
+            float(b.get("conf", 0.0)),
+            b.get("blocked"),
+            b.get("phase"),
+            b.get("can_analyze"),
+            float(b.get("bar_age", 0.0)),
+            x_sym.get("visible"),
+            x_sym.get("trade_mode"),
+            float(x_sym.get("spread_points", 0.0)),
+            b_sym.get("visible"),
+            b_sym.get("trade_mode"),
+            float(b_sym.get("spread_points", 0.0)),
+        )
+
+    # ---------------------------------------------------------------------
+    # Diagnostics (NO TELEGRAM): deep snapshot to Logs/portfolio_engine_diag.jsonl
+    # ---------------------------------------------------------------------
+    def _maybe_log_diag(self) -> None:
+        if not _DIAG_ENABLED:
+            return
+        now = time.time()
+        if (now - self._diag_last_ts) < float(_DIAG_EVERY_SEC):
+            return
+        self._diag_last_ts = now
+
+        try:
+            snap = self._diag_snapshot()
+            mt5s = snap.get("mt5", {}) if isinstance(snap, dict) else {}
+            log_health.info(
+                "DIAG_SUMMARY | mt5_ok=%s reason=%s connected=%s term_trade=%s acc_trade=%s last_error=%s",
+                mt5s.get("ok"),
+                mt5s.get("reason"),
+                mt5s.get("terminal_connected"),
+                mt5s.get("terminal_trade_allowed"),
+                mt5s.get("account_trade_allowed"),
+                mt5s.get("last_error"),
+            )
+
+            log_diag.info(json.dumps(snap, ensure_ascii=False, separators=(",", ":"), default=_json_default))
+        except Exception:
+            log_err.error("DIAG logging failed | tb=%s", traceback.format_exc())
+
+    def _diag_snapshot(self) -> dict:
+        try:
+            st = self.status()
+        except Exception:
+            st = {"status_error": traceback.format_exc()}
+
+        return {
+            "ts_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "engine": st,
+            "mt5": self._diag_mt5(),
+            "assets": {
+                "XAU": self._diag_asset(self._xau, self._last_cand_xau),
+                "BTC": self._diag_asset(self._btc, self._last_cand_btc),
+            },
+        }
+
+    def _diag_mt5(self) -> dict:
+        ok, reason = False, "unknown"
+        try:
+            ok, reason = mt5_status()
+        except Exception:
+            reason = "mt5_status_exception"
+
+        d: dict = {"ok": bool(ok), "reason": str(reason)}
+
+        # terminal64.exe running?
+        try:
+            if os.name == "nt":
+                out = subprocess.check_output(["tasklist"], text=True, errors="ignore").lower()
+                d["terminal64_running"] = ("terminal64.exe" in out)
+        except Exception:
+            d["terminal64_running"] = None
+
+        with MT5_LOCK:
+            try:
+                d["last_error"] = str(mt5.last_error())
+            except Exception:
+                d["last_error"] = "unknown"
+
+            try:
+                ti = mt5.terminal_info()
+                if ti:
+                    d["terminal_connected"] = bool(getattr(ti, "connected", False))
+                    d["terminal_trade_allowed"] = bool(getattr(ti, "trade_allowed", False))
+                    d["terminal_path"] = str(getattr(ti, "path", "") or "")
+                    d["terminal_name"] = str(getattr(ti, "name", "") or "")
+                    d["terminal_company"] = str(getattr(ti, "company", "") or "")
+                    d["terminal_build"] = int(getattr(ti, "build", 0) or 0)
+                else:
+                    d["terminal_info_none"] = True
+            except Exception:
+                d["terminal_info_exc"] = traceback.format_exc()
+
+            try:
+                acc = mt5.account_info()
+                if acc:
+                    d["account_login"] = int(getattr(acc, "login", 0) or 0)
+                    d["account_server"] = str(getattr(acc, "server", "") or "")
+                    d["account_currency"] = str(getattr(acc, "currency", "") or "")
+                    d["account_trade_allowed"] = bool(getattr(acc, "trade_allowed", False))
+                    d["balance"] = float(getattr(acc, "balance", 0.0) or 0.0)
+                    d["equity"] = float(getattr(acc, "equity", 0.0) or 0.0)
+                    d["margin"] = float(getattr(acc, "margin", 0.0) or 0.0)
+                    d["margin_free"] = float(getattr(acc, "margin_free", 0.0) or 0.0)
+                    d["leverage"] = int(getattr(acc, "leverage", 0) or 0)
+                else:
+                    d["account_info_none"] = True
+            except Exception:
+                d["account_info_exc"] = traceback.format_exc()
+
+        return d
+
+    def _diag_asset(self, pipe: Optional[_AssetPipeline], cand: Optional[AssetCandidate]) -> dict:
+        if pipe is None:
+            return {"present": False}
+
+        d: dict = {
+            "present": True,
+            "asset": pipe.asset,
+            "symbol": pipe.symbol,
+            "market": {
+                "ok": bool(pipe.last_market_ok),
+                "reason": str(pipe.last_market_reason),
+                "bar_age_sec": float(pipe.last_bar_age_sec),
+                "bars": int(pipe.last_market_rows),
+                "close": float(pipe.last_market_close),
+                "tick_volume": float(pipe.last_market_volume),
+                "tf": str(pipe.last_market_tf),
+                "ts": str(pipe.last_market_ts),
+            },
+            "signal": {
+                "last": str(pipe.last_signal),
+                "last_ts": float(pipe.last_signal_ts),
+                "latency_ms": float(pipe.last_latency_ms),
+            },
+        }
+
+        if cand is not None:
+            d["candidate"] = {
+                "signal": cand.signal,
+                "confidence": float(cand.confidence),
+                "lot": float(cand.lot),
+                "sl": float(cand.sl),
+                "tp": float(cand.tp),
+                "blocked": bool(cand.blocked),
+                "reasons": list(cand.reasons),
+                "latency_ms": float(cand.latency_ms),
+                "signal_id": str(cand.signal_id),
+            }
+
+        # Risk metrics snapshot if available
+        try:
+            rm = pipe.risk
+            fn = getattr(rm, "metrics_snapshot", None)
+            if callable(fn):
+                d["risk"] = fn()  # type: ignore[misc]
+        except Exception:
+            d["risk_exc"] = traceback.format_exc()
+
+        # Symbol/tick diagnostics
+        if pipe.symbol:
+            d["mt5_symbol"] = self._diag_symbol(pipe.symbol)
+
+        return d
+
+    def _diag_symbol(self, symbol: str) -> dict:
+        d: dict = {"symbol": symbol}
+        with MT5_LOCK:
+            try:
+                info = mt5.symbol_info(symbol)
+                if info:
+                    d["visible"] = bool(getattr(info, "visible", True))
+                    d["trade_mode"] = int(getattr(info, "trade_mode", -1) or -1)
+                    d["digits"] = int(getattr(info, "digits", 0) or 0)
+                    d["point"] = float(getattr(info, "point", 0.0) or 0.0)
+                    d["stops_level"] = int(getattr(info, "stops_level", 0) or 0)
+                else:
+                    d["symbol_info_none"] = True
+            except Exception:
+                d["symbol_info_exc"] = traceback.format_exc()
+
+            try:
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                    d["bid"] = bid
+                    d["ask"] = ask
+                    d["time_msc"] = int(getattr(tick, "time_msc", 0) or 0)
+
+                    point = float(d.get("point") or 0.0) or 0.0
+                    if bid and ask and point:
+                        d["spread_points"] = (ask - bid) / point
+
+                    now_msc = int(time.time() * 1000)
+                    if d.get("time_msc"):
+                        d["tick_age_sec"] = max(0.0, (now_msc - int(d["time_msc"])) / 1000.0)
+                else:
+                    d["tick_none"] = True
+            except Exception:
+                d["tick_exc"] = traceback.format_exc()
+
+        return d
+
+    # -------------------- status API --------------------
     def status(self) -> PortfolioStatus:
         try:
             with MT5_LOCK:
@@ -1163,7 +1559,7 @@ class MultiAssetTradingEngine:
         if self._exec_worker:
             self._exec_worker.join(timeout=6.0)
 
-        # drain order queue best-effort
+        # Drain queue best-effort
         try:
             while True:
                 _ = self._order_q.get_nowait()
@@ -1214,7 +1610,7 @@ class MultiAssetTradingEngine:
                         time.sleep(0.6)
                     continue
 
-                # Hard stop if any risk wants it
+                # Hard stop if any risk requests it
                 try:
                     if self._xau.risk and hasattr(self._xau.risk, "requires_hard_stop") and self._xau.risk.requires_hard_stop():
                         close_all_position()
@@ -1232,48 +1628,38 @@ class MultiAssetTradingEngine:
                 # Validate market data
                 x_ok = self._xau.validate_market_data()
                 b_ok = self._btc.validate_market_data()
-                rx = self._xau.last_market_reason if self._xau else "-"
-                rb = self._btc.last_market_reason if self._btc else "-"
-                ax = float(self._xau.last_bar_age_sec) if self._xau else 0.0
-                ab = float(self._btc.last_bar_age_sec) if self._btc else 0.0
+                rx = self._xau.last_market_reason
+                rb = self._btc.last_market_reason
+                ax = float(self._xau.last_bar_age_sec)
+                ab = float(self._btc.last_bar_age_sec)
 
                 now_ts = time.time()
                 key = (x_ok, rx, b_ok, rb)
                 if (now_ts - self._last_pipeline_log_ts) >= self._pipeline_log_every or key != self._last_pipeline_log_key:
-                    x_bars = int(self._xau.last_market_rows) if self._xau else 0
-                    b_bars = int(self._btc.last_market_rows) if self._btc else 0
-                    x_close = float(self._xau.last_market_close) if self._xau else 0.0
-                    b_close = float(self._btc.last_market_close) if self._btc else 0.0
-                    x_vol = float(self._xau.last_market_volume) if self._xau else 0.0
-                    b_vol = float(self._btc.last_market_volume) if self._btc else 0.0
-                    x_ts = str(self._xau.last_market_ts) if self._xau else "-"
-                    b_ts = str(self._btc.last_market_ts) if self._btc else "-"
-                    x_tf = str(self._xau.last_market_tf) if self._xau else "-"
-                    b_tf = str(self._btc.last_market_tf) if self._btc else "-"
                     log_health.info(
                         "PIPELINE_STAGE | step=market_data ok_xau=%s reason_xau=%s age_xau=%.1fs tf_xau=%s bars_xau=%s close_xau=%.3f vol_xau=%s ts_xau=%s "
                         "ok_btc=%s reason_btc=%s age_btc=%.1fs tf_btc=%s bars_btc=%s close_btc=%.3f vol_btc=%s ts_btc=%s",
                         x_ok,
                         rx,
                         ax,
-                        x_tf,
-                        x_bars,
-                        x_close,
-                        int(builtins.round(x_vol)) if x_vol else int(0),
-                        x_ts,
+                        str(self._xau.last_market_tf),
+                        int(self._xau.last_market_rows),
+                        float(self._xau.last_market_close),
+                        int(builtins.round(self._xau.last_market_volume)) if self._xau.last_market_volume else 0,
+                        str(self._xau.last_market_ts),
                         b_ok,
                         rb,
                         ab,
-                        b_tf,
-                        b_bars,
-                        b_close,
-                        int(builtins.round(b_vol)) if b_vol else int(0),
-                        b_ts,
+                        str(self._btc.last_market_tf),
+                        int(self._btc.last_market_rows),
+                        float(self._btc.last_market_close),
+                        int(builtins.round(self._btc.last_market_volume)) if self._btc.last_market_volume else 0,
+                        str(self._btc.last_market_ts),
                     )
                     self._last_pipeline_log_ts = now_ts
                     self._last_pipeline_log_key = key
 
-                # Reconcile (throttled per pipeline)
+                # Reconcile positions
                 self._xau.reconcile_positions()
                 self._btc.reconcile_positions()
 
@@ -1284,7 +1670,6 @@ class MultiAssetTradingEngine:
                     except queue.Empty:
                         break
                     try:
-                        # route to proper risk manager
                         rm = self._xau.risk if (self._xau and r.order_id.startswith("PORD_XAU_")) else self._btc.risk
                         if rm and hasattr(rm, "on_execution_result"):
                             rm.on_execution_result(r)
@@ -1296,52 +1681,40 @@ class MultiAssetTradingEngine:
                         except Exception:
                             pass
 
-                # Positions and active asset lock
+                # Positions and active asset (informational only now)
                 open_xau = self._xau.open_positions()
                 open_btc = self._btc.open_positions()
                 self._active_asset = self._select_active_asset(open_xau, open_btc)
 
-                # Detect unsafe state (both open)
-                if self._active_asset == "BOTH":
-                    log_err.error("UNSAFE_STATE: both XAU and BTC positions are open -> trading frozen")
-                    self._heartbeat(open_xau, open_btc)
-                    time.sleep(self._poll_slow)
-                    continue
+                # UNSAFE_STATE check removed to allow concurrent trading
+                # self._active_asset is just for logging now
 
                 self._heartbeat(open_xau, open_btc)
 
-                # Compute candidates (only if market looks ok, otherwise they will likely be neutral/blocked)
+                # Compute candidates
                 cand_x = self._xau.compute_candidate() if x_ok else None
                 cand_b = self._btc.compute_candidate() if b_ok else None
                 self._last_cand_xau = cand_x
                 self._last_cand_btc = cand_b
 
-                # Decide which asset may trade now
+                # Full Concurrent Selection: Check ALL candidates
                 candidates: list[AssetCandidate] = []
-                if self._active_asset == "XAU":
-                    if cand_x:
-                        candidates = [cand_x]
-                elif self._active_asset == "BTC":
-                    if cand_b:
-                        candidates = [cand_b]
-                else:
-                    if cand_x:
-                        candidates.append(cand_x)
-                    if cand_b:
-                        candidates.append(cand_b)
+                if cand_x:
+                    candidates.append(cand_x)
+                if cand_b:
+                    candidates.append(cand_b)
 
-                # Filter tradeable
+                # Enqueue ALL valid candidates (don't pick just one)
                 candidates = [c for c in candidates if self._candidate_is_tradeable(c)]
 
-                selected: Optional[AssetCandidate] = None
-                if candidates:
-                    selected = max(candidates, key=self._score)
-
-                if selected:
+                # Execute all valid signals (Concurrent Execution - Zero Latency Batch)
+                for selected in candidates:
+                    # enqueue_order checks duplicate, then puts to Queue.
+                    # The ExecutionWorker picks it up instantly.
                     ok, oid = self._enqueue_order(selected)
                     if ok:
                         log_health.info(
-                            "ORDER_SELECTED | asset=%s symbol=%s signal=%s conf=%.4f lot=%.4f sl=%s tp=%s order_id=%s",
+                            "ORDER_SELECTED | asset=%s symbol=%s signal=%s conf=%.4f lot=%.4f sl=%s tp=%s order_id=%s reasons=%s",
                             selected.asset,
                             selected.symbol,
                             selected.signal,
@@ -1350,6 +1723,7 @@ class MultiAssetTradingEngine:
                             selected.sl,
                             selected.tp,
                             oid,
+                            ",".join(selected.reasons) if selected.reasons else "-",
                         )
                     else:
                         log_health.info(
@@ -1369,7 +1743,7 @@ class MultiAssetTradingEngine:
                 poll = self._poll_fast
                 if self._order_q.qsize() >= max(3, self._max_queue // 2):
                     poll = self._poll_slow
-                if selected and selected.latency_ms >= 250.0:
+                if any(c.latency_ms >= 250.0 for c in candidates):
                     poll = self._poll_slow
                 time.sleep(max(0.10, poll - dt))
 
@@ -1385,6 +1759,5 @@ class MultiAssetTradingEngine:
                     time.sleep(0.6)
 
 
-# Global instance (backward-compatible import style)
-# Set PORTFOLIO_DRY_RUN=1 to disable real order_send (safe test mode).
+# Global instance (import-compatible)
 engine = MultiAssetTradingEngine(dry_run=bool(int(os.getenv("PORTFOLIO_DRY_RUN", "0"))))

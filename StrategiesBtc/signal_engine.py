@@ -496,6 +496,8 @@ class SignalEngine:
         If absent -> always True (BTC is 24/7).
         """
         try:
+            if bool(getattr(self.cfg, "ignore_sessions", False)):
+                return True
             sessions = list(getattr(self.cfg, "active_sessions", []) or [])
             if not sessions:
                 return True
@@ -540,7 +542,11 @@ class SignalEngine:
             except Exception:
                 pass
 
-        conf_min = 98 if phase in ("A", "B") else 100
+        # Fallback if adaptive params missing
+        # Use config-based min confidence (default 0.90 -> 90)
+        base_min = int(float(getattr(self.cfg, "min_confidence_signal", 0.90) or 0.90) * 100)
+        conf_min = base_min if phase in ("A", "B") else min(100, base_min + 2)
+
         return {
             "conf_min": int(conf_min),
             "sl_mult": float(getattr(self.cfg, "sl_atr_mult_trend", 1.35) or 1.35),

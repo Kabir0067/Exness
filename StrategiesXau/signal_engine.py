@@ -308,6 +308,32 @@ class SignalEngine:
 
             signal, conf = self._apply_filters(signal, conf, indp)
 
+            # 10.5) Risk-level signal emission gate (align with BTC stack)
+            if signal in ("Buy", "Sell") and hasattr(self.risk, "can_emit_signal"):
+                try:
+                    allowed, gate_reasons = self.risk.can_emit_signal(int(conf), getattr(self.feed, "tz", None))
+                    if not bool(allowed):
+                        return self._neutral(
+                            sym,
+                            ["emit_gate"] + list(gate_reasons or []),
+                            t0,
+                            spread_pct=spread_pct,
+                            bar_key=bar_key,
+                            regime=str(adapt.get("regime")),
+                            trade_blocked=True,
+                        )
+                except Exception:
+                    # Fail-safe: block trade if gate crashes
+                    return self._neutral(
+                        sym,
+                        ["emit_gate_error"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
             if signal == "Neutral" and blocked_by_htf:
                 conf = min(conf, max(0, conf_min - 1))
 
@@ -409,6 +435,8 @@ class SignalEngine:
 
     def _in_active_session(self) -> bool:
         try:
+            if bool(getattr(self.cfg, "ignore_sessions", False)):
+                return True
             h = int(self.feed.now_local().hour)
             sessions = list(getattr(self.cfg, "active_sessions", []) or [])
             return any(int(s) <= h < int(e) for s, e in sessions)
@@ -439,7 +467,11 @@ class SignalEngine:
             except Exception:
                 pass
 
-        conf_min = 98 if phase in ("A", "B") else 100
+        # Fallback if adaptive params missing
+        conf_min = int(getattr(self.cfg, "conf_min", 94) or 94)
+        if phase not in ("A", "B"):
+            conf_min = min(100, conf_min + 2)
+
         return {
             "conf_min": int(conf_min),
             "sl_mult": float(getattr(self.cfg, "sl_atr_mult_trend", 1.35) or 1.35),
@@ -766,12 +798,24 @@ class SignalEngine:
                 tick_vol = float(getattr(tick_stats, "volatility", 0.0) or 0.0)
                 open_pos, unreal_pl = self._position_context(sym)
 
+                                # Use executable market price (bid/ask) as entry for SL/TP planning (scalping-safe)
+                entry_price = float(indp.get("close", 0.0) or 0.0)
+                try:
+                    with MT5_LOCK:
+                        tick = mt5.symbol_info_tick(sym)
+                    if tick is not None:
+                        px = float(tick.ask if signal == "Buy" else tick.bid)
+                        if px > 0:
+                            entry_price = px
+                except Exception:
+                    pass
+
                 entry_val, sl_val, tp_val, lot_val = self.risk.plan_order(
                     signal,
                     float(conf) / 100.0,
                     indp,
                     adapt,
-                    entry=float(indp.get("close", 0.0) or 0.0),
+                    entry=float(entry_price),
                     ticks=tick_stats,
                     zones=zones,
                     tick_volatility=tick_vol,

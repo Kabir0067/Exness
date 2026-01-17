@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""Telegram control plane (Exness Portfolio Bot)
+
+Ин файл UI/Control қисми система мебошад.
+- Танҳо ADMIN истифода мебарад.
+- Engine/Strategy-ро идора мекунад (start/stop/status)
+- Амалҳои идоракунӣ: close_all, TP/SL (USD) барои ҳамаи позицияҳо
+
+Эзоҳ:
+- Логикаи тиҷорат дар portfolio_engine ва Strategies аст.
+- Ин ҷо танҳо Telegram ва даъват ба ExnessAPI/orders.py.
+"""
+
 import logging
 import os
 import re
@@ -12,7 +24,6 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from threading import Lock
 from typing import Any, Callable, Dict, Optional, Tuple
-from urllib.parse import urlparse
 
 import MetaTrader5 as mt5
 import requests
@@ -35,6 +46,7 @@ from ExnessAPI.history import (
     get_week_loss,
     get_week_profit,
     format_usdt,
+    
 )
 from ExnessAPI.orders import (
     close_all_position,
@@ -42,8 +54,10 @@ from ExnessAPI.orders import (
     get_order_by_index,
     get_positions_summary,
     close_order,
+    set_takeprofit_all_positions_usd,
+    set_stoploss_all_positions_usd,
 )
-from Bot.engine import engine
+from Bot.portfolio_engine import engine
 from StrategiesXau.indicators import Classic_FeatureEngine
 from StrategiesXau.risk_management import RiskManager
 from StrategiesXau.signal_engine import SignalEngine
@@ -57,7 +71,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 LOG_DIR = LOG_ROOT
 
 log = logging.getLogger("telegram.bot")
-log.setLevel(logging.INFO)
+log.setLevel(logging.ERROR)
 log.propagate = False
 
 if not log.handlers:
@@ -69,15 +83,23 @@ if not log.handlers:
         backupCount=3,
         encoding="utf-8",
     )
-    fh.setLevel(logging.INFO)
+    fh.setLevel(logging.ERROR)
     fh.setFormatter(fmt)
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.ERROR)
     ch.setFormatter(fmt)
 
     log.addHandler(fh)
     log.addHandler(ch)
+
+    # Capture internal TeleBot errors too
+    tb_log = logging.getLogger("TeleBot")
+    tb_log.setLevel(logging.ERROR)
+    tb_log.propagate = False
+    if not tb_log.handlers:
+        tb_log.addHandler(fh)
+        tb_log.addHandler(ch)
 
 
 # =============================================================================
@@ -86,6 +108,14 @@ if not log.handlers:
 cfg = get_config_from_env()
 ADMIN = int(getattr(cfg, "admin_id", 0) or 0)
 PAGE_SIZE = 1
+
+TP_USD_MIN = 1
+TP_USD_MAX = 10
+TP_CALLBACK_PREFIX = "tp_usd:"
+
+SL_USD_MIN = 1
+SL_USD_MAX = 10
+SL_CALLBACK_PREFIX = "sl_usd:"
 
 _session = requests.Session()
 _adapter = HTTPAdapter(
@@ -97,73 +127,10 @@ _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
 apihelper.SESSION = _session
-apihelper.READ_TIMEOUT = int(getattr(cfg, "telegram_read_timeout", 30) or 30)
-apihelper.CONNECT_TIMEOUT = int(getattr(cfg, "telegram_connect_timeout", 30) or 30)
+apihelper.READ_TIMEOUT = int(getattr(cfg, "telegram_read_timeout", 60) or 60)
+apihelper.CONNECT_TIMEOUT = int(getattr(cfg, "telegram_connect_timeout", 60) or 60)
 
 
-# =============================================================================
-# Proxy (validated + safe apply; never crashes bot)
-# =============================================================================
-_ALLOWED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
-
-
-def _normalize_proxy_url(raw: str) -> Optional[str]:
-    s = (raw or "").strip()
-    if not s:
-        return None
-
-    p = urlparse(s)
-    if p.scheme not in _ALLOWED_PROXY_SCHEMES:
-        return None
-    if not p.hostname or not p.port:
-        return None
-    if any(ch.isspace() for ch in s):
-        return None
-
-    auth = ""
-    if p.username and p.password:
-        auth = f"{p.username}:{p.password}@"
-    elif p.username:
-        auth = f"{p.username}@"
-
-    return f"{p.scheme}://{auth}{p.hostname}:{int(p.port)}"
-
-
-def _apply_proxy_env() -> None:
-    raw = os.getenv("TELEGRAM_PROXY_URL", "").strip()
-    if not raw:
-        log.info("No TELEGRAM_PROXY_URL set")
-        return
-
-    proxy = _normalize_proxy_url(raw)
-    if not proxy:
-        log.warning("TELEGRAM_PROXY_URL invalid -> proxy disabled")
-        return
-
-    # Apply proxy
-    try:
-        apihelper.proxy = {"https": proxy}
-        log.info("Telegram proxy enabled: %s", proxy)
-    except Exception as exc:
-        log.error("Failed to set proxy: %s | tb=%s", exc, traceback.format_exc())
-        apihelper.proxy = {}
-        return
-
-    # Safe test: if SOCKS missing => requests raises InvalidSchema quickly
-    try:
-        _session.get("https://api.telegram.org", timeout=3, proxies={"https": proxy})
-    except requests.exceptions.InvalidSchema as exc:
-        log.error("Proxy disabled (missing SOCKS support). Install: pip install 'requests[socks]' | %s", exc)
-        apihelper.proxy = {}
-    except RequestException as exc:
-        # network down is OK; keep proxy
-        log.info("Proxy test request failed (network issue is ok): %s", exc)
-    except Exception as exc:
-        log.error("Proxy disabled due to unexpected error: %s | tb=%s", exc, traceback.format_exc())
-        apihelper.proxy = {}
-
-
-_apply_proxy_env()
 
 
 # =============================================================================
@@ -489,13 +456,16 @@ def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
 def build_health_ribbon(status: Any, compact: bool = True) -> str:
     try:
         # Portfolio engine status fields
+        active_str = str(getattr(status, 'active_asset', 'NONE'))
+        if active_str == "NONE" and getattr(status, 'trading', False):
+            active_str = "SCANNING"
+
         segments: list[str] = [
             f"DD {float(getattr(status, 'dd_pct', 0.0)) * 100:.1f}%",
             f"PnL {float(getattr(status, 'today_pnl', 0.0)):+.2f}",
-            f"Active {str(getattr(status, 'active_asset', 'NONE'))}",
+            f"Mode {active_str}",
             f"XAU {int(getattr(status, 'open_trades_xau', 0))}",
             f"BTC {int(getattr(status, 'open_trades_btc', 0))}",
-            f"LastSel {str(getattr(status, 'last_selected_asset', 'NONE'))}",
         ]
 
         # Add last signals for both assets
@@ -519,12 +489,16 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
 
 
 def _format_status_message(status: Any) -> str:
+    active_label = str(getattr(status, 'active_asset', 'NONE'))
+    if active_label == "NONE" and getattr(status, 'trading', False):
+        active_label = "✅ SCANNING (XAU + BTC)"
+
     return (
         "⚙️ Статуси Portfolio Bot (XAU + BTC)\n"
         f"- 🔗 Пайваст ба MT5: {'✅' if getattr(status, 'connected', False) else '❌'}\n"
         f"- 📈 Тиҷорат фаъол аст: {'✅' if getattr(status, 'trading', False) else '❌'}\n"
         f"- ⛔ Реҷаи дастӣ: {'✅' if getattr(status, 'manual_stop', False) else '❌'}\n"
-        f"- 🎯 Активи ҷорӣ: {str(getattr(status, 'active_asset', 'NONE'))}\n"
+        f"- 🎯 Реҷаи ҷорӣ: {active_label}\n"
         f"- 💰 Баланс: {float(getattr(status, 'balance', 0.0)):.2f}$\n"
         f"- 📊 Арзиш: {float(getattr(status, 'equity', 0.0)):.2f}$\n"
         f"- 📉 Коҳиш: {float(getattr(status, 'dd_pct', 0.0)):.2%}\n"
@@ -549,6 +523,8 @@ def bot_commands() -> None:
         types.BotCommand("/balance", "💰 Дидани баланси худ"),
         types.BotCommand("/buttons", "🎛️ Тугмаҳои асосӣ"),
         types.BotCommand("/status", "⚙️ Статус оператсия"),
+        types.BotCommand("/tek_prof", "💰 Гузоштани тек профит"),
+        types.BotCommand("/stop_ls", "🛡 SL: гузоштан (USD 1..10)"),
     ]
     ok = bot.set_my_commands(commands)
     if not ok:
@@ -586,6 +562,175 @@ def buttons_func(message: types.Message) -> None:
     markup.row(KeyboardButton(BTN_LOSS_D), KeyboardButton(BTN_LOSS_W), KeyboardButton(BTN_LOSS_M))
 
     bot.send_message(message.chat.id, "📋 Менюи Асосӣ: Як амалиётро интихоб кунед ⬇️", reply_markup=markup)
+
+
+
+
+
+def _build_tp_usd_keyboard(min_usd: int = TP_USD_MIN, max_usd: int = TP_USD_MAX, row_width: int = 5) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=row_width)
+    kb.add(*[
+        InlineKeyboardButton(text=f"{i}$", callback_data=f"{TP_CALLBACK_PREFIX}{i}")
+        for i in range(int(min_usd), int(max_usd) + 1)
+    ])
+    kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{TP_CALLBACK_PREFIX}cancel"))
+    return kb
+
+
+def _format_tp_result(usd: float, res: dict) -> str:
+    total = int(res.get("total", 0) or 0)
+    updated = int(res.get("updated", 0) or 0)
+    skipped = int(res.get("skipped", 0) or 0)
+    ok = bool(res.get("ok", False))
+    errors = res.get("errors") or []
+
+    status = "✅ ИҶРО ШУД" if ok else "⚠️ ҚИСМАН / ХАТО"
+    lines = [
+        f"{status}",
+        f"🎯 TP барои ҳамаи позицияҳо: {usd:.0f}$",
+        "",
+        f"📌 Ҳамагӣ позицияҳо: {total}",
+        f"✅ Навсозӣ шуд: {updated}",
+        f"⏭️ Skip: {skipped}",
+    ]
+
+    if errors:
+        preview = "\n".join(f"• {e}" for e in errors[:10])
+        lines += ["", "🧾 Хатоҳо (10-тои аввал):", preview]
+
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["tek_prof"])
+def tek_profit_put(message):
+    kb = _build_tp_usd_keyboard()
+    bot.send_message(
+        message.chat.id,
+        "🎛 *Take Profit (USD)* интихоб кунед (барои *ҳамаи* позицияҳои кушода):",
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(TP_CALLBACK_PREFIX))
+def on_tp_usd_click(call):
+    data = (call.data or "").split(":", 1)[-1].strip().lower()
+
+    if data == "cancel":
+        bot.answer_callback_query(call.id, "Бекор шуд")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        usd = float(data)
+        if not (TP_USD_MIN <= usd <= TP_USD_MAX):
+            bot.answer_callback_query(call.id, "Диапазон: 1..10", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id, f"⏳ Гузоштани TP={usd:.0f}$ ...")
+        res = set_takeprofit_all_positions_usd(usd_profit=usd)
+
+        # Update message text (clean UX)
+        text = _format_tp_result(usd, res)
+        try:
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            bot.send_message(call.message.chat.id, text)
+
+    except Exception as exc:
+        bot.answer_callback_query(call.id, "Хато дар обработчик", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Handler error: {exc}")
+
+
+
+# =============================================================================
+# SL (USD) — interactive keyboard (1..10$)
+# =============================================================================
+
+
+def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX, row_width: int = 5):
+    kb = InlineKeyboardMarkup(row_width=row_width)
+    kb.add(*[
+        InlineKeyboardButton(text=f"{i}$", callback_data=f"{SL_CALLBACK_PREFIX}{i}")
+        for i in range(int(min_usd), int(max_usd) + 1)
+    ])
+    kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
+    return kb
+
+
+def _format_sl_result(usd: float, res: dict) -> str:
+    total = int(res.get("total", 0) or 0)
+    updated = int(res.get("updated", 0) or 0)
+    skipped = int(res.get("skipped", 0) or 0)
+    ok = bool(res.get("ok", False))
+    errors = res.get("errors") or []
+
+    status = "✅ ИҶРО ШУД" if ok else "⚠️ ҚИСМАН / ХАТО"
+    lines = [
+        f"{status}",
+        f"🛡 SL барои ҳамаи позицияҳо: {usd:.0f}$",
+        "",
+        f"📌 Ҳамагӣ позицияҳо: {total}",
+        f"✅ Навсозӣ шуд: {updated}",
+        f"⏭️ Skip: {skipped}",
+    ]
+    if errors:
+        preview = "\n".join(f"• {e}" for e in errors[:10])
+        lines += ["", "🧾 Хатоҳо (10-тои аввал):", preview]
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["stop_ls"])
+def tek_stoploss_put(message):
+    kb = _build_sl_usd_keyboard()
+    bot.send_message(
+        message.chat.id,
+        "🛡 *Stop Loss (USD)* интихоб кунед (барои *ҳамаи* позицияҳои кушода, 1..10$):",
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(SL_CALLBACK_PREFIX))
+def on_sl_usd_click(call):
+    data = (call.data or "").split(":", 1)[-1].strip().lower()
+
+    if data == "cancel":
+        bot.answer_callback_query(call.id, "Бекор шуд")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        usd = float(data)
+        if not (SL_USD_MIN <= usd <= SL_USD_MAX):
+            bot.answer_callback_query(call.id, "Диапазон: 1..10", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id, f"⏳ Гузоштани SL={usd:.0f}$ ...")
+        res = set_stoploss_all_positions_usd(usd_loss=usd)
+
+        text = _format_sl_result(usd, res)
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            bot.send_message(call.message.chat.id, text)
+
+    except Exception as exc:
+        bot.answer_callback_query(call.id, "Хато дар обработчик", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Handler error: {exc}")
+
+
 
 
 # =============================================================================
@@ -674,6 +819,9 @@ def balance_handler(message: types.Message) -> None:
         bot.send_message(message.chat.id, "⚠️ Хатогӣ ҳангоми гирифтани баланс рӯй дод.")
         return
     bot.send_message(message.chat.id, f"💰 Баланс:\n {format_usdt(bal)}", parse_mode="HTML")
+
+
+
 
 
 @bot.message_handler(commands=["buttons"])
@@ -1022,55 +1170,44 @@ def message_dispatcher(message: types.Message) -> None:
 def check_full_program() -> tuple[bool, str]:
     issues: list[str] = []
 
+    # 1. MT5 Connectivity
     try:
         ensure_mt5()
         with MT5_LOCK:
             acc = mt5.account_info()
         if not acc:
-            issues.append("Маълумоти ҳисоб (account_info) дастрас нест.")
+            issues.append("MT5 Account Info дастрас нест.")
     except Exception as exc:
-        issues.append(f"Пайвастшавӣ ба MT5 ноком шуд: {exc}")
+        issues.append(f"MT5 Connection failed: {exc}")
 
-    feed = getattr(engine, "_feed", None)
-    feed_created = False
+    # 2. Check Portfolio Engine Pipelines
+    # We inspect the live engine instance directly
+    xau_pipe = getattr(engine, "_xau", None)
+    btc_pipe = getattr(engine, "_btc", None)
 
-    try:
-        if feed is None:
-            feed = MarketFeed(cfg, cfg.symbol_params)
-            feed_created = True
+    if not xau_pipe or not btc_pipe:
+        issues.append("Portfolio Pipelines (XAU/BTC) ҳанӯз сохта нашудаанд (Engine not started?).")
+    else:
+        # Check XAU
+        if not xau_pipe.last_market_ok:
+            issues.append(f"XAU Market Data Error: {xau_pipe.last_market_reason}")
+        
+        # Check BTC
+        if not btc_pipe.last_market_ok:
+            issues.append(f"BTC Market Data Error: {btc_pipe.last_market_reason}")
 
-        tf = cfg.symbol_params.tf_primary
-        rates_primary = feed.fetch_rates(tf, 220)
-        if rates_primary is None or getattr(rates_primary, "empty", True):
-            issues.append(f"Маълумоти кендл барои TF {tf} холӣ аст.")
-    except Exception as exc:
-        issues.append(f"Гирифтани маълумоти бозор ноком шуд: {exc}")
-        feed = None
-
-    features = getattr(engine, "_features", None)
-    try:
-        if features is None:
-            features = Classic_FeatureEngine(cfg)
-    except Exception as exc:
-        issues.append(f"Classic_FeatureEngine эҷод нашуд: {exc}")
-        features = None
-
-    risk = getattr(engine, "_risk", None)
-    try:
-        if risk is None:
-            risk = RiskManager(cfg, cfg.symbol_params)
-        risk.evaluate_account_state()
-    except Exception as exc:
-        issues.append(f"RiskManager.evaluate_account_state() хатогӣ дод: {exc}")
-
-    if feed is not None and features is not None and risk is not None:
-        signal_engine = getattr(engine, "_signal", None)
+        # Check Risk Managers (Basic)
         try:
-            if signal_engine is None:
-                signal_engine = SignalEngine(cfg, cfg.symbol_params, feed, features, risk)
-            signal_engine.compute(execute=False)
-        except Exception as exc:
-            issues.append(f"SignalEngine.compute() хатогӣ дод: {exc}")
+            if xau_pipe.risk:
+                xau_pipe.risk.evaluate_account_state()
+        except Exception as e:
+            issues.append(f"XAU Risk Calc Error: {e}")
+
+        try:
+            if btc_pipe.risk:
+                btc_pipe.risk.evaluate_account_state()
+        except Exception as e:
+            issues.append(f"BTC Risk Calc Error: {e}")
 
     telemetry = ""
     try:
@@ -1078,12 +1215,9 @@ def check_full_program() -> tuple[bool, str]:
     except Exception:
         telemetry = ""
 
-    if feed_created:
-        feed = None
-
     if issues:
         summary = "⚠️ Омор нишон медиҳад, ки мушкилот пайдо шуданд:\n" + "\n".join(f"• {i}" for i in issues)
         return False, summary + ("\n" + telemetry if telemetry else "")
 
-    ok_note = "✅ Санҷиши пурраи барнома анҷом ёфт. Ҳамаи модулҳо ба таври дуруст фаъоланд."
+    ok_note = "✅ Санҷиши пурраи барнома анҷом ёфт. Ҳамаи модулҳо (XAU + BTC) ба таври дуруст фаъоланд."
     return True, ok_note + ("\n" + telemetry if telemetry else "")

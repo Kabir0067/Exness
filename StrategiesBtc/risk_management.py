@@ -437,7 +437,8 @@ class RiskManager:
         return time.time() >= self._analysis_blocked_until
 
     def on_position_opened(self) -> None:
-        self.block_analysis(float(getattr(self.cfg, "cooldown_seconds", 2.0) or 2.0))
+        if bool(getattr(self.cfg, "pause_analysis_on_position_open", False)):
+            self.block_analysis(float(getattr(self.cfg, "cooldown_seconds", 2.0) or 2.0))
 
     def on_all_flat(self) -> None:
         dd = float(self._current_drawdown)
@@ -831,9 +832,10 @@ class RiskManager:
                 reasons.append(f"micro:{tick_reason}")
 
             # BTC session: engine should pass market_open_24_5()
-            if not in_session:
-                ok, r = self._trade_mode_state()
-                reasons.append(r or "maintenance_blackout" if not ok else "session_blocked")
+            if not bool(getattr(self.cfg, "ignore_sessions", False)):
+                if not in_session:
+                    ok, r = self._trade_mode_state()
+                    reasons.append(r or "maintenance_blackout" if not ok else "session_blocked")
 
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
@@ -842,13 +844,15 @@ class RiskManager:
                 if spread_pct > float(self.sp.spread_limit_pct) * 1.2:
                     reasons.append("dd_strict_spread")
 
-            per_hour = max(1, int(float(self.cfg.max_signals_per_day) / 24.0))
-            now = time.time()
-            if (now - self._hour_window_start_ts) >= 3600.0:
-                self._hour_window_start_ts = now
-                self._hour_window_count = 0
-            if self._hour_window_count >= per_hour:
-                reasons.append("hourly_signal_limit")
+            max_per_day = int(getattr(self.cfg, "max_signals_per_day", 0) or 0)
+            if max_per_day > 0:
+                per_hour = max(1, int(float(max_per_day) / 24.0))
+                now = time.time()
+                if (now - self._hour_window_start_ts) >= 3600.0:
+                    self._hour_window_start_ts = now
+                    self._hour_window_count = 0
+                if self._hour_window_count >= per_hour:
+                    reasons.append("hourly_signal_limit")
 
             if spread_pct > float(self.sp.spread_limit_pct) * 1.5:
                 reasons.append("excessive_spread_pct")
@@ -1056,6 +1060,19 @@ class RiskManager:
             if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
                 risk_money *= float(getattr(self.cfg, "dd_risk_mult", 1.0) or 1.0)
 
+            # Confidence-based risk scaling (keeps risk tighter on weaker signals)
+            conf = float(confidence)
+            if conf > 1.5:
+                conf = conf / 100.0
+            conf = max(0.0, min(1.0, conf))
+
+            min_mult = float(getattr(self.cfg, "confidence_risk_min_mult", 0.75) or 0.75)
+            max_mult = float(getattr(self.cfg, "confidence_risk_max_mult", 1.15) or 1.15)
+            if max_mult < min_mult:
+                max_mult = min_mult
+
+            risk_money *= (min_mult + (max_mult - min_mult) * conf)
+
             risk_1lot = abs(self._order_calc_profit_money(side_n, 1.0, entry_price, stop_loss))
             if risk_1lot <= 0:
                 return float(self.cfg.fixed_volume)
@@ -1087,6 +1104,7 @@ class RiskManager:
             return float(self.cfg.fixed_volume)
 
     # ------------------- SL/TP planners -------------------
+
     def _micro_zone_sl_tp(
         self,
         side: str,
@@ -1095,11 +1113,11 @@ class RiskManager:
         tick_volatility: float,
     ) -> Tuple[float, float]:
         """
-        BTC micro SL/TP:
+        BTC micro SL/TP (scalping-correct):
           - base buffer in % of price (cfg.micro_buffer_pct)
           - add microstructure volatility buffer (cfg.micro_vol_mult)
-          - RR uses cfg.micro_rr
-          - optionally anchor to orderbook extremes if provided by feed
+          - keep SL tight (entry ± buffer)
+          - TP uses cfg.micro_rr, but may "snap" to nearest book wall ONLY if RR >= cfg.min_rr
         """
         try:
             if not _is_finite(entry) or entry <= 0:
@@ -1118,21 +1136,47 @@ class RiskManager:
 
             micro_buffer = float(base_buffer + vol_buffer)
 
-            z = zones
-            bid_floor = float(getattr(z, "bid_floor", 0.0) or 0.0) if z else 0.0
-            ask_ceil = float(getattr(z, "ask_ceiling", 0.0) or 0.0) if z else 0.0
-
             side_n = _side_norm(side)
+
             rr_micro = float(getattr(self.cfg, "micro_rr", 2.2) or 2.2)
+            rr_floor = float(getattr(self.cfg, "min_rr", 1.0) or 1.0)
 
             if side_n == "Buy":
-                sl = min(bid_floor, entry - micro_buffer) if bid_floor > 0 else (entry - micro_buffer)
-                tp = max(ask_ceil, entry + micro_buffer * rr_micro) if ask_ceil > 0 else (entry + micro_buffer * rr_micro)
+                sl = entry - micro_buffer
+                tp_target = entry + micro_buffer * rr_micro
+                tp = tp_target
+
+                if zones:
+                    levels = [
+                        float(getattr(zones, "strong_resistance", 0.0) or 0.0),
+                        float(getattr(zones, "value_area_high", 0.0) or 0.0),
+                        float(getattr(zones, "poc", 0.0) or 0.0),
+                    ]
+                    levels = [x for x in levels if x > entry]
+                    if levels:
+                        nearest = min(levels)
+                        if self._rr(entry, sl, nearest) >= rr_floor:
+                            tp = nearest
+
             else:
-                sl = max(ask_ceil, entry + micro_buffer) if ask_ceil > 0 else (entry + micro_buffer)
-                tp = min(bid_floor, entry - micro_buffer * rr_micro) if bid_floor > 0 else (entry - micro_buffer * rr_micro)
+                sl = entry + micro_buffer
+                tp_target = entry - micro_buffer * rr_micro
+                tp = tp_target
+
+                if zones:
+                    levels = [
+                        float(getattr(zones, "strong_support", 0.0) or 0.0),
+                        float(getattr(zones, "value_area_low", 0.0) or 0.0),
+                        float(getattr(zones, "poc", 0.0) or 0.0),
+                    ]
+                    levels = [x for x in levels if 0.0 < x < entry]
+                    if levels:
+                        nearest = max(levels)
+                        if self._rr(entry, sl, nearest) >= rr_floor:
+                            tp = nearest
 
             return float(sl), float(tp)
+
         except Exception as exc:
             log_risk.error("_micro_zone_sl_tp error: %s | tb=%s", exc, traceback.format_exc())
             return entry, entry
@@ -1280,13 +1324,27 @@ class RiskManager:
             return None, None, None, None
 
     # ------------------- trade recording (engine hooks) -------------------
+
     def record_trade(self, *args, **kwargs) -> None:
+        """
+        Engine hook.
+        IMPORTANT: never trust positions_open from caller (can be stale/incorrect).
+        We re-check MT5 positions to keep phase/breakers correct.
+        """
         try:
-            positions_open = 0
-            if "positions_open" in kwargs:
-                positions_open = int(kwargs.get("positions_open", 0) or 0)
-            elif len(args) >= 5:
-                positions_open = int(args[4] or 0)
+            positions_open: int
+
+            # Prefer truth from MT5 whenever possible
+            if self._ensure_ready():
+                with MT5_LOCK:
+                    pos = mt5.positions_get(symbol=self.symbol) or ()
+                positions_open = int(len(pos))
+            else:
+                positions_open = 0
+                if "positions_open" in kwargs:
+                    positions_open = int(kwargs.get("positions_open", 0) or 0)
+                elif len(args) >= 5:
+                    positions_open = int(args[4] or 0)
 
             if positions_open > 0:
                 self.on_position_opened()

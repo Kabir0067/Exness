@@ -144,7 +144,7 @@ class EngineConfig:
     mt5_path: Optional[str] = None
     mt5_portable: bool = False
 
-    daily_target_pct: float = 0.15
+    daily_target_pct: float = 0.10
     ultra_confidence_min: float = 0.97
     protect_drawdown_from_peak_pct: float = 0.03
     max_daily_loss_pct: float = 0.10
@@ -197,7 +197,7 @@ class EngineConfig:
 
     max_drawdown: float = 0.09
     max_trades_per_hour: int = 20
-    max_signals_per_day: int = 30
+    max_signals_per_day: int = 0
 
     sl_atr_mult_trend: float = 1.25
     tp_atr_mult_trend: float = 2.5
@@ -248,6 +248,11 @@ class EngineConfig:
     rtt_cb_ms: int = 450
     spread_cb_pct: float = 0.0010
     slippage_backoff: float = 0.5
+
+    # Policy toggles
+    ignore_sessions: bool = True
+    pause_analysis_on_position_open: bool = False
+    ignore_microstructure: bool = True
 
     def validate(self) -> None:
         if self.login <= 0:
@@ -301,6 +306,17 @@ def get_config_from_env() -> EngineConfig:
     # Optional overrides
     if os.getenv("DAILY_TARGET_PCT"):
         cfg.daily_target_pct = _env_float("DAILY_TARGET_PCT", cfg.daily_target_pct)
+    if os.getenv("MAX_SIGNALS_PER_DAY"):
+        cfg.max_signals_per_day = _env_int("MAX_SIGNALS_PER_DAY", cfg.max_signals_per_day)
+    if os.getenv("IGNORE_SESSIONS"):
+        cfg.ignore_sessions = _env_bool("IGNORE_SESSIONS", default=cfg.ignore_sessions)
+    if os.getenv("PAUSE_ANALYSIS_ON_POSITION_OPEN"):
+        cfg.pause_analysis_on_position_open = _env_bool(
+            "PAUSE_ANALYSIS_ON_POSITION_OPEN",
+            default=cfg.pause_analysis_on_position_open,
+        )
+    if os.getenv("IGNORE_MICROSTRUCTURE"):
+        cfg.ignore_microstructure = _env_bool("IGNORE_MICROSTRUCTURE", default=cfg.ignore_microstructure)
 
     cfg.enable_debug_logging = _env_bool("ENABLE_DEBUG_LOGGING", default=cfg.enable_debug_logging)
 

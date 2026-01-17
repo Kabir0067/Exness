@@ -1,5 +1,7 @@
 from typing import Literal, Dict, Any, List
 from datetime import datetime, timedelta
+import os
+from zoneinfo import ZoneInfo
 import MetaTrader5 as mt5
 
 from mt5_client import ensure_mt5, MT5_LOCK
@@ -7,6 +9,26 @@ from mt5_client import ensure_mt5, MT5_LOCK
 
 _cache = None
 _cache_time = None
+
+
+def _local_now() -> datetime:
+    tz_name = os.getenv("TIMEZONE", "Asia/Dushanbe")
+    try:
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return datetime.now()
+
+
+def _day_start_local(now: datetime) -> datetime:
+    try:
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    except Exception:
+        return datetime(now.year, now.month, now.day, 0, 0, 0)
+
+
+def _naive_local(dt: datetime) -> datetime:
+    # MT5 history APIs accept naive datetime (terminal local time).
+    return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
 
 
 def _connect() -> bool:
@@ -25,20 +47,20 @@ def get_profit_period(period: Literal["day", "week", "month"]) -> dict:
     if not _connect():
         return {"profit": 0.0, "loss": 0.0, "net": 0.0}
 
-    utc_now = datetime.utcnow() + timedelta(hours=5)
+    local_now = _local_now()
 
     if period == "day":
-        from_date = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        from_date = _day_start_local(local_now)
     elif period == "week":
-        from_date = utc_now - timedelta(days=utc_now.weekday())
-        from_date = from_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        from_date = local_now - timedelta(days=local_now.weekday())
+        from_date = _day_start_local(from_date)
     elif period == "month":
-        from_date = utc_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        from_date = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     else:
         return {"profit": 0.0, "loss": 0.0, "net": 0.0}
 
     with MT5_LOCK:
-        deals = mt5.history_deals_get(from_date, datetime.utcnow() + timedelta(hours=10)) 
+        deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(local_now))
 
     total_profit = 0.0
     total_loss = 0.0
@@ -108,7 +130,7 @@ def format_usdt(amount: float, show_plus: bool = False) -> str:
 def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
     global _cache, _cache_time
 
-    now = datetime.now()
+    now = _local_now()
 
     if force_refresh or not _cache or not _cache_time or (now - _cache_time).seconds > 5:
         if not _connect():
@@ -124,12 +146,12 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             _cache_time = now
             return empty_summary
 
-        today_start = datetime(now.year, now.month, now.day, 0, 0, 0)
-        from_date = today_start - timedelta(hours=3) 
-        to_date = now + timedelta(hours=2)
+        today_start = _day_start_local(now)
+        from_date = today_start
+        to_date = now
 
         with MT5_LOCK:
-            deals = mt5.history_deals_get(from_date.timestamp(), to_date.timestamp())
+            deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(to_date))
             open_positions = mt5.positions_get() or []
             acc = mt5.account_info()
         balance = float(acc.balance) if acc else 0.0

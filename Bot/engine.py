@@ -1,29 +1,26 @@
-"""Bot/engine.py
+# Bot/engine.py  (PORTFOLIO WRAPPER, PRODUCTION)
+"""Compatibility wrapper.
 
-Unified engine export for portfolio trading (XAU + BTC).
+Your project originally had a single-asset engine in Bot/engine.py.
+For the multi-asset system (XAU + BTC) we keep the same import path:
 
-The production runner uses the portfolio engine that operates both XAU and BTC,
-but executes trades for only one asset at a time (single-asset lock).
+    from Bot.engine import engine
 
-Public API:
-- engine.start() - Start portfolio engine
-- engine.stop() - Stop portfolio engine
-- engine.status() - Get PortfolioStatus
-- engine.request_manual_stop() - Manual stop via Telegram
-- engine.clear_manual_stop() - Clear manual stop
-- engine.manual_stop_active() - Check manual stop status
-
-Exported classes:
-- MultiAssetTradingEngine - Main portfolio engine class
-- engine - Global singleton instance
+…and re-export the portfolio engine instance from Bot/portfolio_engine.py.
 """
 
 from __future__ import annotations
 
-from .portfolio_engine import MultiAssetTradingEngine, engine
+from .portfolio_engine import (  # type: ignore
+    engine,
+    MultiAssetTradingEngine,
+    PortfolioStatus,
+    AssetCandidate,
+)
 
-# Export all public API
 __all__ = [
-    "MultiAssetTradingEngine",
     "engine",
+    "MultiAssetTradingEngine",
+    "PortfolioStatus",
+    "AssetCandidate",
 ]
