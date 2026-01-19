@@ -1,20 +1,21 @@
 # Системаи Скальпинг Portfolio (XAUUSDm + BTCUSDm)
 
 Ин лоиҳа системаи савдои алгоритмист, ки ба MetaTrader 5 пайваст мешавад ва ду стратегияро ҳамзамон иҷро мекунад:
-яке барои тилло (XAUUSDm) ва дигаре барои биткоин (BTCUSDm). Ҳар ду pipeline ҳамзамон кор мекунанд,
-сигнал месозанд, risk‑қоидаҳоро мегузаранд ва ордерҳоро ба MT5 мефиристанд.
+XAUUSDm (тилло) ва BTCUSDm (биткоин). Ҳар ду pipeline ҳамзамон кор мекунанд, сигнал месозанд,
+risk‑қоидаҳоро мегузаранд ва ордерҳоро ба MT5 мефиристанд.
 
-README пурра мувофиқи коди воқеӣ навишта шудааст (ENV танҳо барои 5 тағйирёбанда).
+README бо код мувофиқ аст. ENV танҳо барои 5 тағйирёбандаи махфӣ истифода мешавад.
 
 ## Система чӣ мекунад
 
-- Ду pipeline (XAU + BTC) ҳамзамон таҳлил мешавад ва ордер кушода мешавад.
-- 3 таймфрейм истифода мекунад: M1, M5, M15. Агар M5/M15 дастрас набошад → ба M1 меафтад.
+- Ду pipeline (XAU + BTC) ҳамзамон таҳлил мешавад; ҳар ду метавонад ордер кушояд.
+- Таймфреймҳо: M1 + M5 + M15 (агар M5/M15 дастрас набошад → ба M1 меафтад).
 - Сигнал + нақшаи SL/TP/lot месозад, баъд order‑ро дар MT5 иҷро мекунад.
 - Telegram‑бот барои назорат ва идоракунии система дорад (паём барои ҳар ордери кушодашуда).
-- Логҳои health/diagnostic ба `Logs/` менависад (паёми health ба Telegram фиристода намешавад).
+- Логҳои health/diagnostic ба `Logs/` менависад (health ба Telegram фиристода намешавад).
 - Аз рӯи дақиқии сигнал 1–3 ордер мекушояд (ҳамзамон).
 - Ҳатто бо ордерҳои кушода ҳам анализ идома меёбад.
+- BTC 24/7 кор мекунад; XAU 24/5 (market_open_24_5 назорат мекунад).
 
 ## Архитектура (модулҳои асосӣ)
 
@@ -124,9 +125,11 @@ py main.py
 
 Муҳим:
 - `Logs/portfolio_engine_health.log`
-- `Logs/order_execution_health.log`
+- `Logs/portfolio_engine_diag.jsonl`
+- `Logs/order_execution.log` (health log ғайрифаъол аст)
 - `Logs/telegram.log`
 - `Logs/mt5.log`
+- `Logs/main.log`
 
 Майдонҳои маъмул:
 - `xau_ok` / `btc_ok` → data fresh?
@@ -158,16 +161,17 @@ py main.py
 
 Муҳим:
 - `daily_target_pct=0.10` → ҳадафи рӯзона 10% → режим B.
-- `protect_drawdown_from_peak_pct=0.30` → агар аз пик 30% баргардад → режим C.
-- `enforce_daily_limits=True` → ҳисобҳои A/B/C фаъол; hard‑stop аз `ignore_daily_stop_for_trading` вобаста аст.
-- `ignore_daily_stop_for_trading=True` → hard‑stop танҳо лог мешавад, engine STOP намешавад.
+- `daily_loss_b_pct=0.02` ва `daily_loss_c_pct=0.03` → режими B/C.
+- Дар C: **hard‑stop** фаъол аст (engine барои он рӯз қатъ мешавад).
+- `enforce_daily_limits=True` → режимҳои A/B/C фаъол.
+- `ignore_daily_stop_for_trading=False` → hard‑stop воқеан engine‑ро қатъ мекунад.
 - `enforce_drawdown_limits=False` → drawdown ордерро қатъ намекунад.
 - `multi_order_confidence_tiers` ва `multi_order_max_orders` → 1–3 ордер аз рӯи дақиқии сигнал.
 - `max_signals_per_day=0` → лимит нест (ҳар сигнал → ордер).
 - `ignore_external_positions=True` → ордерҳои дастӣ ба ҳисобҳои risk/phase таъсир намерасонанд.
 - `magic=777001` → magic number барои фарқ кардани ордерҳои бот.
-- `tp_rr_cap=1.0` → TP аз рӯи RR маҳдуд мешавад (TP дур намеравад).
-  
+- `ignore_microstructure=True` → BTC аз micro‑филтрҳо блок намешавад.
+
 Барои скалпинг‑суръат:
 - `poll_seconds_fast=0.05`
 - `decision_debounce_ms=50`
@@ -225,8 +229,3 @@ Exness/
 ├── config_btc.py
 └── main.py
 ```
-
-
-Kabir#VPS2019!Strong2026
-
-kabir-vps1.localdomain
