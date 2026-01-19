@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import http.client
 import logging
-import os
 import signal
 import socket
 import sys
@@ -11,7 +10,8 @@ import time
 import traceback
 import urllib3
 
-TG_HEALTH_NOTIFY = os.getenv("TG_HEALTH_NOTIFY", "0").strip().lower() in {"1","true","yes","on"}
+TG_HEALTH_NOTIFY = False
+
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from queue import Queue, Full, Empty
@@ -37,8 +37,8 @@ if not log.handlers:
 
     fh = RotatingFileHandler(
         str(get_log_path("main.log")),
-        maxBytes=int(os.getenv("MAIN_LOG_MAX_BYTES", "5242880")),  # 5MB
-        backupCount=int(os.getenv("MAIN_LOG_BACKUPS", "5")),
+        maxBytes=5242880,  # 5MB (дар шакли байт)
+        backupCount=5,     # Миқдори файлҳои кӯҳна
         encoding="utf-8",
         delay=True,
     )
@@ -264,9 +264,9 @@ class LogMonitor:
         self._t: Optional[Thread] = None
         self._log_rl = RateLimiter(600.0)
 
-        self.interval = float(os.getenv("LOG_MONITOR_INTERVAL_SEC", "300"))
-        self.max_mb = float(os.getenv("LOG_MAX_TOTAL_MB", "512"))
-        self.max_files = int(os.getenv("LOG_MAX_FILES", "2000"))
+        self.interval = 300.0   # 5 дақиқа (бо сония)
+        self.max_mb = 512.0     # 512 Мегабайт
+        self.max_files = 2000   # 2000 адад файл
 
     def start(self) -> None:
         if self._t and self._t.is_alive():
@@ -309,7 +309,6 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     backoff = Backoff(base=2.0, factor=2.0, max_delay=60.0)
     restart_guard = RateLimiter(20.0)  # at most one restart attempt per 20s
     manual_stop_rl = RateLimiter(60.0)  # throttle manual-stop logs
-    health_notify_rl = RateLimiter(float(os.getenv("HEALTH_NOTIFY_INTERVAL_SEC", "300.0")))  # 5 min default
     started_once = False
     attempt = 0
 
@@ -384,29 +383,6 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                 else:
                     sleep_interruptible(stop_event, 2.0)
                 continue
-
-            # Periodic health notification (DISABLED by default)
-            if TG_HEALTH_NOTIFY and health_notify_rl.allow("health_status"):
-                try:
-                    st = engine.status()
-                    msg = (
-                        f"💹 Portfolio Health\n"
-                        f"Connected: {'✅' if st.connected else '❌'}\n"
-                        f"Trading: {'✅' if st.trading else '⏸️'}\n"
-                        f"Active: {st.active_asset}\n"
-                        f"Balance: {st.balance:.2f}\n"
-                        f"Equity: {st.equity:.2f}\n"
-                        f"DD: {st.dd_pct*100:.2f}%\n"
-                        f"PnL Today: {st.today_pnl:.2f}\n"
-                        f"Open XAU: {st.open_trades_xau}\n"
-                        f"Open BTC: {st.open_trades_btc}\n"
-                        f"Queue: {st.exec_queue_size}\n"
-                        f"Last Signal XAU: {st.last_signal_xau}\n"
-                        f"Last Signal BTC: {st.last_signal_btc}"
-                    )
-                    notifier.notify(msg)
-                except Exception as exc:
-                    log.warning("Health notification failed: %s", exc)
 
             sleep_interruptible(stop_event, 1.0)
 

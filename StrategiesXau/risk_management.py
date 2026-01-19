@@ -4,7 +4,6 @@ import csv
 import json
 import logging
 import math
-import os
 import threading
 import time
 import traceback
@@ -40,12 +39,12 @@ log_risk.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
-        filename=str(get_log_path("risk_manager.log")),
-        maxBytes=int(os.getenv("RISK_LOG_MAX_BYTES", "5242880")),  # 5MB
-        backupCount=int(os.getenv("RISK_LOG_BACKUPS", "5")),
-        encoding="utf-8",
-        delay=True,
-    )
+            filename=str(get_log_path("risk_manager.log")),
+            maxBytes=5242880,  # Ин 5MB дар шакли байт аст
+            backupCount=5,     # Миқдори файлҳои эҳтиётӣ
+            encoding="utf-8",
+            delay=True,
+        )
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     log_risk.addHandler(fh)
@@ -327,6 +326,7 @@ class RiskManager:
         self._acc_cache_ts: float = 0.0
         self._acc_cache_balance: float = 0.0
         self._acc_cache_equity: float = 0.0
+        self._bot_balance_base: float = 0.0
 
         # Signal throttling (production: real rolling hour + per-day)
         self._daily_signal_count: int = 0
@@ -428,6 +428,10 @@ class RiskManager:
         self._analysis_blocked_until = max(self._analysis_blocked_until, time.time() + lock)
 
     def requires_hard_stop(self) -> bool:
+        if not bool(getattr(self.cfg, "enforce_daily_limits", False)):
+            return False
+        if bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
+            return False
         if self._trading_disabled_until <= 0:
             return False
         if time.time() >= self._trading_disabled_until:
@@ -475,6 +479,22 @@ class RiskManager:
         self._daily_signal_count = 0
         self._hour_window_start_ts = time.time()
         self._hour_window_count = 0
+        self._reset_bot_balance_base()
+
+    def _reset_bot_balance_base(self) -> None:
+        if not bool(getattr(self.cfg, "ignore_external_positions", False)):
+            return
+        try:
+            if not self._ensure_ready():
+                return
+            with MT5_LOCK:
+                acc = mt5.account_info()
+            if acc:
+                bal = float(getattr(acc, "balance", 0.0) or 0.0)
+                if bal > 0:
+                    self._bot_balance_base = bal
+        except Exception:
+            pass
 
     # ------------------- MT5 readiness / symbol meta -------------------
     def _ensure_ready(self) -> bool:
@@ -614,6 +634,9 @@ class RiskManager:
         Single MT5 account_info() snapshot with short cache.
         Prevents temporary 0.0 reads from MT5 from triggering wrong risk decisions.
         """
+        if bool(getattr(self.cfg, "ignore_external_positions", False)):
+            return self._bot_account_snapshot()
+
         cache_sec = float(getattr(self.cfg, "account_snapshot_cache_sec", 0.5) or 0.5)
         now = time.time()
 
@@ -641,6 +664,65 @@ class RiskManager:
 
         except Exception as exc:
             log_risk.error("_account_snapshot error: %s | tb=%s", exc, traceback.format_exc())
+
+        return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
+    def _bot_account_snapshot(self) -> Tuple[float, float]:
+        """
+        Bot-only balance/equity snapshot (ignores manual/external positions).
+        Uses magic filtering and a fixed base balance captured at daily reset.
+        """
+        cache_sec = float(getattr(self.cfg, "account_snapshot_cache_sec", 0.5) or 0.5)
+        now = time.time()
+
+        if (now - float(self._acc_cache_ts)) < cache_sec:
+            return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
+        if not self._ensure_ready():
+            return float(self._acc_cache_balance), float(self._acc_cache_equity)
+
+        try:
+            magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+        except Exception:
+            magic = 777001
+
+        try:
+            with MT5_LOCK:
+                acc = mt5.account_info()
+                positions = mt5.positions_get()
+                day_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                deals = mt5.history_deals_get(day_start, _utcnow())
+
+            base = float(self._bot_balance_base)
+            if base <= 0 and acc:
+                base = float(getattr(acc, "balance", 0.0) or 0.0)
+                if base > 0:
+                    self._bot_balance_base = base
+
+            realized = 0.0
+            if deals:
+                realized = float(
+                    sum(float(getattr(d, "profit", 0.0) or 0.0) for d in deals if int(getattr(d, "magic", 0) or 0) == magic)
+                )
+
+            open_pnl = 0.0
+            if positions:
+                open_pnl = float(
+                    sum(float(getattr(p, "profit", 0.0) or 0.0) for p in positions if int(getattr(p, "magic", 0) or 0) == magic)
+                )
+
+            bal = max(0.0, base + realized)
+            eq = max(0.0, bal + open_pnl)
+
+            if bal > 0:
+                self._acc_cache_balance = bal
+            if eq > 0:
+                self._acc_cache_equity = eq
+
+            self._acc_cache_ts = now
+
+        except Exception as exc:
+            log_risk.error("_bot_account_snapshot error: %s | tb=%s", exc, traceback.format_exc())
 
         return float(self._acc_cache_balance), float(self._acc_cache_equity)
 
@@ -675,13 +757,22 @@ class RiskManager:
                 self.current_phase = "B"
                 self._target_breached = True
 
-            if daily_return <= -float(self.cfg.max_daily_loss_pct):
-                self._enter_hard_stop("max_daily_loss")
+            if bool(getattr(self.cfg, "enforce_daily_limits", False)):
+                loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
+                loss_c = float(getattr(self.cfg, "daily_loss_c_pct", 0.0) or 0.0)
+                if loss_b > 0 and daily_return <= -loss_b:
+                    if self.current_phase == "A":
+                        self.current_phase = "B"
+                if loss_c > 0 and daily_return <= -loss_c:
+                    self._enter_hard_stop("daily_loss_c")
+                elif daily_return <= -float(self.cfg.max_daily_loss_pct):
+                    self._enter_hard_stop("max_daily_loss")
 
-            if self._target_breached and self.current_phase == "B":
-                dd_from_peak = float((self.daily_peak_equity - eq) / max(1.0, self.daily_peak_equity))
-                if dd_from_peak >= float(self.cfg.protect_drawdown_from_peak_pct):
-                    self._enter_hard_stop("daily_target_protection")
+            if bool(getattr(self.cfg, "enforce_daily_limits", False)):
+                if self._target_breached and self.current_phase == "B":
+                    dd_from_peak = float((self.daily_peak_equity - eq) / max(1.0, self.daily_peak_equity))
+                    if dd_from_peak >= float(self.cfg.protect_drawdown_from_peak_pct):
+                        self._enter_hard_stop("daily_target_protection")
         except Exception as exc:
             log_risk.error("evaluate_account_state error: %s | tb=%s", exc, traceback.format_exc())
 
@@ -788,7 +879,7 @@ class RiskManager:
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
 
-            if drawdown_exceeded:
+            if bool(getattr(self.cfg, "enforce_drawdown_limits", False)) and drawdown_exceeded:
                 reasons.append("max_drawdown")
 
             if spread_pct > float(self.sp.spread_limit_pct):
@@ -804,9 +895,10 @@ class RiskManager:
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
 
-            if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
-                if spread_pct > float(self.sp.spread_limit_pct) * 1.2:
-                    reasons.append("dd_strict_spread")
+            if bool(getattr(self.cfg, "enforce_drawdown_limits", False)):
+                if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
+                    if spread_pct > float(self.sp.spread_limit_pct) * 1.2:
+                        reasons.append("dd_strict_spread")
 
             max_per_day = int(getattr(self.cfg, "max_signals_per_day", 0) or 0)
             if max_per_day > 0:
@@ -858,8 +950,9 @@ class RiskManager:
             if not self.can_analyze():
                 reasons.append("analysis_cooldown")
 
-            if self._current_drawdown > float(self.cfg.max_drawdown):
-                reasons.append("high_drawdown")
+            if bool(getattr(self.cfg, "enforce_drawdown_limits", False)):
+                if self._current_drawdown > float(self.cfg.max_drawdown):
+                    reasons.append("high_drawdown")
 
             if self._last_fill_ts and (time.time() - self._last_fill_ts) < float(self.cfg.cooldown_seconds):
                 reasons.append("cooldown_period")
@@ -908,9 +1001,10 @@ class RiskManager:
             if self.current_phase == "B" and conf_f < float(self.cfg.ultra_confidence_min):
                 reasons.append("not_ultra_confidence")
 
-            if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
-                if conf_f < float(self.cfg.min_confidence_signal) + 0.1:
-                    reasons.append("drawdown_strict_confidence")
+            if bool(getattr(self.cfg, "enforce_drawdown_limits", False)):
+                if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
+                    if conf_f < float(self.cfg.min_confidence_signal) + 0.1:
+                        reasons.append("drawdown_strict_confidence")
 
             if time.time() < self._exec_breaker_until:
                 reasons.append("exec_breaker_active")
@@ -1137,16 +1231,88 @@ class RiskManager:
             if not _is_finite(entry_price) or entry_price <= 0:
                 return None, None, None, None
 
-            sl, tp = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
+            # -----------------------------------------------------------------
+            # SL/TP planning (SCALPING, scientific): ATR first + execution-cost floor
+            #  - No more micro-zone as primary (it was shrinking TP to ~$2 on XAU).
+            #  - Micro-zones only EXTEND (never shrink) after ATR plan.
+            # -----------------------------------------------------------------
 
+            # 1) ATR injection (from adapt or indicators)
+            atr = 0.0
+            try:
+                atr = float((adapt or {}).get("atr", 0.0) or ind.get("atr", 0.0) or 0.0)
+            except Exception:
+                atr = 0.0
+
+            adapt2 = dict(adapt or {})
+            adapt2["atr"] = float(atr)
+
+            # 2) Base ATR plan
+            sl, tp = self._fallback_atr_sl_tp(side_n, entry_price, adapt2)
+
+            # 3) If ATR missing, fallback to micro-zone as last resort
+            if (not _is_finite(sl, tp)) or sl == entry_price or tp == entry_price:
+                sl, tp = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
+
+            # 4) Build a realistic cost-floor from execution monitor (spread/slip/noise)
             min_dist = self._min_stop_distance()
             min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.0002) or 0.0002)
             min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.0003) or 0.0003)
-            min_sl = max(min_dist, entry_price * min_sl_pct)
-            min_tp = max(min_dist, entry_price * min_tp_pct)
 
-            if (not _is_finite(sl, tp)) or abs(entry_price - sl) < min_sl or abs(tp - entry_price) < min_tp:
-                sl, tp = self._fallback_atr_sl_tp(side_n, entry_price, adapt)
+            cost_floor = float(min_dist)
+            try:
+                snap = self.execmon.snapshot()
+                sp_pts = max(float(snap.get("p95_spread_points", 0.0) or 0.0), float(snap.get("ewma_spread_points", 0.0) or 0.0))
+                slp_pts = max(float(snap.get("p95_slippage_points", 0.0) or 0.0), float(snap.get("ewma_slippage_points", 0.0) or 0.0))
+                mv_pts = float(snap.get("p95_mid_move_points", 0.0) or 0.0)
+
+                if self._symbol_meta() and float(self._point) > 0:
+                    sp_px = sp_pts * float(self._point)
+                    slp_px = slp_pts * float(self._point)
+                    mv_px = mv_pts * float(self._point)
+                else:
+                    sp_px = slp_px = mv_px = 0.0
+
+                k_sp = float(getattr(self.cfg, "sltp_cost_spread_mult", 1.8) or 1.8)
+                k_slp = float(getattr(self.cfg, "sltp_cost_slip_mult", 1.0) or 1.0)
+                k_mv = float(getattr(self.cfg, "sltp_cost_move_mult", 0.6) or 0.6)
+
+                cost_floor = max(float(min_dist), sp_px * k_sp + slp_px * k_slp + mv_px * k_mv)
+            except Exception:
+                cost_floor = float(min_dist)
+
+            sl_floor_mult = float(getattr(self.cfg, "sltp_sl_floor_mult", 1.15) or 1.15)
+            tp_floor_mult = float(getattr(self.cfg, "sltp_tp_floor_mult", 1.75) or 1.75)
+
+            min_sl = max(float(min_dist), entry_price * min_sl_pct, cost_floor * sl_floor_mult)
+            min_tp = max(float(min_dist), entry_price * min_tp_pct, cost_floor * tp_floor_mult)
+
+            # 5) Enforce floors (never allow too-tight SL/TP)
+            if not _is_finite(sl, tp):
+                return None, None, None, None
+
+            if side_n == "Buy":
+                if abs(entry_price - float(sl)) < min_sl:
+                    sl = self._normalize_price(entry_price - min_sl)
+                if abs(float(tp) - entry_price) < min_tp:
+                    tp = self._normalize_price(entry_price + min_tp)
+            else:
+                if abs(entry_price - float(sl)) < min_sl:
+                    sl = self._normalize_price(entry_price + min_sl)
+                if abs(float(tp) - entry_price) < min_tp:
+                    tp = self._normalize_price(entry_price - min_tp)
+
+            # 6) Micro-zones: only EXTEND (never shrink)
+            if zones is not None:
+                slz, tpz = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
+                if _is_finite(slz, tpz) and slz != entry_price and tpz != entry_price:
+                    if side_n == "Buy":
+                        sl = min(float(sl), float(slz))
+                        tp = max(float(tp), float(tpz))
+                    else:
+                        sl = max(float(sl), float(slz))
+                        tp = min(float(tp), float(tpz))
+
 
             if not _is_finite(sl, tp) or sl == entry_price or tp == entry_price:
                 return None, None, None, None
@@ -1168,6 +1334,22 @@ class RiskManager:
                         tp = self._normalize_price(entry_price + dist * rr_min)
                     else:
                         tp = self._normalize_price(entry_price - dist * rr_min)
+                    sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+
+            rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
+            if rr_cap > 0:
+                dist_sl = abs(entry_price - sl)
+                dist_tp = abs(tp - entry_price)
+                if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
+                    if side_n == "Buy":
+                        tp = self._normalize_price(entry_price + dist_sl * rr_cap)
+                    else:
+                        tp = self._normalize_price(entry_price - dist_sl * rr_cap)
+                    if abs(tp - entry_price) < min_tp:
+                        if side_n == "Buy":
+                            tp = self._normalize_price(entry_price + min_tp)
+                        else:
+                            tp = self._normalize_price(entry_price - min_tp)
                     sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
             lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))

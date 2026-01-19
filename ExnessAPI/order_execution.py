@@ -1,3 +1,4 @@
+# ExnessAPI/order_execution.py  (PRODUCTION-GRADE / ULTRA-FAST / SLTP-ROBUST)
 from __future__ import annotations
 
 import logging
@@ -5,7 +6,7 @@ import math
 import os
 import time
 import traceback
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Optional
 
@@ -16,7 +17,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # =============================================================================
 # Logging
-#   NOTE: for maximum speed, you can disable health logs:
+#   For maximum speed, you can disable health logs:
 #     set ORDER_EXEC_HEALTH_LOG=0
 # =============================================================================
 
@@ -27,8 +28,6 @@ def _rotating_file_logger(
     name: str,
     filename: str,
     level: int,
-    max_bytes_env: str,
-    backups_env: str,
     default_max_bytes: int = 5_242_880,  # 5MB
     default_backups: int = 5,
 ) -> logging.Logger:
@@ -39,8 +38,8 @@ def _rotating_file_logger(
     if not any(isinstance(h, RotatingFileHandler) for h in log.handlers):
         fh = RotatingFileHandler(
             filename=str(get_log_path(filename)),
-            maxBytes=int(os.getenv(max_bytes_env, str(default_max_bytes))),
-            backupCount=int(os.getenv(backups_env, str(default_backups))),
+            maxBytes=default_max_bytes,
+            backupCount=default_backups,
             encoding="utf-8",
             delay=True,
         )
@@ -51,24 +50,13 @@ def _rotating_file_logger(
     return log
 
 
-log_err = _rotating_file_logger(
-    "order_execution",
-    "order_execution.log",
-    logging.ERROR,
-    max_bytes_env="ORDER_EXEC_LOG_MAX_BYTES",
-    backups_env="ORDER_EXEC_LOG_BACKUPS",
-)
+log_err = _rotating_file_logger("order_execution", "order_execution.log", logging.ERROR)
 
-_HEALTH_ENABLED = os.getenv("ORDER_EXEC_HEALTH_LOG", "1").strip().lower() not in {"0", "false", "no", "off"}
-
-log_health = _rotating_file_logger(
-    "order_execution.health",
-    "order_execution_health.log",
-    logging.WARNING if _HEALTH_ENABLED else logging.CRITICAL,
-    max_bytes_env="ORDER_EXEC_HEALTH_LOG_MAX_BYTES",
-    backups_env="ORDER_EXEC_HEALTH_LOG_BACKUPS",
-)
-
+# Health logger disabled (only errors to order_execution.log)
+_HEALTH_ENABLED = False
+log_health = logging.getLogger("order_execution.health")
+log_health.setLevel(logging.CRITICAL)
+log_health.propagate = False
 
 # =============================================================================
 # Models
@@ -127,10 +115,10 @@ class _SymbolMeta:
 class OrderExecutor:
     """Ultra-fast MT5 market order executor.
 
-    Speed design choices:
-    - No time.sleep() retries; retries (if any) are immediate.
-    - No terminal/account health checks per order (optional warmup only).
-    - Per-symbol metadata cache.
+    Key properties:
+    - Zero sleep retry loop for transient retcodes
+    - Symbol metadata cache
+    - Robust SL/TP attachment (position ticket resolve: result.position/order/deal + bounded polling)
     """
 
     def __init__(
@@ -149,7 +137,7 @@ class OrderExecutor:
         self.auto_ensure_mt5 = bool(auto_ensure_mt5)
         self.symbol_cache_ttl = float(symbol_cache_ttl)
 
-        env_default = os.getenv("CLOSE_ON_SLTP_FAIL", "1").strip().lower() in {"1", "true", "yes", "on"}
+        env_default = True
         self.close_on_sltp_fail = bool(env_default if close_on_sltp_fail is None else close_on_sltp_fail)
 
         self._meta: dict[str, _SymbolMeta] = {}
@@ -169,8 +157,12 @@ class OrderExecutor:
         if side not in ("Buy", "Sell"):
             return self._fail(request, time.time(), "bad_side", 0)
 
-        # IMPORTANT for speed: do NOT call ensure_mt5() per order in engine.
-        # Use auto_ensure_mt5=True only for standalone tests.
+        if self.auto_ensure_mt5:
+            try:
+                ensure_mt5()
+            except Exception:
+                return self._fail(request, time.time(), "mt5_not_ready", 0)
+
         planned_sl = float(request.sl) if float(request.sl) > 0 else 0.0
         planned_tp = float(request.tp) if float(request.tp) > 0 else 0.0
 
@@ -188,32 +180,29 @@ class OrderExecutor:
         last_retcode = 0
         sent_ts = time.time()
 
-        # Cache symbol meta once (fast path)
         meta = self._get_symbol_meta(request.symbol)
         if meta is None:
             return self._fail(request, sent_ts, "symbol_meta_none", 0)
 
         order_type = mt5.ORDER_TYPE_BUY if side == "Buy" else mt5.ORDER_TYPE_SELL
 
-        # Compute volume + stops outside MT5 lock
+        # Compute volume outside lock
         vol = self._normalize_volume(float(request.lot), meta)
 
         # INSTANT RETRY LOOP (Zero Sleep)
-        # We assume the caller (Engine) handles major backoff.
-        # Here we just want to punch through requotes/busy instantly.
         for attempt in range(1, int(max_attempts) + 1):
             try:
-                # Tick + send deal under one lock to minimize contention windows
                 with MT5_LOCK:
                     tick = mt5.symbol_info_tick(request.symbol)
-                    if tick is None:
-                        last_reason = "tick_none"
-                        continue
+                    le_tick = mt5.last_error()
+                if tick is None:
+                    last_reason = f"tick_none_{le_tick}"
+                    continue
 
-                    req_price = float(tick.ask) if side == "Buy" else float(tick.bid)
-                    if req_price <= 0.0:
-                        last_reason = "bad_req_price"
-                        continue
+                req_price = float(tick.ask) if side == "Buy" else float(tick.bid)
+                if req_price <= 0.0:
+                    last_reason = "bad_req_price"
+                    continue
 
                 if self.normalize_price_fn:
                     try:
@@ -244,8 +233,8 @@ class OrderExecutor:
                     order_type=int(order_type),
                     price=float(req_price),
                     volume=float(vol),
-                    sl=float(sl_s), # Instant SL
-                    tp=float(tp_s), # Instant TP
+                    sl=float(sl_s),
+                    tp=float(tp_s),
                     filling=int(meta.filling),
                     request=request,
                 )
@@ -285,7 +274,12 @@ class OrderExecutor:
                     exec_vol = float(getattr(result, "volume", vol) or vol)
                     slippage = abs(exec_price - req_price)
 
-                    # Ensure SL/TP if needed (fast polling, no sleep)
+                    # Candidate tickets from MT5 result (may be 0 depending on broker/terminal)
+                    pos_ticket = int(getattr(result, "position", 0) or 0)
+                    ord_ticket = int(getattr(result, "order", 0) or 0)
+                    deal_ticket = int(getattr(result, "deal", 0) or 0)
+
+                    # Ensure SL/TP (robust resolve, bounded polling, no sleep)
                     if planned_sl > 0.0 or planned_tp > 0.0:
                         attached = True
                         if (not used_stops) or (not self._position_has_any_sltp(request.symbol, side, int(request.magic))):
@@ -297,6 +291,9 @@ class OrderExecutor:
                                 planned_sl=planned_sl,
                                 planned_tp=planned_tp,
                                 magic=int(request.magic),
+                                ticket=pos_ticket if pos_ticket > 0 else None,
+                                candidate_tickets=(pos_ticket, ord_ticket, deal_ticket),
+                                sent_ts=float(sent_ts),
                                 rc_done=RC_DONE,
                                 rc_done_partial=RC_DONE_PARTIAL,
                             )
@@ -311,7 +308,15 @@ class OrderExecutor:
                     except Exception:
                         positions_open = 1
 
-                    self._safe_hook(hooks, "record_trade", exec_price, float(request.sl), exec_vol, float(request.tp), int(positions_open))
+                    self._safe_hook(
+                        hooks,
+                        "record_trade",
+                        exec_price,
+                        float(request.sl),
+                        exec_vol,
+                        float(request.tp),
+                        int(positions_open),
+                    )
                     self._safe_hook(
                         hooks,
                         "record_execution_metrics",
@@ -327,7 +332,7 @@ class OrderExecutor:
 
                     if _HEALTH_ENABLED:
                         log_health.info(
-                            "ORDER_FILLED | order_id=%s side=%s symbol=%s ret=%s req=%.5f exec=%.5f vol=%.4f slip=%.5f",
+                            "ORDER_FILLED | order_id=%s side=%s symbol=%s ret=%s req=%.5f exec=%.5f vol=%.4f slip=%.5f pos=%s ord=%s deal=%s",
                             request.order_id,
                             side,
                             request.symbol,
@@ -336,6 +341,9 @@ class OrderExecutor:
                             exec_price,
                             exec_vol,
                             slippage,
+                            pos_ticket,
+                            ord_ticket,
+                            deal_ticket,
                         )
 
                     return OrderResult(
@@ -439,7 +447,6 @@ class OrderExecutor:
             if v_step <= 0:
                 v_step = 0.01
 
-            # decimals from step (fast)
             v_decimals = 0
             if v_step < 1.0:
                 try:
@@ -515,7 +522,9 @@ class OrderExecutor:
             "type_filling": int(filling),
         }
         with MT5_LOCK:
-            return mt5.order_send(req)
+            r = mt5.order_send(req)
+            _ = mt5.last_error()
+        return r
 
     def _position_has_any_sltp(self, symbol: str, side: str, magic: int) -> bool:
         try:
@@ -535,6 +544,8 @@ class OrderExecutor:
         except Exception:
             return False
 
+    # -------------------- SLTP robust attach --------------------
+
     def _ensure_sltp_fast(
         self,
         *,
@@ -545,6 +556,9 @@ class OrderExecutor:
         planned_sl: float,
         planned_tp: float,
         magic: int,
+        ticket: Optional[int] = None,
+        candidate_tickets: tuple[int, ...] = (),
+        sent_ts: float = 0.0,
         rc_done: int,
         rc_done_partial: int,
     ) -> bool:
@@ -555,14 +569,40 @@ class OrderExecutor:
         if sl2 <= 0.0 and tp2 <= 0.0:
             return False
 
-        ticket = self._find_position_ticket_fast(symbol=symbol, side=side, volume=volume, magic=magic)
-        if not ticket:
-            log_err.error("SLTP: position_not_found | symbol=%s side=%s vol=%.4f", symbol, side, volume)
+        resolved = self._resolve_position_ticket(
+            symbol=symbol,
+            side=side,
+            magic=magic,
+            exec_price=exec_price,
+            volume=volume,
+            ticket=ticket,
+            candidate_tickets=candidate_tickets,
+            sent_ts=sent_ts,
+            poll_ms=280,  # bounded window for terminal update (no sleep)
+        )
+
+        if resolved == 0:
+            # No open position (netting/offset/instant close) => SLTP not applicable
+            if _HEALTH_ENABLED:
+                log_health.info("SLTP_SKIP_NO_POSITION | symbol=%s side=%s", symbol, side)
+            return True
+
+        if resolved is None:
+            with MT5_LOCK:
+                le = mt5.last_error()
+            log_err.error(
+                "SLTP: position_not_found | symbol=%s side=%s vol=%.4f candidates=%s last_error=%s",
+                symbol,
+                side,
+                float(volume),
+                candidate_tickets,
+                le,
+            )
             return False
 
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "position": int(ticket),
+            "position": int(resolved),
             "symbol": str(symbol),
             "sl": float(sl2) if float(sl2) > 0 else 0.0,
             "tp": float(tp2) if float(tp2) > 0 else 0.0,
@@ -570,25 +610,130 @@ class OrderExecutor:
             "comment": "sltp_fast",
         }
 
-        # Immediate limited retries (no sleep)
-        for i in range(1, 3):
+        for i in range(1, 4):
             with MT5_LOCK:
                 r = mt5.order_send(req)
+                le = mt5.last_error()
             rc = int(getattr(r, "retcode", 0) or 0) if r is not None else 0
+
             if _HEALTH_ENABLED:
-                log_health.info("SLTP_SET | try=%s ticket=%s rc=%s sl=%.5f tp=%.5f", i, ticket, rc, sl2, tp2)
+                log_health.info(
+                    "SLTP_SET | try=%s ticket=%s rc=%s sl=%.5f tp=%.5f last_error=%s",
+                    i,
+                    int(resolved),
+                    rc,
+                    float(sl2),
+                    float(tp2),
+                    le,
+                )
+
             if r is not None and rc in (rc_done, rc_done_partial):
                 return True
 
-        log_err.error("SLTP_SET_FAILED | ticket=%s symbol=%s", ticket, symbol)
+        log_err.error("SLTP_SET_FAILED | ticket=%s symbol=%s", int(resolved), symbol)
         return False
+
+    def _resolve_position_ticket(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        magic: int,
+        exec_price: float,
+        volume: float,
+        ticket: Optional[int],
+        candidate_tickets: tuple[int, ...],
+        sent_ts: float,
+        poll_ms: int = 250,
+    ) -> Optional[int]:
+        want_type = mt5.POSITION_TYPE_BUY if side == "Buy" else mt5.POSITION_TYPE_SELL
+
+        def _pos_exists_by_ticket(tk: int) -> bool:
+            if tk <= 0:
+                return False
+            try:
+                with MT5_LOCK:
+                    try:
+                        p = mt5.positions_get(ticket=int(tk)) or []
+                    except TypeError:
+                        p = None
+                    if p:
+                        px = p[0]
+                        return str(getattr(px, "symbol", "")) == str(symbol)
+            except Exception:
+                return False
+            return False
+
+        # A) direct candidates first
+        direct = [int(ticket or 0)] + [int(x or 0) for x in candidate_tickets]
+        for tk in direct:
+            if tk > 0 and _pos_exists_by_ticket(tk):
+                return tk
+
+        # B) bounded polling by elapsed time (no sleep)
+        deadline = time.perf_counter() + (float(poll_ms) / 1000.0)
+        best_ticket: int = 0
+        best_score = None
+        saw_any = False
+
+        while time.perf_counter() < deadline:
+            try:
+                with MT5_LOCK:
+                    positions = mt5.positions_get(symbol=symbol) or []
+            except Exception:
+                positions = []
+
+            if positions:
+                saw_any = True
+            else:
+                continue
+
+            for p in positions:
+                try:
+                    if int(getattr(p, "type", -1) or -1) != int(want_type):
+                        continue
+
+                    tk = int(getattr(p, "ticket", 0) or 0)
+                    if tk <= 0:
+                        continue
+
+                    pmagic = int(getattr(p, "magic", 0) or 0)
+                    pv = float(getattr(p, "volume", 0.0) or 0.0)
+                    popen = float(getattr(p, "price_open", 0.0) or 0.0)
+
+                    tmsc = getattr(p, "time_msc", None)
+                    pt = float(tmsc) if tmsc is not None else float(getattr(p, "time", 0.0) or 0.0) * 1000.0
+
+                    magic_penalty = 0 if pmagic == int(magic) else 1  # prefer matching magic
+                    dv = abs(pv - float(volume))
+                    dp = abs(popen - float(exec_price)) if popen > 0 else 0.0
+
+                    # Prefer: magic match, newest, closest volume, closest open price
+                    score = (magic_penalty, -pt, dv, dp)
+
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_ticket = tk
+                except Exception:
+                    continue
+
+            if best_ticket > 0:
+                return int(best_ticket)
+
+        # If we saw positions but couldn't select a ticket => inconsistent state
+        if saw_any:
+            return None
+
+        # Never saw any open position => netting/offset/instant close
+        return 0
+
+    # -------------------- legacy fast finder (kept) --------------------
 
     @staticmethod
     def _find_position_ticket_fast(*, symbol: str, side: str, volume: float, magic: int) -> Optional[int]:
         try:
             want_type = mt5.POSITION_TYPE_BUY if side == "Buy" else mt5.POSITION_TYPE_SELL
 
-            # Poll a few times immediately (no sleep). Usually position appears instantly.
             for _ in range(12):
                 with MT5_LOCK:
                     positions = mt5.positions_get(symbol=symbol) or []
@@ -664,7 +809,13 @@ class OrderExecutor:
                     }
                     with MT5_LOCK:
                         r = mt5.order_send(req)
-                    log_err.error("FAILSAFE_CLOSE | ticket=%s rc=%s", ticket, int(getattr(r, "retcode", 0) or 0))
+                        le = mt5.last_error()
+                    log_err.error(
+                        "FAILSAFE_CLOSE | ticket=%s rc=%s last_error=%s",
+                        ticket,
+                        int(getattr(r, "retcode", 0) or 0),
+                        le,
+                    )
                 except Exception:
                     continue
         except Exception:

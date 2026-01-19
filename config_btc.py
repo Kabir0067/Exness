@@ -112,13 +112,13 @@ class SymbolParams:
     entry_mode: str = "market"
 
     # Microstructure gate (ticks/second + imbalance + quote flips)
-    micro_window_sec: int = 4
-    micro_min_tps: float = 1.5
-    micro_max_tps: float = 320.0
-    micro_imb_thresh: float = 0.30
-    micro_spread_med_x: float = 1.65
-    quote_flips_max: int = 18
-    micro_tstat_thresh: float = 0.60
+    micro_window_sec: int = 3
+    micro_min_tps: float = 1.0
+    micro_max_tps: float = 360.0
+    micro_imb_thresh: float = 0.26
+    micro_spread_med_x: float = 1.75
+    quote_flips_max: int = 26
+    micro_tstat_thresh: float = 0.50
 
     pullback_atr_mult: float = 0.30
 
@@ -173,16 +173,16 @@ class SymbolParams:
 @dataclass(slots=True)
 class EngineConfig:
     # Credentials
-    login: int
-    password: str
-    server: str
-    telegram_token: str
-    admin_id: int
+    login: int = field(default_factory=lambda: _env_int("EXNESS_LOGIN"))
+    password: str = field(default_factory=lambda: _env_required("EXNESS_PASSWORD"))
+    server: str = field(default_factory=lambda: _env_required("EXNESS_SERVER"))
+    telegram_token: str = field(default_factory=lambda: _env_required("BOT_TOKEN"))
+    admin_id: int = field(default_factory=lambda: _env_int("ADMIN_ID"))
 
     symbol_params: SymbolParams = field(default_factory=SymbolParams)
 
     # Runtime
-    tz_local: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Asia/Dushanbe"))
+    tz_local: str = "Asia/Dushanbe"
     active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(0, 24)])
 
     # MT5 control (used by mt5_client.py)
@@ -201,12 +201,19 @@ class EngineConfig:
     # -------------------------------------------------------------------------
     daily_target_pct: float = 0.10
     max_daily_loss_pct: float = 0.03
-    protect_drawdown_from_peak_pct: float = 0.04
+    protect_drawdown_from_peak_pct: float = 0.30
     max_drawdown: float = 0.12
+    daily_loss_b_pct: float = 0.02
+    daily_loss_c_pct: float = 0.03
+    enforce_daily_limits: bool = True
+    ignore_daily_stop_for_trading: bool = False
+    enforce_drawdown_limits: bool = False
+    ignore_external_positions: bool = True
+    magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.90
-    ultra_confidence_min: float = 0.97
+    min_confidence_signal: float = 0.88
+    ultra_confidence_min: float = 0.95
 
     # Indicators
     ema_short: int = 9
@@ -258,22 +265,25 @@ class EngineConfig:
     min_bars_default: int = 200
 
     # Engine loop (BTC fast)
-    poll_seconds_fast: float = 0.12
-    decision_debounce_ms: float = 120.0
-    analysis_cooldown_sec: float = 10.0
-    cooldown_seconds: float = 30.0
+    poll_seconds_fast: float = 0.05
+    decision_debounce_ms: float = 50.0
+    analysis_cooldown_sec: float = 0.0
+    cooldown_seconds: float = 0.0  # No wait between order openings
+    signal_cooldown_sec_override: Optional[float] = None
 
     # Position sizing (force fixed volume for scalping stability)
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
-    max_positions: int = 3
+    max_positions: int = 8  # Scalp stability cap
 
     # Multi-order shaping
     multi_order_tp_bonus_pct: float = 0.18
-    multi_order_sl_tighten_pct: float = 0.60
+    multi_order_sl_tighten_pct: float = 0.25
+    multi_order_confidence_tiers: Tuple[float, float] = (0.94, 0.97)
+    multi_order_max_orders: int = 3
 
     # Limits (24/7 BTC)
-    max_trades_per_hour: int = 24
+    max_trades_per_hour: int = 100  # Increased
     max_signals_per_day: int = 0
 
     # SL/TP (ATR)
@@ -281,7 +291,14 @@ class EngineConfig:
     tp_atr_mult_trend: float = 2.20
     sl_atr_mult_range: float = 1.45
     tp_atr_mult_range: float = 1.75
+    tp_rr_cap: float = 1.1
 
+    min_rr: float = 1.0
+    sltp_cost_spread_mult: float = 1.8
+    sltp_cost_slip_mult: float = 1.0
+    sltp_cost_move_mult: float = 0.6
+    sltp_sl_floor_mult: float = 1.15
+    sltp_tp_floor_mult: float = 1.75
     signal_amplification: float = 1.10
     weights: Dict[str, float] = field(
         default_factory=lambda: {
@@ -356,7 +373,10 @@ class EngineConfig:
     # Policy toggles
     ignore_sessions: bool = True
     pause_analysis_on_position_open: bool = False
-    ignore_microstructure: bool = True
+    ignore_microstructure: bool = False
+    micro_rr: float = 1.0
+    micro_buffer_pct: float = 0.0007
+    micro_vol_mult: float = 1.6
 
     def validate(self) -> None:
         if int(self.login) <= 0:
@@ -405,6 +425,7 @@ class EngineConfig:
 
 
 def get_config_from_env() -> EngineConfig:
+    # Env for secrets ONLY
     cfg = EngineConfig(
         login=_env_int("EXNESS_LOGIN"),
         password=_env_required("EXNESS_PASSWORD"),
@@ -413,55 +434,9 @@ def get_config_from_env() -> EngineConfig:
         admin_id=_env_int("ADMIN_ID"),
     )
 
-    # Hard enforce BTCUSDm only
-    cfg.symbol_params.base = "BTCUSDm"
-    cfg.symbol_params.resolved = os.getenv("SYMBOL_RESOLVED", "").strip() or None
-
-    # Sessions: must be 0-24
-    if os.getenv("ACTIVE_SESSIONS"):
-        cfg.active_sessions = _parse_sessions(os.getenv("ACTIVE_SESSIONS", "0-24"))
-    else:
-        cfg.active_sessions = [(0, 24)]
-
-    # MT5 control
-    cfg.mt5_path = os.getenv("MT5_PATH", "").strip() or None
-    cfg.mt5_portable = _env_bool("MT5_PORTABLE", default=cfg.mt5_portable)
-    cfg.mt5_autostart = _env_bool("MT5_AUTOSTART", default=cfg.mt5_autostart)
-    cfg.mt5_timeout_ms = _env_int("MT5_TIMEOUT_MS", default=cfg.mt5_timeout_ms)
-
-    # Overrides (BTC)
-    if os.getenv("SPREAD_LIMIT_PCT"):
-        cfg.symbol_params.spread_limit_pct = _env_float("SPREAD_LIMIT_PCT", cfg.symbol_params.spread_limit_pct)
-    if os.getenv("SPREAD_CB_PCT"):
-        cfg.spread_cb_pct = _env_float("SPREAD_CB_PCT", cfg.spread_cb_pct)
-
-    if os.getenv("FIXED_VOLUME"):
-        cfg.fixed_volume = _env_float("FIXED_VOLUME", cfg.fixed_volume)
-    if os.getenv("MAX_POSITIONS"):
-        cfg.max_positions = _env_int("MAX_POSITIONS", cfg.max_positions)
-
-    if os.getenv("MAX_RISK_PER_TRADE"):
-        cfg.max_risk_per_trade = _env_float("MAX_RISK_PER_TRADE", cfg.max_risk_per_trade)
-
-    if os.getenv("DAILY_TARGET_PCT"):
-        cfg.daily_target_pct = _env_float("DAILY_TARGET_PCT", cfg.daily_target_pct)
-    if os.getenv("MAX_DAILY_LOSS_PCT"):
-        cfg.max_daily_loss_pct = _env_float("MAX_DAILY_LOSS_PCT", cfg.max_daily_loss_pct)
-    if os.getenv("MAX_DRAWDOWN"):
-        cfg.max_drawdown = _env_float("MAX_DRAWDOWN", cfg.max_drawdown)
-    if os.getenv("MAX_SIGNALS_PER_DAY"):
-        cfg.max_signals_per_day = _env_int("MAX_SIGNALS_PER_DAY", cfg.max_signals_per_day)
-    if os.getenv("IGNORE_SESSIONS"):
-        cfg.ignore_sessions = _env_bool("IGNORE_SESSIONS", default=cfg.ignore_sessions)
-    if os.getenv("PAUSE_ANALYSIS_ON_POSITION_OPEN"):
-        cfg.pause_analysis_on_position_open = _env_bool(
-            "PAUSE_ANALYSIS_ON_POSITION_OPEN",
-            default=cfg.pause_analysis_on_position_open,
-        )
-    if os.getenv("IGNORE_MICROSTRUCTURE"):
-        cfg.ignore_microstructure = _env_bool("IGNORE_MICROSTRUCTURE", default=cfg.ignore_microstructure)
-
-    cfg.enable_debug_logging = _env_bool("ENABLE_DEBUG_LOGGING", default=cfg.enable_debug_logging)
+    # All other params are now defaults in the class definition.
+    # Env overrides can be re-enabled here if strictly necessary,
+    # but based on requirements we stick to variables/code defaults.
 
     cfg.validate()
     return cfg
@@ -470,13 +445,14 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
-    cfg.min_confidence_signal = 0.92
-    cfg.ultra_confidence_min = 0.975
+    cfg.min_confidence_signal = 0.88
+    cfg.ultra_confidence_min = 0.95
     cfg.max_risk_per_trade = 0.012
-    cfg.poll_seconds_fast = 0.12
+    cfg.poll_seconds_fast = 0.05
     cfg.active_sessions = [(0, 24)]
     cfg.overnight_block_hours = 0.0
     cfg.trail_on_entry = True
+    cfg.ignore_microstructure = False
 
 
 __all__ = [

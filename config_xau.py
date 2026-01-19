@@ -95,16 +95,16 @@ class SymbolParams:
 
     entry_mode: str = "market"
 
-    micro_window_sec: int = 4
-    micro_min_tps: float = 1.5
-    micro_max_tps: float = 140.0
-    micro_imb_thresh: float = 0.28
-    micro_spread_med_x: float = 1.45
-    quote_flips_max: int = 16
-    micro_tstat_thresh: float = 0.6
+    micro_window_sec: int = 3
+    micro_min_tps: float = 1.0
+    micro_max_tps: float = 220.0
+    micro_imb_thresh: float = 0.24
+    micro_spread_med_x: float = 1.55
+    quote_flips_max: int = 22
+    micro_tstat_thresh: float = 0.50
 
     pullback_atr_mult: float = 0.28
-    spread_limit_pct: float = 0.00018
+    spread_limit_pct: float = 0.00025
 
     def validate(self) -> None:
         sym = self.resolved or self.base
@@ -137,28 +137,43 @@ class EngineConfig:
 
     symbol_params: SymbolParams = field(default_factory=SymbolParams)
 
-    tz_local: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Asia/Dushanbe"))
+    # Telegram / HTTP client tuning (no ENV)
+    http_pool_conn: int = 20
+    http_pool_max: int = 20
+    telegram_read_timeout: int = 60
+    telegram_connect_timeout: int = 60
+
+    tz_local: str = "Asia/Dushanbe"
     active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: list(XAU_SESSIONS_DEFAULT))
 
     # MT5 control (used by mt5_client.py)
     mt5_path: Optional[str] = None
     mt5_portable: bool = False
+    mt5_autostart: bool = True
+    mt5_timeout_ms: int = 10_000
 
     daily_target_pct: float = 0.10
-    ultra_confidence_min: float = 0.97
-    protect_drawdown_from_peak_pct: float = 0.03
+    ultra_confidence_min: float = 0.95
+    protect_drawdown_from_peak_pct: float = 0.30
     max_daily_loss_pct: float = 0.10
+    daily_loss_b_pct: float = 0.02
+    daily_loss_c_pct: float = 0.03
+    enforce_daily_limits: bool = True
+    ignore_daily_stop_for_trading: bool = False
+    enforce_drawdown_limits: bool = False
+    ignore_external_positions: bool = True
+    magic: int = 777001
 
-    min_confidence_signal: float = 0.90
-    conf_min: int = 94
-    conf_min_low: int = 86
-    conf_min_high: int = 97
+    min_confidence_signal: float = 0.84
+    conf_min: int = 88
+    conf_min_low: int = 80
+    conf_min_high: int = 93
 
-    adx_trend_lo: float = 19.0
-    adx_trend_hi: float = 28.0
+    adx_trend_lo: float = 18.0
+    adx_trend_hi: float = 27.0
     atr_rel_lo: float = 0.00055
     atr_rel_hi: float = 0.0028
-    min_body_pct_of_atr: float = 0.14
+    min_body_pct_of_atr: float = 0.12
     min_bar_age_sec: int = 1
 
     ema_short: int = 9
@@ -171,11 +186,12 @@ class EngineConfig:
     vol_lookback: int = 80
     rn_step: float = 20.0
 
-    poll_seconds_fast: float = 0.15
-    decision_debounce_ms: float = 150.0
-    analysis_cooldown_sec: float = 12.0
-    cooldown_seconds: float = 45.0
+    poll_seconds_fast: float = 0.05
+    decision_debounce_ms: float = 50.0
+    analysis_cooldown_sec: float = 0.0
+    cooldown_seconds: float = 0.0
     overnight_block_hours: float = 3.0
+    signal_cooldown_sec_override: Optional[float] = None
 
     health_window_minutes: int = 180
     enable_telemetry: bool = True
@@ -190,7 +206,9 @@ class EngineConfig:
     max_risk_per_trade: float = 0.02
     max_positions: int = 3
     multi_order_tp_bonus_pct: float = 0.18
-    multi_order_sl_tighten_pct: float = 0.6
+    multi_order_sl_tighten_pct: float = 0.25
+    multi_order_confidence_tiers: Tuple[float, float] = (0.94, 0.97)
+    multi_order_max_orders: int = 3
 
     islamic_min_leverage: int = 1
     require_swap_free: bool = False
@@ -203,6 +221,13 @@ class EngineConfig:
     tp_atr_mult_trend: float = 2.5
     sl_atr_mult_range: float = 1.45
     tp_atr_mult_range: float = 1.8
+    tp_rr_cap: float = 1.8
+    min_rr: float = 1.05
+    sltp_cost_spread_mult: float = 1.8
+    sltp_cost_slip_mult: float = 1.0
+    sltp_cost_move_mult: float = 0.6
+    sltp_sl_floor_mult: float = 1.15
+    sltp_tp_floor_mult: float = 1.6
     be_trigger_R: float = 0.8
     be_lock_spread_mult: float = 1.25
     trail_atr_mult: float = 1.05
@@ -299,34 +324,6 @@ def get_config_from_env() -> EngineConfig:
         admin_id=_env_int("ADMIN_ID"),
     )
 
-    # Optional MT5 control
-    cfg.mt5_path = os.getenv("MT5_PATH", "").strip() or None
-    cfg.mt5_portable = _env_bool("MT5_PORTABLE", default=False)
-
-    # Optional overrides
-    if os.getenv("DAILY_TARGET_PCT"):
-        cfg.daily_target_pct = _env_float("DAILY_TARGET_PCT", cfg.daily_target_pct)
-    if os.getenv("MAX_SIGNALS_PER_DAY"):
-        cfg.max_signals_per_day = _env_int("MAX_SIGNALS_PER_DAY", cfg.max_signals_per_day)
-    if os.getenv("IGNORE_SESSIONS"):
-        cfg.ignore_sessions = _env_bool("IGNORE_SESSIONS", default=cfg.ignore_sessions)
-    if os.getenv("PAUSE_ANALYSIS_ON_POSITION_OPEN"):
-        cfg.pause_analysis_on_position_open = _env_bool(
-            "PAUSE_ANALYSIS_ON_POSITION_OPEN",
-            default=cfg.pause_analysis_on_position_open,
-        )
-    if os.getenv("IGNORE_MICROSTRUCTURE"):
-        cfg.ignore_microstructure = _env_bool("IGNORE_MICROSTRUCTURE", default=cfg.ignore_microstructure)
-
-    cfg.enable_debug_logging = _env_bool("ENABLE_DEBUG_LOGGING", default=cfg.enable_debug_logging)
-
-    if os.getenv("CORRELATION_SYMBOL"):
-        cfg.correlation_symbol = os.getenv("CORRELATION_SYMBOL", cfg.correlation_symbol).strip()
-    if os.getenv("CORRELATION_VS_CURRENCY"):
-        cfg.correlation_vs_currency = os.getenv("CORRELATION_VS_CURRENCY", cfg.correlation_vs_currency).strip()
-    if os.getenv("CORRELATION_REFRESH_SEC"):
-        cfg.correlation_refresh_sec = _env_int("CORRELATION_REFRESH_SEC", cfg.correlation_refresh_sec)
-
     cfg.validate()
     return cfg
 
@@ -334,14 +331,14 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
-    cfg.min_confidence_signal = 0.90
-    cfg.ultra_confidence_min = 0.97
+    cfg.min_confidence_signal = 0.84
+    cfg.ultra_confidence_min = 0.95
     cfg.max_risk_per_trade = 0.02
     cfg.tp_atr_mult_trend = 2.5
     cfg.use_squeeze_filter = True
     cfg.hedge_flip_enabled = False
     cfg.pyramid_enabled = False
-    cfg.poll_seconds_fast = 0.15
+    cfg.poll_seconds_fast = 0.05
 
 
 __all__ = [

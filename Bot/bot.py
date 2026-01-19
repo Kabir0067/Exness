@@ -13,7 +13,6 @@ from __future__ import annotations
 """
 
 import logging
-import os
 import re
 import socket
 import time
@@ -65,6 +64,7 @@ from mt5_client import ensure_mt5, MT5_LOCK
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 
+
 # =============================================================================
 # Logging (production-grade: rotate + no dup handlers)
 # =============================================================================
@@ -102,6 +102,7 @@ if not log.handlers:
         tb_log.addHandler(ch)
 
 
+
 # =============================================================================
 # Config / Session
 # =============================================================================
@@ -120,8 +121,8 @@ SL_CALLBACK_PREFIX = "sl_usd:"
 _session = requests.Session()
 _adapter = HTTPAdapter(
     max_retries=3,
-    pool_connections=int(os.getenv("HTTP_POOL_CONN", "20")),
-    pool_maxsize=int(os.getenv("HTTP_POOL_MAX", "20")),
+    pool_connections=int(getattr(cfg, "http_pool_conn", 20) or 20),
+    pool_maxsize=int(getattr(cfg, "http_pool_max", 20) or 20),
 )
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
@@ -132,18 +133,17 @@ apihelper.CONNECT_TIMEOUT = int(getattr(cfg, "telegram_connect_timeout", 60) or 
 
 
 
-
 # =============================================================================
 # Bot instance
 # =============================================================================
 bot = telebot.TeleBot(cfg.telegram_token)
 
 
+
 # =============================================================================
 # Reliability: single retry/backoff layer (no double wrapping)
 # =============================================================================
 TG_LOCK = Lock()
-
 
 @dataclass(frozen=True)
 class Backoff:
@@ -154,7 +154,6 @@ class Backoff:
     def delay(self, attempt: int) -> float:
         return min(self.max_delay, self.base * (self.factor ** max(0, attempt - 1)))
 
-
 _NETWORK_EXC = (
     ReadTimeout,
     ConnectTimeout,
@@ -164,7 +163,6 @@ _NETWORK_EXC = (
     socket.gaierror,
     OSError,
 )
-
 
 def _should_retry(exc: Exception) -> bool:
     if isinstance(exc, _NETWORK_EXC):
@@ -184,7 +182,6 @@ def _should_retry(exc: Exception) -> bool:
         return any(x in msg for x in ("timed out", "timeout", "connection", "read timed"))
 
     return False
-
 
 def tg_call(
     fn: Callable[..., Any],
@@ -227,7 +224,6 @@ def tg_call(
             time.sleep(d)
     return None
 
-
 # Patch critical bot methods ONCE (keeps your old code calls working)
 _orig_send_message = bot.send_message
 _orig_edit_message_text = bot.edit_message_text
@@ -246,7 +242,6 @@ def _safe_send_message(*a: Any, **kw: Any) -> Any:
         **kw,
     )
 
-
 def _safe_edit_message_text(*a: Any, **kw: Any) -> Any:
     chat_id = _extract_chat_id_from_call("edit_message_text", a, kw)
     if chat_id is not None and _blocked_chat_cache.get(chat_id):
@@ -258,7 +253,6 @@ def _safe_edit_message_text(*a: Any, **kw: Any) -> Any:
         **kw,
     )
 
-
 def _safe_answer_callback_query(*a: Any, **kw: Any) -> Any:
     return tg_call(
         _orig_answer_callback_query,
@@ -266,7 +260,6 @@ def _safe_answer_callback_query(*a: Any, **kw: Any) -> Any:
         on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("answer_callback_query", exc, a, kw),
         **kw,
     )
-
 
 def _safe_send_chat_action(*a: Any, **kw: Any) -> Any:
     chat_id = _extract_chat_id_from_call("send_chat_action", a, kw)
@@ -278,7 +271,6 @@ def _safe_send_chat_action(*a: Any, **kw: Any) -> Any:
         on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("send_chat_action", exc, a, kw),
         **kw,
     )
-
 
 def _safe_set_my_commands(*a: Any, **kw: Any) -> Any:
     return tg_call(
@@ -295,12 +287,53 @@ bot.send_chat_action = _safe_send_chat_action
 bot.set_my_commands = _safe_set_my_commands
 
 
+
 # =============================================================================
 # Small utilities (security + maintainability)
 # =============================================================================
 def is_admin_chat(chat_id: int) -> bool:
     return bool(ADMIN and int(chat_id) == int(ADMIN))
 
+
+def _fmt_price(val: float) -> str:
+    try:
+        return f"{float(val):.3f}"
+    except Exception:
+        return str(val)
+
+
+def _notify_order_opened(intent: Any, result: Any) -> None:
+    try:
+        if not is_admin_chat(ADMIN):
+            return
+        if not getattr(result, "ok", False):
+            return
+
+        sl = float(getattr(intent, "sl", 0.0) or 0.0)
+        tp = float(getattr(intent, "tp", 0.0) or 0.0)
+        conf = float(getattr(intent, "confidence", 0.0) or 0.0)
+        conf_pct = max(0.0, min(1.0, conf)) * 100.0
+
+        sltp = f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0 and tp > 0) else "-"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        msg = (
+            "✅ <b>Ордер кушода шуд</b>\n"
+            f"Ассет: <b>{intent.asset}</b> | Символ: <b>{intent.symbol}</b>\n"
+            f"Самт: <b>{intent.signal}</b>\n"
+            f"Лот: <b>{float(intent.lot):.4f}</b>\n"
+            f"Нарх: <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b>\n"
+            f"SL/TP: <b>{sltp}</b>\n"
+            f"Дақиқӣ: <b>{conf_pct:.1f}%</b>\n"
+            f"ID: <code>{intent.order_id}</code>\n"
+            f"Вақт: {ts}"
+        )
+        bot.send_message(ADMIN, msg, parse_mode="HTML")
+    except Exception:
+        return
+
+
+engine.set_order_notifier(_notify_order_opened)
 
 def deny(message: types.Message) -> None:
     bot.send_message(
@@ -309,7 +342,6 @@ def deny(message: types.Message) -> None:
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
-
 def admin_only_message(fn: Callable[[types.Message], None]) -> Callable[[types.Message], None]:
     def wrapper(message: types.Message) -> None:
         if not is_admin_chat(message.chat.id):
@@ -317,7 +349,6 @@ def admin_only_message(fn: Callable[[types.Message], None]) -> Callable[[types.M
             return
         fn(message)
     return wrapper
-
 
 def admin_only_callback(fn: Callable[[types.CallbackQuery], None]) -> Callable[[types.CallbackQuery], None]:
     def wrapper(call: types.CallbackQuery) -> None:
@@ -333,6 +364,7 @@ def admin_only_callback(fn: Callable[[types.CallbackQuery], None]) -> Callable[[
             return
         fn(call)
     return wrapper
+
 
 
 # =============================================================================
@@ -366,10 +398,8 @@ class TTLCache:
             while len(self._d) > self.maxsize:
                 self._d.popitem(last=False)
 
-
 # Cache of chats that blocked the bot to avoid repeated 403 spam.
 _blocked_chat_cache = TTLCache(maxsize=512, ttl_sec=12 * 3600)
-
 
 def _extract_chat_id_from_call(
     fn_name: str,
@@ -392,7 +422,6 @@ def _extract_chat_id_from_call(
             if isinstance(candidate, (int, str)):
                 return candidate
     return None
-
 
 def _handle_permanent_telegram_failure(
     fn_name: str,
@@ -418,6 +447,7 @@ def _handle_permanent_telegram_failure(
                 )
             return True
     return False
+
 
 
 # =============================================================================
@@ -451,7 +481,6 @@ def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
         log.warning("fetch_external_correlation error: %s", exc)
         _corr_cache.set(key, None)
         return None
-
 
 def build_health_ribbon(status: Any, compact: bool = True) -> str:
     try:
@@ -487,7 +516,6 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
         log.error("build_health_ribbon error: %s", exc)
         return ""
 
-
 def _format_status_message(status: Any) -> str:
     active_label = str(getattr(status, 'active_asset', 'NONE'))
     if active_label == "NONE" and getattr(status, 'trading', False):
@@ -513,6 +541,7 @@ def _format_status_message(status: Any) -> str:
     )
 
 
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -529,6 +558,7 @@ def bot_commands() -> None:
     ok = bot.set_my_commands(commands)
     if not ok:
         log.warning("set_my_commands failed (non-fatal)")
+
 
 
 # =============================================================================
@@ -550,7 +580,6 @@ BTN_DAILY = "📋 Хулосаи руз"
 BTN_ENGINE = "🔍 Санҷиши Муҳаррик"
 BTN_FULL = "🛠 Санҷиши Пурраи Барнома"
 
-
 def buttons_func(message: types.Message) -> None:
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row(KeyboardButton(BTN_START), KeyboardButton(BTN_STOP))
@@ -563,10 +592,6 @@ def buttons_func(message: types.Message) -> None:
 
     bot.send_message(message.chat.id, "📋 Менюи Асосӣ: Як амалиётро интихоб кунед ⬇️", reply_markup=markup)
 
-
-
-
-
 def _build_tp_usd_keyboard(min_usd: int = TP_USD_MIN, max_usd: int = TP_USD_MAX, row_width: int = 5) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=row_width)
     kb.add(*[
@@ -575,7 +600,6 @@ def _build_tp_usd_keyboard(min_usd: int = TP_USD_MIN, max_usd: int = TP_USD_MAX,
     ])
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{TP_CALLBACK_PREFIX}cancel"))
     return kb
-
 
 def _format_tp_result(usd: float, res: dict) -> str:
     total = int(res.get("total", 0) or 0)
@@ -600,8 +624,8 @@ def _format_tp_result(usd: float, res: dict) -> str:
 
     return "\n".join(lines)
 
-
 @bot.message_handler(commands=["tek_prof"])
+@admin_only_message
 def tek_profit_put(message):
     kb = _build_tp_usd_keyboard()
     bot.send_message(
@@ -611,8 +635,8 @@ def tek_profit_put(message):
         parse_mode="Markdown",
     )
 
-
 @bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(TP_CALLBACK_PREFIX))
+@admin_only_callback
 def on_tp_usd_click(call):
     data = (call.data or "").split(":", 1)[-1].strip().lower()
 
@@ -654,8 +678,6 @@ def on_tp_usd_click(call):
 # =============================================================================
 # SL (USD) — interactive keyboard (1..10$)
 # =============================================================================
-
-
 def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX, row_width: int = 5):
     kb = InlineKeyboardMarkup(row_width=row_width)
     kb.add(*[
@@ -664,7 +686,6 @@ def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX,
     ])
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
     return kb
-
 
 def _format_sl_result(usd: float, res: dict) -> str:
     total = int(res.get("total", 0) or 0)
@@ -687,8 +708,8 @@ def _format_sl_result(usd: float, res: dict) -> str:
         lines += ["", "🧾 Хатоҳо (10-тои аввал):", preview]
     return "\n".join(lines)
 
-
 @bot.message_handler(commands=["stop_ls"])
+@admin_only_message
 def tek_stoploss_put(message):
     kb = _build_sl_usd_keyboard()
     bot.send_message(
@@ -698,8 +719,8 @@ def tek_stoploss_put(message):
         parse_mode="Markdown",
     )
 
-
 @bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(SL_CALLBACK_PREFIX))
+@admin_only_callback
 def on_sl_usd_click(call):
     data = (call.data or "").split(":", 1)[-1].strip().lower()
 
@@ -729,7 +750,6 @@ def on_sl_usd_click(call):
     except Exception as exc:
         bot.answer_callback_query(call.id, "Хато дар обработчик", show_alert=True)
         bot.send_message(call.message.chat.id, f"Handler error: {exc}")
-
 
 
 
@@ -770,7 +790,6 @@ def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     text += "———————————————\n"
     return text
 
-
 def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     bot.send_chat_action(chat_id, "typing")
 
@@ -793,6 +812,7 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     bot.send_message(chat_id, text, parse_mode="HTML")
 
 
+
 # =============================================================================
 # /start /history /balance /buttons /status
 # =============================================================================
@@ -804,12 +824,10 @@ def start_handler(message: types.Message) -> None:
     bot.send_message(message.chat.id, "👋 Хуш омадед ба бот! Барои идома тугмаҳои зерро истифода баред.")
     buttons_func(message)
 
-
 @bot.message_handler(commands=["history"])
 @admin_only_message
 def history_handler(message: types.Message) -> None:
     send_daily_summary(message.chat.id, force_refresh=True)
-
 
 @bot.message_handler(commands=["balance"])
 @admin_only_message
@@ -820,15 +838,10 @@ def balance_handler(message: types.Message) -> None:
         return
     bot.send_message(message.chat.id, f"💰 Баланс:\n {format_usdt(bal)}", parse_mode="HTML")
 
-
-
-
-
 @bot.message_handler(commands=["buttons"])
 @admin_only_message
 def buttons_handler(message: types.Message) -> None:
     buttons_func(message)
-
 
 @bot.message_handler(commands=["status"])
 @admin_only_message
@@ -844,6 +857,7 @@ def status_handler(message: types.Message) -> None:
             "⚠️ Ҳангоми дархости статус мушкил пеш омад. Эҳтимолан пайвастшавӣ ба MT5 вуҷуд надорад.",
             parse_mode="HTML",
         )
+
 
 
 # =============================================================================
@@ -864,7 +878,6 @@ def format_order(order_data: Dict[str, Any]) -> str:
         f"🔹 <b>Нархи Кушодан:</b> <code>{float(order_data.get('price', 0.0) or 0.0):.5f}</code>\n"
         f"🔹 <b>P&L (нореалӣ):</b> <code>{profit_sign}{profit:.2f}$</code>"
     )
-
 
 def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     key = (index, total, ticket)
@@ -889,7 +902,6 @@ def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     _orders_kb_cache.set(key, kb)
     return kb
 
-
 def start_view_open_orders(message: types.Message) -> None:
     if not is_admin_chat(message.chat.id):
         return
@@ -906,6 +918,7 @@ def start_view_open_orders(message: types.Message) -> None:
     bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="HTML")
 
 
+
 # =============================================================================
 # Callback router (no monolith)
 # =============================================================================
@@ -917,7 +930,6 @@ def callback_route(pattern: str) -> Callable[[Callable[[types.CallbackQuery, re.
         _CALLBACK_ROUTES.append((rx, fn))
         return fn
     return deco
-
 
 @bot.callback_query_handler(func=lambda call: True)
 @admin_only_callback
@@ -939,7 +951,6 @@ def callback_dispatch(call: types.CallbackQuery) -> None:
 
     bot.answer_callback_query(call.id)  # unknown callback -> silent
 
-
 @callback_route(r"^orders:nav:(\d+)$")
 def cb_orders_nav(call: types.CallbackQuery, m: re.Match[str]) -> None:
     idx = int(m.group(1))
@@ -959,7 +970,6 @@ def cb_orders_nav(call: types.CallbackQuery, m: re.Match[str]) -> None:
         reply_markup=kb,
     )
     bot.answer_callback_query(call.id)
-
 
 @callback_route(r"^orders:close:(\d+):(\d+)$")
 def cb_orders_close(call: types.CallbackQuery, m: re.Match[str]) -> None:
@@ -998,6 +1008,7 @@ def cb_orders_close_view(call: types.CallbackQuery, m: re.Match[str]) -> None:
         parse_mode="HTML",
     )
     bot.answer_callback_query(call.id, "Намоиш пӯшида шуд.")
+
 
 
 # =============================================================================
@@ -1069,27 +1080,39 @@ def handle_balance(message: types.Message) -> None:
 
 def handle_trade_start(message: types.Message) -> None:
     try:
+        st = engine.status()
+        if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
+            bot.send_message(message.chat.id, "ℹ️ Мотор аллакай фаъол аст.")
+            return
+
         if engine.manual_stop_active():
             engine.clear_manual_stop()
+
         engine.start()
-        if engine.manual_stop_active():
+
+        st_after = engine.status()
+        if bool(getattr(st_after, "manual_stop", False)):
             bot.send_message(
                 message.chat.id,
                 "⚠️ Тиҷорат ҳоло дар реҷаи дастӣ қатъ аст. Аввал аз режими дастӣ бароед.",
             )
-        else:
+        elif bool(getattr(st_after, "trading", False)):
             bot.send_message(message.chat.id, "🚀 Тиҷорат бомуваффақият оғоз шуд! (Мотор фаъол аст)")
+        else:
+            bot.send_message(message.chat.id, "⚠️ Мотор оғоз нашуд. Лутфан пайвастшавӣ ба MT5-ро санҷед.")
     except Exception as exc:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ ҳангоми оғози тиҷорат: {exc}")
 
 def handle_trade_stop(message: types.Message) -> None:
     try:
-        was_active = engine.stop()
-        engine.request_manual_stop()
+        st = engine.status()
+        was_active = engine.request_manual_stop()
         if was_active:
             bot.send_message(message.chat.id, "🛑 Тиҷорат қатъ карда шуд ва ба реҷаи дастӣ гузашт.")
+        elif bool(getattr(st, "manual_stop", False)):
+            bot.send_message(message.chat.id, "ℹ️ Реҷаи дастӣ аллакай фаъол аст.")
         else:
-            bot.send_message(message.chat.id, "ℹ️ Мотор аллакай қатъ буд. Реҷаи дастӣ фаъол аст.")
+            bot.send_message(message.chat.id, "ℹ️ Мотор аллакай қатъ буд.")
     except Exception as exc:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ ҳангоми қатъи тиҷорат: {exc}")
 
@@ -1120,7 +1143,6 @@ def handle_full_check(message: types.Message) -> None:
     if not ok:
         log.warning("Full check found issues")
 
-
 BUTTONS: Dict[str, Callable[[types.Message], None]] = {
     BTN_PROFIT_D: handle_profit_day,
     BTN_DAILY: handle_daily,
@@ -1138,7 +1160,6 @@ BUTTONS: Dict[str, Callable[[types.Message], None]] = {
     BTN_ENGINE: handle_engine_check,
     BTN_FULL: handle_full_check,
 }
-
 
 @bot.message_handler(func=lambda m: True)
 def message_dispatcher(message: types.Message) -> None:
@@ -1162,6 +1183,7 @@ def message_dispatcher(message: types.Message) -> None:
         return
 
     bot.send_message(message.chat.id, "❓ Амали номаълум. Лутфан аз менюи асосӣ интихоб кунед.")
+
 
 
 # =============================================================================
@@ -1221,3 +1243,6 @@ def check_full_program() -> tuple[bool, str]:
 
     ok_note = "✅ Санҷиши пурраи барнома анҷом ёфт. Ҳамаи модулҳо (XAU + BTC) ба таври дуруст фаъоланд."
     return True, ok_note + ("\n" + telemetry if telemetry else "")
+
+
+

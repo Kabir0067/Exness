@@ -445,12 +445,15 @@ class SignalEngine:
 
     def _check_drawdown(self) -> bool:
         try:
-            with MT5_LOCK:
-                acc = mt5.account_info()
-            if not acc:
-                return False
-            bal = float(acc.balance or 0.0)
-            eq = float(acc.equity or 0.0)
+            if bool(getattr(self.cfg, "ignore_external_positions", False)):
+                bal, eq = self.risk._account_snapshot()
+            else:
+                with MT5_LOCK:
+                    acc = mt5.account_info()
+                if not acc:
+                    return False
+                bal = float(acc.balance or 0.0)
+                eq = float(acc.equity or 0.0)
             if bal <= 0:
                 self._current_drawdown = 0.0
             else:
@@ -471,6 +474,11 @@ class SignalEngine:
         conf_min = int(getattr(self.cfg, "conf_min", 94) or 94)
         if phase not in ("A", "B"):
             conf_min = min(100, conf_min + 2)
+        # ALWAYS inject ATR so RiskManager can plan SL/TP scientifically
+        try:
+            atr_p = float(indp.get("atr", 0.0) or 0.0)
+        except Exception:
+            atr_p = 0.0
 
         return {
             "conf_min": int(conf_min),
@@ -480,6 +488,7 @@ class SignalEngine:
             "w_mul": {"trend": 1.0, "momentum": 1.0, "meanrev": 1.0, "structure": 1.0, "volume": 1.0},
             "regime": "trend",
             "phase": phase,
+            "atr": float(atr_p),
         }
 
     def _extreme_flag(self, dfp: pd.DataFrame, indp: Dict[str, Any]) -> bool:
@@ -798,7 +807,7 @@ class SignalEngine:
                 tick_vol = float(getattr(tick_stats, "volatility", 0.0) or 0.0)
                 open_pos, unreal_pl = self._position_context(sym)
 
-                                # Use executable market price (bid/ask) as entry for SL/TP planning (scalping-safe)
+                # Use executable market price (bid/ask) as entry for SL/TP planning (scalping-safe)
                 entry_price = float(indp.get("close", 0.0) or 0.0)
                 try:
                     with MT5_LOCK:
@@ -873,6 +882,12 @@ class SignalEngine:
         try:
             with MT5_LOCK:
                 positions = mt5.positions_get(symbol=sym) or []
+            if bool(getattr(self.cfg, "ignore_external_positions", False)):
+                try:
+                    magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+                except Exception:
+                    magic = 777001
+                positions = [p for p in positions if int(getattr(p, "magic", 0) or 0) == magic]
             open_pos = int(len(positions))
             unreal_pl = float(sum(float(p.profit or 0.0) for p in positions))
             return open_pos, unreal_pl

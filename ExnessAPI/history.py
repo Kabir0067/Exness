@@ -1,6 +1,5 @@
 from typing import Literal, Dict, Any, List
 from datetime import datetime, timedelta
-import os
 from zoneinfo import ZoneInfo
 import MetaTrader5 as mt5
 
@@ -12,7 +11,7 @@ _cache_time = None
 
 
 def _local_now() -> datetime:
-    tz_name = os.getenv("TIMEZONE", "Asia/Dushanbe")
+    tz_name = "Asia/Dushanbe"
     try:
         return datetime.now(ZoneInfo(tz_name))
     except Exception:
@@ -171,7 +170,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
 
         trades: Dict[int, Dict] = {}
         for d in deals:
-            pid = d.position_id
+            pid = int(getattr(d, "position_id", 0) or 0)
             if pid not in trades:
                 trades[pid] = {"entry": None, "exit": None}
             if d.entry == mt5.DEAL_ENTRY_IN:
@@ -184,6 +183,13 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
         unrealized_pnl = sum(float(p.profit) for p in open_positions)
 
         records = []
+        open_map: Dict[int, Any] = {}
+        for p in open_positions:
+            pos_id = int(getattr(p, "position_id", 0) or 0)
+            if pos_id == 0:
+                pos_id = int(getattr(p, "ticket", 0) or 0)
+            if pos_id:
+                open_map[pos_id] = p
 
         for pid, t in trades.items():
             entry = t["entry"]
@@ -191,7 +197,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             if not entry:
                 continue
 
-            open_pos = next((p for p in open_positions if p.position_id == pid), None)
+            open_pos = open_map.get(int(pid))
             if open_pos:
                 profit = float(open_pos.profit)
                 status = "open"

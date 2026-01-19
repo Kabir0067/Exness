@@ -58,38 +58,31 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 
 def _rotating_file_logger(
-    name: str,
-    filename: str,
-    level: int,
-    max_bytes_env: Optional[str] = None,
-    backups_env: Optional[str] = None,
-    default_max_bytes: int = 5_242_880,  # 5MB
-    default_backups: int = 5,
-) -> logging.Logger:
-    """Create a rotated file logger.
-
-    FIX vs your broken version:
-    - max_bytes_env/backups_env are optional so diag logger doesn't crash import.
-    """
-
+        name: str, 
+        filename: str, 
+        level: int, 
+        max_bytes: int = 5_242_880, 
+        backups: int = 5
+    ) -> logging.Logger:
+    
     logger = logging.getLogger(name)
+    if logger.handlers:  # Кӯтоҳтарин роҳи санҷиши Idempotency
+        return logger
+
     logger.setLevel(level)
     logger.propagate = False
 
-    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
-        max_bytes = int(os.getenv(max_bytes_env, str(default_max_bytes))) if max_bytes_env else default_max_bytes
-        backups = int(os.getenv(backups_env, str(default_backups))) if backups_env else default_backups
-
-        fh = RotatingFileHandler(
-            filename=str(get_log_path(filename)),
-            maxBytes=max_bytes,
-            backupCount=backups,
-            encoding="utf-8",
-            delay=True,
-        )
-        fh.setLevel(level)
-        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
-        logger.addHandler(fh)
+    fh = RotatingFileHandler(
+        filename=str(get_log_path(filename)),
+        maxBytes=max_bytes,
+        backupCount=backups,
+        encoding="utf-8",
+        delay=True
+    )
+    
+    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
+    fh.setFormatter(logging.Formatter(fmt))
+    logger.addHandler(fh)
 
     return logger
 
@@ -98,16 +91,12 @@ log_err = _rotating_file_logger(
     "portfolio.engine",
     "portfolio_engine.log",
     logging.ERROR,
-    max_bytes_env="PORTFOLIO_ENGINE_LOG_MAX_BYTES",
-    backups_env="PORTFOLIO_ENGINE_LOG_BACKUPS",
 )
 
 log_health = _rotating_file_logger(
     "portfolio.engine.health",
     "portfolio_engine_health.log",
     logging.INFO,
-    max_bytes_env="PORTFOLIO_ENGINE_HEALTH_LOG_MAX_BYTES",
-    backups_env="PORTFOLIO_ENGINE_HEALTH_LOG_BACKUPS",
 )
 
 # Structured snapshots (jsonl)
@@ -115,14 +104,12 @@ log_diag = _rotating_file_logger(
     "portfolio.engine.diag",
     "portfolio_engine_diag.jsonl",
     logging.INFO,
-    max_bytes_env="PORTFOLIO_ENGINE_DIAG_MAX_BYTES",
-    backups_env="PORTFOLIO_ENGINE_DIAG_BACKUPS",
-    default_max_bytes=10_485_760,  # 10MB
-    default_backups=8,
+    max_bytes=10_485_760,  # 10MB
+    backups=8,
 )
 
-_DIAG_ENABLED = os.getenv("PORTFOLIO_DIAG", "1").strip().lower() in {"1", "true", "yes", "on"}
-_DIAG_EVERY_SEC = float(os.getenv("PORTFOLIO_DIAG_SEC", "30") or 30)
+_DIAG_ENABLED = True
+_DIAG_EVERY_SEC = 30.0
 
 # =============================================================================
 # JSON encoding helper for diagnostics (dataclasses + common non-JSON types)
@@ -271,6 +258,7 @@ class OrderIntent:
     asset: str
     symbol: str
     signal: str
+    confidence: float
     lot: float
     sl: float
     tp: float
@@ -331,12 +319,12 @@ class _AssetPipeline:
             else "-"
         )
 
-        self._signal_log_every = float(os.getenv("PORTFOLIO_SIGNAL_LOG_SEC", "5.0"))
+        self._signal_log_every = 5.0      
         self._last_signal_log_ts = 0.0
 
         # Market freshness thresholds
-        self._max_bar_age_mult = float(os.getenv("PORTFOLIO_MAX_BAR_AGE_MULT", "2.5"))
-        self._min_bar_age_sec = float(os.getenv("PORTFOLIO_MIN_BAR_AGE_SEC", "180"))
+        self._max_bar_age_mult = 2.5     
+        self._min_bar_age_sec = 180.0
 
         self._last_market_ok_ts = 0.0
         self._market_validate_every = float(getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0)
@@ -536,6 +524,12 @@ class _AssetPipeline:
         try:
             with MT5_LOCK:
                 pos = mt5.positions_get(symbol=self.symbol) or []
+            if bool(getattr(self.cfg, "ignore_external_positions", False)):
+                try:
+                    magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+                except Exception:
+                    magic = 777001
+                pos = [p for p in pos if int(getattr(p, "magic", 0) or 0) == magic]
             if self.risk and hasattr(self.risk, "on_reconcile_positions"):
                 try:
                     self.risk.on_reconcile_positions(pos)
@@ -548,6 +542,12 @@ class _AssetPipeline:
         try:
             with MT5_LOCK:
                 pos = mt5.positions_get(symbol=self.symbol) or []
+            if bool(getattr(self.cfg, "ignore_external_positions", False)):
+                try:
+                    magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+                except Exception:
+                    magic = 777001
+                pos = [p for p in pos if int(getattr(p, "magic", 0) or 0) == magic]
             return int(len(pos))
         except Exception:
             return 0
@@ -615,11 +615,18 @@ class _AssetPipeline:
 
 
 class ExecutionWorker(threading.Thread):
-    def __init__(self, order_queue: "queue.Queue[OrderIntent]", result_queue: "queue.Queue[ExecutionResult]", dry_run: bool) -> None:
+    def __init__(
+        self,
+        order_queue: "queue.Queue[OrderIntent]",
+        result_queue: "queue.Queue[ExecutionResult]",
+        dry_run: bool,
+        order_notify_cb: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None,
+    ) -> None:
         super().__init__(daemon=True)
         self.order_queue = order_queue
         self.result_queue = result_queue
         self.dry_run = bool(dry_run)
+        self.order_notify_cb = order_notify_cb
         self._run = threading.Event()
         self._run.set()
 
@@ -787,6 +794,27 @@ class ExecutionWorker(threading.Thread):
             (float(r.fill_ts) - float(r.sent_ts)) * 1000.0,
         )
 
+        if (not self.dry_run) and bool(r.ok) and self.order_notify_cb:
+            try:
+                self.order_notify_cb(
+                    intent,
+                    ExecutionResult(
+                        order_id=r.order_id,
+                        signal_id=r.signal_id,
+                        ok=bool(r.ok),
+                        reason=str(r.reason),
+                        sent_ts=float(r.sent_ts),
+                        fill_ts=float(r.fill_ts),
+                        req_price=float(r.req_price),
+                        exec_price=float(r.exec_price),
+                        volume=float(r.volume),
+                        slippage=float(r.slippage),
+                        retcode=int(r.retcode),
+                    ),
+                )
+            except Exception:
+                pass
+
         return ExecutionResult(
             order_id=r.order_id,
             signal_id=r.signal_id,
@@ -824,32 +852,31 @@ class MultiAssetTradingEngine:
 
         # Idempotency
         self._seen: Deque[Tuple[str, str, float]] = deque(maxlen=8000)  # (asset, signal_id, ts)
-        self._seen_index: Dict[Tuple[str, str], float] = {}
-        raw_cd = os.getenv("PORTFOLIO_SIGNAL_COOLDOWN_SEC", "").strip()
-        self._signal_cooldown_override_sec: Optional[float] = float(raw_cd) if raw_cd else None
+        self._seen_index: Dict[Tuple[str, str], Tuple[float, int]] = {}
+        self._signal_cooldown_override_sec: Optional[float] = None
         # Per-asset idempotency cooldown (defaults; refreshed after pipelines build)
         self._signal_cooldown_sec_by_asset: Dict[str, float] = {"XAU": 60.0, "BTC": 60.0}
-        # Queues
-        self._max_queue = int(os.getenv("PORTFOLIO_MAX_EXEC_QUEUE", "12"))
+        # Queues_ signal_cooldown_sec
+        self._max_queue = 64
         self._order_q: "queue.Queue[OrderIntent]" = queue.Queue(maxsize=self._max_queue)
         self._result_q: "queue.Queue[ExecutionResult]" = queue.Queue(maxsize=max(60, self._max_queue * 6))
         self._exec_worker: Optional[ExecutionWorker] = None
 
         # Loop timings
-        self._poll_fast = float(os.getenv("PORTFOLIO_POLL_FAST", "0.20"))
-        self._poll_slow = float(os.getenv("PORTFOLIO_POLL_SLOW", "1.00"))
-        self._heartbeat_every = float(os.getenv("PORTFOLIO_HEARTBEAT_SEC", "5.0"))
+        self._poll_fast = 0.05
+        self._poll_slow = 0.20
+        self._heartbeat_every = 5.0
         self._last_heartbeat_ts = 0.0
         self._exec_health_last_ts = 0.0
 
-        self._pipeline_log_every = float(os.getenv("PORTFOLIO_PIPELINE_LOG_SEC", "2.0"))
+        self._pipeline_log_every = 2.0
         self._last_pipeline_log_ts = 0.0
         self._last_pipeline_log_key: Tuple[Any, ...] = (None, None, None, None)
         self._last_reconcile_ts = 0.0
 
         # Recovery
-        self._max_consecutive_errors = int(os.getenv("PORTFOLIO_MAX_CONSECUTIVE_ERRORS", "12"))
-        self._recover_backoff_s = float(os.getenv("PORTFOLIO_RECOVER_BACKOFF_SEC", "10.0"))
+        self._max_consecutive_errors = 12   
+        self._recover_backoff_s = 10.0
         self._last_recover_ts = 0.0
 
         # Diagnostics
@@ -861,11 +888,21 @@ class MultiAssetTradingEngine:
         self._btc_cfg: BtcConfig = get_btc_config()
         btc_apply_high_accuracy_mode(self._btc_cfg, True)
 
+        raw_cd = (
+            getattr(self._xau_cfg, "signal_cooldown_sec_override", None)
+            or getattr(self._btc_cfg, "signal_cooldown_sec_override", None)
+        )
+        self._signal_cooldown_override_sec = float(raw_cd) if raw_cd else None
+
         self._xau: Optional[_AssetPipeline] = None
         self._btc: Optional[_AssetPipeline] = None
 
         self._last_cand_xau: Optional[AssetCandidate] = None
         self._last_cand_btc: Optional[AssetCandidate] = None
+        self._order_notifier: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None
+
+    def set_order_notifier(self, cb: Optional[Callable[[OrderIntent, ExecutionResult], None]]) -> None:
+        self._order_notifier = cb
 
     # -------------------- MT5 init/health --------------------
     def _init_mt5(self) -> bool:
@@ -937,6 +974,14 @@ class MultiAssetTradingEngine:
         self._btc.ensure_symbol_selected()
 
         self._refresh_signal_cooldowns()
+        try:
+            self._poll_fast = min(
+                float(getattr(self._xau_cfg, "poll_seconds_fast", self._poll_fast) or self._poll_fast),
+                float(getattr(self._btc_cfg, "poll_seconds_fast", self._poll_fast) or self._poll_fast),
+            )
+            self._poll_slow = max(self._poll_fast * 4.0, 0.20)
+        except Exception:
+            pass
 
         log_health.info("PIPELINES_BUILT | xau=%s btc=%s", self._xau.symbol, self._btc.symbol)
 
@@ -948,7 +993,12 @@ class MultiAssetTradingEngine:
         except Exception:
             pass
 
-        self._exec_worker = ExecutionWorker(self._order_q, self._result_q, dry_run=self._dry_run)
+        self._exec_worker = ExecutionWorker(
+            self._order_q,
+            self._result_q,
+            dry_run=self._dry_run,
+            order_notify_cb=self._order_notifier,
+        )
         self._exec_worker.start()
 
     def _recover_all(self) -> bool:
@@ -1006,20 +1056,37 @@ class MultiAssetTradingEngine:
             self._signal_cooldown_sec_by_asset["BTC"] = 60.0
 
     # -------------------- idempotency --------------------
-    def _is_duplicate(self, asset: str, signal_id: str, now: float) -> bool:
+    def _cooldown_for_asset(self, asset: str) -> float:
+        return float(self._signal_cooldown_sec_by_asset.get(asset, 60.0))
+
+    def _is_duplicate(self, asset: str, signal_id: str, now: float, max_orders: int) -> bool:
         last = self._seen_index.get((asset, signal_id))
-        cooldown = float(self._signal_cooldown_sec_by_asset.get(asset, 60.0))
-        return bool(last is not None and (now - last) < cooldown)
+        if not last:
+            return False
+        last_ts, count = last
+        cooldown = self._cooldown_for_asset(asset)
+        if (now - float(last_ts)) >= cooldown:
+            return False
+        return int(count) >= int(max_orders)
 
     def _mark_seen(self, asset: str, signal_id: str, now: float) -> None:
         key = (asset, signal_id)
-        self._seen_index[key] = now
+        cooldown = self._cooldown_for_asset(asset)
+        last = self._seen_index.get(key)
+        count = 0
+        if last:
+            last_ts, last_count = last
+            if (now - float(last_ts)) < cooldown:
+                count = int(last_count)
+        count += 1
+        self._seen_index[key] = (float(now), int(count))
         self._seen.append((asset, signal_id, now))
         max_cd = max(self._signal_cooldown_sec_by_asset.values(), default=60.0)
         ttl = max(2.0 * float(max_cd), 120.0)
         while self._seen and (now - self._seen[0][2]) > ttl:
             a, sid, ts = self._seen.popleft()
-            if self._seen_index.get((a, sid)) == ts:
+            rec = self._seen_index.get((a, sid))
+            if rec and float(rec[0]) == float(ts):
                 self._seen_index.pop((a, sid), None)
 
     # -------------------- portfolio logic --------------------
@@ -1056,10 +1123,17 @@ class MultiAssetTradingEngine:
             return "BTC"
         return "NONE"
 
-    def _enqueue_order(self, cand: AssetCandidate) -> Tuple[bool, Optional[str]]:
+    def _enqueue_order(
+        self,
+        cand: AssetCandidate,
+        *,
+        order_index: int = 0,
+        order_count: int = 1,
+        lot_override: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str]]:
         now = time.time()
 
-        if self._is_duplicate(cand.asset, cand.signal_id, now):
+        if self._is_duplicate(cand.asset, cand.signal_id, now, max_orders=int(order_count)):
             log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
             return False, None
 
@@ -1086,11 +1160,16 @@ class MultiAssetTradingEngine:
             risk = self._btc.risk if self._btc else None
             cfg = self._btc_cfg
 
+        lot_val = float(lot_override) if lot_override is not None else float(cand.lot)
+        if lot_val <= 0:
+            log_health.info("ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset)
+            return False, None
         intent = OrderIntent(
             asset=cand.asset,
             symbol=cand.symbol,
             signal=cand.signal,
-            lot=float(cand.lot),
+            confidence=float(cand.confidence),
+            lot=float(lot_val),
             sl=float(cand.sl),
             tp=float(cand.tp),
             price=float(price),
@@ -1123,6 +1202,55 @@ class MultiAssetTradingEngine:
                 pass
 
         return True, order_id
+
+    def _orders_for_candidate(self, cand: AssetCandidate) -> int:
+        if cand.asset == "XAU":
+            cfg = self._xau_cfg
+        else:
+            cfg = self._btc_cfg
+
+        tiers = getattr(cfg, "multi_order_confidence_tiers", (0.94, 0.97)) or (0.94, 0.97)
+        if len(tiers) < 2:
+            tiers = (0.94, 0.97)
+        lo, hi = sorted((float(tiers[0]), float(tiers[1])))
+
+        max_orders = int(getattr(cfg, "multi_order_max_orders", 3) or 3)
+        max_orders = max(1, min(3, max_orders))
+
+        conf = float(cand.confidence)
+        if conf > 1.5:
+            conf = conf / 100.0
+
+        n_orders = 1
+        if conf >= lo:
+            n_orders = 2
+        if conf >= hi:
+            n_orders = 3
+
+        return int(min(max_orders, max(1, n_orders)))
+
+    @staticmethod
+    def _min_lot(risk: Any) -> float:
+        try:
+            if risk and hasattr(risk, "_symbol_meta"):
+                risk._symbol_meta()  # type: ignore[attr-defined]
+            return float(getattr(risk, "_vol_min", 0.01) or 0.01)
+        except Exception:
+            return 0.01
+
+    def _split_lot(self, lot: float, parts: int, risk: Any) -> list[float]:
+        lot = float(lot)
+        if int(parts) <= 1:
+            return [lot]
+
+        min_lot = self._min_lot(risk)
+        if min_lot <= 0 or (lot / float(parts)) < min_lot:
+            return [lot]
+
+        base = lot / float(parts)
+        lots = [base for _ in range(int(parts))]
+        lots[-1] = float(lot) - (base * float(int(parts) - 1))
+        return lots
 
     # -------------------- heartbeat/status --------------------
     def _heartbeat(self, open_xau: int, open_btc: int) -> None:
@@ -1610,16 +1738,18 @@ class MultiAssetTradingEngine:
                         time.sleep(0.6)
                     continue
 
-                # Hard stop if any risk requests it
+                # Hard stop (stop engine for the day)
                 try:
                     if self._xau.risk and hasattr(self._xau.risk, "requires_hard_stop") and self._xau.risk.requires_hard_stop():
-                        close_all_position()
-                        log_health.info("HARD_STOP_TRIGGERED | asset=XAU")
+                        log_health.info("HARD_STOP_TRIGGERED | asset=XAU (stop_for_day)")
+                        with self._lock:
+                            self._manual_stop = True
                         self._run.clear()
                         break
                     if self._btc.risk and hasattr(self._btc.risk, "requires_hard_stop") and self._btc.risk.requires_hard_stop():
-                        close_all_position()
-                        log_health.info("HARD_STOP_TRIGGERED | asset=BTC")
+                        log_health.info("HARD_STOP_TRIGGERED | asset=BTC (stop_for_day)")
+                        with self._lock:
+                            self._manual_stop = True
                         self._run.clear()
                         break
                 except Exception:
@@ -1709,32 +1839,48 @@ class MultiAssetTradingEngine:
 
                 # Execute all valid signals (Concurrent Execution - Zero Latency Batch)
                 for selected in candidates:
-                    # enqueue_order checks duplicate, then puts to Queue.
-                    # The ExecutionWorker picks it up instantly.
-                    ok, oid = self._enqueue_order(selected)
-                    if ok:
-                        log_health.info(
-                            "ORDER_SELECTED | asset=%s symbol=%s signal=%s conf=%.4f lot=%.4f sl=%s tp=%s order_id=%s reasons=%s",
-                            selected.asset,
-                            selected.symbol,
-                            selected.signal,
-                            selected.confidence,
-                            selected.lot,
-                            selected.sl,
-                            selected.tp,
-                            oid,
-                            ",".join(selected.reasons) if selected.reasons else "-",
+                    order_count = self._orders_for_candidate(selected)
+                    risk = self._xau.risk if selected.asset == "XAU" and self._xau else (
+                        self._btc.risk if self._btc else None
+                    )
+                    lots = self._split_lot(float(selected.lot), order_count, risk)
+
+                    for idx, lot_val in enumerate(lots):
+                        # enqueue_order checks duplicate, then puts to Queue.
+                        # The ExecutionWorker picks it up instantly.
+                        ok, oid = self._enqueue_order(
+                            selected,
+                            order_index=int(idx),
+                            order_count=int(order_count),
+                            lot_override=float(lot_val),
                         )
-                    else:
-                        log_health.info(
-                            "ORDER_SKIP | asset=%s symbol=%s signal=%s conf=%.4f blocked=%s reasons=%s",
-                            selected.asset,
-                            selected.symbol,
-                            selected.signal,
-                            selected.confidence,
-                            selected.blocked,
-                            ",".join(selected.reasons) if selected.reasons else "-",
-                        )
+                        if ok:
+                            log_health.info(
+                                "ORDER_SELECTED | asset=%s symbol=%s signal=%s conf=%.4f lot=%.4f sl=%s tp=%s order_id=%s batch=%s/%s reasons=%s",
+                                selected.asset,
+                                selected.symbol,
+                                selected.signal,
+                                selected.confidence,
+                                float(lot_val),
+                                selected.sl,
+                                selected.tp,
+                                oid,
+                                int(idx) + 1,
+                                int(order_count),
+                                ",".join(selected.reasons) if selected.reasons else "-",
+                            )
+                        else:
+                            log_health.info(
+                                "ORDER_SKIP | asset=%s symbol=%s signal=%s conf=%.4f blocked=%s batch=%s/%s reasons=%s",
+                                selected.asset,
+                                selected.symbol,
+                                selected.signal,
+                                selected.confidence,
+                                selected.blocked,
+                                int(idx) + 1,
+                                int(order_count),
+                                ",".join(selected.reasons) if selected.reasons else "-",
+                            )
 
                 consecutive_errors = 0
 
@@ -1745,7 +1891,7 @@ class MultiAssetTradingEngine:
                     poll = self._poll_slow
                 if any(c.latency_ms >= 250.0 for c in candidates):
                     poll = self._poll_slow
-                time.sleep(max(0.10, poll - dt))
+                time.sleep(max(0.02, poll - dt))
 
             except Exception as exc:
                 consecutive_errors += 1
@@ -1760,4 +1906,4 @@ class MultiAssetTradingEngine:
 
 
 # Global instance (import-compatible)
-engine = MultiAssetTradingEngine(dry_run=bool(int(os.getenv("PORTFOLIO_DRY_RUN", "0"))))
+engine = MultiAssetTradingEngine(dry_run=False)
