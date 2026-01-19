@@ -373,7 +373,7 @@ class EngineConfig:
     # Policy toggles
     ignore_sessions: bool = True
     pause_analysis_on_position_open: bool = False
-    ignore_microstructure: bool = False
+    ignore_microstructure: bool = True
     micro_rr: float = 1.0
     micro_buffer_pct: float = 0.0007
     micro_vol_mult: float = 1.6
@@ -452,7 +452,7 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     cfg.active_sessions = [(0, 24)]
     cfg.overnight_block_hours = 0.0
     cfg.trail_on_entry = True
-    cfg.ignore_microstructure = False
+    cfg.ignore_microstructure = True
 
 
 __all__ = [

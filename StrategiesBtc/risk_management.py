@@ -923,8 +923,10 @@ class RiskManager:
             if spread_pct > float(self.sp.spread_limit_pct):
                 reasons.append("spread_pct")
 
-            if not tick_ok and tick_reason not in ("tps_low", "no_rates"):
-                reasons.append(f"micro:{tick_reason}")
+            ignore_micro = bool(getattr(self.cfg, "ignore_microstructure", False))
+            if not ignore_micro:
+                if not tick_ok and tick_reason not in ("tps_low", "no_rates"):
+                    reasons.append(f"micro:{tick_reason}")
 
             # BTC session: engine should pass market_open_24_5()
             if not bool(getattr(self.cfg, "ignore_sessions", False)):
