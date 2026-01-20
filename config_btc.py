@@ -189,7 +189,7 @@ class EngineConfig:
     mt5_path: Optional[str] = None
     mt5_portable: bool = False
     mt5_autostart: bool = True
-    mt5_timeout_ms: int = 10_000
+    mt5_timeout_ms: int = 30_000
 
     # BTC is 24/7: no overnight block
     overnight_block_hours: float = 0.0
@@ -212,8 +212,8 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.88
-    ultra_confidence_min: float = 0.95
+    min_confidence_signal: float = 0.82
+    ultra_confidence_min: float = 0.90
 
     # Indicators
     ema_short: int = 9
@@ -225,12 +225,12 @@ class EngineConfig:
     adx_period: int = 14
     vol_lookback: int = 80
 
-    adx_trend_lo: float = 18.0
+    adx_trend_lo: float = 16.0
     adx_trend_hi: float = 32.0
     adx_impulse_hi: float = 42.0
     atr_rel_lo: float = 0.00080
     atr_rel_hi: float = 0.01000
-    min_body_pct_of_atr: float = 0.12
+    min_body_pct_of_atr: float = 0.09
     min_bar_age_sec: int = 1
 
     # Volume thresholds (BTC scalping)
@@ -260,13 +260,13 @@ class EngineConfig:
     indicator_cache_min_interval_ms: float = 0.0
 
     # Minimum bars for analysis
-    min_bars_m1: int = 260
-    min_bars_m5_m15: int = 220
-    min_bars_default: int = 200
+    min_bars_m1: int = 200
+    min_bars_m5_m15: int = 180
+    min_bars_default: int = 160
 
     # Engine loop (BTC fast)
     poll_seconds_fast: float = 0.05
-    decision_debounce_ms: float = 50.0
+    decision_debounce_ms: float = 20.0
     analysis_cooldown_sec: float = 0.0
     cooldown_seconds: float = 0.0  # No wait between order openings
     signal_cooldown_sec_override: Optional[float] = None
@@ -274,12 +274,12 @@ class EngineConfig:
     # Position sizing (force fixed volume for scalping stability)
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
-    max_positions: int = 8  # Scalp stability cap
+    max_positions: int = 3  # Scalp stability cap
 
     # Multi-order shaping
     multi_order_tp_bonus_pct: float = 0.18
     multi_order_sl_tighten_pct: float = 0.25
-    multi_order_confidence_tiers: Tuple[float, float] = (0.94, 0.97)
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.92, 0.95, 0.97)
     multi_order_max_orders: int = 3
 
     # Limits (24/7 BTC)
@@ -364,7 +364,7 @@ class EngineConfig:
 
     # Strategy flags (keep compatible with your system)
     adaptive_enabled: bool = True
-    use_squeeze_filter: bool = True
+    use_squeeze_filter: bool = False
     hedge_flip_enabled: bool = False
     pyramid_enabled: bool = False
 
@@ -377,6 +377,24 @@ class EngineConfig:
     micro_rr: float = 1.0
     micro_buffer_pct: float = 0.0007
     micro_vol_mult: float = 1.6
+
+    # Signal stability / debounce (faster scalping)
+    signal_stability_eps: float = 0.012
+
+    # Market freshness (portfolio pipeline)
+    market_min_bar_age_sec: float = 120.0
+    market_max_bar_age_mult: float = 2.0
+    market_validate_interval_sec: float = 1.0
+
+    # Meta/conformal gates (looser for scalping)
+    conformal_window: int = 240
+    conformal_q: float = 0.95
+    meta_barrier_R: float = 0.45
+    meta_h_bars: int = 4
+    tc_bps: float = 1.0
+
+    # Multi-order behavior
+    multi_order_split_lot: bool = False
 
     def validate(self) -> None:
         if int(self.login) <= 0:
@@ -445,14 +463,15 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
-    cfg.min_confidence_signal = 0.88
-    cfg.ultra_confidence_min = 0.95
+    cfg.min_confidence_signal = 0.82
+    cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05
     cfg.active_sessions = [(0, 24)]
     cfg.overnight_block_hours = 0.0
     cfg.trail_on_entry = True
     cfg.ignore_microstructure = True
+    cfg.use_squeeze_filter = False
 
 
 __all__ = [

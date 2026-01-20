@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
+from bisect import bisect_right
+
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -225,6 +227,42 @@ class ExecutionQualityMonitor:
         if s["max_spread_points"] > max_spread:
             reasons.append("mkt:spread_shock")
         return reasons
+
+
+
+_THRESHOLDS = [0, 200, 300, 451, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 2000, 3000, 5000, 7000, 10000]
+
+_RULES = [
+    (0.01, 1.0),  
+    (0.01, 1.0), 
+    (0.02, 2.0),  
+    (0.03, 3.0),  
+    (0.04, 4.0), 
+    (0.05, 5.0),  
+    (0.06, 6.0),  
+    (0.07, 7.0),  
+    (0.08, 8.0),  
+    (0.09, 9.0),  
+    (0.10, 10.0), 
+    (0.11, 11.0), 
+    (0.12, 12.0), 
+    (0.13, 13.0), 
+    (0.14, 14.0), 
+    (0.20, 20.0), 
+    (0.30, 30.0), 
+    (0.40, 40.0), 
+    (0.50, 50.0), 
+    (0.60, 60.0), 
+]
+
+assert all(_THRESHOLDS[i] < _THRESHOLDS[i+1] for i in range(len(_THRESHOLDS)-1)), "THRESHOLDS must be increasing"
+assert len(_RULES) == len(_THRESHOLDS) + 1, "RULES must be len(THRESHOLDS)+1"
+
+def btc_lot_and_tp_usd(balance: float) -> Tuple[float, float]:
+    i = bisect_right(_THRESHOLDS, balance)
+    return _RULES[i]
+
+
 
 
 @dataclass(slots=True)
@@ -555,6 +593,48 @@ class RiskManager:
         v = max(float(self._vol_min), min(float(vol), float(self._vol_max)))
         v = math.floor(v / step) * step
         return float(round(v, 8))
+
+    def _tp_usd_to_price(self, entry: float, side: str, volume: float, usd_profit: float) -> Optional[float]:
+        """
+        Convert desired TP in USD to a price using broker tick specs.
+        Returns None on any invalid inputs or MT5 info failures.
+        """
+        try:
+            if float(entry) <= 0 or float(volume) <= 0 or float(usd_profit) <= 0:
+                return None
+            if not self._ensure_ready():
+                return None
+            with MT5_LOCK:
+                info = mt5.symbol_info(self.symbol)
+            if not info:
+                return None
+
+            tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+            tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+            digits = int(getattr(info, "digits", 5) or 5)
+
+            if tick_value <= 0.0 or tick_size <= 0.0:
+                return None
+
+            ticks_needed = float(usd_profit) / (tick_value * float(volume))
+            if not np.isfinite(ticks_needed) or ticks_needed <= 0:
+                return None
+
+            price_delta = ticks_needed * tick_size
+            side_n = _side_norm(side)
+            tp = float(entry) + price_delta if side_n == "Buy" else float(entry) - price_delta
+            tp = round(float(tp), digits)
+            if tp <= 0:
+                return None
+
+            if side_n == "Buy" and not (tp > float(entry)):
+                return None
+            if side_n == "Sell" and not (tp < float(entry)):
+                return None
+
+            return tp
+        except Exception:
+            return None
 
     # ------------------- BTC session: trade_mode + blackout -------------------
     def _minutes_utc(self) -> Tuple[int, int]:
@@ -1378,38 +1458,54 @@ class RiskManager:
             if side_n == "Sell" and not (tp < entry_price < sl):
                 return None, None, None, None
 
-            # Enforce RR if configured
-            min_rr = getattr(self.cfg, "min_rr", None)
-            if min_rr is not None:
-                rr = self._rr(entry_price, sl, tp)
-                rr_min = float(min_rr)
-                if rr < rr_min:
-                    dist = abs(entry_price - sl)
-                    if side_n == "Buy":
-                        tp = self._normalize_price(entry_price + dist * rr_min)
-                    else:
-                        tp = self._normalize_price(entry_price - dist * rr_min)
-                    sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+            use_usd_tp = False
+            balance = float(self._get_balance())
+            base_lot, tp_usd = btc_lot_and_tp_usd(balance) if balance > 0 else (0.0, 0.0)
+            base_lot = self._normalize_volume_floor(float(base_lot or 0.0))
 
-            rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
-            if rr_cap > 0:
-                dist_sl = abs(entry_price - sl)
-                dist_tp = abs(tp - entry_price)
-                if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
-                    if side_n == "Buy":
-                        tp = self._normalize_price(entry_price + dist_sl * rr_cap)
-                    else:
-                        tp = self._normalize_price(entry_price - dist_sl * rr_cap)
-                    if abs(tp - entry_price) < min_tp:
+            if base_lot > 0 and float(tp_usd or 0.0) > 0.0:
+                tp_price = self._tp_usd_to_price(entry_price, side_n, base_lot, float(tp_usd))
+                if tp_price is not None:
+                    tp = float(tp_price)
+                    sl, tp = self._apply_broker_constraints(side_n, entry_price, float(sl), float(tp))
+                    if (side_n == "Buy" and tp > entry_price) or (side_n == "Sell" and tp < entry_price):
+                        use_usd_tp = True
+
+            if use_usd_tp:
+                lot = float(base_lot)
+            else:
+                # Enforce RR if configured
+                min_rr = getattr(self.cfg, "min_rr", None)
+                if min_rr is not None:
+                    rr = self._rr(entry_price, sl, tp)
+                    rr_min = float(min_rr)
+                    if rr < rr_min:
+                        dist = abs(entry_price - sl)
                         if side_n == "Buy":
-                            tp = self._normalize_price(entry_price + min_tp)
+                            tp = self._normalize_price(entry_price + dist * rr_min)
                         else:
-                            tp = self._normalize_price(entry_price - min_tp)
-                    sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+                            tp = self._normalize_price(entry_price - dist * rr_min)
+                        sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
-            lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
-            if lot <= 0 or not _is_finite(lot):
-                return None, None, None, None
+                rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
+                if rr_cap > 0:
+                    dist_sl = abs(entry_price - sl)
+                    dist_tp = abs(tp - entry_price)
+                    if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
+                        if side_n == "Buy":
+                            tp = self._normalize_price(entry_price + dist_sl * rr_cap)
+                        else:
+                            tp = self._normalize_price(entry_price - dist_sl * rr_cap)
+                        if abs(tp - entry_price) < min_tp:
+                            if side_n == "Buy":
+                                tp = self._normalize_price(entry_price + min_tp)
+                            else:
+                                tp = self._normalize_price(entry_price - min_tp)
+                        sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+
+                lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
+                if lot <= 0 or not _is_finite(lot):
+                    return None, None, None, None
 
             # Multi-position scaling (pyramiding): only if profitable + ultra confidence
             if (
@@ -1418,20 +1514,21 @@ class RiskManager:
                 and float(unrealized_pl) >= 0.0
                 and float(confidence) >= float(self.cfg.ultra_confidence_min)
             ):
-                scale_factor = max(0.3, 1.0 - (int(open_positions) / max(1, int(max_positions))))
-                lot = self._normalize_volume_floor(lot * scale_factor)
+                if not use_usd_tp:
+                    scale_factor = max(0.3, 1.0 - (int(open_positions) / max(1, int(max_positions))))
+                    lot = self._normalize_volume_floor(lot * scale_factor)
 
-                tp_bonus = 1.0 + float(self.cfg.multi_order_tp_bonus_pct)
-                sl_tight = 1.0 - float(self.cfg.multi_order_sl_tighten_pct)
+                    tp_bonus = 1.0 + float(self.cfg.multi_order_tp_bonus_pct)
+                    sl_tight = 1.0 - float(self.cfg.multi_order_sl_tighten_pct)
 
-                if side_n == "Buy":
-                    tp = self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
-                    sl = self._normalize_price(entry_price - abs(entry_price - sl) * sl_tight)
-                else:
-                    tp = self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
-                    sl = self._normalize_price(entry_price + abs(entry_price - sl) * sl_tight)
+                    if side_n == "Buy":
+                        tp = self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
+                        sl = self._normalize_price(entry_price - abs(entry_price - sl) * sl_tight)
+                    else:
+                        tp = self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
+                        sl = self._normalize_price(entry_price + abs(entry_price - sl) * sl_tight)
 
-                sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+                    sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
             return float(entry_price), float(sl), float(tp), float(lot)
 

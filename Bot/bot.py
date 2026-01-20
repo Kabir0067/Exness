@@ -93,13 +93,10 @@ if not log.handlers:
     log.addHandler(fh)
     log.addHandler(ch)
 
-    # Capture internal TeleBot errors too
+    # Silence TeleBot internal exception spam (network/DNS issues)
     tb_log = logging.getLogger("TeleBot")
-    tb_log.setLevel(logging.ERROR)
+    tb_log.setLevel(logging.CRITICAL)
     tb_log.propagate = False
-    if not tb_log.handlers:
-        tb_log.addHandler(fh)
-        tb_log.addHandler(ch)
 
 
 

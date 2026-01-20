@@ -150,10 +150,10 @@ class EngineConfig:
     mt5_path: Optional[str] = None
     mt5_portable: bool = False
     mt5_autostart: bool = True
-    mt5_timeout_ms: int = 10_000
+    mt5_timeout_ms: int = 30_000
 
     daily_target_pct: float = 0.10
-    ultra_confidence_min: float = 0.95
+    ultra_confidence_min: float = 0.90
     protect_drawdown_from_peak_pct: float = 0.30
     max_daily_loss_pct: float = 0.10
     daily_loss_b_pct: float = 0.02
@@ -164,16 +164,16 @@ class EngineConfig:
     ignore_external_positions: bool = True
     magic: int = 777001
 
-    min_confidence_signal: float = 0.84
+    min_confidence_signal: float = 0.78
     conf_min: int = 88
     conf_min_low: int = 80
     conf_min_high: int = 93
 
-    adx_trend_lo: float = 18.0
+    adx_trend_lo: float = 16.0
     adx_trend_hi: float = 27.0
     atr_rel_lo: float = 0.00055
     atr_rel_hi: float = 0.0028
-    min_body_pct_of_atr: float = 0.12
+    min_body_pct_of_atr: float = 0.09
     min_bar_age_sec: int = 1
 
     ema_short: int = 9
@@ -187,7 +187,7 @@ class EngineConfig:
     rn_step: float = 20.0
 
     poll_seconds_fast: float = 0.05
-    decision_debounce_ms: float = 50.0
+    decision_debounce_ms: float = 20.0
     analysis_cooldown_sec: float = 0.0
     cooldown_seconds: float = 0.0
     overnight_block_hours: float = 3.0
@@ -207,7 +207,7 @@ class EngineConfig:
     max_positions: int = 3
     multi_order_tp_bonus_pct: float = 0.18
     multi_order_sl_tighten_pct: float = 0.25
-    multi_order_confidence_tiers: Tuple[float, float] = (0.94, 0.97)
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.92, 0.95, 0.97)
     multi_order_max_orders: int = 3
 
     islamic_min_leverage: int = 1
@@ -243,7 +243,7 @@ class EngineConfig:
 
     adaptive_enabled: bool = True
     trail_on_entry: bool = True
-    use_squeeze_filter: bool = True
+    use_squeeze_filter: bool = False
     hedge_flip_enabled: bool = False
     pyramid_enabled: bool = False
 
@@ -254,6 +254,23 @@ class EngineConfig:
     extreme_near_pct: float = 0.12
     rn_step_xau: float = 5.0
     rn_buffer_pct: float = 0.0012
+
+    min_bars_m1: int = 200
+    min_bars_m5_m15: int = 180
+    min_bars_default: int = 160
+
+    signal_stability_eps: float = 0.012
+
+    market_min_bar_age_sec: float = 120.0
+    market_max_bar_age_mult: float = 2.0
+    market_validate_interval_sec: float = 1.0
+
+    meta_barrier_R: float = 0.45
+    meta_h_bars: int = 4
+    conformal_q: float = 0.95
+    tc_bps: float = 1.0
+
+    multi_order_split_lot: bool = False
 
     atr_percentile_lookback: int = 1000
     tod_boost_minutes: int = 120
@@ -331,11 +348,11 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
-    cfg.min_confidence_signal = 0.84
-    cfg.ultra_confidence_min = 0.95
+    cfg.min_confidence_signal = 0.78
+    cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.02
     cfg.tp_atr_mult_trend = 2.5
-    cfg.use_squeeze_filter = True
+    cfg.use_squeeze_filter = False
     cfg.hedge_flip_enabled = False
     cfg.pyramid_enabled = False
     cfg.poll_seconds_fast = 0.05

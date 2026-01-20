@@ -319,12 +319,12 @@ class _AssetPipeline:
             else "-"
         )
 
-        self._signal_log_every = 5.0      
+        self._signal_log_every = 5.0
         self._last_signal_log_ts = 0.0
 
-        # Market freshness thresholds
-        self._max_bar_age_mult = 2.5     
-        self._min_bar_age_sec = 180.0
+        # Market freshness thresholds (configurable)
+        self._max_bar_age_mult = float(getattr(cfg, "market_max_bar_age_mult", 2.0) or 2.0)
+        self._min_bar_age_sec = float(getattr(cfg, "market_min_bar_age_sec", 120.0) or 120.0)
 
         self._last_market_ok_ts = 0.0
         self._market_validate_every = float(getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0)
@@ -1209,23 +1209,23 @@ class MultiAssetTradingEngine:
         else:
             cfg = self._btc_cfg
 
-        tiers = getattr(cfg, "multi_order_confidence_tiers", (0.94, 0.97)) or (0.94, 0.97)
+        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.94, 0.97)) or (0.94, 0.97))
+        tiers = [float(x) for x in tiers if x is not None]
         if len(tiers) < 2:
-            tiers = (0.94, 0.97)
-        lo, hi = sorted((float(tiers[0]), float(tiers[1])))
+            tiers = [0.94, 0.97]
+        tiers = sorted(tiers)
 
         max_orders = int(getattr(cfg, "multi_order_max_orders", 3) or 3)
-        max_orders = max(1, min(3, max_orders))
+        max_orders = max(1, min(6, max_orders))
 
         conf = float(cand.confidence)
         if conf > 1.5:
             conf = conf / 100.0
 
         n_orders = 1
-        if conf >= lo:
-            n_orders = 2
-        if conf >= hi:
-            n_orders = 3
+        for idx, thr in enumerate(tiers):
+            if conf >= float(thr):
+                n_orders = max(n_orders, idx + 2)
 
         return int(min(max_orders, max(1, n_orders)))
 
@@ -1238,12 +1238,18 @@ class MultiAssetTradingEngine:
         except Exception:
             return 0.01
 
-    def _split_lot(self, lot: float, parts: int, risk: Any) -> list[float]:
+    def _split_lot(self, lot: float, parts: int, risk: Any, cfg: Any) -> list[float]:
         lot = float(lot)
         if int(parts) <= 1:
             return [lot]
 
         min_lot = self._min_lot(risk)
+        split_enabled = bool(getattr(cfg, "multi_order_split_lot", True))
+        if not split_enabled:
+            if min_lot <= 0 or lot < min_lot:
+                return [lot]
+            return [lot for _ in range(int(parts))]
+
         if min_lot <= 0 or (lot / float(parts)) < min_lot:
             return [lot]
 
@@ -1843,7 +1849,8 @@ class MultiAssetTradingEngine:
                     risk = self._xau.risk if selected.asset == "XAU" and self._xau else (
                         self._btc.risk if self._btc else None
                     )
-                    lots = self._split_lot(float(selected.lot), order_count, risk)
+                    cfg = self._xau_cfg if selected.asset == "XAU" else self._btc_cfg
+                    lots = self._split_lot(float(selected.lot), order_count, risk, cfg)
 
                     for idx, lot_val in enumerate(lots):
                         # enqueue_order checks duplicate, then puts to Queue.
@@ -1906,4 +1913,4 @@ class MultiAssetTradingEngine:
 
 
 # Global instance (import-compatible)
-engine = MultiAssetTradingEngine(dry_run=False)
+engine = MultiAssetTradingEngine(dry_run=True)
