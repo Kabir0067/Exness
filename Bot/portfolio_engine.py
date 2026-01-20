@@ -1913,4 +1913,4 @@ class MultiAssetTradingEngine:
 
 
 # Global instance (import-compatible)
-engine = MultiAssetTradingEngine(dry_run=True)
+engine = MultiAssetTradingEngine(dry_run=False)

@@ -40,7 +40,8 @@ SLTPUnits = Literal["points", "usd", "price"]
 # Default knobs (бо хоҳиш метавонед аз ҷойи дигар override кунед)
 DEFAULT_DEVIATION = 50
 DEFAULT_MAGIC = 123456
-DEFAULT_RETRIES = 3
+DEFAULT_RETRIES = 2
+DEFAULT_MODIFY_SLEEP_SEC = 0.08
 
 # Positions cache барои Telegram pagination
 _POS_CACHE_TTL_SEC = 1.0
@@ -681,7 +682,7 @@ def set_takeprofit_all_positions_usd(
                 if res and last_ret == mt5.TRADE_RETCODE_DONE:
                     ok_one = True
                     break
-                time.sleep(0.25)
+                time.sleep(DEFAULT_MODIFY_SLEEP_SEC)
 
             if ok_one:
                 out["updated"] += 1
@@ -770,7 +771,7 @@ def set_stoploss_all_positions_usd(
                 if res and last_ret == mt5.TRADE_RETCODE_DONE:
                     ok_one = True
                     break
-                time.sleep(0.25)
+                time.sleep(DEFAULT_MODIFY_SLEEP_SEC)
 
             if ok_one:
                 out["updated"] += 1

@@ -230,37 +230,37 @@ class ExecutionQualityMonitor:
 
 
 
-_THRESHOLDS = [0, 200, 300, 451, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 2000, 3000, 5000, 7000, 10000]
-
-_RULES = [
-    (0.01, 1.0),  
-    (0.01, 1.0), 
-    (0.02, 2.0),  
-    (0.03, 3.0),  
-    (0.04, 4.0), 
-    (0.05, 5.0),  
-    (0.06, 6.0),  
-    (0.07, 7.0),  
-    (0.08, 8.0),  
-    (0.09, 9.0),  
-    (0.10, 10.0), 
-    (0.11, 11.0), 
-    (0.12, 12.0), 
-    (0.13, 13.0), 
-    (0.14, 14.0), 
-    (0.20, 20.0), 
-    (0.30, 30.0), 
-    (0.40, 40.0), 
-    (0.50, 50.0), 
-    (0.60, 60.0), 
-]
-
-assert all(_THRESHOLDS[i] < _THRESHOLDS[i+1] for i in range(len(_THRESHOLDS)-1)), "THRESHOLDS must be increasing"
-assert len(_RULES) == len(_THRESHOLDS) + 1, "RULES must be len(THRESHOLDS)+1"
+_BASE_LOT = 0.02
+_BASE_TP_USD = 2.0
+_STEP_BALANCE = 100.0
+_STEP_LOT = 0.01
+_STEP_TP_USD = 1.0
+_STEP_START_BALANCE = 200.0
 
 def btc_lot_and_tp_usd(balance: float) -> Tuple[float, float]:
-    i = bisect_right(_THRESHOLDS, balance)
-    return _RULES[i]
+    """
+    Balance-based ladder:
+      1..199   -> lot=0.02, tp=2
+      200..299 -> lot=0.03, tp=3
+      300..399 -> lot=0.04, tp=4
+      ... (each +100 balance adds +0.01 lot and +1 USD TP)
+    """
+    try:
+        bal = float(balance or 0.0)
+    except Exception:
+        return 0.0, 0.0
+
+    if bal < 1.0:
+        return 0.0, 0.0
+
+    if bal < _STEP_START_BALANCE:
+        step = 0
+    else:
+        step = int((bal - _STEP_START_BALANCE) // _STEP_BALANCE) + 1
+
+    lot = _BASE_LOT + (step * _STEP_LOT)
+    tp = _BASE_TP_USD + (step * _STEP_TP_USD)
+    return round(float(lot), 2), round(float(tp), 2)
 
 
 
