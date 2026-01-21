@@ -8,18 +8,17 @@ import socket
 import sys
 import time
 import traceback
-import urllib3
-
-TG_HEALTH_NOTIFY = False
-
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from queue import Queue, Full, Empty
 from threading import Event, Lock, Thread
 from typing import Optional
-    
+
+import urllib3
+
+TG_HEALTH_NOTIFY = False
+
 from Bot.bot import ADMIN, bot, bot_commands
-# Portfolio engine: trades XAU and BTC, but only one at a time.
 from Bot.portfolio_engine import engine
 from log_config import LOG_DIR as LOG_ROOT, get_log_path, log_dir_stats
 
@@ -37,8 +36,8 @@ if not log.handlers:
 
     fh = RotatingFileHandler(
         str(get_log_path("main.log")),
-        maxBytes=5242880,  # 5MB (дар шакли байт)
-        backupCount=5,     # Миқдори файлҳои кӯҳна
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
         encoding="utf-8",
         delay=True,
     )
@@ -52,16 +51,15 @@ if not log.handlers:
     log.addHandler(fh)
     log.addHandler(ch)
 
-
 log_super = logging.getLogger("telegram.supervisor")
-log_super.setLevel(logging.INFO)  # Supervisor needs INFO to show starts/stops
+log_super.setLevel(logging.INFO)
 log_super.propagate = False
 
 if not log_super.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     fh = RotatingFileHandler(
-        str(get_log_path("telegram.log")),  # Share with bot logic
+        str(get_log_path("telegram.log")),
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -76,11 +74,13 @@ if not log_super.handlers:
 
     log_super.addHandler(fh)
     log_super.addHandler(ch)
+
+
 def sleep_interruptible(stop_event: Event, seconds: float) -> None:
     """Sleep, but exit early if stop_event set."""
-    end = time.time() + float(seconds)
+    end = time.monotonic() + float(seconds)
     while not stop_event.is_set():
-        left = end - time.time()
+        left = end - time.monotonic()
         if left <= 0:
             return
         stop_event.wait(timeout=min(0.5, left))
@@ -95,7 +95,10 @@ class Backoff:
     def delay(self, attempt: int) -> float:
         if attempt <= 1:
             return min(self.max_delay, self.base)
-        return min(self.max_delay, self.base * (self.factor ** (attempt - 1)))
+        try:
+            return min(self.max_delay, self.base * (self.factor ** (attempt - 1)))
+        except Exception:
+            return float(self.max_delay)
 
 
 class RateLimiter:
@@ -107,9 +110,9 @@ class RateLimiter:
         self._last: dict[str, float] = {}
 
     def allow(self, key: str) -> bool:
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
-            last = self._last.get(key, 0.0)
+            last = float(self._last.get(key, 0.0) or 0.0)
             if (now - last) >= self.interval:
                 self._last[key] = now
                 return True
@@ -140,6 +143,18 @@ NETWORK_EXC = (
     socket.gaierror,
     socket.timeout,
     OSError,
+)
+
+_NET_ERRS_TG = (
+    ReadTimeout,
+    ConnectTimeout,
+    RequestException,
+    urllib3.exceptions.ReadTimeoutError,
+    urllib3.exceptions.ProtocolError,
+    ConnectionError,
+    RequestsConnectionError,
+    ChunkedEncodingError,
+    http.client.RemoteDisconnected,
 )
 
 
@@ -264,9 +279,9 @@ class LogMonitor:
         self._t: Optional[Thread] = None
         self._log_rl = RateLimiter(600.0)
 
-        self.interval = 300.0   # 5 дақиқа (бо сония)
-        self.max_mb = 512.0     # 512 Мегабайт
-        self.max_files = 2000   # 2000 адад файл
+        self.interval = 300.0
+        self.max_mb = 512.0
+        self.max_files = 2000
 
     def start(self) -> None:
         if self._t and self._t.is_alive():
@@ -278,9 +293,9 @@ class LogMonitor:
         while not self.stop_event.is_set():
             try:
                 total_bytes, file_count = log_dir_stats()
-                total_mb = total_bytes / (1024 * 1024)
+                total_mb = float(total_bytes) / (1024.0 * 1024.0)
 
-                if total_mb > self.max_mb or file_count > self.max_files:
+                if total_mb > self.max_mb or int(file_count) > self.max_files:
                     if self._log_rl.allow("log_volume"):
                         log.warning(
                             "Log volume high | size=%.1fMB files=%s thresholds=(%.1fMB,%s)",
@@ -302,94 +317,67 @@ class LogMonitor:
 def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     """
     High-reliability engine supervisor:
-    - Start engine with backoff if MT5/internet not ready
-    - Monitor loop; if engine stops/fails -> restart with guarded backoff
+    - Start engine with backoff if MT5 not ready
+    - Monitor loop; if engine stops/fails -> guarded restart
     - Never raises; never restart-storms
     """
     backoff = Backoff(base=2.0, factor=2.0, max_delay=60.0)
-    restart_guard = RateLimiter(20.0)  # at most one restart attempt per 20s
-    manual_stop_rl = RateLimiter(60.0)  # throttle manual-stop logs
+    restart_guard = RateLimiter(20.0)
+    manual_stop_rl = RateLimiter(60.0)
+
     started_once = False
     attempt = 0
 
     notifier.notify("🧠 Engine supervisor started")
 
     while not stop_event.is_set():
-        # Ensure engine running
+        # Cheap status probe first (avoid engine.start() spam)
+        ok_connected = True
+        ok_trading = True
+        manual_stop = False
         try:
-            attempt += 1
-            engine.start()
-            if not started_once:
-                started_once = True
-                notifier.notify("🟢 Мотори тиҷорат оғоз шуд")
-            attempt = 0  # reset on successful start
-        except Exception as exc:
-            delay = backoff.delay(attempt)
-            if attempt == 1 or attempt % 5 == 0:
-                log.error("Engine start failed: %s | retry in %.1fs", exc, delay)
-                notifier.notify(f"⚠️ Engine start failed: {exc} | retry in {delay:.0f}s")
-            sleep_interruptible(stop_event, delay)
-            continue
-
-        # Monitor phase
-        try:
-            # Prefer status() if available; never crash if status has issues
+            st = engine.status()
+            ok_connected = bool(getattr(st, "connected", True))
+            ok_trading = bool(getattr(st, "trading", True))
+            manual_stop = bool(getattr(st, "manual_stop", False))
+        except Exception:
             ok_connected = True
             ok_trading = True
             manual_stop = False
-            try:
-                st = engine.status()
-                ok_connected = bool(getattr(st, "connected", True))
-                ok_trading = bool(getattr(st, "trading", True))
-                manual_stop = bool(getattr(st, "manual_stop", False))
-            except Exception:
-                ok_connected = True
-                ok_trading = True
-                manual_stop = False
 
-            if not ok_connected:
-                # restart guarded
-                if restart_guard.allow("engine_restart"):
-                    log.warning("Engine unhealthy (connected=%s trading=%s) -> restarting", ok_connected, ok_trading)
-                    if TG_HEALTH_NOTIFY:
-
-                        notifier.notify("🟠 Engine unhealthy -> restart")
-                    try:
-                        engine.stop()
-                    except Exception:
-                        pass
-                    sleep_interruptible(stop_event, 2.0)
-                else:
-                    sleep_interruptible(stop_event, 2.0)
-                continue
-
-            if not ok_trading:
-                if manual_stop:
-                    if manual_stop_rl.allow("engine_manual_stop"):
-                        log.info("Engine idle (manual stop active); supervisor waiting")
-                    sleep_interruptible(stop_event, 2.0)
-                    continue
-
-                if restart_guard.allow("engine_restart"):
-                    log.warning("Engine unhealthy (connected=%s trading=%s) -> restarting", ok_connected, ok_trading)
-                    if TG_HEALTH_NOTIFY:
-
-                        notifier.notify("🟠 Engine unhealthy -> restart")
-                    try:
-                        engine.stop()
-                    except Exception:
-                        pass
-                    sleep_interruptible(stop_event, 2.0)
-                else:
-                    sleep_interruptible(stop_event, 2.0)
-                continue
-
+        if manual_stop:
+            if manual_stop_rl.allow("engine_manual_stop"):
+                log.info("Engine idle (manual stop active); supervisor waiting")
             sleep_interruptible(stop_event, 1.0)
+            continue
 
-        except Exception as exc:
-            # Engine monitor must never crash
-            log.error("Engine supervisor error: %s | tb=%s", exc, traceback.format_exc())
+        # Ensure engine running
+        if not ok_trading:
+            try:
+                attempt += 1
+                engine.start()
+                if not started_once:
+                    started_once = True
+                    notifier.notify("🟢 Мотори тиҷорат оғоз шуд")
+                attempt = 0
+            except Exception as exc:
+                delay = backoff.delay(attempt)
+                if attempt == 1 or attempt % 5 == 0:
+                    log.error("Engine start failed: %s | retry in %.1fs", exc, delay)
+                    notifier.notify(f"⚠️ Engine start failed: {exc} | retry in {delay:.0f}s")
+                sleep_interruptible(stop_event, delay)
+                continue
+
+        # Monitor connected health
+        if not ok_connected:
+            if restart_guard.allow("engine_unhealthy"):
+                log.warning("Engine unhealthy (connected=%s trading=%s) -> waiting/recovering", ok_connected, ok_trading)
+                if TG_HEALTH_NOTIFY:
+                    notifier.notify("🟠 Engine unhealthy -> waiting for reconnect")
             sleep_interruptible(stop_event, 2.0)
+            continue
+
+        sleep_interruptible(stop_event, 1.0)
 
     # Shutdown
     try:
@@ -409,7 +397,6 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
     - On internet loss: WAIT silently + throttle logs (no crash)
     - stop_event stops polling (best-effort)
     """
-    # Best-effort set commands (do not block startup)
     try:
         bot_commands()
     except NETWORK_EXC as exc:
@@ -423,43 +410,33 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
     log_rl = RateLimiter(20.0)
 
     attempt = 0
-    # Common network errors to catch
-    NET_ERRS = (
-        ReadTimeout, ConnectTimeout, RequestException,
-        urllib3.exceptions.ReadTimeoutError,
-        urllib3.exceptions.ProtocolError,
-        ConnectionError,
-        RequestsConnectionError,
-        ChunkedEncodingError,
-        http.client.RemoteDisconnected,
-    )
 
     while not stop_event.is_set():
         try:
             attempt += 1
             log_super.info("Starting Telegram bot polling (attempt %s)...", attempt)
-            
-            # Increased timeouts for bad network stability
+
+            # skip_pending speeds up startup and avoids old backlog
             bot.infinity_polling(
-                timeout=75, 
-                long_polling_timeout=75, 
-                restart_on_change=False
+                timeout=75,
+                long_polling_timeout=75,
+                restart_on_change=False,
+                skip_pending=True,
             )
-            
-            # If polling returns normally (unlikely), reset backoff
+
             attempt = 0
-            
-        except NET_ERRS as exc:
+
+        except _NET_ERRS_TG as exc:
             delay = backoff.delay(attempt)
             if log_rl.allow("tg_net"):
                 log_super.warning("Telegram network unstable: %s | retry in %.1fs", exc, delay)
             sleep_interruptible(stop_event, delay)
+
         except Exception as exc:
             delay = backoff.delay(attempt)
             log.error("Telegram polling error: %s | retry in %.1fs | tb=%s", exc, delay, traceback.format_exc())
             sleep_interruptible(stop_event, delay)
 
-    # best-effort stop
     try:
         bot.stop_polling()
     except Exception:
@@ -481,6 +458,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     notifier = Notifier(shutdown.stop_event, queue_max=200)
     notifier.start()
+
     log_monitor = LogMonitor(shutdown.stop_event)
     log_monitor.start()
 
@@ -507,7 +485,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             bot_thread.start()
 
-        # Main wait loop (signals handled here)
         while not shutdown.stop_event.is_set():
             shutdown.stop_event.wait(timeout=1.0)
 
@@ -545,7 +522,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
 
         notifier.notify("⏹️ System stopped")
-        sleep_interruptible(shutdown.stop_event, 0.5) 
+        sleep_interruptible(shutdown.stop_event, 0.2)
 
 
 if __name__ == "__main__":

@@ -204,7 +204,7 @@ class EngineConfig:
     protect_drawdown_from_peak_pct: float = 0.30
     max_drawdown: float = 0.12
     daily_loss_b_pct: float = 0.02
-    daily_loss_c_pct: float = 0.03
+    daily_loss_c_pct: float = 0.05
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
     enforce_drawdown_limits: bool = False
@@ -215,8 +215,9 @@ class EngineConfig:
     min_confidence_signal: float = 0.74
     ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
-    confidence_gain: float = 40.0
-    net_norm_signal_threshold: float = 0.02
+    confidence_gain: float = 120.0
+    net_norm_signal_threshold: float = 0.08
+    strong_conf_min: int = 88
 
     # Indicators
     ema_short: int = 9
@@ -280,10 +281,11 @@ class EngineConfig:
     max_positions: int = 3  # Scalp stability cap
 
     # Multi-order shaping
-    multi_order_tp_bonus_pct: float = 0.18
-    multi_order_sl_tighten_pct: float = 0.25
+    multi_order_tp_bonus_pct: float = 0.12
+    multi_order_sl_tighten_pct: float = 0.00
     multi_order_confidence_tiers: Tuple[float, float, float] = (0.92, 0.95, 0.97)
     multi_order_max_orders: int = 3
+    max_spread_bps_for_multi: float = 6.0
 
     # Limits (24/7 BTC)
     max_trades_per_hour: int = 100  # Increased
@@ -397,7 +399,7 @@ class EngineConfig:
     tc_bps: float = 1.0
 
     # Multi-order behavior
-    multi_order_split_lot: bool = False
+    multi_order_split_lot: bool = True
 
     def validate(self) -> None:
         if int(self.login) <= 0:

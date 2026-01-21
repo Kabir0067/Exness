@@ -339,11 +339,11 @@ def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         reason_line = f"Сабаб: <b>{reason}</b>\n" if reason else ""
         msg = (
-            "🔔 <b>Тағйири режим</b>\n"
-            f"Ассет: <b>{asset}</b>\n"
-            f"Аз <b>{old_phase}</b> → <b>{new_phase}</b>\n"
+            "🧭 <b>Тағйири режим</b>\n"
+            f"📌 Ассет: <b>{asset}</b>\n"
+            f"🔁 Аз <b>{old_phase}</b> → <b>{new_phase}</b>\n"
             f"{reason_line}"
-            f"Вақт: {ts}"
+            f"⏱ Вақт: {ts}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -359,11 +359,11 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         reason_line = f"Сабаб: <b>{reason}</b>\n" if reason else ""
         msg = (
-            "🛑 <b>Трейд стоп шуд</b>\n"
-            f"Ассет: <b>{asset}</b>\n"
+            "🛑 <b>Трейд қатъ шуд</b>\n"
+            f"📌 Ассет: <b>{asset}</b>\n"
             f"{reason_line}"
-            "Агар хоҳед, метавонед аз нав оғоз кунед.\n"
-            f"Вақт: {ts}"
+            "✅ Агар хоҳед, метавонед аз нав оғоз кунед.\n"
+            f"⏱ Вақт: {ts}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -371,6 +371,25 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
 
 
 engine.set_engine_stop_notifier(_notify_engine_stopped)
+
+def _notify_daily_start(asset: str, day: str) -> None:
+    try:
+        if not is_admin_chat(ADMIN):
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = (
+            "🌅 <b>Оғози рӯзи нав</b>\n"
+            f"📌 Ассет: <b>{asset}</b>\n"
+            f"📅 Рӯз: <b>{day}</b>\n"
+            "✅ Лимитҳо аз нав ҳисоб шуданд, савдо омода аст.\n"
+            f"⏱ Вақт: {ts}"
+        )
+        bot.send_message(ADMIN, msg, parse_mode="HTML")
+    except Exception:
+        return
+
+
+engine.set_daily_start_notifier(_notify_daily_start)
 
 def deny(message: types.Message) -> None:
     bot.send_message(

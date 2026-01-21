@@ -347,6 +347,8 @@ class RiskManager:
         self.daily_start_balance = 0.0
         self.daily_peak_equity = 0.0
         self._target_breached = False
+        self._target_breached_return = 0.0
+        self._phase_reason_last: Optional[str] = None
         self.current_phase = "A"
         self._trading_disabled_until: float = 0.0
         self._hard_stop_reason: Optional[str] = None
@@ -457,6 +459,7 @@ class RiskManager:
     def _enter_hard_stop(self, reason: str) -> None:
         self.current_phase = "C"
         self._hard_stop_reason = reason
+        self._phase_reason_last = str(reason)
         self._target_breached = True
         lock = self._seconds_until_next_utc_day()
         self._trading_disabled_until = time.time() + lock
@@ -479,6 +482,9 @@ class RiskManager:
 
     def hard_stop_reason(self) -> Optional[str]:
         return self._hard_stop_reason
+
+    def phase_reason(self) -> Optional[str]:
+        return self._phase_reason_last
 
     def block_analysis(self, seconds: float) -> None:
         self._analysis_blocked_until = max(self._analysis_blocked_until, time.time() + float(seconds))
@@ -507,6 +513,8 @@ class RiskManager:
         self.daily_peak_equity = float(max(eq, self.daily_start_balance))
 
         self._target_breached = False
+        self._target_breached_return = 0.0
+        self._phase_reason_last = None
         self.current_phase = "A"
         self._trading_disabled_until = 0.0
         self._hard_stop_reason = None
@@ -835,6 +843,8 @@ class RiskManager:
             if (not self._target_breached) and daily_return >= float(self.cfg.daily_target_pct):
                 self.current_phase = "B"
                 self._target_breached = True
+                self._target_breached_return = float(daily_return)
+                self._phase_reason_last = "daily_target_reached"
 
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
                 loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
@@ -842,16 +852,18 @@ class RiskManager:
                 if loss_b > 0 and daily_return <= -loss_b:
                     if self.current_phase == "A":
                         self.current_phase = "B"
+                        self._phase_reason_last = "daily_loss_b"
                 if loss_c > 0 and daily_return <= -loss_c:
-                    self._enter_hard_stop("daily_loss_c")
-                elif daily_return <= -float(self.cfg.max_daily_loss_pct):
-                    self._enter_hard_stop("max_daily_loss")
+                    if self.current_phase != "C":
+                        self.current_phase = "C"
+                        self._phase_reason_last = "daily_loss_c"
 
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
                 if self._target_breached and self.current_phase == "B":
-                    dd_from_peak = float((self.daily_peak_equity - eq) / max(1.0, self.daily_peak_equity))
-                    if dd_from_peak >= float(self.cfg.protect_drawdown_from_peak_pct):
-                        self._enter_hard_stop("daily_target_protection")
+                    self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
+                    if self._target_breached_return > float(self.cfg.daily_target_pct):
+                        if daily_return <= float(self.cfg.daily_target_pct):
+                            self._enter_hard_stop("daily_target_lock")
         except Exception as exc:
             log_risk.error("evaluate_account_state error: %s | tb=%s", exc, traceback.format_exc())
 
@@ -2055,6 +2067,7 @@ class RiskManager:
             "daily_start_balance": float(self.daily_start_balance),
             "daily_peak_equity": float(self.daily_peak_equity),
             "_target_breached": bool(self._target_breached),
+            "_target_breached_return": float(self._target_breached_return),
             "current_phase": str(self.current_phase),
             "_trading_disabled_until": float(self._trading_disabled_until),
             "_hard_stop_reason": self._hard_stop_reason,
@@ -2092,12 +2105,21 @@ class RiskManager:
             self.execmon.ewma_slip = float(em.get("ewma_slip", 0.0) or 0.0)
             self.execmon.ewma_lat = float(em.get("ewma_lat", 0.0) or 0.0)
             self.execmon.ewma_spread = float(em.get("ewma_spread", 0.0) or 0.0)
+            # Ensure a clean day start (no carryover hard-stop)
+            self.daily_date = self._utc_date()
+            self._trading_disabled_until = 0.0
+            self._hard_stop_reason = None
+            self._phase_reason_last = None
+            self.current_phase = "A"
+            self._target_breached = False
+            self._target_breached_return = 0.0
             return
 
         self.daily_date = self._utc_date()
         self.daily_start_balance = float(st.get("daily_start_balance", self.daily_start_balance) or 0.0)
         self.daily_peak_equity = float(st.get("daily_peak_equity", self.daily_peak_equity) or 0.0)
         self._target_breached = bool(st.get("_target_breached", self._target_breached))
+        self._target_breached_return = float(st.get("_target_breached_return", self._target_breached_return) or 0.0)
         self.current_phase = str(st.get("current_phase", self.current_phase) or self.current_phase)
         self._trading_disabled_until = float(st.get("_trading_disabled_until", self._trading_disabled_until) or 0.0)
         self._hard_stop_reason = st.get("_hard_stop_reason", self._hard_stop_reason)

@@ -387,8 +387,17 @@ class SignalEngine:
             if (now_ms - self._last_decision_ms) < self._debounce_ms:
                 return self._neutral(sym, ["debounce"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
 
+            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 88) or 88)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
-                return self._neutral(sym, ["stable"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
+                if conf < strong_conf_min:
+                    return self._neutral(
+                        sym,
+                        ["stable"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                    )
 
             self._last_decision_ms = now_ms
             self._last_net_norm = float(net_norm)
@@ -748,14 +757,34 @@ class SignalEngine:
     def _structure_score(self, indp: Dict[str, Any]) -> float:
         try:
             sc = 0.0
-            if str(indp.get("liquidity_sweep", "") or ""):
+            sweep = str(indp.get("liquidity_sweep", "") or "").strip().lower()
+            if sweep == "bull":
                 sc += 1.0
-            if bool(indp.get("fvg_bull", False)) or bool(indp.get("fvg_bear", False)):
+            elif sweep == "bear":
+                sc -= 1.0
+
+            if bool(indp.get("fvg_bull", False)):
                 sc += 0.5
-            if str(indp.get("rsi_div", "none") or "none") != "none":
+            if bool(indp.get("fvg_bear", False)):
+                sc -= 0.5
+
+            div = str(indp.get("rsi_div", "none") or "none").strip().lower()
+            if div in ("bull", "bullish"):
                 sc += 0.5
-            if bool(indp.get("near_round", False)):
-                sc += 0.25
+            elif div in ("bear", "bearish"):
+                sc -= 0.5
+
+            macd_div = str(indp.get("macd_div", "none") or "none").strip().lower()
+            if macd_div in ("bull", "bullish"):
+                sc += 0.4
+            elif macd_div in ("bear", "bearish"):
+                sc -= 0.4
+
+            ob = str(indp.get("order_block", "") or "").strip().lower()
+            if ob == "bull_ob":
+                sc += 0.4
+            elif ob == "bear_ob":
+                sc -= 0.4
             return float(sc)
         except Exception:
             return 0.0

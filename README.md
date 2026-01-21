@@ -1,106 +1,130 @@
-# Системаи Скальпинг Portfolio (XAUUSDm + BTCUSDm)
+# Portfolio Scalping System (XAUUSDm + BTCUSDm)
 
-Ин лоиҳа системаи савдои алгоритмист, ки ба MetaTrader 5 пайваст мешавад ва ду стратегияро ҳамзамон иҷро мекунад:
-XAUUSDm (тилло) ва BTCUSDm (биткоин). Ҳар ду pipeline ҳамзамон кор мекунанд, сигнал месозанд,
-risk‑қоидаҳоро мегузаранд ва ордерҳоро ба MT5 мефиристанд.
+This project is a production-grade algorithmic trading system connected to **MetaTrader 5 (MT5)**.  
+It runs **two strategies in parallel**:
 
-README бо код мувофиқ аст. ENV танҳо барои 5 тағйирёбандаи махфӣ истифода мешавад.
+- **XAUUSDm** (Gold)
+- **BTCUSDm** (Bitcoin)
 
-## Система чӣ мекунад
+Each pipeline continuously analyzes the market, generates signals, applies risk rules, and sends orders to MT5.
 
-- Ду pipeline (XAU + BTC) ҳамзамон таҳлил мешавад; ҳар ду метавонад ордер кушояд.
-- Таймфреймҳо: M1 + M5 + M15 (агар M5/M15 дастрас набошад → ба M1 меафтад).
-- Сигнал + нақшаи SL/TP/lot месозад, баъд order‑ро дар MT5 иҷро мекунад.
-- Telegram‑бот барои назорат ва идоракунии система дорад (паём барои ҳар ордери кушодашуда).
-- Логҳои health/diagnostic ба `Logs/` менависад (health ба Telegram фиристода намешавад).
-- Аз рӯи дақиқии сигнал 1–3 ордер мекушояд (ҳамзамон).
-- Ҳатто бо ордерҳои кушода ҳам анализ идома меёбад.
-- BTC 24/7 кор мекунад; XAU 24/5 (market_open_24_5 назорат мекунад).
+This README is aligned with the current codebase. Environment variables are used **only for 5 secret values**.
 
-## Архитектура (модулҳои асосӣ)
+---
 
-### Portfolio engine
-Файл: `Bot/portfolio_engine.py`
+## What the System Does
 
-Масъулиятҳо:
-- Пайвастшавӣ ба MT5 ва сохтани pipeline‑ҳо.
-- Санҷиши “freshness”‑и маълумот.
-- Гирифтани кандидатҳо аз ҳар сигнал engine.
-- Иҷрои order‑ҳо тавассути worker.
-- Лог/диагностикаи health.
+- Runs two pipelines (**XAU + BTC**) concurrently; **both are allowed to open trades**.
+- Uses multi-timeframe analysis: **M1 + M5 + M15**  
+  If M5/M15 are not available → falls back to **M1**.
+- Produces **Signal + SL/TP/Lot** via the risk layer, then executes orders in MT5.
+- Includes a **Telegram bot** for supervision and control.
+- Writes **health + diagnostic logs** into `Logs/`.
+- Opens **1–3 orders** depending on signal confidence (lot splitting; **SL is never tightened**).
+- Continues analyzing **even while positions are open**.
+- BTC is **24/7**; XAU is **24/5** (controlled by `market_open_24_5`).
 
-### Strategy pipeline‑ҳо
-XAU: `StrategiesXau/`  
-BTC: `StrategiesBtc/`
+---
 
-Ҳар pipeline:
-- `indicators.py` (feature engine)
-- `signal_engine.py` (logic барои сигнал)
-- `risk_management.py` (risk + sizing)
+## Telegram Notifications
 
-### MT5 пайвастшавӣ
-Файл: `mt5_client.py`
+The system notifies the admin:
 
-Функсияҳо:
-- Initialize/login бо retry ва recovery.
-- Single‑instance lock (як Python процесс).
+- When an order is opened (with full details).
+- When risk regime changes (**A/B/C**) with reason.
+- When a new trading day starts (daily reset).
+- When **trade-lock (hard stop)** is triggered with reason.
 
-### Order execution
-Файл: `ExnessAPI/order_execution.py`
+---
 
-Функсияҳо:
-- Market order бо SL/TP.
-- Retry барои баъзе retcode‑ҳо.
-- Metrics (latency/slippage) ба лог.
+## Architecture (Core Modules)
 
-### Telegram бот
-Файл: `Bot/bot.py`
+### Portfolio Engine
+File: `Bot/portfolio_engine.py`
 
-Функсияҳо:
-- Start/Stop engine
-- Status/Balance/Open positions/Profit‑Loss
-- Танҳо админ: `/tek_prof` ва `/stop_ls`
-- Ҳар ордери кушодашуда ба админ SMS мефиристад (бо формати тоҷикӣ).
+Responsibilities:
+- MT5 connection and pipeline orchestration.
+- Market data freshness validation.
+- Collecting candidates from each signal engine.
+- Executing orders via a dedicated worker thread.
+- Health + diagnostic logging.
 
-## Индикаторҳо
+### Strategy Pipelines
+- XAU: `StrategiesXau/`
+- BTC: `StrategiesBtc/`
 
-Индикаторҳои классикӣ (XAU ва BTC):
-- EMA (short/mid/long/vlong)
+Each pipeline includes:
+- `indicators.py` — feature/indicator engine
+- `signal_engine.py` — signal logic
+- `risk_management.py` — risk control + sizing + regimes
+
+### Market Data Feed
+- `DataFeed/xau_market_feed.py`
+- `DataFeed/btc_market_feed.py`
+
+### MT5 Connection Layer
+File: `mt5_client.py`
+
+Includes:
+- Initialize/login with retry + recovery.
+- Single-instance lock (one Python engine process at a time).
+
+### Order Execution
+File: `ExnessAPI/order_execution.py`
+
+Includes:
+- Market order sending with SL/TP.
+- Retry logic for selected retcodes.
+- Execution telemetry: latency and slippage.
+
+### Telegram Bot
+File: `Bot/bot.py`
+
+Capabilities:
+- Start/stop engine
+- Status/balance/open positions/profit-loss
+- Admin-only commands: `/tek_prof` and `/stop_ls`
+- Notifications for orders, regimes, trade-lock, and new day reset
+
+---
+
+## Indicators
+
+Classic indicators (XAU and BTC):
+- EMA (short / mid / long / very-long)
 - ATR
 - RSI
 - ADX
 - MACD (signal + histogram)
 - Bollinger Bands
-- Z‑Volume (z‑score)
+- Z-Volume (z-score)
 
-Илова барои BTC (derived features):
-- VWAP
-- ATR percent
-- BB width
-- EMA/RSI/MACD slope
-- Return features (ret1, ret3)
-
-Сигналҳои структурӣ (pattern/filter):
-- FVG (fair value gap)
+Structural/pattern filters:
+- FVG (Fair Value Gap)
 - Liquidity sweep
 - Order block
 - Divergence (RSI/MACD)
-- Near round‑number
+- Near round-number filter
 
-## Runtime талабот
+---
 
-- Windows + MetaTrader 5 (логиншуда).
-- Python 3.10+.
-- MT5 AutoTrading фаъол.
+## Runtime Requirements
 
-## Танзим (Setup)
+- **Windows + MetaTrader 5** (logged in).
+- **Python 3.10+**
+- MT5 **AutoTrading enabled**.
 
-### 1) Dependencies
+---
+
+## Setup
+
+### 1) Install dependencies
 ```powershell
 pip install -r requirements.txt
-```
+````
 
-### 2) .env (environment variables)
+### 2) `.env` (only 5 environment variables)
+
 ```ini
 EXNESS_LOGIN=12345678
 EXNESS_PASSWORD=your_password
@@ -108,113 +132,171 @@ EXNESS_SERVER=Exness-MT5Real
 BOT_TOKEN=your_telegram_bot_token
 ADMIN_ID=your_telegram_user_id
 ```
-Танҳо ҳамин 5 тағйирёбанда аз ENV хонда мешавад. Дигар ҳама танзимот дар `config_xau.py` ва `config_btc.py` муайян шудааст.
 
-## Запуск
+Only these 5 values are read from ENV.
+All other configuration is defined in:
+
+* `config_xau.py`
+* `config_btc.py`
+
+---
+
+## Run
+
 ```powershell
 py main.py
 ```
 
-Флагҳо:
-- `--headless` → бе Telegram
-- `--engine-only` → танҳо engine
+Flags:
 
-## Логҳо ва мониторинг
+* `--headless` → run without Telegram (VPS mode)
+* `--engine-only` → engine only, no bot
 
-Логҳо дар `Logs/` навишта мешаванд.
+---
 
-Муҳим:
-- `Logs/portfolio_engine_health.log`
-- `Logs/portfolio_engine_diag.jsonl`
-- `Logs/order_execution.log` (health log ғайрифаъол аст)
-- `Logs/telegram.log`
-- `Logs/mt5.log`
-- `Logs/main.log`
+## Logs & Monitoring
 
-Майдонҳои маъмул:
-- `xau_ok` / `btc_ok` → data fresh?
-- `xau_reason` / `btc_reason` → сабаби блок
-- `spread_pts` → spread дар points
-- `q` → queue size
+All logs are stored under `Logs/`.
 
-## Risk ва safety control
+Key files:
 
-Дар `StrategiesXau/risk_management.py` ва `StrategiesBtc/risk_management.py`:
-- режимҳои A/B/C (рӯзи нав — reset)
-- signal throttling (hour/day)
-- latency + spread breakers
-- execution quality monitor
-- optional session filtering
-- cooldown баъди fill ё latency
+* `Logs/portfolio_engine_health.log`
+* `Logs/telegram.log`
+* `Logs/main.log`
+* `Logs/mt5.log`
+* `Logs/order_execution.log`
 
-## Маҳдудиятҳо
+Common fields:
 
-- Агар MT5 барҳои нав надиҳад → trade block мешавад.
-- Агар spread баланд бошад → trade block мешавад.
-- Агар M5/M15 дастрас набошад → система M1‑ро истифода мебарад.
+* `ok_xau` / `ok_btc` → market data fresh?
+* `reason_xau` / `reason_btc` → block reason
+* `q` → execution queue size
 
-## Танзимоти касбӣ (config)
+---
 
-Танзимоти асосӣ дар ин файлҳо ҷойгир аст:
-- `config_xau.py` (тилло)
-- `config_btc.py` (биткоин)
+## Risk & Safety Control
 
-Муҳим:
-- `daily_target_pct=0.10` → ҳадафи рӯзона 10% → режим B.
-- `daily_loss_b_pct=0.02` ва `daily_loss_c_pct=0.03` → режими B/C.
-- Дар C: **hard‑stop** фаъол аст (engine барои он рӯз қатъ мешавад).
-- `enforce_daily_limits=True` → режимҳои A/B/C фаъол.
-- `ignore_daily_stop_for_trading=False` → hard‑stop воқеан engine‑ро қатъ мекунад.
-- `enforce_drawdown_limits=False` → drawdown ордерро қатъ намекунад.
-- `multi_order_confidence_tiers` ва `multi_order_max_orders` → 1–3 ордер аз рӯи дақиқии сигнал.
-- `max_signals_per_day=0` → лимит нест (ҳар сигнал → ордер).
-- `ignore_external_positions=True` → ордерҳои дастӣ ба ҳисобҳои risk/phase таъсир намерасонанд.
-- `magic=777001` → magic number барои фарқ кардани ордерҳои бот.
-- `ignore_microstructure=True` → BTC аз micro‑филтрҳо блок намешавад.
+Implemented in:
 
-Барои скалпинг‑суръат:
-- `poll_seconds_fast=0.05`
-- `decision_debounce_ms=50`
+* `StrategiesXau/risk_management.py`
+* `StrategiesBtc/risk_management.py`
 
-## Маълумоти муҳим (MT5)
+Includes:
 
-- Агар `IPC timeout` бинед, ин аз MT5 аст (на аз код).
-- MT5 бояд кушода, login шуда ва AutoTrading фаъол бошад.
-- Агар лозим шавад, `mt5_path`‑ро дар `config_xau.py`/`config_btc.py` муайян кунед.
+* Regimes **A/B/C** (resets on new day)
+* Signal throttling (hour/day)
+* Latency + spread breakers
+* Execution quality monitor
+* Optional session filtering
+* Cooldowns after fill or high latency
 
-## Тавзеҳ: /tek_prof ва /stop_ls
+Important rules:
 
-Ин ду команда **TP/SL‑и ҳамаи позицияҳои кушода**‑ро бо **USD** ҳисоб мекунанд (на бо пункт).
+* **Hard-stop does NOT stop the engine** — it only **locks trading** (trade-lock).
+* Full engine stop happens only via the **“Stop Trading”** control.
 
-Формулаи умумӣ (барои ҳар позиция):
-- `profit_per_tick = trade_tick_value * volume`
-- `ticks_needed = usd / profit_per_tick`
-- `price_delta = ticks_needed * trade_tick_size`
+---
 
-Барои TP:
-- BUY → `TP = open_price + price_delta`
-- SELL → `TP = open_price - price_delta`
+## Core Daily Profit-Lock Rule
 
-Барои SL:
-- BUY → `SL = open_price - price_delta`
-- SELL → `SL = open_price + price_delta`
+If daily profit exceeds **10%**, and then **returns back to 10% or below**, the system triggers **trade-lock**.
+Trade-lock remains active until the end of the **UTC day**, then resets automatically on the new day.
 
-Агар broker `trade_tick_value` ё `trade_tick_size` = 0 диҳад, ҳисоб имконнопазир мешавад ва позиция **skip** мешавад.
+---
 
-## Project structure
+## SL/TP and Lot Sizing
+
+Computed by `RiskManager`:
+
+* Initial SL/TP comes from micro-zones or ATR logic.
+* Then enforced with:
+
+  * **min distance**
+  * **cost floor**
+  * **ATR floor**
+* Broker constraints (stop/freeze levels) are always respected.
+* Lot sizing is computed from **equity × max_risk_per_trade**, then translated via `mt5.order_calc_profit`.
+* Multi-order behavior:
+
+  * TP may receive a bonus
+  * SL is never tightened
+  * lots are split when allowed
+
+---
+
+## Professional Configuration (config)
+
+Main config files:
+
+* `config_xau.py` (Gold)
+* `config_btc.py` (Bitcoin)
+
+Key parameters:
+
+* `daily_target_pct=0.10` → 10% daily target (profit-lock logic)
+* `daily_loss_b_pct=0.02` and `daily_loss_c_pct=0.05` → regimes B/C
+* `enforce_daily_limits=True` → enables A/B/C regime logic
+* `ignore_daily_stop_for_trading=False` → enables trade-lock (engine continues, trading locked)
+* `multi_order_confidence_tiers` + `multi_order_max_orders` → 1–3 orders based on signal confidence
+* `max_signals_per_day=0` → unlimited
+* `ignore_external_positions=True` → manual trades do not affect regime/risk state
+* `magic=777001` → magic number to identify bot positions
+
+---
+
+## Limitations
+
+* If MT5 does not deliver fresh bars → trading is blocked.
+* If spread is too high → trading is blocked.
+* If M5/M15 are unavailable → system operates on **M1**.
+
+---
+
+## MT5 Notes
+
+* If you see `IPC timeout`, it is an MT5-side issue (not Python logic).
+* MT5 must be open, logged in, and AutoTrading enabled.
+* If required, define `mt5_path` inside `config_xau.py` / `config_btc.py`.
+
+---
+
+## Commands: `/tek_prof` and `/stop_ls`
+
+These commands modify TP/SL for all open positions using **USD distance** (not points).
+
+General formula (per position):
+
+* `profit_per_tick = trade_tick_value * volume`
+* `ticks_needed = usd / profit_per_tick`
+* `price_delta = ticks_needed * trade_tick_size`
+
+For TP:
+
+* BUY → `TP = open_price + price_delta`
+* SELL → `TP = open_price - price_delta`
+
+For SL:
+
+* BUY → `SL = open_price - price_delta`
+* SELL → `SL = open_price + price_delta`
+
+If the broker returns `trade_tick_value` or `trade_tick_size` as 0, the calculation is impossible and the position is skipped.
+
+---
+
+## Project Structure
 
 ```text
 Exness/
 ├── Bot/
 │   ├── portfolio_engine.py
-│   ├── bot.py
-│   └── engine.py
+│   └── bot.py
 ├── DataFeed/
-│   ├── market_feed.py
-│   └── btc_feed.py
+│   ├── xau_market_feed.py
+│   └── btc_market_feed.py
 ├── ExnessAPI/
 │   ├── order_execution.py
-│   ├── orders.py
+│   ├── functions.py
 │   └── history.py
 ├── StrategiesXau/
 │   ├── indicators.py
@@ -228,4 +310,4 @@ Exness/
 ├── config_xau.py
 ├── config_btc.py
 └── main.py
-```
+

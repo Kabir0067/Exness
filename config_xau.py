@@ -1,4 +1,4 @@
-# config.py
+# config.py  (PRODUCTION / FAST / CLEAN / NO-STRUCTURE-CHANGE)
 from __future__ import annotations
 
 import os
@@ -7,11 +7,15 @@ from typing import Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
+
 from log_config import get_log_path
 
+# Keep import-time .env loading (system-wide behavior). No structure change.
+load_dotenv(override=False)
 
-load_dotenv()
-
+# =============================================================================
+# Constants
+# =============================================================================
 ALLOWED_SYMBOLS: Tuple[str, ...] = ("XAUUSDm",)
 XAU_SESSIONS_DEFAULT: List[Tuple[int, int]] = [(0, 24)]
 
@@ -26,46 +30,69 @@ TF_MAP: Dict[str, int] = {
     "H1": mt5.TIMEFRAME_H1,
 }
 
+_BOOL_TRUE = {"1", "true", "yes", "y", "on"}
+_BOOL_FALSE = {"0", "false", "no", "n", "off"}
 
+
+# =============================================================================
+# ENV helpers (strict + fast)
+# =============================================================================
 def _env_required(name: str) -> str:
     """Return env value if present and non-empty, else raise."""
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
-        raise RuntimeError(f".env error: missing/empty variable → {name}")
-    return str(val).strip()
+    v = os.environ.get(name)
+    if v is None:
+        raise RuntimeError(f".env error: missing variable → {name}")
+    s = str(v).strip()
+    if not s:
+        raise RuntimeError(f".env error: empty variable → {name}")
+    return s
 
 
 def _env_int(name: str, default: Optional[int] = None) -> int:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    v = os.environ.get(name)
+    if v is None or not str(v).strip():
         if default is None:
             raise RuntimeError(f".env error: missing/empty variable → {name}")
         return int(default)
+    s = str(v).strip()
     try:
-        return int(str(val).strip())
-    except ValueError as exc:
-        raise RuntimeError(f".env error: invalid int for {name} = {val!r}") from exc
+        return int(s)
+    except Exception as exc:
+        raise RuntimeError(f".env error: invalid int for {name} = {s!r}") from exc
 
 
 def _env_float(name: str, default: Optional[float] = None) -> float:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    v = os.environ.get(name)
+    if v is None or not str(v).strip():
         if default is None:
             raise RuntimeError(f".env error: missing/empty variable → {name}")
         return float(default)
+    s = str(v).strip()
     try:
-        return float(str(val).strip())
-    except ValueError as exc:
-        raise RuntimeError(f".env error: invalid float for {name} = {val!r}") from exc
+        x = float(s)
+    except Exception as exc:
+        raise RuntimeError(f".env error: invalid float for {name} = {s!r}") from exc
+    if x != x or x in (float("inf"), float("-inf")):
+        raise RuntimeError(f".env error: non-finite float for {name} = {s!r}")
+    return float(x)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    v = os.environ.get(name)
+    if v is None or not str(v).strip():
         return bool(default)
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+    s = str(v).strip().lower()
+    if s in _BOOL_TRUE:
+        return True
+    if s in _BOOL_FALSE:
+        return False
+    # strict: don't silently accept garbage
+    raise RuntimeError(f".env error: invalid bool for {name} = {s!r} (use one of {sorted(_BOOL_TRUE | _BOOL_FALSE)})")
 
 
+# =============================================================================
+# Validation helpers
+# =============================================================================
 def _validate_tf(tf: str, field_name: str) -> None:
     if tf not in TF_MAP:
         raise RuntimeError(f"config error: invalid {field_name}={tf!r}. Allowed={list(TF_MAP.keys())}")
@@ -74,16 +101,29 @@ def _validate_tf(tf: str, field_name: str) -> None:
 def _validate_sessions(sessions: List[Tuple[int, int]]) -> None:
     if not sessions:
         raise RuntimeError("config error: active_sessions is empty")
+
     for start_h, end_h in sessions:
-        if not (0 <= int(start_h) <= 24 and 0 <= int(end_h) <= 24):
+        sh = int(start_h)
+        eh = int(end_h)
+
+        if not (0 <= sh <= 24 and 0 <= eh <= 24):
             raise RuntimeError(f"config error: invalid session hours {(start_h, end_h)}; must be in [0..24]")
-        if int(start_h) == int(end_h):
+
+        if sh == eh:
             raise RuntimeError(f"config error: session {(start_h, end_h)} is zero-length")
-        # Режими шабонарӯзӣ: (0,24) иҷозат, дигар ҳолатҳо бояд start < end
-        if (int(start_h), int(end_h)) != (0, 24) and int(start_h) > int(end_h):
+
+        # 24/7 ok
+        if (sh, eh) == (0, 24):
+            continue
+
+        # Disallow crossing midnight here (explicit split is required)
+        if sh > eh:
             raise RuntimeError(f"config error: session {(start_h, end_h)} crosses midnight; split into two sessions")
 
 
+# =============================================================================
+# Config models
+# =============================================================================
 @dataclass
 class SymbolParams:
     base: str = "XAUUSDm"
@@ -110,20 +150,24 @@ class SymbolParams:
         sym = self.resolved or self.base
         if sym not in ALLOWED_SYMBOLS:
             raise RuntimeError(f"config error: symbol {sym!r} not allowed. Allowed={ALLOWED_SYMBOLS}")
+
         _validate_tf(self.tf_primary, "tf_primary")
         _validate_tf(self.tf_confirm, "tf_confirm")
         _validate_tf(self.tf_long, "tf_long")
 
-        if self.entry_mode not in {"market"}:
+        if self.entry_mode != "market":
             raise RuntimeError(f"config error: entry_mode {self.entry_mode!r} not supported (only 'market')")
 
-        if self.micro_window_sec <= 0:
+        if int(self.micro_window_sec) <= 0:
             raise RuntimeError("config error: micro_window_sec must be > 0")
-        if self.micro_min_tps <= 0 or self.micro_max_tps <= 0:
+
+        if float(self.micro_min_tps) <= 0 or float(self.micro_max_tps) <= 0:
             raise RuntimeError("config error: micro_min_tps/micro_max_tps must be > 0")
-        if self.micro_min_tps >= self.micro_max_tps:
+
+        if float(self.micro_min_tps) >= float(self.micro_max_tps):
             raise RuntimeError("config error: micro_min_tps must be < micro_max_tps")
-        if not (0.0 < self.spread_limit_pct < 0.01):
+
+        if not (0.0 < float(self.spread_limit_pct) < 0.01):
             raise RuntimeError("config error: spread_limit_pct out of range")
 
 
@@ -157,17 +201,22 @@ class EngineConfig:
     protect_drawdown_from_peak_pct: float = 0.30
     max_daily_loss_pct: float = 0.10
     daily_loss_b_pct: float = 0.02
-    daily_loss_c_pct: float = 0.03
+    daily_loss_c_pct: float = 0.05
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
     enforce_drawdown_limits: bool = False
     ignore_external_positions: bool = True
     magic: int = 777001
 
-    min_confidence_signal: float = 0.78
-    conf_min: int = 88
+    min_confidence_signal: float = 0.80
+    conf_min: int = 84
     conf_min_low: int = 80
     conf_min_high: int = 93
+    confidence_bias: float = 50.0
+    confidence_gain: float = 70.0
+    net_norm_signal_threshold: float = 0.06
+    strong_conf_min: int = 88
+    require_ema_stack: bool = True
 
     adx_trend_lo: float = 16.0
     adx_trend_hi: float = 27.0
@@ -205,11 +254,13 @@ class EngineConfig:
     fixed_volume: Optional[float] = None
     max_risk_per_trade: float = 0.02
     max_positions: int = 3
+
     # --- Multi-order tuning (SAFE scalping) ---
     multi_order_tp_bonus_pct: float = 0.12
     multi_order_sl_tighten_pct: float = 0.00
     multi_order_confidence_tiers: Tuple[float, float, float] = (0.965, 0.985, 0.993)
     multi_order_max_orders: int = 3
+    max_spread_bps_for_multi: float = 6.0
 
     islamic_min_leverage: int = 1
     require_swap_free: bool = False
@@ -271,7 +322,7 @@ class EngineConfig:
     conformal_q: float = 0.95
     tc_bps: float = 1.0
 
-    multi_order_split_lot: bool = False
+    multi_order_split_lot: bool = True
 
     atr_percentile_lookback: int = 1000
     tod_boost_minutes: int = 120
@@ -298,25 +349,27 @@ class EngineConfig:
     ignore_microstructure: bool = True
 
     def validate(self) -> None:
-        if self.login <= 0:
+        if int(self.login) <= 0:
             raise RuntimeError("config error: login must be > 0")
-        if not self.password.strip():
+        if not str(self.password).strip():
             raise RuntimeError("config error: password empty")
-        if not self.server.strip():
+        if not str(self.server).strip():
             raise RuntimeError("config error: server empty")
-        if not self.telegram_token.strip():
+        if not str(self.telegram_token).strip():
             raise RuntimeError("config error: telegram_token empty")
-        if self.admin_id <= 0:
+        if int(self.admin_id) <= 0:
             raise RuntimeError("config error: admin_id must be > 0")
 
         self.symbol_params.validate()
         _validate_sessions(self.active_sessions)
 
-        if not (0.0 < self.max_risk_per_trade <= 0.10):
+        if not (0.0 < float(self.max_risk_per_trade) <= 0.10):
             raise RuntimeError("config error: max_risk_per_trade out of range (0..0.10]")
-        if self.max_positions <= 0:
+
+        if int(self.max_positions) <= 0:
             raise RuntimeError("config error: max_positions must be > 0")
-        if self.poll_seconds_fast <= 0:
+
+        if float(self.poll_seconds_fast) <= 0:
             raise RuntimeError("config error: poll_seconds_fast must be > 0")
 
     @property
@@ -333,6 +386,9 @@ class EngineConfig:
         }
 
 
+# =============================================================================
+# Public API
+# =============================================================================
 def get_config_from_env() -> EngineConfig:
     cfg = EngineConfig(
         login=_env_int("EXNESS_LOGIN"),
@@ -341,7 +397,6 @@ def get_config_from_env() -> EngineConfig:
         telegram_token=_env_required("BOT_TOKEN"),
         admin_id=_env_int("ADMIN_ID"),
     )
-
     cfg.validate()
     return cfg
 
@@ -349,6 +404,7 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
+    # Keep your original behavior; only clean assignments.
     cfg.min_confidence_signal = 0.78
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.02

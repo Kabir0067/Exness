@@ -255,9 +255,14 @@ class SignalEngine:
             ema50_l = float(indl.get("ema50", close_p) or close_p)
             adx_l = float(indl.get("adx", 0.0) or 0.0)
             adx_lo = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
+            ema_s, ema_m = self._ema_s_m(indp, close_p)
+            require_stack = bool(getattr(self.cfg, "require_ema_stack", True))
 
             trend_ok_buy = (adx_l >= adx_lo and close_p > ema50_l * 0.999)
             trend_ok_sell = (adx_l >= adx_lo and close_p < ema50_l * 1.001)
+            if require_stack:
+                trend_ok_buy = trend_ok_buy and (close_p > ema_s > ema_m)
+                trend_ok_sell = trend_ok_sell and (close_p < ema_s < ema_m)
 
             # 7) Ensemble score
             book = self.feed.fetch_book() or {}
@@ -291,10 +296,25 @@ class SignalEngine:
             blocked_by_htf = False
             conf_min = int(adapt.get("conf_min", 98) or 98)
 
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.05) or 0.05)
+            regime = str(adapt.get("regime", "trend") or "trend").lower()
+            if regime.startswith("range"):
+                net_thr += 0.03
+                if not (near_rn or sweep or div != "none"):
+                    return self._neutral(
+                        sym,
+                        ["range_no_confluence"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
             if conf >= conf_min:
-                if net_norm > 0.05 and trend_ok_buy:
+                if net_norm > net_thr and trend_ok_buy:
                     signal = "Buy"
-                elif net_norm < -0.05 and trend_ok_sell:
+                elif net_norm < -net_thr and trend_ok_sell:
                     signal = "Sell"
                 else:
                     blocked_by_htf = True
@@ -342,8 +362,17 @@ class SignalEngine:
             if (now_ms - self._last_decision_ms) < self._debounce_ms:
                 return self._neutral(sym, ["debounce"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
 
+            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 90) or 90)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
-                return self._neutral(sym, ["stable"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
+                if conf < strong_conf_min:
+                    return self._neutral(
+                        sym,
+                        ["stable"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                    )
 
             self._last_decision_ms = now_ms
             self._last_net_norm = float(net_norm)
@@ -580,7 +609,9 @@ class SignalEngine:
             scores[4] = float(np.tanh(z_vol / 3.0))
 
             net_norm = float(np.sum(scores * weights))
-            base_conf = 50.0 + (net_norm * 30.0)
+            conf_bias = float(getattr(self.cfg, "confidence_bias", 50.0) or 50.0)
+            conf_gain = float(getattr(self.cfg, "confidence_gain", 30.0) or 30.0)
+            base_conf = conf_bias + (net_norm * conf_gain)
             conf = int(_clamp(base_conf, 10.0, 99.0))
             return net_norm, conf
         except Exception as exc:
@@ -659,14 +690,34 @@ class SignalEngine:
     def _structure_score(self, indp: Dict[str, Any]) -> float:
         try:
             sc = 0.0
-            if str(indp.get("liquidity_sweep", "") or ""):
+            sweep = str(indp.get("liquidity_sweep", "") or "").strip().lower()
+            if sweep == "bull":
                 sc += 1.0
-            if bool(indp.get("fvg_bull", False)) or bool(indp.get("fvg_bear", False)):
+            elif sweep == "bear":
+                sc -= 1.0
+
+            if bool(indp.get("fvg_bull", False)):
                 sc += 0.5
-            if str(indp.get("rsi_div", "none") or "none") != "none":
+            if bool(indp.get("fvg_bear", False)):
+                sc -= 0.5
+
+            div = str(indp.get("rsi_div", "none") or "none").strip().lower()
+            if div in ("bull", "bullish"):
                 sc += 0.5
-            if bool(indp.get("near_round", False)):
-                sc += 0.25
+            elif div in ("bear", "bearish"):
+                sc -= 0.5
+
+            macd_div = str(indp.get("macd_div", "none") or "none").strip().lower()
+            if macd_div in ("bull", "bullish"):
+                sc += 0.4
+            elif macd_div in ("bear", "bearish"):
+                sc -= 0.4
+
+            ob = str(indp.get("order_block", "") or "").strip().lower()
+            if ob == "bull_ob":
+                sc += 0.4
+            elif ob == "bear_ob":
+                sc -= 0.4
             return float(sc)
         except Exception:
             return 0.0
