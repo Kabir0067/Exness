@@ -4,20 +4,16 @@ from __future__ import annotations
 
 Ин модул танҳо як кор мекунад: идоракунии позицияҳо дар MT5.
 
-Чӣ чизҳо дар ин ҷо ҳастанд:
-  1) Health-check + cache (то MT5-ро 100 бор дар як сония напурсад)
-  2) Helpers: баланс, PnL (open positions), pagination (get_order_by_index)
-  3) Close: close_order / close_all_position
-  4) SL/TP дар USD: set_takeprofit_all_positions_usd / set_stoploss_all_positions_usd
-
-Мавридҳои муҳим:
-- Барои ҳисобкунии TP/SL аз USD мо `trade_tick_value` ва `trade_tick_size`-ро истифода мебарем.
-  Агар брокер ин параметрҳоро 0 диҳад → ҳисоб имконнопазир мешавад ва позиция skip мешавад.
-- Ҳамаи даъватҳои MT5 дар MT5_LOCK иҷро мешаванд.
-- Логҳо ба `Logs/orders.log` (rotating) меравад.
+Оптимизатсияҳои SENIOR:
+- MT5_LOCK барои 100% ҳамаи mt5.* call
+- health-cache + symbol-info/tick micro-cache (камфишор ба терминал)
+- group-by-symbol дар close_all_position (тик 1x барои ҳар symbol)
+- numpy хориҷ (сабуктар/тезтар)
+- retry backoff хурд ва муайян (бе спам)
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -25,40 +21,40 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import MetaTrader5 as mt5
-import numpy as np
 
 from mt5_client import MT5_LOCK, ensure_mt5
-from log_config import LOG_DIR as LOG_ROOT, get_log_path
-
-
+from log_config import get_log_path
 
 # =============================================================================
 # Types / constants
 # =============================================================================
 SLTPUnits = Literal["points", "usd", "price"]
 
-# Default knobs (бо хоҳиш метавонед аз ҷойи дигар override кунед)
 DEFAULT_DEVIATION = 50
 DEFAULT_MAGIC = 123456
 DEFAULT_RETRIES = 2
-DEFAULT_MODIFY_SLEEP_SEC = 0.08
 
-# Positions cache барои Telegram pagination
+# Sleep knobs (deterministic, low-pressure)
+_CLOSE_RETRY_BASE_SEC = 0.12
+_CLOSE_RETRY_CAP_SEC = 0.60
+_CANCEL_RETRY_BASE_SEC = 0.08
+_CANCEL_RETRY_CAP_SEC = 0.40
+_MODIFY_RETRY_BASE_SEC = 0.05
+_MODIFY_RETRY_CAP_SEC = 0.25
+
+# Caches
 _POS_CACHE_TTL_SEC = 1.0
-
-# MT5 health cache
 _MT5_HEALTH_TTL_SEC = 0.5
-
-
+_SYMBOL_CACHE_TTL_SEC = 0.25
+_TICK_CACHE_TTL_SEC = 0.20
 
 # =============================================================================
 # Logging (ERROR-only, rotating)
 # =============================================================================
 _ORDERS_LOG_PATH = get_log_path("orders.log")
 
-def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
-    """Attach RotatingFileHandler only once (no duplicates)."""
 
+def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
     logger.setLevel(level)
     logger.propagate = False
 
@@ -82,9 +78,34 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
     h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(h)
 
+
 log_orders = logging.getLogger("orders")
 _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 
+# =============================================================================
+# Time helpers
+# =============================================================================
+def _mono() -> float:
+    return time.monotonic()
+
+
+def _sleep_backoff(attempt: int, base: float, cap: float) -> None:
+    # deterministic exponential backoff
+    a = int(attempt)
+    delay = base * (2.0 ** a)
+    delay = min(cap, delay)
+    time.sleep(delay)
+
+
+# =============================================================================
+# MT5 safe last_error
+# =============================================================================
+def _safe_last_error() -> str:
+    with MT5_LOCK:
+        try:
+            return str(mt5.last_error())
+        except Exception:
+            return "n/a"
 
 
 # =============================================================================
@@ -92,7 +113,7 @@ _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 # =============================================================================
 @dataclass
 class _MT5HealthCache:
-    ts: float = 0.0
+    ts_mono: float = 0.0
     ok: bool = False
     trade_allowed: bool = False
 
@@ -100,22 +121,9 @@ class _MT5HealthCache:
 _MT5_CACHE = _MT5HealthCache()
 
 
-def _safe_last_error() -> str:
-    try:
-        return str(mt5.last_error())
-    except Exception:
-        return "n/a"
-
-
-def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 1.0) -> bool:
-    """Health-check бо кеш.
-
-    require_trade_allowed=True → AutoTrading бояд фаъол бошад.
-    ttl_sec → дар ин муддат натиҷа cached мемонад.
-    """
-
-    now = time.time()
-    if (now - _MT5_CACHE.ts) < float(ttl_sec):
+def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 0.5) -> bool:
+    now = _mono()
+    if (now - _MT5_CACHE.ts_mono) < float(ttl_sec):
         return bool(_MT5_CACHE.ok and (not require_trade_allowed or _MT5_CACHE.trade_allowed))
 
     try:
@@ -127,27 +135,25 @@ def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 
         ok = bool(term and getattr(term, "connected", False) and acc)
         trade_allowed = bool(term and getattr(term, "trade_allowed", False))
 
-        _MT5_CACHE.ts = now
+        _MT5_CACHE.ts_mono = now
         _MT5_CACHE.ok = ok
         _MT5_CACHE.trade_allowed = trade_allowed
 
         return bool(ok and (not require_trade_allowed or trade_allowed))
 
     except Exception as exc:
-        _MT5_CACHE.ts = now
+        _MT5_CACHE.ts_mono = now
         _MT5_CACHE.ok = False
         _MT5_CACHE.trade_allowed = False
         log_orders.error("MT5 health check failed: %s | last_error=%s", exc, _safe_last_error())
         return False
 
-def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
-    """Raises RuntimeError if MT5 is not ready."""
 
+def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
     ok = _mt5_health_cached(require_trade_allowed=require_trade_allowed, ttl_sec=_MT5_HEALTH_TTL_SEC)
     if ok:
         return
 
-    # Extra context for debugging
     with MT5_LOCK:
         term = mt5.terminal_info()
 
@@ -158,18 +164,135 @@ def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
     )
 
 
+# =============================================================================
+# Symbol micro-cache (info + tick)
+# =============================================================================
+@dataclass
+class _SymCacheEntry:
+    info: Any = None
+    info_ts: float = 0.0
+    tick: Any = None
+    tick_ts: float = 0.0
+
+
+_SYM_CACHE: Dict[str, _SymCacheEntry] = {}
+
+
+def _get_sym_entry(symbol: str) -> _SymCacheEntry:
+    e = _SYM_CACHE.get(symbol)
+    if e is None:
+        e = _SymCacheEntry()
+        _SYM_CACHE[symbol] = e
+    return e
+
+
+def _symbol_select(symbol: str) -> bool:
+    with MT5_LOCK:
+        try:
+            return bool(mt5.symbol_select(symbol, True))
+        except Exception:
+            return False
+
+
+def _symbol_info_cached(symbol: str) -> Any:
+    now = _mono()
+    e = _get_sym_entry(symbol)
+    if e.info is not None and (now - e.info_ts) < _SYMBOL_CACHE_TTL_SEC:
+        return e.info
+
+    with MT5_LOCK:
+        try:
+            info = mt5.symbol_info(symbol)
+        except Exception:
+            info = None
+
+    e.info = info
+    e.info_ts = now
+    return info
+
+
+def _tick_cached(symbol: str) -> Any:
+    now = _mono()
+    e = _get_sym_entry(symbol)
+    if e.tick is not None and (now - e.tick_ts) < _TICK_CACHE_TTL_SEC:
+        return e.tick
+
+    with MT5_LOCK:
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+        except Exception:
+            tick = None
+
+    e.tick = tick
+    e.tick_ts = now
+    return tick
+
+
+def _best_filling_type(symbol: str) -> int:
+    """
+    Барои устуворӣ: IOC/FOK/RETURN интихоб мекунад.
+    Агар маълумот набошад → IOC.
+    """
+    info = _symbol_info_cached(symbol)
+    if info is None:
+        return mt5.ORDER_FILLING_IOC
+
+    # 1) filling_mode (агар вуҷуд дошта бошад)
+    fm = getattr(info, "filling_mode", None)
+    if isinstance(fm, int) and fm in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+        return int(fm)
+
+    # 2) trade_fill_flags (агар bitmask бошад)
+    flags = getattr(info, "trade_fill_flags", None)
+    if isinstance(flags, int) and flags > 0:
+        # афзалият: IOC -> FOK -> RETURN
+        if flags & mt5.ORDER_FILLING_IOC:
+            return mt5.ORDER_FILLING_IOC
+        if flags & mt5.ORDER_FILLING_FOK:
+            return mt5.ORDER_FILLING_FOK
+        if flags & mt5.ORDER_FILLING_RETURN:
+            return mt5.ORDER_FILLING_RETURN
+
+    return mt5.ORDER_FILLING_IOC
+
+
+# =============================================================================
+# order_send retry helper (NO sleep under MT5_LOCK)
+# =============================================================================
+def _send_with_retries(
+    req: Dict[str, Any],
+    *,
+    retries: int,
+    success_retcodes: Tuple[int, ...],
+    sleep_base: float,
+    sleep_cap: float,
+) -> Tuple[bool, Optional[Any], Optional[int]]:
+    r = max(1, int(retries))
+    last_res = None
+    last_ret: Optional[int] = None
+
+    for attempt in range(r):
+        with MT5_LOCK:
+            last_res = mt5.order_send(req)
+        last_ret = int(getattr(last_res, "retcode", -1)) if last_res else None
+
+        if last_res and (last_ret in success_retcodes):
+            return True, last_res, last_ret
+
+        if attempt < r - 1:
+            _sleep_backoff(attempt, base=float(sleep_base), cap=float(sleep_cap))
+
+    return False, last_res, last_ret
+
 
 # =============================================================================
 # Public helpers
 # =============================================================================
 def enable_trading() -> None:
-    """Validates that AutoTrading is enabled in MT5 terminal."""
-
     _ensure_mt5_connected(require_trade_allowed=True)
 
-def get_balance() -> float:
-    """Returns account balance (0.0 on failure)."""
 
+def get_balance() -> float:
     try:
         _ensure_mt5_connected()
         with MT5_LOCK:
@@ -180,19 +303,14 @@ def get_balance() -> float:
             return 0.0
 
         bal = float(getattr(acc, "balance", 0.0) or 0.0)
-        return float(bal) if np.isfinite(bal) else 0.0
+        return float(bal) if math.isfinite(bal) else 0.0
 
     except Exception as exc:
         log_orders.error("get_balance error: %s | last_error=%s", exc, _safe_last_error())
         return 0.0
 
+
 def get_positions_summary(symbol: Optional[str] = None) -> float:
-    """Returns total unrealized P/L (profit) for open positions.
-
-    symbol=None → ҳамаи позицияҳо
-    symbol='XAUUSDm' → танҳо барои ҳамин symbol
-    """
-
     try:
         _ensure_mt5_connected()
         with MT5_LOCK:
@@ -201,7 +319,7 @@ def get_positions_summary(symbol: Optional[str] = None) -> float:
         total = 0.0
         for p in positions or []:
             pr = float(getattr(p, "profit", 0.0) or 0.0)
-            if np.isfinite(pr):
+            if math.isfinite(pr):
                 total += pr
 
         return float(total)
@@ -211,29 +329,25 @@ def get_positions_summary(symbol: Optional[str] = None) -> float:
         return 0.0
 
 
-
 # =============================================================================
 # Positions cache (Telegram pagination)
 # =============================================================================
-_positions_cache: Dict[str, Any] = {"data": [], "ts": 0.0}
+_positions_cache: Dict[str, Any] = {"data": [], "ts_mono": 0.0}
+
 
 def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Returns open position by 0-based index and total positions count.
-
-    Cached for 1 second to support Telegram pagination.
-    """
-
     global _positions_cache
 
     try:
-        now = time.time()
-        if now - float(_positions_cache.get("ts", 0.0)) < _POS_CACHE_TTL_SEC and _positions_cache.get("data"):
+        now = _mono()
+        cached_ok = (now - float(_positions_cache.get("ts_mono", 0.0))) < _POS_CACHE_TTL_SEC and _positions_cache.get("data")
+        if cached_ok:
             positions = _positions_cache["data"]
         else:
             _ensure_mt5_connected()
             with MT5_LOCK:
                 positions = mt5.positions_get() or []
-            _positions_cache = {"data": positions, "ts": now}
+            _positions_cache = {"data": positions, "ts_mono": now}
 
         total = len(positions)
         if total <= 0:
@@ -258,15 +372,13 @@ def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
         log_orders.error("get_order_by_index error: %s | last_error=%s", exc, _safe_last_error())
         return None, 0
 
-def get_all_open_positions() -> List[Any]:
-    """Returns list of all open positions (mt5.positions_get())."""
 
+def get_all_open_positions() -> List[Any]:
     try:
         _ensure_mt5_connected()
         with MT5_LOCK:
             positions = mt5.positions_get() or []
         return list(positions)
-
     except Exception as exc:
         log_orders.error("get_all_open_positions error: %s | last_error=%s", exc, _safe_last_error())
         return []
@@ -282,11 +394,6 @@ def close_order(
     magic: int = DEFAULT_MAGIC,
     retries: int = DEFAULT_RETRIES,
 ) -> bool:
-    """Closes a specific open position by ticket.
-
-    Returns True on success.
-    """
-
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
@@ -302,16 +409,21 @@ def close_order(
         volume = float(getattr(pos, "volume", 0.0) or 0.0)
         ptype = int(getattr(pos, "type", 0) or 0)
 
-        with MT5_LOCK:
-            _ = mt5.symbol_select(symbol, True)
-            tick = mt5.symbol_info_tick(symbol)
+        if not symbol or volume <= 0:
+            log_orders.error("close_order: invalid position ticket=%s symbol=%s volume=%s", ticket, symbol, volume)
+            return False
 
+        _symbol_select(symbol)
+        tick = _tick_cached(symbol)
         if tick is None:
             log_orders.error("close_order: tick_missing symbol=%s ticket=%s", symbol, ticket)
             return False
 
         close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
+        if price <= 0:
+            log_orders.error("close_order: bad_price symbol=%s ticket=%s", symbol, ticket)
+            return False
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -323,23 +435,25 @@ def close_order(
             "deviation": int(deviation),
             "magic": int(magic),
             "comment": "manual_close",
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": int(_best_filling_type(symbol)),
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
-        res = None
-        for _ in range(max(1, int(retries))):
-            with MT5_LOCK:
-                res = mt5.order_send(req)
-            if res and int(getattr(res, "retcode", -1)) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
-                return True
-            time.sleep(0.35)
+        ok, res, last_ret = _send_with_retries(
+            req,
+            retries=max(1, int(retries)),
+            success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+            sleep_base=_CLOSE_RETRY_BASE_SEC,
+            sleep_cap=_CLOSE_RETRY_CAP_SEC,
+        )
+        if ok:
+            return True
 
         log_orders.error(
             "close_order failed ticket=%s symbol=%s ret=%s last_error=%s",
             ticket,
             symbol,
-            getattr(res, "retcode", None) if res else None,
+            last_ret,
             _safe_last_error(),
         )
         return False
@@ -348,80 +462,83 @@ def close_order(
         log_orders.error("close_order error ticket=%s: %s | last_error=%s", ticket, exc, _safe_last_error())
         return False
 
+
 def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAULT_MAGIC) -> Dict[str, Any]:
-    """Closes all open positions and cancels all pending orders.
-
-    Returns:
-      {
-        "ok": bool,
-        "closed": int,
-        "canceled": int,
-        "errors": [str, ...],
-        "last_error": tuple
-      }
-    """
-
     out: Dict[str, Any] = {"ok": False, "closed": 0, "canceled": 0, "errors": [], "last_error": None}
 
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
-        # 1) Close positions
+        # 1) Close positions (group by symbol -> 1 tick per symbol)
         with MT5_LOCK:
             positions = mt5.positions_get() or []
 
-        for pos in positions:
+        by_symbol: Dict[str, List[Any]] = {}
+        for p in positions:
+            s = str(getattr(p, "symbol", ""))
+            if s:
+                by_symbol.setdefault(s, []).append(p)
+
+        for symbol, plist in by_symbol.items():
             try:
-                ticket = int(getattr(pos, "ticket", 0) or 0)
-                symbol = str(getattr(pos, "symbol", ""))
-                volume = float(getattr(pos, "volume", 0.0) or 0.0)
-                ptype = int(getattr(pos, "type", 0) or 0)
-
-                with MT5_LOCK:
-                    _ = mt5.symbol_select(symbol, True)
-                    tick = mt5.symbol_info_tick(symbol)
-
+                _symbol_select(symbol)
+                tick = _tick_cached(symbol)
                 if tick is None:
-                    out["errors"].append(f"{ticket}: tick_missing")
+                    for pos in plist:
+                        ticket = int(getattr(pos, "ticket", 0) or 0)
+                        out["errors"].append(f"{ticket}: tick_missing")
                     continue
 
-                close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
+                bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                if bid <= 0 or ask <= 0:
+                    for pos in plist:
+                        ticket = int(getattr(pos, "ticket", 0) or 0)
+                        out["errors"].append(f"{ticket}: bad_tick")
+                    continue
 
-                req = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": float(volume),
-                    "type": int(close_type),
-                    "position": int(ticket),
-                    "price": float(price),
-                    "deviation": int(deviation),
-                    "magic": int(magic),
-                    "comment": "close_all",
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                }
+                filling = int(_best_filling_type(symbol))
 
-                ok_one = False
-                last_ret: Optional[int] = None
-                res = None
-                for _ in range(5):
-                    with MT5_LOCK:
-                        res = mt5.order_send(req)
-                    last_ret = int(getattr(res, "retcode", -1)) if res else None
-                    if res and last_ret in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
-                        ok_one = True
-                        break
-                    time.sleep(0.35)
+                for pos in plist:
+                    ticket = int(getattr(pos, "ticket", 0) or 0)
+                    volume = float(getattr(pos, "volume", 0.0) or 0.0)
+                    ptype = int(getattr(pos, "type", 0) or 0)
+                    if ticket <= 0 or volume <= 0:
+                        out["errors"].append(f"{ticket}: invalid_position")
+                        continue
 
-                if ok_one:
-                    out["closed"] += 1
-                else:
-                    out["errors"].append(f"{ticket}: close_failed retcode={last_ret}")
+                    close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                    price = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
 
-            except Exception as exc_pos:
-                log_orders.error("close_all_position: close position error: %s | last_error=%s", exc_pos, _safe_last_error())
-                out["errors"].append("pos_close_exception")
+                    req = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": symbol,
+                        "volume": float(volume),
+                        "type": int(close_type),
+                        "position": int(ticket),
+                        "price": float(price),
+                        "deviation": int(deviation),
+                        "magic": int(magic),
+                        "comment": "close_all",
+                        "type_filling": filling,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                    }
+
+                    ok, _, last_ret = _send_with_retries(
+                        req,
+                        retries=5,
+                        success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+                        sleep_base=_CLOSE_RETRY_BASE_SEC,
+                        sleep_cap=_CLOSE_RETRY_CAP_SEC,
+                    )
+                    if ok:
+                        out["closed"] += 1
+                    else:
+                        out["errors"].append(f"{ticket}: close_failed retcode={last_ret}")
+
+            except Exception as exc_sym:
+                log_orders.error("close_all_position: symbol batch error: %s | last_error=%s", exc_sym, _safe_last_error())
+                out["errors"].append("symbol_batch_exception")
 
         # 2) Cancel pending orders
         with MT5_LOCK:
@@ -430,21 +547,21 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
         for o in pending:
             try:
                 oticket = int(getattr(o, "ticket", 0) or 0)
+                if oticket <= 0:
+                    out["errors"].append("bad_pending_ticket")
+                    continue
+
                 req = {"action": mt5.TRADE_ACTION_REMOVE, "order": oticket}
 
-                ok_one = False
-                last_ret: Optional[int] = None
-                res = None
-                for _ in range(3):
-                    with MT5_LOCK:
-                        res = mt5.order_send(req)
-                    last_ret = int(getattr(res, "retcode", -1)) if res else None
-                    if res and last_ret == mt5.TRADE_RETCODE_DONE:
-                        ok_one = True
-                        break
-                    time.sleep(0.25)
+                ok, _, last_ret = _send_with_retries(
+                    req,
+                    retries=3,
+                    success_retcodes=(mt5.TRADE_RETCODE_DONE,),
+                    sleep_base=_CANCEL_RETRY_BASE_SEC,
+                    sleep_cap=_CANCEL_RETRY_CAP_SEC,
+                )
 
-                if ok_one:
+                if ok:
                     out["canceled"] += 1
                 else:
                     out["errors"].append(f"{oticket}: cancel_failed retcode={last_ret}")
@@ -453,33 +570,21 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                 log_orders.error("close_all_position: cancel order error: %s | last_error=%s", exc_ord, _safe_last_error())
                 out["errors"].append("order_cancel_exception")
 
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["ok"] = len(out["errors"]) == 0
         return out
 
     except Exception as exc:
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
         log_orders.error("close_all_position global error: %s | last_error=%s", exc, _safe_last_error())
         return out
-
 
 
 # =============================================================================
 # USD -> TP/SL price conversion helpers
 # =============================================================================
 def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float]:
-    """Converts desired profit in USD to TP price for a position.
-
-    Формула:
-      profit_per_tick_for_volume = trade_tick_value * volume
-      ticks_needed = usd_profit / profit_per_tick_for_volume
-      price_delta = ticks_needed * trade_tick_size
-
-    BUY  → TP = open_price + price_delta
-    SELL → TP = open_price - price_delta
-    """
-
     try:
         symbol = str(getattr(pos, "symbol", ""))
         vol = float(getattr(pos, "volume", 0.0) or 0.0)
@@ -489,8 +594,7 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
         if not symbol or vol <= 0.0 or usd_profit <= 0.0 or open_price <= 0.0:
             return None
 
-        with MT5_LOCK:
-            info = mt5.symbol_info(symbol)
+        info = _symbol_info_cached(symbol)
         if info is None:
             return None
 
@@ -502,29 +606,21 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
             return None
 
         ticks_needed = float(usd_profit) / (tick_value * vol)
-        if not np.isfinite(ticks_needed) or ticks_needed <= 0:
+        if not math.isfinite(ticks_needed) or ticks_needed <= 0:
             return None
 
         price_delta = ticks_needed * tick_size
         tp = open_price + price_delta if ptype == mt5.POSITION_TYPE_BUY else open_price - price_delta
 
         tp = round(float(tp), digits)
-        if tp <= 0:
-            return None
-
-        return tp
+        return tp if tp > 0 else None
 
     except Exception as exc:
         log_orders.error("_usd_to_tp_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
         return None
 
+
 def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
-    """Converts desired loss in USD to SL price for a position.
-
-    BUY  → SL = open_price - delta
-    SELL → SL = open_price + delta
-    """
-
     try:
         symbol = str(getattr(pos, "symbol", ""))
         vol = float(getattr(pos, "volume", 0.0) or 0.0)
@@ -534,8 +630,7 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         if not symbol or vol <= 0.0 or usd_loss <= 0.0 or open_price <= 0.0:
             return None
 
-        with MT5_LOCK:
-            info = mt5.symbol_info(symbol)
+        info = _symbol_info_cached(symbol)
         if info is None:
             return None
 
@@ -547,7 +642,7 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
             return None
 
         ticks_needed = float(usd_loss) / (tick_value * vol)
-        if not np.isfinite(ticks_needed) or ticks_needed <= 0:
+        if not math.isfinite(ticks_needed) or ticks_needed <= 0:
             return None
 
         price_delta = ticks_needed * tick_size
@@ -557,7 +652,6 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         if sl <= 0:
             return None
 
-        # Direction sanity
         if ptype == mt5.POSITION_TYPE_BUY and not (sl < open_price):
             return None
         if ptype == mt5.POSITION_TYPE_SELL and not (sl > open_price):
@@ -569,21 +663,11 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         log_orders.error("_usd_to_sl_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
         return None
 
+
 def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> float:
-    """Enforces broker minimum stop distance (trade_stops_level).
-
-    BUY:  SL <= bid - min_dist
-    SELL: SL >= ask + min_dist
-
-    Агар stop distance 0 бошад → unchanged.
-    Агар tick/info набошад → unchanged.
-    """
-
     try:
-        with MT5_LOCK:
-            info = mt5.symbol_info(symbol)
-            tick = mt5.symbol_info_tick(symbol)
-
+        info = _symbol_info_cached(symbol)
+        tick = _tick_cached(symbol)
         if not info or not tick:
             return float(sl_price)
 
@@ -595,7 +679,6 @@ def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> f
             return round(float(sl_price), digits)
 
         min_dist = float(stops_level) * point
-
         bid = float(getattr(tick, "bid", 0.0) or 0.0)
         ask = float(getattr(tick, "ask", 0.0) or 0.0)
         if bid <= 0.0 or ask <= 0.0:
@@ -614,7 +697,6 @@ def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> f
         return float(sl_price)
 
 
-
 # =============================================================================
 # Public: set TP/SL for ALL positions by USD
 # =============================================================================
@@ -625,11 +707,6 @@ def set_takeprofit_all_positions_usd(
     magic: int = DEFAULT_MAGIC,
     retries: int = DEFAULT_RETRIES,
 ) -> Dict[str, Any]:
-    """Sets TP for ALL open positions by desired profit in USD (same usd_profit per position).
-
-    SL нигоҳ дошта мешавад (ҳамон SL мемонад).
-    """
-
     out: Dict[str, Any] = {"ok": False, "total": 0, "updated": 0, "skipped": 0, "errors": [], "last_error": None}
 
     try:
@@ -641,7 +718,7 @@ def set_takeprofit_all_positions_usd(
         out["total"] = len(positions)
         if not positions:
             out["ok"] = True
-            out["last_error"] = mt5.last_error()
+            out["last_error"] = _safe_last_error()
             return out
 
         for pos in positions:
@@ -672,32 +749,29 @@ def set_takeprofit_all_positions_usd(
                 "comment": f"tp_all_usd_{usd_profit}",
             }
 
-            ok_one = False
-            last_ret: Optional[int] = None
-            res = None
-            for _ in range(max(1, int(retries))):
-                with MT5_LOCK:
-                    res = mt5.order_send(req)
-                last_ret = int(getattr(res, "retcode", -1)) if res else None
-                if res and last_ret == mt5.TRADE_RETCODE_DONE:
-                    ok_one = True
-                    break
-                time.sleep(DEFAULT_MODIFY_SLEEP_SEC)
+            ok, _, last_ret = _send_with_retries(
+                req,
+                retries=max(1, int(retries)),
+                success_retcodes=(mt5.TRADE_RETCODE_DONE,),
+                sleep_base=_MODIFY_RETRY_BASE_SEC,
+                sleep_cap=_MODIFY_RETRY_CAP_SEC,
+            )
 
-            if ok_one:
+            if ok:
                 out["updated"] += 1
             else:
                 out["errors"].append(f"{ticket}:{symbol}: update_failed retcode={last_ret}")
 
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["ok"] = len(out["errors"]) == 0
         return out
 
     except Exception as exc:
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
         log_orders.error("set_takeprofit_all_positions_usd error: %s | last_error=%s", exc, _safe_last_error())
         return out
+
 
 def set_stoploss_all_positions_usd(
     usd_loss: float,
@@ -706,11 +780,6 @@ def set_stoploss_all_positions_usd(
     magic: int = DEFAULT_MAGIC,
     retries: int = DEFAULT_RETRIES,
 ) -> Dict[str, Any]:
-    """Sets SL for ALL open positions by desired loss in USD (same usd_loss per position).
-
-    TP нигоҳ дошта мешавад (ҳамон TP мемонад).
-    """
-
     out: Dict[str, Any] = {"ok": False, "total": 0, "updated": 0, "skipped": 0, "errors": [], "last_error": None}
 
     try:
@@ -722,7 +791,7 @@ def set_stoploss_all_positions_usd(
         out["total"] = len(positions)
         if not positions:
             out["ok"] = True
-            out["last_error"] = mt5.last_error()
+            out["last_error"] = _safe_last_error()
             return out
 
         for pos in positions:
@@ -739,7 +808,6 @@ def set_stoploss_all_positions_usd(
                 out["errors"].append(f"{ticket}:{symbol}: sl_calc_failed")
                 continue
 
-            # Broker constraints (min stop distance)
             sl_price = _enforce_stop_distance_for_sl(symbol, ptype, float(sl_price))
             if sl_price <= 0:
                 out["skipped"] += 1
@@ -761,33 +829,28 @@ def set_stoploss_all_positions_usd(
                 "comment": f"sl_all_usd_{usd_loss}",
             }
 
-            ok_one = False
-            last_ret: Optional[int] = None
-            res = None
-            for _ in range(max(1, int(retries))):
-                with MT5_LOCK:
-                    res = mt5.order_send(req)
-                last_ret = int(getattr(res, "retcode", -1)) if res else None
-                if res and last_ret == mt5.TRADE_RETCODE_DONE:
-                    ok_one = True
-                    break
-                time.sleep(DEFAULT_MODIFY_SLEEP_SEC)
+            ok, _, last_ret = _send_with_retries(
+                req,
+                retries=max(1, int(retries)),
+                success_retcodes=(mt5.TRADE_RETCODE_DONE,),
+                sleep_base=_MODIFY_RETRY_BASE_SEC,
+                sleep_cap=_MODIFY_RETRY_CAP_SEC,
+            )
 
-            if ok_one:
+            if ok:
                 out["updated"] += 1
             else:
                 out["errors"].append(f"{ticket}:{symbol}: update_failed retcode={last_ret}")
 
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["ok"] = len(out["errors"]) == 0
         return out
 
     except Exception as exc:
-        out["last_error"] = mt5.last_error()
+        out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
         log_orders.error("set_stoploss_all_positions_usd error: %s | last_error=%s", exc, _safe_last_error())
         return out
-
 
 
 __all__ = [

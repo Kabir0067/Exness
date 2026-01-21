@@ -20,7 +20,6 @@ except Exception:
 # Prefer your BTC-only config module name.
 from config_btc import EngineConfig
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
-  # type: ignore
 
 # =============================================================================
 # Logging (ERROR only)

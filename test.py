@@ -42,9 +42,3 @@ def trading_no_percent():
 
 
 trading_no_percent()
-
-
-
-
-
-

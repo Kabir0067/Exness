@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
     talib = None  # type: ignore
 
 from config_btc import EngineConfig, SymbolParams
-from DataFeed.btc_feed import MarketFeed, TickStats
+from DataFeed.btc_market_feed import MarketFeed, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
 from StrategiesBtc.indicators import Classic_FeatureEngine, safe_last
 from StrategiesBtc.risk_management import RiskManager
@@ -288,14 +288,14 @@ class SignalEngine:
             # 6) Adaptive params
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
-            # 7) HTF alignment
+            # 7) HTF alignment (BTC: allow EMA bias even when ADX is soft)
             close_p = float(indp.get("close", 0.0) or 0.0)
             ema50_l = float(indl.get("ema50", close_p) or close_p)
             adx_l = float(indl.get("adx", 0.0) or 0.0)
             adx_lo = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
-
-            trend_ok_buy = (adx_l >= adx_lo) and (close_p > ema50_l * 0.999)
-            trend_ok_sell = (adx_l >= adx_lo) and (close_p < ema50_l * 1.001)
+            trend_l = str(indl.get("trend", "") or "")
+            bias_up = ("up" in trend_l)
+            bias_dn = ("down" in trend_l)
 
             # 8) Ensemble score
             book = self.feed.fetch_book() or {}
@@ -329,10 +329,14 @@ class SignalEngine:
             blocked_by_htf = False
             conf_min = int(adapt.get("conf_min", 98) or 98)
 
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.05) or 0.05)
+            trend_ok_buy = (close_p > ema50_l * 0.999) and (adx_l >= adx_lo or bias_up)
+            trend_ok_sell = (close_p < ema50_l * 1.001) and (adx_l >= adx_lo or bias_dn)
+
             if conf >= conf_min:
-                if net_norm > 0.05 and trend_ok_buy:
+                if net_norm > net_thr and trend_ok_buy:
                     signal = "Buy"
-                elif net_norm < -0.05 and trend_ok_sell:
+                elif net_norm < -net_thr and trend_ok_sell:
                     signal = "Sell"
                 else:
                     blocked_by_htf = True
@@ -663,7 +667,9 @@ class SignalEngine:
             scores[4] = float(np.tanh(z_vol / 3.0))
 
             net_norm = float(np.sum(scores * weights))
-            base_conf = 50.0 + (net_norm * 30.0)
+            conf_bias = float(getattr(self.cfg, "confidence_bias", 50.0) or 50.0)
+            conf_gain = float(getattr(self.cfg, "confidence_gain", 30.0) or 30.0)
+            base_conf = conf_bias + (net_norm * conf_gain)
             conf = int(_clamp(base_conf, 10.0, 99.0))
             return net_norm, conf
         except Exception as exc:

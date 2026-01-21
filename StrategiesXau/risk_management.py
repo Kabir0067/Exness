@@ -14,8 +14,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from bisect import bisect_right
-
-
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
@@ -26,7 +24,7 @@ except Exception:
     talib = None  # type: ignore
 
 from config_xau import EngineConfig, SymbolParams, GOLD_MARKET_END_MINUTES, GOLD_MARKET_START_MINUTES
-from DataFeed.market_feed import MicroZones, TickStats
+from DataFeed.xau_market_feed import MicroZones, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
@@ -41,12 +39,12 @@ log_risk.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
-            filename=str(get_log_path("risk_manager.log")),
-            maxBytes=5242880,  # Ин 5MB дар шакли байт аст
-            backupCount=5,     # Миқдори файлҳои эҳтиётӣ
-            encoding="utf-8",
-            delay=True,
-        )
+        filename=str(get_log_path("risk_manager.log")),
+        maxBytes=5242880,  # Ин 5MB дар шакли байт аст
+        backupCount=5,  # Миқдори файлҳои эҳтиётӣ
+        encoding="utf-8",
+        delay=True,
+    )
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     log_risk.addHandler(fh)
@@ -587,7 +585,9 @@ class RiskManager:
     def _min_stop_distance(self) -> float:
         if not self._symbol_meta():
             return 0.0
-        return float(self._stops_level_points) * float(self._point)
+        # stops + freeze + pad (2 points) => production-safe for fast market
+        pts = int(max(0, self._stops_level_points)) + int(max(0, self._freeze_level_points)) + 2
+        return float(pts) * float(self._point)
 
     def _normalize_price(self, price: float) -> float:
         if not self._symbol_meta():
@@ -1117,19 +1117,22 @@ class RiskManager:
         except Exception:
             return 0.0
 
-    def _apply_broker_constraints(self, side: str, entry: float, sl: float, tp: float) -> Tuple[float, float]:
+    def _apply_broker_constraints(
+        self, side: str, entry: float, sl: float, tp: float, ref_price: Optional[float] = None
+    ) -> Tuple[float, float]:
         if not self._symbol_meta():
             return sl, tp
 
         side_n = _side_norm(side)
         min_dist = self._min_stop_distance()
+        px = float(ref_price) if ref_price and ref_price > 0 else float(entry)
         if min_dist > 0:
             if side_n == "Buy":
-                sl = min(sl, entry - min_dist)
-                tp = max(tp, entry + min_dist)
+                sl = min(sl, px - min_dist)
+                tp = max(tp, px + min_dist)
             else:
-                sl = max(sl, entry + min_dist)
-                tp = min(tp, entry - min_dist)
+                sl = max(sl, px + min_dist)
+                tp = min(tp, px - min_dist)
 
         return self._normalize_price(sl), self._normalize_price(tp)
 
@@ -1335,8 +1338,8 @@ class RiskManager:
 
             # 4) Build a realistic cost-floor from execution monitor (spread/slip/noise)
             min_dist = self._min_stop_distance()
-            min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.0002) or 0.0002)
-            min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.0003) or 0.0003)
+            min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.00045) or 0.00045)
+            min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.00055) or 0.00055)
 
             cost_floor = float(min_dist)
             try:
@@ -1363,8 +1366,11 @@ class RiskManager:
             sl_floor_mult = float(getattr(self.cfg, "sltp_sl_floor_mult", 1.15) or 1.15)
             tp_floor_mult = float(getattr(self.cfg, "sltp_tp_floor_mult", 1.75) or 1.75)
 
-            min_sl = max(float(min_dist), entry_price * min_sl_pct, cost_floor * sl_floor_mult)
-            min_tp = max(float(min_dist), entry_price * min_tp_pct, cost_floor * tp_floor_mult)
+            min_sl_atr_floor = float(getattr(self.cfg, "min_sl_atr_floor", 0.55) or 0.55) * float(atr)
+            min_tp_atr_floor = float(getattr(self.cfg, "min_tp_atr_floor", 0.65) or 0.65) * float(atr)
+
+            min_sl = max(float(min_dist), entry_price * min_sl_pct, cost_floor * sl_floor_mult, min_sl_atr_floor)
+            min_tp = max(float(min_dist), entry_price * min_tp_pct, cost_floor * tp_floor_mult, min_tp_atr_floor)
 
             # 5) Enforce floors (never allow too-tight SL/TP)
             if not _is_finite(sl, tp):
@@ -1460,15 +1466,13 @@ class RiskManager:
                     scale_factor = max(0.3, 1.0 - (int(open_positions) / max(1, int(max_positions))))
                     lot = self._normalize_volume_floor(lot * scale_factor)
 
-                    tp_bonus = 1.0 + float(self.cfg.multi_order_tp_bonus_pct)
-                    sl_tight = 1.0 - float(self.cfg.multi_order_sl_tighten_pct)
+                    tp_bonus = 1.0 + float(getattr(self.cfg, "multi_order_tp_bonus_pct", 0.12) or 0.12)
 
+                    # SL tightening is DISABLED (risk handled by lot splitting, not by shrinking stops)
                     if side_n == "Buy":
                         tp = self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
-                        sl = self._normalize_price(entry_price - abs(entry_price - sl) * sl_tight)
                     else:
                         tp = self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
-                        sl = self._normalize_price(entry_price + abs(entry_price - sl) * sl_tight)
 
                     sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 

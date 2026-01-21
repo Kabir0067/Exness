@@ -205,9 +205,10 @@ class EngineConfig:
     fixed_volume: Optional[float] = None
     max_risk_per_trade: float = 0.02
     max_positions: int = 3
-    multi_order_tp_bonus_pct: float = 0.18
-    multi_order_sl_tighten_pct: float = 0.25
-    multi_order_confidence_tiers: Tuple[float, float, float] = (0.92, 0.95, 0.97)
+    # --- Multi-order tuning (SAFE scalping) ---
+    multi_order_tp_bonus_pct: float = 0.12
+    multi_order_sl_tighten_pct: float = 0.00
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.965, 0.985, 0.993)
     multi_order_max_orders: int = 3
 
     islamic_min_leverage: int = 1

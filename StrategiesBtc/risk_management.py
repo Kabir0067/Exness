@@ -14,8 +14,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from bisect import bisect_right
-
-
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
@@ -26,7 +24,7 @@ except Exception:
     talib = None  # type: ignore
 
 from config_btc import EngineConfig, SymbolParams
-from DataFeed.btc_feed import MicroZones, TickStats
+from DataFeed.btc_market_feed import MicroZones, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
@@ -41,12 +39,12 @@ log_risk.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
-            filename=str(get_log_path("risk_manager_btc.log")),
-            maxBytes=5242880,  # 5MB дар шакли байт
-            backupCount=5,     # Шумораи файлҳои кӯҳна
-            encoding="utf-8",
-            delay=True,
-        )
+        filename=str(get_log_path("risk_manager_btc.log")),
+        maxBytes=5242880,  # 5MB дар шакли байт
+        backupCount=5,  # Шумораи файлҳои кӯҳна
+        encoding="utf-8",
+        delay=True,
+    )
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     log_risk.addHandler(fh)

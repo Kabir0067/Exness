@@ -29,14 +29,14 @@ from ExnessAPI.order_execution import (
     OrderResult as ExecOrderResult,
     log_health as exec_health_log,
 )
-from ExnessAPI.orders import close_all_position
+from ExnessAPI.functions import close_all_position
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 # -------------------- XAU stack --------------------
 from config_xau import EngineConfig as XauConfig
 from config_xau import apply_high_accuracy_mode as xau_apply_high_accuracy_mode
 from config_xau import get_config_from_env as get_xau_config
-from DataFeed.market_feed import MarketFeed as XauMarketFeed
+from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
 from StrategiesXau.indicators import Classic_FeatureEngine as XauFeatureEngine
 from StrategiesXau.risk_management import RiskManager as XauRiskManager
 from StrategiesXau.signal_engine import SignalEngine as XauSignalEngine
@@ -45,7 +45,7 @@ from StrategiesXau.signal_engine import SignalEngine as XauSignalEngine
 from config_btc import EngineConfig as BtcConfig
 from config_btc import apply_high_accuracy_mode as btc_apply_high_accuracy_mode
 from config_btc import get_config_from_env as get_btc_config
-from DataFeed.btc_feed import MarketFeed as BtcMarketFeed
+from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
 from StrategiesBtc.indicators import Classic_FeatureEngine as BtcFeatureEngine
 from StrategiesBtc.risk_management import RiskManager as BtcRiskManager
 from StrategiesBtc.signal_engine import SignalEngine as BtcSignalEngine
@@ -900,9 +900,18 @@ class MultiAssetTradingEngine:
         self._last_cand_xau: Optional[AssetCandidate] = None
         self._last_cand_btc: Optional[AssetCandidate] = None
         self._order_notifier: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None
+        self._phase_notifier: Optional[Callable[[str, str, str, str], None]] = None
+        self._engine_stop_notifier: Optional[Callable[[str, str], None]] = None
+        self._last_phase_by_asset: Dict[str, str] = {"XAU": "?", "BTC": "?"}
 
     def set_order_notifier(self, cb: Optional[Callable[[OrderIntent, ExecutionResult], None]]) -> None:
         self._order_notifier = cb
+
+    def set_phase_notifier(self, cb: Optional[Callable[[str, str, str, str], None]]) -> None:
+        self._phase_notifier = cb
+
+    def set_engine_stop_notifier(self, cb: Optional[Callable[[str, str], None]]) -> None:
+        self._engine_stop_notifier = cb
 
     # -------------------- MT5 init/health --------------------
     def _init_mt5(self) -> bool:
@@ -972,6 +981,9 @@ class MultiAssetTradingEngine:
         # Ensure symbols are available
         self._xau.ensure_symbol_selected()
         self._btc.ensure_symbol_selected()
+
+        self._last_phase_by_asset["XAU"] = str(getattr(self._xau.risk, "current_phase", "A") or "A")
+        self._last_phase_by_asset["BTC"] = str(getattr(self._btc.risk, "current_phase", "A") or "A")
 
         self._refresh_signal_cooldowns()
         try:
@@ -1055,6 +1067,36 @@ class MultiAssetTradingEngine:
             self._signal_cooldown_sec_by_asset["XAU"] = 60.0
             self._signal_cooldown_sec_by_asset["BTC"] = 60.0
 
+    def _phase_reason(self, risk: Any, new_phase: str) -> str:
+        if new_phase == "C" and risk is not None:
+            fn = getattr(risk, "hard_stop_reason", None)
+            if callable(fn):
+                try:
+                    return str(fn() or "")
+                except Exception:
+                    return ""
+        return ""
+
+    def _check_phase_change(self, asset: str, risk: Any) -> None:
+        try:
+            if risk is None:
+                return
+            fn = getattr(risk, "update_phase", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            current = str(getattr(risk, "current_phase", "A") or "A")
+            prev = str(self._last_phase_by_asset.get(asset, "A") or "A")
+            if current != prev:
+                self._last_phase_by_asset[asset] = current
+                if self._phase_notifier:
+                    reason = self._phase_reason(risk, current)
+                    self._phase_notifier(str(asset), prev, current, reason)
+        except Exception:
+            return
+
     # -------------------- idempotency --------------------
     def _cooldown_for_asset(self, asset: str) -> float:
         return float(self._signal_cooldown_sec_by_asset.get(asset, 60.0))
@@ -1092,8 +1134,8 @@ class MultiAssetTradingEngine:
     # -------------------- portfolio logic --------------------
     def _next_order_id(self, asset: str) -> str:
         self._order_counter += 1
-        return f"PORD_{asset}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._order_counter}" \
-            f"_{os.getpid()}"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"PORD_{asset}_{ts}_{self._order_counter}_{os.getpid()}"
 
     @staticmethod
     def _candidate_is_tradeable(c: AssetCandidate) -> bool:
@@ -1204,16 +1246,7 @@ class MultiAssetTradingEngine:
         return True, order_id
 
     def _orders_for_candidate(self, cand: AssetCandidate) -> int:
-        if cand.asset == "XAU":
-            cfg = self._xau_cfg
-        else:
-            cfg = self._btc_cfg
-
-        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.94, 0.97)) or (0.94, 0.97))
-        tiers = [float(x) for x in tiers if x is not None]
-        if len(tiers) < 2:
-            tiers = [0.94, 0.97]
-        tiers = sorted(tiers)
+        cfg = self._xau_cfg if cand.asset == "XAU" else self._btc_cfg
 
         max_orders = int(getattr(cfg, "multi_order_max_orders", 3) or 3)
         max_orders = max(1, min(6, max_orders))
@@ -1222,12 +1255,37 @@ class MultiAssetTradingEngine:
         if conf > 1.5:
             conf = conf / 100.0
 
-        n_orders = 1
-        for idx, thr in enumerate(tiers):
-            if conf >= float(thr):
-                n_orders = max(n_orders, idx + 2)
+        # Read context from SignalResult if present
+        regime = ""
+        spread_bps = 0.0
+        try:
+            rr = cand.raw_result
+            regime = str(getattr(rr, "regime", "") or "")
+            spread_bps = float(getattr(rr, "spread_bps", 0.0) or 0.0)
+        except Exception:
+            pass
 
-        return int(min(max_orders, max(1, n_orders)))
+        # Hard rule: if spread high => never scale-in
+        max_spread_bps_for_multi = float(getattr(cfg, "max_spread_bps_for_multi", 6.0) or 6.0)
+        if spread_bps > max_spread_bps_for_multi:
+            return 1
+
+        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.965, 0.985, 0.993)) or (0.965, 0.985, 0.993))
+        tiers = sorted([float(x) for x in tiers if x is not None])
+
+        # Range regime is noisier: demand higher confidence to scale
+        if regime.lower().startswith("range"):
+            tiers = [min(0.999, t + 0.004) for t in tiers]
+
+        n = 1
+        if conf >= tiers[0]:
+            n = 2
+        if conf >= tiers[1]:
+            n = 3
+        if len(tiers) >= 3 and conf >= tiers[2]:
+            n = 3
+
+        return int(min(max_orders, max(1, n)))
 
     @staticmethod
     def _min_lot(risk: Any) -> float:
@@ -1748,12 +1806,18 @@ class MultiAssetTradingEngine:
                 try:
                     if self._xau.risk and hasattr(self._xau.risk, "requires_hard_stop") and self._xau.risk.requires_hard_stop():
                         log_health.info("HARD_STOP_TRIGGERED | asset=XAU (stop_for_day)")
+                        if self._engine_stop_notifier:
+                            reason = self._phase_reason(self._xau.risk, "C")
+                            self._engine_stop_notifier("XAU", reason)
                         with self._lock:
                             self._manual_stop = True
                         self._run.clear()
                         break
                     if self._btc.risk and hasattr(self._btc.risk, "requires_hard_stop") and self._btc.risk.requires_hard_stop():
                         log_health.info("HARD_STOP_TRIGGERED | asset=BTC (stop_for_day)")
+                        if self._engine_stop_notifier:
+                            reason = self._phase_reason(self._btc.risk, "C")
+                            self._engine_stop_notifier("BTC", reason)
                         with self._lock:
                             self._manual_stop = True
                         self._run.clear()
@@ -1798,6 +1862,10 @@ class MultiAssetTradingEngine:
                 # Reconcile positions
                 self._xau.reconcile_positions()
                 self._btc.reconcile_positions()
+
+                # Phase change notifications (A/B/C)
+                self._check_phase_change("XAU", self._xau.risk if self._xau else None)
+                self._check_phase_change("BTC", self._btc.risk if self._btc else None)
 
                 # Drain execution results
                 while True:

@@ -212,8 +212,11 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.82
+    min_confidence_signal: float = 0.74
     ultra_confidence_min: float = 0.90
+    confidence_bias: float = 50.0
+    confidence_gain: float = 40.0
+    net_norm_signal_threshold: float = 0.02
 
     # Indicators
     ema_short: int = 9

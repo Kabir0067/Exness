@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
     talib = None  # type: ignore
 
 from config_xau import EngineConfig, SymbolParams
-from DataFeed.market_feed import MarketFeed, TickStats
+from DataFeed.xau_market_feed import MarketFeed, TickStats
 from mt5_client import MT5_LOCK
 from StrategiesXau.indicators import Classic_FeatureEngine, safe_last
 from StrategiesXau.risk_management import RiskManager

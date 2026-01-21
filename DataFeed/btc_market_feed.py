@@ -20,7 +20,7 @@ from mt5_client import MT5_LOCK, ensure_mt5
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # =============================================================================
-# Logging (ERROR-only) + safe Logs dir  
+# Logging (ERROR-only) + safe Logs dir
 # =============================================================================
 LOG_DIR = LOG_ROOT
 

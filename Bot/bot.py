@@ -35,7 +35,7 @@ from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from config_xau import get_config_from_env
-from DataFeed.market_feed import MarketFeed
+from DataFeed.xau_market_feed import MarketFeed
 from ExnessAPI.history import (
     view_all_history_dict,
     get_day_loss,
@@ -47,7 +47,7 @@ from ExnessAPI.history import (
     format_usdt,
     
 )
-from ExnessAPI.orders import (
+from ExnessAPI.functions import (
     close_all_position,
     get_balance,
     get_order_by_index,
@@ -331,6 +331,46 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
 
 
 engine.set_order_notifier(_notify_order_opened)
+
+def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str = "") -> None:
+    try:
+        if not is_admin_chat(ADMIN):
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        reason_line = f"Сабаб: <b>{reason}</b>\n" if reason else ""
+        msg = (
+            "🔔 <b>Тағйири режим</b>\n"
+            f"Ассет: <b>{asset}</b>\n"
+            f"Аз <b>{old_phase}</b> → <b>{new_phase}</b>\n"
+            f"{reason_line}"
+            f"Вақт: {ts}"
+        )
+        bot.send_message(ADMIN, msg, parse_mode="HTML")
+    except Exception:
+        return
+
+
+engine.set_phase_notifier(_notify_phase_change)
+
+def _notify_engine_stopped(asset: str, reason: str = "") -> None:
+    try:
+        if not is_admin_chat(ADMIN):
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        reason_line = f"Сабаб: <b>{reason}</b>\n" if reason else ""
+        msg = (
+            "🛑 <b>Трейд стоп шуд</b>\n"
+            f"Ассет: <b>{asset}</b>\n"
+            f"{reason_line}"
+            "Агар хоҳед, метавонед аз нав оғоз кунед.\n"
+            f"Вақт: {ts}"
+        )
+        bot.send_message(ADMIN, msg, parse_mode="HTML")
+    except Exception:
+        return
+
+
+engine.set_engine_stop_notifier(_notify_engine_stopped)
 
 def deny(message: types.Message) -> None:
     bot.send_message(
