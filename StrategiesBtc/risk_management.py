@@ -619,8 +619,12 @@ class RiskManager:
             log_risk.error("ensure_ready error: %s | tb=%s", exc, traceback.format_exc())
             return False
 
-    def _symbol_meta(self) -> bool:
-        if time.time() - self._symbol_meta.ts < 10.0:
+    def _ensure_symbol_meta(self) -> bool:
+        """Ensure symbol meta is loaded and fresh (returns True if valid)."""
+        meta = self._symbol_meta  # Access attribute directly
+        if not isinstance(meta, SymbolMeta):
+            return False
+        if time.time() - meta.ts < 10.0:
             return True
         if not self._ensure_ready():
             return False
@@ -630,32 +634,32 @@ class RiskManager:
             if not info:
                 return False
 
-            self._symbol_meta.digits = int(getattr(info, "digits", 2) or 2)
-            self._symbol_meta.point = float(getattr(info, "point", 0.01) or 0.01)
-            self._symbol_meta.vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
-            self._symbol_meta.vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
-            self._symbol_meta.vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
-            self._symbol_meta.stops_level_points = int(getattr(info, "trade_stops_level", 0) or 0)
-            self._symbol_meta.freeze_level_points = int(getattr(info, "trade_freeze_level", 0) or 0)
+            meta.digits = int(getattr(info, "digits", 2) or 2)
+            meta.point = float(getattr(info, "point", 0.01) or 0.01)
+            meta.vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+            meta.vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+            meta.vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+            meta.stops_level_points = int(getattr(info, "trade_stops_level", 0) or 0)
+            meta.freeze_level_points = int(getattr(info, "trade_freeze_level", 0) or 0)
 
-            self._symbol_meta.ts = time.time()
+            meta.ts = time.time()
             return True
         except Exception as exc:
             log_risk.error("symbol_meta error: %s | tb=%s", exc, traceback.format_exc())
             return False
 
     def _min_stop_distance(self) -> float:
-        if not self._symbol_meta():
+        if not self._ensure_symbol_meta():
             return 0.0
         return float(self._symbol_meta.stops_level_points) * float(self._symbol_meta.point)
 
     def _normalize_price(self, price: float) -> float:
-        if not self._symbol_meta():
+        if not self._ensure_symbol_meta():
             return float(price)
         return float(round(float(price), int(self._symbol_meta.digits)))
 
     def _normalize_volume_floor(self, vol: float) -> float:
-        if not self._symbol_meta():
+        if not self._ensure_symbol_meta():
             return float(vol)
 
         step = max(1e-9, float(self._symbol_meta.vol_step))
@@ -770,7 +774,7 @@ class RiskManager:
     # ------------------- quote/execution hooks -------------------
     def on_quote(self, bid: float, ask: float) -> None:
         try:
-            if not self._symbol_meta():
+            if not self._ensure_symbol_meta():
                 return
             self.execmon.on_quote(float(bid), float(ask), float(self._symbol_meta.point))
         except Exception as exc:
@@ -1036,7 +1040,7 @@ class RiskManager:
     # ------------------- helpers: spread points -------------------
     def _current_spread_points(self) -> float:
         try:
-            if not self._symbol_meta():
+            if not self._ensure_symbol_meta():
                 return 0.0
             with MT5_LOCK:
                 t = mt5.symbol_info_tick(self.symbol)
@@ -1264,7 +1268,7 @@ class RiskManager:
             return 0.0
 
     def _apply_broker_constraints(self, side: str, entry: float, sl: float, tp: float) -> Tuple[float, float]:
-        if not self._symbol_meta():
+        if not self._ensure_symbol_meta():
             return sl, tp
 
         side_n = _side_norm(side)
@@ -1302,7 +1306,7 @@ class RiskManager:
             if not _is_finite(entry_price, stop_loss, take_profit, confidence):
                 return float(self.cfg.fixed_volume)
 
-            if not self._symbol_meta():
+            if not self._ensure_symbol_meta():
                 return float(self.cfg.fixed_volume)
 
             min_rr = getattr(self.cfg, "min_rr", None)
@@ -1378,7 +1382,7 @@ class RiskManager:
             base_buffer = entry * base_pct
 
             tv = float(max(0.0, tick_volatility))
-            if self._symbol_meta() and tv > entry * 0.02:
+            if self._ensure_symbol_meta() and tv > entry * 0.02:
                 tv = tv * float(self._symbol_meta.point)
 
             vol_mult = float(getattr(self.cfg, "micro_vol_mult", 2.0) or 2.0)
@@ -1662,7 +1666,7 @@ class RiskManager:
             else:
                 side_n = _side_norm(side)
 
-            if self._symbol_meta() and float(self._symbol_meta.point) > 0:
+            if self._ensure_symbol_meta() and float(self._symbol_meta.point) > 0:
                 slip_points = float(slippage) / max(1e-9, float(self._symbol_meta.point))
             else:
                 slip_points = float(slippage)
@@ -1700,7 +1704,7 @@ class RiskManager:
 
             # Feed execmon (breaker)
             try:
-                if self._symbol_meta():
+                if self._ensure_symbol_meta():
                     spread_points = 0.0
                     with MT5_LOCK:
                         t = mt5.symbol_info_tick(self.symbol)

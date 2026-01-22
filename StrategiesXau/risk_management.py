@@ -1,3 +1,4 @@
+# StrategiesXau/risk_management.py  (PRODUCTION-GRADE / FAST / SAFE / PEP8)
 from __future__ import annotations
 
 import csv
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
-from bisect import bisect_right
+
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
@@ -40,8 +41,8 @@ log_risk.propagate = False
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
         filename=str(get_log_path("risk_manager.log")),
-        maxBytes=5242880,  # Ин 5MB дар шакли байт аст
-        backupCount=5,  # Миқдори файлҳои эҳтиётӣ
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
         encoding="utf-8",
         delay=True,
     )
@@ -53,13 +54,12 @@ _FILE_LOCK = threading.Lock()
 
 
 def _utcnow() -> datetime:
-    """Naive UTC datetime without using deprecated utcnow()."""
+    """Naive UTC datetime (tzinfo=None) for safe JSON/csv writes and date compares."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-
 def percentile_rank(series: np.ndarray, value: float) -> float:
-    """Percentile rank for finite values only."""
+    """Percentile rank for finite values only. Returns 50.0 on any failure."""
     try:
         if series is None or len(series) == 0:
             return 50.0
@@ -79,13 +79,33 @@ def _is_finite(*xs: float) -> bool:
         return False
 
 
+_SIDE_MAP = {
+    "buy": "Buy",
+    "long": "Buy",
+    "b": "Buy",
+    "1": "Buy",
+    "order_type_buy": "Buy",
+    "op_buy": "Buy",
+    "sell": "Sell",
+    "short": "Sell",
+    "s": "Sell",
+    "-1": "Sell",
+    "order_type_sell": "Sell",
+    "op_sell": "Sell",
+}
+
+
 def _side_norm(side: str) -> str:
     s = str(side or "").strip().lower()
-    if s in ("buy", "long", "b", "1", "order_type_buy", "op_buy"):
+    if not s:
         return "Buy"
-    if s in ("sell", "short", "s", "-1", "order_type_sell", "op_sell"):
+    if s in _SIDE_MAP:
+        return _SIDE_MAP[s]
+    if "buy" in s:
+        return "Buy"
+    if "sell" in s:
         return "Sell"
-    return "Buy" if "buy" in s else "Sell" if "sell" in s else str(side)
+    return str(side)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -94,13 +114,14 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-
+# -------------------- deterministic ladder (keep your logic) --------------------
 _BASE_LOT = 0.02
 _BASE_TP_USD = 2.0
 _STEP_BALANCE = 100.0
 _STEP_LOT = 0.01
 _STEP_TP_USD = 1.0
 _STEP_START_BALANCE = 200.0
+
 
 def gold_lot_and_takeprofit(balance: float) -> Tuple[float, float]:
     """
@@ -128,19 +149,18 @@ def gold_lot_and_takeprofit(balance: float) -> Tuple[float, float]:
     return round(float(lot), 2), round(float(tp), 2)
 
 
-
 def _atr_fallback(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
-    """
-    Wilder ATR fallback (no TA-Lib).
-    """
+    """Wilder ATR fallback (no TA-Lib)."""
     h = np.asarray(high, dtype=np.float64)
     l = np.asarray(low, dtype=np.float64)
     c = np.asarray(close, dtype=np.float64)
+
     prev_c = np.roll(c, 1)
     prev_c[0] = c[0]
     tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
 
-    alpha = 1.0 / max(1, int(period))
+    p = max(1, int(period))
+    alpha = 1.0 / float(p)
     out = np.empty_like(tr, dtype=np.float64)
     out[0] = tr[0]
     for i in range(1, len(tr)):
@@ -186,7 +206,6 @@ class ExecutionQualityMonitor:
 
         self._last_mid: Optional[float] = None
 
-        # EWMA
         self.ewma_slip: Optional[float] = None
         self.ewma_lat: Optional[float] = None
         self.ewma_spread: Optional[float] = None
@@ -269,7 +288,7 @@ class RiskDecision:
 
 
 # ============================================================
-# Signal survival: NO CSV rewrites (fixed performance defect)
+# Signal survival: no CSV rewrites
 # ============================================================
 @dataclass(slots=True)
 class SignalSurvivalState:
@@ -308,10 +327,12 @@ class RiskManager:
     """
     Risk management for XAUUSDm scalping on Exness MT5.
 
-    Ключевые production фиксы:
-      - Account snapshot cache: устраняет временные 0.0 от MT5 (которые могли ломать risk decisions).
-      - market_open_24_5: start/end минут можно задавать из cfg (инъекция), иначе берём GOLD_MARKET_*.
-      - Signal survival: append-only CSV, active JSON атомарно, JSONL updates.
+    Production guarantees:
+      - No sleeps under MT5_LOCK
+      - MT5 snapshot cache prevents temporary 0.0 glitches from breaking risk decisions
+      - Atomic state writes
+      - Signal survival logs are append-only / throttled
+      - Heavy pandas usage removed from histograms (csv-based counters instead)
     """
 
     _REQUIRED_CFG_FIELDS = (
@@ -359,13 +380,13 @@ class RiskManager:
         self._last_fill_ts: float = 0.0
         self._latency_bad_since: Optional[float] = None
 
-        # Account snapshot cache (prevents MT5 temporary 0.0 glitches)
+        # Account snapshot cache
         self._acc_cache_ts: float = 0.0
         self._acc_cache_balance: float = 0.0
         self._acc_cache_equity: float = 0.0
         self._bot_balance_base: float = 0.0
 
-        # Signal throttling (production: real rolling hour + per-day)
+        # Signal throttling
         self._daily_signal_count: int = 0
         self._hour_window_start_ts: float = time.time()
         self._hour_window_count: int = 0
@@ -374,7 +395,7 @@ class RiskManager:
         self._ready_ts: float = 0.0
         self._ready_ok: bool = False
 
-        # Symbol meta cache (broker rules)
+        # Symbol meta cache
         self._meta_ts: float = 0.0
         self._digits: int = 2
         self._point: float = 0.01
@@ -388,14 +409,19 @@ class RiskManager:
         self.execmon = ExecutionQualityMonitor(window=int(getattr(self.cfg, "exec_window", 300)))
         self._exec_breaker_until: float = 0.0
 
-        # Reconcile tracking (detect flat/open transitions)
+        # Reconcile tracking
         self._last_open_positions: int = 0
 
-        # Signal survival (fixed)
+        # Signal survival
         self._survival: Dict[str, SignalSurvivalState] = {}
         self._survival_last_flush_ts: float = 0.0
         self._survival_last_update_emit: Dict[str, float] = {}
         self._init_signal_survival()
+
+        # lightweight analytics counters (csv rewrite is tiny and atomic)
+        self._hist_slip_counts: Optional[Dict[str, int]] = None
+        self._hist_delay_counts: Optional[Dict[str, int]] = None
+        self._reject_counts: Optional[Dict[str, int]] = None
 
         # init daily
         self._reset_daily_state()
@@ -418,20 +444,22 @@ class RiskManager:
         if missing:
             raise RuntimeError(f"EngineConfig missing required fields: {missing}")
 
-        if float(self.cfg.max_drawdown) <= 0 or float(self.cfg.max_drawdown) >= 1:
-            raise RuntimeError("EngineConfig.max_drawdown must be in (0, 1)")
-        if float(self.cfg.max_risk_per_trade) <= 0 or float(self.cfg.max_risk_per_trade) >= 1:
-            raise RuntimeError("EngineConfig.max_risk_per_trade must be in (0, 1)")
-        if float(self.cfg.max_daily_loss_pct) <= 0 or float(self.cfg.max_daily_loss_pct) >= 1:
-            raise RuntimeError("EngineConfig.max_daily_loss_pct must be in (0, 1)")
-        if float(self.cfg.daily_target_pct) <= 0 or float(self.cfg.daily_target_pct) >= 1:
-            raise RuntimeError("EngineConfig.daily_target_pct must be in (0, 1)")
-        if float(self.cfg.ultra_confidence_min) <= 0 or float(self.cfg.ultra_confidence_min) > 1:
+        def _in01(x: float, name: str) -> None:
+            if x <= 0 or x >= 1:
+                raise RuntimeError(f"EngineConfig.{name} must be in (0, 1)")
+
+        _in01(float(self.cfg.max_drawdown), "max_drawdown")
+        _in01(float(self.cfg.max_risk_per_trade), "max_risk_per_trade")
+        _in01(float(self.cfg.max_daily_loss_pct), "max_daily_loss_pct")
+        _in01(float(self.cfg.daily_target_pct), "daily_target_pct")
+
+        ucm = float(self.cfg.ultra_confidence_min)
+        mcs = float(self.cfg.min_confidence_signal)
+        if ucm <= 0 or ucm > 1:
             raise RuntimeError("EngineConfig.ultra_confidence_min must be in (0, 1]")
-        if float(self.cfg.min_confidence_signal) <= 0 or float(self.cfg.min_confidence_signal) > 1:
+        if mcs <= 0 or mcs > 1:
             raise RuntimeError("EngineConfig.min_confidence_signal must be in (0, 1]")
 
-        # fixed_volume is OPTIONAL (None => dynamic sizing). If provided, it must be > 0.
         fv = getattr(self.cfg, "fixed_volume", None)
         if fv is not None:
             try:
@@ -440,7 +468,6 @@ class RiskManager:
                 raise RuntimeError("EngineConfig.fixed_volume must be float when provided") from exc
             if fv_f <= 0:
                 raise RuntimeError("EngineConfig.fixed_volume must be > 0 when provided")
-
 
     # ------------------- time / daily -------------------
     @staticmethod
@@ -462,8 +489,9 @@ class RiskManager:
         self._phase_reason_last = str(reason)
         self._target_breached = True
         lock = self._seconds_until_next_utc_day()
-        self._trading_disabled_until = time.time() + lock
-        self._analysis_blocked_until = max(self._analysis_blocked_until, time.time() + lock)
+        now = time.time()
+        self._trading_disabled_until = now + lock
+        self._analysis_blocked_until = max(self._analysis_blocked_until, now + lock)
 
     def requires_hard_stop(self) -> bool:
         if not bool(getattr(self.cfg, "enforce_daily_limits", False)):
@@ -593,7 +621,6 @@ class RiskManager:
     def _min_stop_distance(self) -> float:
         if not self._symbol_meta():
             return 0.0
-        # stops + freeze + pad (2 points) => production-safe for fast market
         pts = int(max(0, self._stops_level_points)) + int(max(0, self._freeze_level_points)) + 2
         return float(pts) * float(self._point)
 
@@ -615,7 +642,7 @@ class RiskManager:
     def _tp_usd_to_price(self, entry: float, side: str, volume: float, usd_profit: float) -> Optional[float]:
         """
         Convert desired TP in USD to a price using broker tick specs.
-        Returns None on any invalid inputs or MT5 info failures.
+        Robust to symbols where trade_tick_value is 0 (uses profit/loss tick values).
         """
         try:
             if float(entry) <= 0 or float(volume) <= 0 or float(usd_profit) <= 0:
@@ -627,10 +654,16 @@ class RiskManager:
             if not info:
                 return None
 
-            tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
             tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
-            digits = int(getattr(info, "digits", 5) or 5)
+            if tick_size <= 0:
+                tick_size = float(getattr(info, "point", 0.0) or 0.0)
 
+            tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+            tvp = float(getattr(info, "trade_tick_value_profit", 0.0) or 0.0)
+            tvl = float(getattr(info, "trade_tick_value_loss", 0.0) or 0.0)
+            tick_value = max(tick_value, tvp, tvl)
+
+            digits = int(getattr(info, "digits", 5) or 5)
             if tick_value <= 0.0 or tick_size <= 0.0:
                 return None
 
@@ -642,29 +675,25 @@ class RiskManager:
             side_n = _side_norm(side)
             tp = float(entry) + price_delta if side_n == "Buy" else float(entry) - price_delta
             tp = round(float(tp), digits)
+
             if tp <= 0:
                 return None
-
             if side_n == "Buy" and not (tp > float(entry)):
                 return None
             if side_n == "Sell" and not (tp < float(entry)):
                 return None
 
-            return tp
+            return float(tp)
         except Exception:
             return None
 
     def _fallback_volume(self) -> float:
         """
-        Safe fallback volume used when dynamic sizing cannot be computed.
+        Safe fallback volume when dynamic sizing cannot be computed.
 
         Rules:
           - If cfg.fixed_volume is set -> return normalized broker-safe volume.
           - If cfg.fixed_volume is None -> return 0.0 (skip trade).
-
-        Rationale:
-          - Never open a position when risk inputs/account snapshot are invalid.
-          - Avoid TypeError from float(None).
         """
         fv = getattr(self.cfg, "fixed_volume", None)
         if fv is None:
@@ -715,7 +744,7 @@ class RiskManager:
         self._hour_window_count += 1
         self._daily_signal_count += 1
 
-    # ------------------- account snapshot (FIX) -------------------
+    # ------------------- account snapshot (cached) -------------------
     def _account_snapshot(self) -> Tuple[float, float]:
         """
         Single MT5 account_info() snapshot with short cache.
@@ -741,7 +770,6 @@ class RiskManager:
                 bal = float(getattr(acc, "balance", 0.0) or 0.0)
                 eq = float(getattr(acc, "equity", 0.0) or 0.0)
 
-                # update cache only with sane values
                 if bal > 0:
                     self._acc_cache_balance = bal
                 if eq > 0:
@@ -789,13 +817,21 @@ class RiskManager:
             realized = 0.0
             if deals:
                 realized = float(
-                    sum(float(getattr(d, "profit", 0.0) or 0.0) for d in deals if int(getattr(d, "magic", 0) or 0) == magic)
+                    sum(
+                        float(getattr(d, "profit", 0.0) or 0.0)
+                        for d in deals
+                        if int(getattr(d, "magic", 0) or 0) == magic
+                    )
                 )
 
             open_pnl = 0.0
             if positions:
                 open_pnl = float(
-                    sum(float(getattr(p, "profit", 0.0) or 0.0) for p in positions if int(getattr(p, "magic", 0) or 0) == magic)
+                    sum(
+                        float(getattr(p, "profit", 0.0) or 0.0)
+                        for p in positions
+                        if int(getattr(p, "magic", 0) or 0) == magic
+                    )
                 )
 
             bal = max(0.0, base + realized)
@@ -821,9 +857,8 @@ class RiskManager:
         _, eq = self._account_snapshot()
         return float(eq)
 
-    # ------------------- state evaluation -------------------
+    # ------------------- state evaluation (Phase A/B/C) -------------------
     def evaluate_account_state(self) -> None:
-        """Evaluate account state and update Phase A/B/C based on daily P&L."""
         try:
             if self._utc_date() != self.daily_date:
                 self._reset_daily_state()
@@ -841,55 +876,57 @@ class RiskManager:
             if self.daily_start_balance > 0:
                 daily_return = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
-            old_phase = str(self.current_phase)
-            
-            # Phase B: Daily target reached (profit protection mode)
+            # A -> B by daily target
             if (not self._target_breached) and daily_return >= float(self.cfg.daily_target_pct):
                 if self.current_phase != "B":
                     self.current_phase = "B"
                     self._target_breached = True
                     self._target_breached_return = float(daily_return)
                     self._phase_reason_last = "daily_target_reached"
-                    log_risk.error("PHASE_CHANGE | A->B | reason=daily_target_reached daily_return=%.4f target=%.4f", 
-                                 daily_return, float(self.cfg.daily_target_pct))
+                    log_risk.error(
+                        "PHASE_CHANGE | A->B | reason=daily_target_reached daily_return=%.4f target=%.4f",
+                        daily_return,
+                        float(self.cfg.daily_target_pct),
+                    )
 
-            # Phase transitions based on daily loss (only if enforce_daily_limits=True)
+            # A/B -> C by loss thresholds (optional)
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
                 loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
                 loss_c = float(getattr(self.cfg, "daily_loss_c_pct", 0.0) or 0.0)
-                
-                # Phase A -> B: Daily loss >= loss_b threshold
-                if loss_b > 0 and daily_return <= -loss_b:
-                    if self.current_phase == "A":
-                        self.current_phase = "B"
-                        self._phase_reason_last = "daily_loss_b"
-                        log_risk.error("PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f", 
-                                     daily_return, -loss_b)
-                
-                # Phase -> C: Daily loss >= loss_c threshold (hard stop)
-                if loss_c > 0 and daily_return <= -loss_c:
-                    if self.current_phase != "C":
-                        self.current_phase = "C"
-                        self._phase_reason_last = "daily_loss_c"
-                        log_risk.error("PHASE_CHANGE | ->C | reason=daily_loss_c daily_return=%.4f loss_c=%.4f", 
-                                     daily_return, -loss_c)
 
-            if bool(getattr(self.cfg, "enforce_daily_limits", False)):
+                if loss_b > 0 and daily_return <= -loss_b and self.current_phase == "A":
+                    self.current_phase = "B"
+                    self._phase_reason_last = "daily_loss_b"
+                    log_risk.error(
+                        "PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
+                        daily_return,
+                        loss_b,
+                    )
+
+                if loss_c > 0 and daily_return <= -loss_c and self.current_phase != "C":
+                    self.current_phase = "C"
+                    self._phase_reason_last = "daily_loss_c"
+                    log_risk.error(
+                        "PHASE_CHANGE | ->C | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
+                        daily_return,
+                        loss_c,
+                    )
+
+                # target lock: after overshoot, if returns back to target -> hard stop
                 if self._target_breached and self.current_phase == "B":
                     self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
-                    # Lock only if we've exceeded target by at least 0.5% AND dropped back to target or below
                     target_pct = float(self.cfg.daily_target_pct)
-                    lock_threshold = target_pct + 0.005  # 0.5% above target (e.g., 10.5%)
-                    if self._target_breached_return >= lock_threshold:
-                        if daily_return <= target_pct:
-                            self._enter_hard_stop("daily_target_lock")
+                    lock_threshold = target_pct + 0.005
+                    if self._target_breached_return >= lock_threshold and daily_return <= target_pct:
+                        self._enter_hard_stop("daily_target_lock")
+
         except Exception as exc:
             log_risk.error("evaluate_account_state error: %s | tb=%s", exc, traceback.format_exc())
 
     def update_phase(self) -> None:
         self.evaluate_account_state()
 
-    # ------------------- market hours (FIX: cfg injection) -------------------
+    # ------------------- market hours -------------------
     def market_open_24_5(self) -> bool:
         try:
             start_min = int(getattr(self.cfg, "gold_market_start_minutes", GOLD_MARKET_START_MINUTES))
@@ -932,7 +969,7 @@ class RiskManager:
     def register_latency_violation(self) -> None:
         self._latency_bad_since = time.time()
 
-    # ------------------- ATR percentile (analytics) -------------------
+    # ------------------- ATR percentile -------------------
     def atr_percentile(self, dfp: pd.DataFrame, lookback: int) -> float:
         try:
             h = dfp["high"].values.astype(np.float64)
@@ -989,14 +1026,8 @@ class RiskManager:
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
 
-            # Phase-based protection in guard_decision (CRITICAL: must check phases here too!)
             if self.current_phase == "C":
                 reasons.append("phase_c_protect")
-            
-            # Phase B: require higher confidence (checked in can_trade, but also log here for clarity)
-            if self.current_phase == "B":
-                # Phase B requires ultra_confidence_min (checked in can_trade/can_emit_signal)
-                pass  # Already checked in can_trade/can_emit_signal
 
             if bool(getattr(self.cfg, "enforce_drawdown_limits", False)) and drawdown_exceeded:
                 reasons.append("max_drawdown")
@@ -1007,9 +1038,8 @@ class RiskManager:
             if not tick_ok and tick_reason not in ("tps_low", "no_rates"):
                 reasons.append(f"micro:{tick_reason}")
 
-            if not bool(getattr(self.cfg, "ignore_sessions", False)):
-                if not in_session:
-                    reasons.append("session")
+            if not bool(getattr(self.cfg, "ignore_sessions", False)) and not in_session:
+                reasons.append("session")
 
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
@@ -1041,20 +1071,17 @@ class RiskManager:
             return RiskDecision(allowed=False, reasons=["guard_error"])
 
     def can_trade(self, confidence: float, signal_type: str) -> RiskDecision:
-        """Check if trading is allowed based on current phase and risk limits."""
         try:
             _ = signal_type
-
             reasons: List[str] = []
-            self.evaluate_account_state()  # CRITICAL: Update phase before checking
 
+            self.evaluate_account_state()
             phase = str(self.current_phase or "A")
-            
+
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
                 return RiskDecision(False, reasons)
 
-            # Phase C: Hard stop - no trading allowed
             if phase == "C":
                 reasons.append("phase_c_protect")
                 return RiskDecision(False, reasons)
@@ -1065,17 +1092,14 @@ class RiskManager:
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
 
-            # Phase A: Normal trading (min_confidence_signal threshold)
-            # Phase B: Conservative trading (ultra_confidence_min threshold)
+            conf = float(confidence)
             if phase == "A":
-                if float(confidence) < float(self.cfg.min_confidence_signal):
+                if conf < float(self.cfg.min_confidence_signal):
                     reasons.append("low_confidence")
             elif phase == "B":
-                # Phase B requires ultra_confidence_min (stricter)
                 ultra_min = float(self.cfg.ultra_confidence_min)
-                if float(confidence) < ultra_min:
-                    reasons.append(f"not_ultra_confidence (phase_b requires {ultra_min:.2f}, got {float(confidence):.2f})")
-            # Phase C already handled above
+                if conf < ultra_min:
+                    reasons.append(f"not_ultra_confidence (phase_b requires {ultra_min:.2f}, got {conf:.2f})")
 
             if not self.can_analyze():
                 reasons.append("analysis_cooldown")
@@ -1115,16 +1139,18 @@ class RiskManager:
             return RiskDecision(allowed=False, reasons=["can_trade_error"])
 
     def can_emit_signal(self, confidence: int, tz) -> Tuple[bool, List[str]]:
-        """Check if signal emission is allowed based on current phase."""
         try:
             _ = tz
-            self.evaluate_account_state()  # CRITICAL: Update phase before checking
+            self.evaluate_account_state()
 
             reasons: List[str] = []
-            conf_f = float(confidence) / 100.0
+
+            conf = float(confidence)
+            conf_f = conf / 100.0 if conf > 1.5 else conf
+            conf_f = max(0.0, min(1.0, conf_f))
+
             phase = str(self.current_phase or "A")
 
-            # Phase C: No signals allowed
             if phase == "C":
                 reasons.append("phase_c_protect")
                 return False, reasons
@@ -1132,8 +1158,6 @@ class RiskManager:
             if not self.can_analyze():
                 reasons.append("analysis_cooldown")
 
-            # Phase A: Normal threshold (min_confidence_signal)
-            # Phase B: Stricter threshold (ultra_confidence_min)
             if phase == "A":
                 if conf_f < float(self.cfg.min_confidence_signal):
                     reasons.append("low_confidence")
@@ -1156,7 +1180,7 @@ class RiskManager:
             log_risk.error("can_emit_signal error: %s | tb=%s", exc, traceback.format_exc())
             return False, ["signal_error"]
 
-    # ------------------- broker-true sizing (critical) -------------------
+    # ------------------- broker-true sizing -------------------
     def _order_calc_profit_money(self, side: str, volume: float, entry: float, price2: float) -> float:
         try:
             if not self._ensure_ready():
@@ -1188,6 +1212,7 @@ class RiskManager:
         side_n = _side_norm(side)
         min_dist = self._min_stop_distance()
         px = float(ref_price) if ref_price and ref_price > 0 else float(entry)
+
         if min_dist > 0:
             if side_n == "Buy":
                 sl = min(sl, px - min_dist)
@@ -1215,14 +1240,11 @@ class RiskManager:
         """
         Broker-true risk sizing.
 
-        IMPORTANT SAFETY CONTRACT:
-          - If cfg.fixed_volume is None -> sizing is fully dynamic.
-          - Any invalid inputs / missing broker meta / missing equity / MT5 calc failure
-            must return 0.0 (skip trade) instead of crashing or blindly opening min-lot.
+        Safety contract:
+          - Any invalid inputs or calc failures -> return 0.0 (skip trade) or fixed_volume fallback if configured.
         """
         try:
-            # CRITICAL: Phase C block - return 0.0 (no lot size)
-            self.evaluate_account_state()  # Update phase before checking
+            self.evaluate_account_state()
             if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
                 return 0.0
 
@@ -1235,11 +1257,9 @@ class RiskManager:
             tp = float(take_profit)
             conf = float(confidence)
 
-            # Invalid numbers => do NOT trade.
             if (not _is_finite(ep, sl, tp, conf)) or ep <= 0 or sl <= 0 or tp <= 0:
                 return 0.0
 
-            # Need broker constraints for normalization and MT5 calc.
             if not self._symbol_meta():
                 return self._fallback_volume()
 
@@ -1253,23 +1273,19 @@ class RiskManager:
             if float(eq) <= 0:
                 return self._fallback_volume()
 
-            # Risk budget in account currency
             risk_money = float(eq) * float(self.cfg.max_risk_per_trade)
 
-            # Phase / drawdown adjustments
             if self.current_phase == "B":
                 risk_money *= float(getattr(self.cfg, "phase_b_risk_mult", 1.0) or 1.0)
             if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
                 risk_money *= float(getattr(self.cfg, "dd_risk_mult", 1.0) or 1.0)
 
-            # True money loss for 1.0 lot to SL using broker calc
             risk_1lot = abs(self._order_calc_profit_money(side_n, 1.0, ep, sl))
             if risk_1lot <= 0:
                 return self._fallback_volume()
 
             raw_lot = float(risk_money) / float(risk_1lot)
 
-            # Optional margin cap
             if hasattr(self.cfg, "max_position_percentage"):
                 cap_pct = float(getattr(self.cfg, "max_position_percentage")) / 100.0
                 if cap_pct > 0:
@@ -1361,7 +1377,10 @@ class RiskManager:
         unrealized_pl: float = 0.0,
     ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
-        Plan order (entry/sl/tp/lot) - CRITICAL: Must block in Phase C!
+        Plan order (entry/sl/tp/lot).
+        CRITICAL:
+          - Phase C blocks everything (returns None, None, None, None)
+          - SL/TP floors prevent too-tight stops in scalping
         """
         try:
             _ = (ind, ticks)
@@ -1372,8 +1391,7 @@ class RiskManager:
             if not self._ensure_ready():
                 return None, None, None, None
 
-            # CRITICAL: Phase C block - NO trading allowed (must return None, None, None, None)
-            self.evaluate_account_state()  # Update phase before checking
+            self.evaluate_account_state()
             if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
                 log_risk.error("plan_order BLOCKED | phase=C | reason=%s", self._phase_reason_last or "phase_c")
                 return None, None, None, None
@@ -1389,13 +1407,7 @@ class RiskManager:
             if not _is_finite(entry_price) or entry_price <= 0:
                 return None, None, None, None
 
-            # -----------------------------------------------------------------
-            # SL/TP planning (SCALPING, scientific): ATR first + execution-cost floor
-            #  - No more micro-zone as primary (it was shrinking TP to ~$2 on XAU).
-            #  - Micro-zones only EXTEND (never shrink) after ATR plan.
-            # -----------------------------------------------------------------
-
-            # 1) ATR injection (from adapt or indicators)
+            # 1) ATR injection
             atr = 0.0
             try:
                 atr = float((adapt or {}).get("atr", 0.0) or ind.get("atr", 0.0) or 0.0)
@@ -1408,11 +1420,11 @@ class RiskManager:
             # 2) Base ATR plan
             sl, tp = self._fallback_atr_sl_tp(side_n, entry_price, adapt2)
 
-            # 3) If ATR missing, fallback to micro-zone as last resort
+            # 3) If ATR missing, fallback to micro-zone (last resort)
             if (not _is_finite(sl, tp)) or sl == entry_price or tp == entry_price:
                 sl, tp = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
 
-            # 4) Build a realistic cost-floor from execution monitor (spread/slip/noise)
+            # 4) Cost-floor from broker constraints + exec monitor
             min_dist = self._min_stop_distance()
             min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.00045) or 0.00045)
             min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.00055) or 0.00055)
@@ -1420,8 +1432,14 @@ class RiskManager:
             cost_floor = float(min_dist)
             try:
                 snap = self.execmon.snapshot()
-                sp_pts = max(float(snap.get("p95_spread_points", 0.0) or 0.0), float(snap.get("ewma_spread_points", 0.0) or 0.0))
-                slp_pts = max(float(snap.get("p95_slippage_points", 0.0) or 0.0), float(snap.get("ewma_slippage_points", 0.0) or 0.0))
+                sp_pts = max(
+                    float(snap.get("p95_spread_points", 0.0) or 0.0),
+                    float(snap.get("ewma_spread_points", 0.0) or 0.0),
+                )
+                slp_pts = max(
+                    float(snap.get("p95_slippage_points", 0.0) or 0.0),
+                    float(snap.get("ewma_slippage_points", 0.0) or 0.0),
+                )
                 mv_pts = float(snap.get("p95_mid_move_points", 0.0) or 0.0)
 
                 if self._symbol_meta() and float(self._point) > 0:
@@ -1448,10 +1466,10 @@ class RiskManager:
             min_sl = max(float(min_dist), entry_price * min_sl_pct, cost_floor * sl_floor_mult, min_sl_atr_floor)
             min_tp = max(float(min_dist), entry_price * min_tp_pct, cost_floor * tp_floor_mult, min_tp_atr_floor)
 
-            # 5) Enforce floors (never allow too-tight SL/TP)
             if not _is_finite(sl, tp):
                 return None, None, None, None
 
+            # 5) Enforce floors
             if side_n == "Buy":
                 if abs(entry_price - float(sl)) < min_sl:
                     sl = self._normalize_price(entry_price - min_sl)
@@ -1463,7 +1481,7 @@ class RiskManager:
                 if abs(float(tp) - entry_price) < min_tp:
                     tp = self._normalize_price(entry_price - min_tp)
 
-            # 6) Micro-zones: only EXTEND (never shrink)
+            # 6) Micro-zones only EXTEND
             if zones is not None:
                 slz, tpz = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
                 if _is_finite(slz, tpz) and slz != entry_price and tpz != entry_price:
@@ -1474,7 +1492,6 @@ class RiskManager:
                         sl = max(float(sl), float(slz))
                         tp = min(float(tp), float(tpz))
 
-
             if not _is_finite(sl, tp) or sl == entry_price or tp == entry_price:
                 return None, None, None, None
 
@@ -1484,24 +1501,20 @@ class RiskManager:
                 return None, None, None, None
             if side_n == "Sell" and not (tp < entry_price < sl):
                 return None, None, None, None
+
+            # ---- lot/TP (your deterministic ladder + USD-TP conversion) ----
+            self.evaluate_account_state()
+            if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
+                log_risk.error(
+                    "plan_order BLOCKED (lot/TP calc) | phase=C | reason=%s",
+                    self._phase_reason_last or "phase_c",
+                )
+                return None, None, None, None
+
             use_usd_tp = False
             balance = float(self._get_balance())
-            # CRITICAL: Double-check Phase C before calculating lot/TP (safety net)
-            self.evaluate_account_state()
-            phase = str(self.current_phase or "A")
-            if phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
-                log_risk.error("plan_order BLOCKED (lot/TP calc) | phase=C | balance=%.2f reason=%s", 
-                             balance, self._phase_reason_last or "phase_c")
-                return None, None, None, None
-            
-            # Calculate lot and TP based on balance (deterministic, not random)
             base_lot, tp_usd = gold_lot_and_takeprofit(balance) if balance > 0 else (0.0, 0.0)
             base_lot = self._normalize_volume_floor(float(base_lot or 0.0))
-            
-            # Log for debugging (only if values are calculated)
-            if base_lot > 0 and tp_usd > 0:
-                log_risk.error("plan_order LOT/TP | phase=%s balance=%.2f base_lot=%.4f tp_usd=%.2f", 
-                             phase, balance, base_lot, tp_usd)
 
             if base_lot > 0 and float(tp_usd or 0.0) > 0.0:
                 tp_price = self._tp_usd_to_price(entry_price, side_n, base_lot, float(tp_usd))
@@ -1520,10 +1533,11 @@ class RiskManager:
                     rr_min = float(min_rr)
                     if rr < rr_min:
                         dist = abs(entry_price - sl)
-                        if side_n == "Buy":
-                            tp = self._normalize_price(entry_price + dist * rr_min)
-                        else:
-                            tp = self._normalize_price(entry_price - dist * rr_min)
+                        tp = (
+                            self._normalize_price(entry_price + dist * rr_min)
+                            if side_n == "Buy"
+                            else self._normalize_price(entry_price - dist * rr_min)
+                        )
                         sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
                 rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
@@ -1531,21 +1545,24 @@ class RiskManager:
                     dist_sl = abs(entry_price - sl)
                     dist_tp = abs(tp - entry_price)
                     if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
-                        if side_n == "Buy":
-                            tp = self._normalize_price(entry_price + dist_sl * rr_cap)
-                        else:
-                            tp = self._normalize_price(entry_price - dist_sl * rr_cap)
+                        tp = (
+                            self._normalize_price(entry_price + dist_sl * rr_cap)
+                            if side_n == "Buy"
+                            else self._normalize_price(entry_price - dist_sl * rr_cap)
+                        )
                         if abs(tp - entry_price) < min_tp:
-                            if side_n == "Buy":
-                                tp = self._normalize_price(entry_price + min_tp)
-                            else:
-                                tp = self._normalize_price(entry_price - min_tp)
+                            tp = (
+                                self._normalize_price(entry_price + min_tp)
+                                if side_n == "Buy"
+                                else self._normalize_price(entry_price - min_tp)
+                            )
                         sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
                 lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
                 if lot <= 0 or not _is_finite(lot):
                     return None, None, None, None
 
+            # multi-order logic (keep semantics; no SL tightening)
             if (
                 int(open_positions) > 0
                 and int(open_positions) < int(max_positions)
@@ -1557,13 +1574,11 @@ class RiskManager:
                     lot = self._normalize_volume_floor(lot * scale_factor)
 
                     tp_bonus = 1.0 + float(getattr(self.cfg, "multi_order_tp_bonus_pct", 0.12) or 0.12)
-
-                    # SL tightening is DISABLED (risk handled by lot splitting, not by shrinking stops)
-                    if side_n == "Buy":
-                        tp = self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
-                    else:
-                        tp = self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
-
+                    tp = (
+                        self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
+                        if side_n == "Buy"
+                        else self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
+                    )
                     sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
             return float(entry_price), float(sl), float(tp), float(lot)
@@ -1612,11 +1627,8 @@ class RiskManager:
     ) -> None:
         try:
             side_n = _side_norm(side)
-
-            if self._symbol_meta() and float(self._point) > 0:
-                slip_points = float(slippage) / max(1e-9, float(self._point))
-            else:
-                slip_points = float(slippage)
+            point = float(self._point) if self._symbol_meta() else 0.0
+            slip_points = float(slippage) / max(1e-9, point) if point > 0 else float(slippage)
 
             metrics = {
                 "order_id": str(order_id),
@@ -1647,25 +1659,26 @@ class RiskManager:
                 with open(jsonl_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
+            # feed exec monitor
             try:
-                if self._symbol_meta():
-                    spread_points = 0.0
+                spread_points = 0.0
+                if self._symbol_meta() and float(self._point) > 0:
                     with MT5_LOCK:
                         t = mt5.symbol_info_tick(self.symbol)
                     if t:
                         spread_points = (float(t.ask) - float(t.bid)) / max(1e-9, float(self._point))
 
-                    self.execmon.on_execution(
-                        ExecSample(
-                            ts=time.time(),
-                            side=side_n,
-                            expected_price=float(expected_price),
-                            filled_price=float(filled_price),
-                            point=float(self._point),
-                            spread_points=float(spread_points),
-                            latency_total_ms=float(metrics["total_latency_ms"]),
-                        )
+                self.execmon.on_execution(
+                    ExecSample(
+                        ts=time.time(),
+                        side=side_n,
+                        expected_price=float(expected_price),
+                        filled_price=float(filled_price),
+                        point=float(self._point),
+                        spread_points=float(spread_points),
+                        latency_total_ms=float(metrics["total_latency_ms"]),
                     )
+                )
             except Exception as exc2:
                 log_risk.error("execmon feed error: %s | tb=%s", exc2, traceback.format_exc())
 
@@ -1698,44 +1711,77 @@ class RiskManager:
         except Exception as exc:
             log_risk.error("record_execution_failure error: %s | tb=%s", exc, traceback.format_exc())
 
+    # ------------------- lightweight histograms (NO pandas) -------------------
+    @staticmethod
+    def _slip_bins() -> List[float]:
+        return [-float("inf"), -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, float("inf")]
+
+    @staticmethod
+    def _delay_bins() -> List[float]:
+        return [0, 50, 100, 150, 200, 250, 300, 400, 500, 1000, float("inf")]
+
+    @staticmethod
+    def _bin_label(a: float, b: float) -> str:
+        return f"{a} to {b}"
+
+    def _load_histogram_counts(self, path: Path, bins: List[float]) -> Dict[str, int]:
+        counts: Dict[str, int] = {self._bin_label(bins[i], bins[i + 1]): 0 for i in range(len(bins) - 1)}
+        if not path.exists():
+            return counts
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    k = str(row.get("bin", "")).strip()
+                    if k in counts:
+                        try:
+                            counts[k] = int(float(row.get("count", 0) or 0))
+                        except Exception:
+                            counts[k] = 0
+        except Exception:
+            return counts
+        return counts
+
+    def _write_histogram_counts_atomic(self, path: Path, counts: Dict[str, int]) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["bin", "count"])
+            w.writeheader()
+            for k, v in counts.items():
+                w.writerow({"bin": k, "count": int(v)})
+        tmp.replace(path)
+
     def _update_execution_analysis(self, metrics: dict) -> None:
         try:
+            s = float(metrics.get("slippage_points", 0.0) or 0.0)
+            d = float(metrics.get("latency_send_to_fill_ms", 0.0) or 0.0)
+
             with _FILE_LOCK:
+                # slippage histogram
                 slippage_file = LOG_DIR / "slippage_histogram.csv"
-                bins = [-float("inf"), -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, float("inf")]
+                bins = self._slip_bins()
+                if self._hist_slip_counts is None:
+                    self._hist_slip_counts = self._load_histogram_counts(slippage_file, bins)
 
-                if slippage_file.exists():
-                    slippage_df = pd.read_csv(slippage_file)
-                else:
-                    slippage_df = pd.DataFrame(
-                        {"bin": [f"{bins[i]} to {bins[i + 1]}" for i in range(len(bins) - 1)], "count": 0}
-                    )
-
-                s = float(metrics.get("slippage_points", 0.0))
                 for i in range(len(bins) - 1):
                     if bins[i] <= s < bins[i + 1]:
-                        label = f"{bins[i]} to {bins[i + 1]}"
-                        slippage_df.loc[slippage_df["bin"] == label, "count"] += 1
+                        label = self._bin_label(bins[i], bins[i + 1])
+                        self._hist_slip_counts[label] = int(self._hist_slip_counts.get(label, 0)) + 1
                         break
-                slippage_df.to_csv(slippage_file, index=False)
+                self._write_histogram_counts_atomic(slippage_file, self._hist_slip_counts)
 
+                # fill delay histogram
                 delay_file = LOG_DIR / "fill_delay_histogram.csv"
-                dbins = [0, 50, 100, 150, 200, 250, 300, 400, 500, 1000, float("inf")]
+                dbins = self._delay_bins()
+                if self._hist_delay_counts is None:
+                    self._hist_delay_counts = self._load_histogram_counts(delay_file, dbins)
 
-                if delay_file.exists():
-                    delay_df = pd.read_csv(delay_file)
-                else:
-                    delay_df = pd.DataFrame(
-                        {"bin": [f"{dbins[i]} to {dbins[i + 1]}" for i in range(len(dbins) - 1)], "count": 0}
-                    )
-
-                d = float(metrics.get("latency_send_to_fill_ms", 0.0))
                 for i in range(len(dbins) - 1):
                     if dbins[i] <= d < dbins[i + 1]:
-                        label = f"{dbins[i]} to {dbins[i + 1]}"
-                        delay_df.loc[delay_df["bin"] == label, "count"] += 1
+                        label = self._bin_label(dbins[i], dbins[i + 1])
+                        self._hist_delay_counts[label] = int(self._hist_delay_counts.get(label, 0)) + 1
                         break
-                delay_df.to_csv(delay_file, index=False)
+                self._write_histogram_counts_atomic(delay_file, self._hist_delay_counts)
 
         except Exception as exc:
             log_risk.error("_update_execution_analysis error: %s | tb=%s", exc, traceback.format_exc())
@@ -1743,33 +1789,48 @@ class RiskManager:
     def _update_rejection_analysis(self, reason: str) -> None:
         try:
             reject_file = LOG_DIR / "reject_rate_analysis.csv"
-
             with _FILE_LOCK:
-                if reject_file.exists():
-                    reject_df = pd.read_csv(reject_file)
-                else:
-                    reject_df = pd.DataFrame(columns=["reason", "count", "total_attempts", "reject_rate"])
+                if self._reject_counts is None:
+                    self._reject_counts = {}
+                    if reject_file.exists():
+                        try:
+                            with open(reject_file, "r", encoding="utf-8", newline="") as f:
+                                r = csv.DictReader(f)
+                                for row in r:
+                                    rs = str(row.get("reason", "")).strip()
+                                    if not rs:
+                                        continue
+                                    try:
+                                        self._reject_counts[rs] = int(float(row.get("count", 0) or 0))
+                                    except Exception:
+                                        self._reject_counts[rs] = 0
+                        except Exception:
+                            self._reject_counts = {}
 
-                if reason in reject_df["reason"].values:
-                    reject_df.loc[reject_df["reason"] == reason, "count"] += 1
-                else:
-                    reject_df = pd.concat(
-                        [
-                            reject_df,
-                            pd.DataFrame([{"reason": reason, "count": 1, "total_attempts": 0, "reject_rate": 0.0}]),
-                        ],
-                        ignore_index=True,
-                    )
+                key = str(reason or "unknown").strip() or "unknown"
+                self._reject_counts[key] = int(self._reject_counts.get(key, 0)) + 1
 
-                total = int(reject_df["count"].sum())
-                reject_df["total_attempts"] = total
-                reject_df["reject_rate"] = reject_df["count"] / max(1, total)
-                reject_df.to_csv(reject_file, index=False)
+                total = int(sum(self._reject_counts.values()))
+                tmp = reject_file.with_suffix(reject_file.suffix + ".tmp")
+                with open(tmp, "w", encoding="utf-8", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["reason", "count", "total_attempts", "reject_rate"])
+                    w.writeheader()
+                    for rs, cnt in sorted(self._reject_counts.items(), key=lambda x: (-x[1], x[0])):
+                        rate = float(cnt) / max(1, total)
+                        w.writerow(
+                            {
+                                "reason": rs,
+                                "count": int(cnt),
+                                "total_attempts": int(total),
+                                "reject_rate": float(rate),
+                            }
+                        )
+                tmp.replace(reject_file)
 
         except Exception as exc:
             log_risk.error("_update_rejection_analysis error: %s | tb=%s", exc, traceback.format_exc())
 
-    # ------------------- signal survival (FIXED: no CSV rewrites) -------------------
+    # ------------------- signal survival -------------------
     def _survival_paths(self) -> Tuple[Path, Path, Path]:
         final_csv = Path(getattr(self.cfg, "signal_survival_log_file", str(LOG_DIR / "signal_survival_final.csv")))
         active_json = Path(getattr(self.cfg, "signal_survival_active_file", str(LOG_DIR / "signal_survival_active.json")))
@@ -1818,10 +1879,6 @@ class RiskManager:
             log_risk.error("_init_signal_survival error: %s | tb=%s", exc, traceback.format_exc())
 
     def _flush_survival_active(self, *, force: bool = False) -> None:
-        """
-        Atomic + throttled flush of active survival map.
-        Default cadence: cfg.signal_survival_flush_sec (2.0s).
-        """
         try:
             flush_sec = float(getattr(self.cfg, "signal_survival_flush_sec", 2.0) or 2.0)
             now = time.time()
@@ -1858,10 +1915,6 @@ class RiskManager:
             log_risk.error("_flush_survival_active error: %s | tb=%s", exc, traceback.format_exc())
 
     def _emit_survival_update(self, order_id: str, st: SignalSurvivalState, kind: str) -> None:
-        """
-        Optional JSONL event stream (throttled per order).
-        Default: cfg.signal_survival_update_emit_sec = 5.0s
-        """
         try:
             emit_sec = float(getattr(self.cfg, "signal_survival_update_emit_sec", 5.0) or 5.0)
             now = time.time()
@@ -1952,15 +2005,10 @@ class RiskManager:
         entry_time: float,
         confidence: float,
     ) -> None:
-        """
-        Register active signal in memory + flush active json (throttled) + emit JSONL entry.
-        NO CSV writes here.
-        """
         try:
             oid = str(order_id)
 
             conf = float(confidence)
-            # robust: accept 0..100
             if conf > 1.5:
                 conf = conf / 100.0
             conf = max(0.0, min(1.0, conf))
@@ -1989,12 +2037,6 @@ class RiskManager:
             log_risk.error("track_signal_survival error: %s | tb=%s", exc, traceback.format_exc())
 
     def update_signal_survival(self, order_id: str, current_price: float, current_time: float, tick_count: int) -> None:
-        """
-        FIXED: no CSV rewrite.
-        - Updates only in memory.
-        - Periodically flushes ACTIVE JSON (small).
-        - Optionally emits JSONL updates throttled per order.
-        """
         try:
             _ = (current_time, tick_count)
             oid = str(order_id)
@@ -2005,7 +2047,6 @@ class RiskManager:
             st.update(current_price=float(current_price))
             st.last_update_ts = time.time()
 
-            # Mark SL/TP hits (best-effort, purely analytic)
             px = float(current_price)
             if _side_norm(st.direction) == "Buy":
                 if st.sl_price > 0 and px <= float(st.sl_price):
@@ -2030,10 +2071,6 @@ class RiskManager:
         exit_price: float,
         exit_time: float,
     ) -> None:
-        """
-        Append-only final row to CSV + remove from active + flush active json.
-        Call this once on close.
-        """
         try:
             oid = str(order_id)
             st = self._survival.get(oid)
@@ -2065,10 +2102,8 @@ class RiskManager:
 
             self._emit_survival_update(oid, st, kind="exit")
 
-            # remove active
             self._survival.pop(oid, None)
             self._survival_last_update_emit.pop(oid, None)
-
             self._flush_survival_active(force=True)
         except Exception as exc:
             log_risk.error("finalize_signal_survival error: %s | tb=%s", exc, traceback.format_exc())
@@ -2131,7 +2166,7 @@ class RiskManager:
             log_risk.error("compute_slippage_model error: %s | tb=%s", exc, traceback.format_exc())
             return {}
 
-    # ------------------- state persistence (critical for 24/7) -------------------
+    # ------------------- state persistence -------------------
     def _state_path(self) -> Path:
         return Path(getattr(self.cfg, "risk_state_file", str(LOG_DIR / "risk_state.json")))
 
@@ -2183,7 +2218,7 @@ class RiskManager:
             self.execmon.ewma_slip = float(em.get("ewma_slip", 0.0) or 0.0)
             self.execmon.ewma_lat = float(em.get("ewma_lat", 0.0) or 0.0)
             self.execmon.ewma_spread = float(em.get("ewma_spread", 0.0) or 0.0)
-            # Ensure a clean day start (no carryover hard-stop)
+
             self.daily_date = self._utc_date()
             self._trading_disabled_until = 0.0
             self._hard_stop_reason = None
@@ -2225,3 +2260,4 @@ __all__ = [
     "percentile_rank",
     "SignalSurvivalState",
 ]
+

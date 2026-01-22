@@ -440,16 +440,8 @@ Exness/
 └── main.py
 
 
----
 
-## 👨‍💻 Connect with me
-| Profession | Specialized In | Markets |
-| :--- | :--- | :--- |
-| **Python Developer** | Django Back-end | XAU - BTC - USD |
-| **Trade Analyst** | Exness MT5 | Global Markets |
-
-**Contact:**
-[![Telegram](https://img.shields.io/badge/-Telegram-0088cc?style=flat&logo=telegram&logoColor=white)](https://t.me/kabir_0067)
-[![Instagram](https://img.shields.io/badge/-Instagram-E1306C?style=flat&logo=instagram&logoColor=white)](https://instagram.com/kabir.gafurov)
+Python Developer | Django Back-end | XAU - BTC - USD |
+Trade Analyst    | Exness MT5      | Global Markets  |
 
 Developed with ❤️ by Gafurov Kabir 📅 2026 | 🇹🇯 Tajikistan

@@ -39,12 +39,22 @@ if not logger.handlers:
 # Utils
 # =========================
 def safe_last(arr: np.ndarray, default: float = 0.0) -> float:
-    """Return last finite value from array; else default."""
+    """Return last finite value from array (scan backwards); else default."""
     try:
-        if arr is None or len(arr) == 0:
+        if arr is None:
             return float(default)
-        v = float(arr[-1])
-        return v if np.isfinite(v) else float(default)
+        a = np.asarray(arr, dtype=np.float64)
+        if a.size == 0:
+            return float(default)
+
+        # scan from end to first finite
+        i = a.size - 1
+        while i >= 0:
+            v = float(a[i])
+            if np.isfinite(v):
+                return v
+            i -= 1
+        return float(default)
     except Exception:
         return float(default)
 
@@ -64,6 +74,47 @@ def _to_f64(a: Any) -> np.ndarray:
     return np.asarray(a, dtype=np.float64)
 
 
+def _ts_to_ns(t: Any) -> int:
+    """
+    Robust timestamp->ns converter:
+      - datetime/Timestamp -> ns
+      - int/float assumed: sec/ms/ns by magnitude
+    """
+    try:
+        if isinstance(t, (pd.Timestamp,)):
+            return int(t.value)
+
+        if isinstance(t, (np.datetime64,)):
+            return int(pd.Timestamp(t).value)
+
+        if isinstance(t, (int, np.integer)):
+            v = int(t)
+            av = abs(v)
+            # seconds ~ 1e9..1e10, ms ~ 1e12..1e13, ns ~ 1e18
+            if av < 10_000_000_000:  # < 1e10 => seconds
+                return v * 1_000_000_000
+            if av < 10_000_000_000_000:  # < 1e13 => milliseconds
+                return v * 1_000_000
+            if av < 10_000_000_000_000_000:  # < 1e16 => microseconds
+                return v * 1_000
+            return v  # already ns
+
+        if isinstance(t, (float, np.floating)):
+            v = float(t)
+            av = abs(v)
+            if av < 10_000_000_000.0:  # seconds
+                return int(v * 1_000_000_000.0)
+            if av < 10_000_000_000_000.0:  # ms
+                return int(v * 1_000_000.0)
+            if av < 10_000_000_000_000_000.0:  # us
+                return int(v * 1_000.0)
+            return int(v)
+
+        return int(pd.Timestamp(t).value)
+    except Exception:
+        return 0
+
+
 # =========================
 # Indicator backend (TA-Lib + fast numpy fallback)
 # =========================
@@ -73,77 +124,124 @@ class _Indicators:
     Fallback is used if talib is missing OR talib throws.
 
     Goals:
-      - no pandas overhead in fallback (scalping-speed)
+      - scalping-speed (no pandas overhead)
       - stable for NaN/inf (failsafe clamps)
+      - Wilder/EMA seeding is correct (near TA-Lib)
     """
 
     def __init__(self) -> None:
         self._has_talib = talib is not None
 
     @staticmethod
+    def _clean(x: np.ndarray) -> np.ndarray:
+        # keep NaNs for warmup math; but remove inf
+        a = _to_f64(x)
+        if a.size == 0:
+            return a
+        a = a.copy()  # local safe
+        a[~np.isfinite(a)] = np.nan
+        return a
+
+    @staticmethod
     def _ema_np(x: np.ndarray, period: int, *, wilder: bool = False) -> np.ndarray:
-        x = _to_f64(x)
+        """
+        EMA with proper seeding:
+          - out[:n-1] = NaN when len >= n
+          - seed = mean(x[:n]) ignoring NaN
+          - Wilder uses alpha = 1/n
+        """
+        x = _Indicators._clean(x)
         n = int(max(1, period))
-        out = np.empty_like(x, dtype=np.float64)
+        out = np.full_like(x, np.nan, dtype=np.float64)
         if x.size == 0:
             return out
 
         alpha = (1.0 / n) if wilder else (2.0 / (n + 1.0))
-        one_m = 1.0 - alpha
 
-        v0 = float(x[0])
-        if not np.isfinite(v0):
-            v0 = 0.0
-        out[0] = v0
+        if x.size < n:
+            # progressive fallback (rare in your pipeline due to min_bars)
+            prev = float(x[0]) if np.isfinite(x[0]) else 0.0
+            out[0] = prev
+            for i in range(1, x.size):
+                xi = float(x[i]) if np.isfinite(x[i]) else prev
+                prev = prev + alpha * (xi - prev)
+                out[i] = prev
+            return out
 
-        for i in range(1, x.size):
-            xi = float(x[i])
-            if not np.isfinite(xi):
-                xi = float(out[i - 1])
-            out[i] = alpha * xi + one_m * out[i - 1]
+        start = n - 1
+        seed = float(np.nanmean(x[:n])) if np.isfinite(np.nanmean(x[:n])) else 0.0
+        out[start] = seed
+        prev = seed
+
+        for i in range(start + 1, x.size):
+            xi = float(x[i]) if np.isfinite(x[i]) else prev
+            prev = prev + alpha * (xi - prev)
+            out[i] = prev
+
         return out
 
     @staticmethod
     def _sma_np(x: np.ndarray, period: int) -> np.ndarray:
-        x = _to_f64(x)
+        x = _Indicators._clean(x)
         n = int(max(1, period))
-        out = np.empty_like(x, dtype=np.float64)
+        out = np.full_like(x, np.nan, dtype=np.float64)
         if x.size == 0:
             return out
 
-        cs = np.cumsum(np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dtype=np.float64)
-        for i in range(x.size):
-            if i < n:
-                out[i] = cs[i] / float(i + 1)
-            else:
-                out[i] = (cs[i] - cs[i - n]) / float(n)
+        if x.size < n:
+            # cumulative mean
+            xc = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            cs = np.cumsum(xc, dtype=np.float64)
+            denom = np.arange(1, x.size + 1, dtype=np.float64)
+            out[:] = cs / denom
+            return out
+
+        xc = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        cs = np.cumsum(xc, dtype=np.float64)
+        cs0 = np.empty(cs.size + 1, dtype=np.float64)
+        cs0[0] = 0.0
+        cs0[1:] = cs
+        window_sum = cs0[n:] - cs0[:-n]
+        out[n - 1 :] = window_sum / float(n)
         return out
 
     @staticmethod
     def _std_np(x: np.ndarray, period: int) -> np.ndarray:
-        x = _to_f64(x)
+        x = _Indicators._clean(x)
         n = int(max(1, period))
-        out = np.empty_like(x, dtype=np.float64)
+        out = np.full_like(x, np.nan, dtype=np.float64)
         if x.size == 0:
             return out
 
-        x0 = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        cs = np.cumsum(x0, dtype=np.float64)
-        cs2 = np.cumsum(x0 * x0, dtype=np.float64)
+        xc = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        for i in range(x.size):
-            if i < n:
-                m = cs[i] / float(i + 1)
-                v = (cs2[i] / float(i + 1)) - (m * m)
-            else:
-                s = cs[i] - cs[i - n]
-                s2 = cs2[i] - cs2[i - n]
-                m = s / float(n)
-                v = (s2 / float(n)) - (m * m)
+        if x.size < n:
+            # running std
+            cs = np.cumsum(xc, dtype=np.float64)
+            cs2 = np.cumsum(xc * xc, dtype=np.float64)
+            denom = np.arange(1, x.size + 1, dtype=np.float64)
+            mean = cs / denom
+            var = (cs2 / denom) - (mean * mean)
+            var = np.maximum(var, 0.0)
+            out[:] = np.sqrt(var)
+            return out
 
-            if v < 0.0:
-                v = 0.0
-            out[i] = math.sqrt(v)
+        cs = np.cumsum(xc, dtype=np.float64)
+        cs2 = np.cumsum(xc * xc, dtype=np.float64)
+
+        cs0 = np.empty(cs.size + 1, dtype=np.float64)
+        cs20 = np.empty(cs2.size + 1, dtype=np.float64)
+        cs0[0] = 0.0
+        cs20[0] = 0.0
+        cs0[1:] = cs
+        cs20[1:] = cs2
+
+        s = cs0[n:] - cs0[:-n]
+        s2 = cs20[n:] - cs20[:-n]
+        mean = s / float(n)
+        var = (s2 / float(n)) - (mean * mean)
+        var = np.maximum(var, 0.0)
+        out[n - 1 :] = np.sqrt(var)
         return out
 
     def EMA(self, x: np.ndarray, period: int) -> np.ndarray:
@@ -201,7 +299,7 @@ class _Indicators:
         if c.size == 0:
             return np.asarray(c, dtype=np.float64)
 
-        delta = np.empty_like(c)
+        delta = np.empty_like(c, dtype=np.float64)
         delta[0] = 0.0
         delta[1:] = c[1:] - c[:-1]
 
@@ -244,8 +342,11 @@ class _Indicators:
         tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
 
         atr = self._ema_np(tr, int(period), wilder=True)
-        plus_di = 100.0 * (self._ema_np(plus_dm, int(period), wilder=True) / np.maximum(1e-12, atr))
-        minus_di = 100.0 * (self._ema_np(minus_dm, int(period), wilder=True) / np.maximum(1e-12, atr))
+        plus_sm = self._ema_np(plus_dm, int(period), wilder=True)
+        minus_sm = self._ema_np(minus_dm, int(period), wilder=True)
+
+        plus_di = 100.0 * (plus_sm / np.maximum(1e-12, atr))
+        minus_di = 100.0 * (minus_sm / np.maximum(1e-12, atr))
 
         dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(1e-12, (plus_di + minus_di)))
         adx = self._ema_np(dx, int(period), wilder=True)
@@ -271,7 +372,11 @@ class _Indicators:
         macd = fast - slow
         signal = self._ema_np(macd, int(signalperiod), wilder=False)
         hist = macd - signal
-        return macd.astype(np.float64, copy=False), signal.astype(np.float64, copy=False), hist.astype(np.float64, copy=False)
+        return (
+            macd.astype(np.float64, copy=False),
+            signal.astype(np.float64, copy=False),
+            hist.astype(np.float64, copy=False),
+        )
 
     def BBANDS(
         self, c: np.ndarray, timeperiod: int, nbdevup: float, nbdevdn: float
@@ -293,7 +398,11 @@ class _Indicators:
         std = self._std_np(c, int(timeperiod))
         upper = mid + float(nbdevup) * std
         lower = mid - float(nbdevdn) * std
-        return upper.astype(np.float64, copy=False), mid.astype(np.float64, copy=False), lower.astype(np.float64, copy=False)
+        return (
+            upper.astype(np.float64, copy=False),
+            mid.astype(np.float64, copy=False),
+            lower.astype(np.float64, copy=False),
+        )
 
 
 @dataclass(frozen=True)
@@ -368,6 +477,12 @@ class Classic_FeatureEngine:
         self._cache_ts: float = 0.0
         self._cache_min_interval_ms: float = float(getattr(cfg, "indicator_cache_min_interval_ms", 0.0) or 0.0)
 
+        # optional tuning knobs (no breaking changes)
+        self._fvg_min_gap_atr = float(getattr(cfg, "fvg_min_gap_atr", 0.5) or 0.5)
+        self._ob_body_atr = float(getattr(cfg, "ob_body_atr", 1.5) or 1.5)
+        self._ob_vol_mult = float(getattr(cfg, "ob_vol_mult", 1.5) or 1.5)
+        self._sweep_lookback = int(getattr(cfg, "sweep_lookback", 20) or 20)
+
     # ------------------- config validation -------------------
     def _validate_cfg(self) -> None:
         ind = getattr(self.cfg, "indicator", None)
@@ -395,26 +510,30 @@ class Classic_FeatureEngine:
                 logger.error("compute_indicators: no known timeframes in df_dict")
                 return None
 
-            # ---- cache key (fast) ----
+            # ---- cache key (fast + robust time parsing) ----
             computed_cache_key: Optional[Tuple[Any, ...]] = None
             try:
                 key_parts: List[Tuple[str, int, int]] = []
+                sh = int(shift)
+
                 for tf in frames:
                     df = df_dict.get(tf)
                     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                         key_parts.append((tf, -1, 0))
                         continue
-                    if len(df) < (int(shift) + 2):
+                    if len(df) < (sh + 2):
                         key_parts.append((tf, -1, int(len(df))))
                         continue
 
+                    ts_ns = 0
                     if "time" in df.columns:
-                        t = df["time"].iloc[-1 - int(shift)]
-                        ts_ns = int(pd.Timestamp(t).value)
+                        t = df["time"].iloc[-1 - sh]
+                        ts_ns = _ts_to_ns(t)
                     else:
+                        # stable fallback
                         ts_ns = int(len(df))
 
-                    key_parts.append((tf, ts_ns, int(len(df))))
+                    key_parts.append((tf, int(ts_ns), int(len(df))))
 
                 computed_cache_key = (int(shift), tuple(key_parts))
 
@@ -499,13 +618,11 @@ class Classic_FeatureEngine:
     # ------------------- per-tf compute -------------------
     def _compute_tf(self, *, tf: str, df: pd.DataFrame, shift: int) -> Tuple[Optional[Dict[str, Any]], float, AnomalyResult]:
         try:
-            # NOTE: slice without copy; pandas gives a view-like object often
             dfp = df.iloc[:-shift]
             required = self._min_bars(tf)
             if len(dfp) < required:
                 return None, 0.0, AnomalyResult(0.0, [], False, "OK")
 
-            # numpy views (fast)
             c = dfp["close"].to_numpy(dtype=np.float64, copy=False)
             h = dfp["high"].to_numpy(dtype=np.float64, copy=False)
             l = dfp["low"].to_numpy(dtype=np.float64, copy=False)
@@ -525,7 +642,7 @@ class Classic_FeatureEngine:
             macd, macd_signal, macd_hist = self.ind.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
             bb_u, bb_m, bb_l = self.ind.BBANDS(c, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
 
-            # z-volume (rolling mean/std) – fast numpy fallback
+            # z-volume
             vol_lookback = int(self.cfg.indicator["vol_lookback"])
             vol_ma = self.ind.SMA(v, vol_lookback)
             vol_std = self.ind.STDDEV(v, vol_lookback)
@@ -835,8 +952,9 @@ class Classic_FeatureEngine:
             bull_gap = low_last - high_m3
             bear_gap = low_m3 - high_last
 
-            bull_fvg = (bull_gap > 0.5 * atr_last)
-            bear_fvg = (bear_gap > 0.5 * atr_last)
+            thr = float(self._fvg_min_gap_atr) * atr_last
+            bull_fvg = (bull_gap > thr)
+            bear_fvg = (bear_gap > thr)
             return bool(bull_fvg), bool(bear_fvg)
         except Exception as exc:
             logger.error("_detect_fvg error: %s | tb=%s", exc, traceback.format_exc())
@@ -844,15 +962,16 @@ class Classic_FeatureEngine:
 
     def _liquidity_sweep(self, df: pd.DataFrame, z_volume: float, adx: np.ndarray) -> Tuple[str, str]:
         try:
-            if len(df) < 25:
+            lb = int(max(10, self._sweep_lookback))
+            if len(df) < (lb + 5):
                 return "", ""
 
             h = df["high"].to_numpy(dtype=np.float64, copy=False)
             l = df["low"].to_numpy(dtype=np.float64, copy=False)
             closes = df["close"].to_numpy(dtype=np.float64, copy=False)
 
-            prev_high = float(np.max(h[-20:-1]))
-            prev_low = float(np.min(l[-20:-1]))
+            prev_high = float(np.max(h[-(lb + 1) : -1]))
+            prev_low = float(np.min(l[-(lb + 1) : -1]))
             curr_high = float(h[-1])
             curr_low = float(l[-1])
             c1 = float(closes[-1])
@@ -865,11 +984,17 @@ class Classic_FeatureEngine:
             z_hot = float(self.z_vol_hot)
             adx_min = float(self.adx_trend_min)
 
-            if curr_high > prev_high and float(z_volume) > z_hot and adx_val > adx_min:
+            hit_high = bool(curr_high > prev_high and float(z_volume) > z_hot and adx_val > adx_min)
+            hit_low = bool(curr_low < prev_low and float(z_volume) > z_hot and adx_val > adx_min)
+
+            # ambiguous big bar (both sides) -> no sweep (avoid false signals)
+            if hit_high and hit_low:
+                return "", ""
+
+            if hit_high:
                 sweep = "bear"
                 bos_choch = "BOS_down" if c1 < c0 else "CHOCH_down"
-
-            if curr_low < prev_low and float(z_volume) > z_hot and adx_val > adx_min:
+            elif hit_low:
                 sweep = "bull"
                 bos_choch = "BOS_up" if c1 > c0 else "CHOCH_up"
 
@@ -892,20 +1017,21 @@ class Classic_FeatureEngine:
             if not _finite(atr_last) or atr_last <= 0.0:
                 return ""
 
-            # fast: compare with slice mean (stable + scalable)
             v_mean = float(np.mean(v_slice)) if v_slice.size else 0.0
-            vol_ok = v_slice[:-1] > 1.5 * max(1e-9, v_mean)
+            vol_ok = v_slice[:-1] > float(self._ob_vol_mult) * max(1e-9, v_mean)
 
             bear_body = (o_vals[:-1] - c_vals[:-1])
             bull_body = (c_vals[:-1] - o_vals[:-1])
 
-            bear_mask = (bear_body > 1.5 * atr_last) & vol_ok
+            body_thr = float(self._ob_body_atr) * atr_last
+
+            bear_mask = (bear_body > body_thr) & vol_ok
             if np.any(bear_mask):
                 idx = int(np.argmax(np.where(bear_mask, bear_body, -1e12)))
                 if float(c_vals[-1]) > float(o_vals[idx]):
                     return "bull_ob"
 
-            bull_mask = (bull_body > 1.5 * atr_last) & vol_ok
+            bull_mask = (bull_body > body_thr) & vol_ok
             if np.any(bull_mask):
                 idx = int(np.argmax(np.where(bull_mask, bull_body, -1e12)))
                 if float(c_vals[-1]) < float(o_vals[idx]):
@@ -925,8 +1051,6 @@ class Classic_FeatureEngine:
             if step <= 0.0:
                 return False
 
-            # O(1) nearest-multiple check (faster than arange)
-            # distance to nearest multiple of step
             rem = math.fmod(float(price), step)
             rem = abs(rem)
             dist = min(rem, abs(step - rem))
@@ -964,5 +1088,7 @@ class Classic_FeatureEngine:
             return "none"
 
 
-__all__ = ["Classic_FeatureEngine", "safe_last", "AnomalyResult"]
+# Optional alias (non-breaking)
+ClassicFeatureEngine = Classic_FeatureEngine
 
+__all__ = ["Classic_FeatureEngine", "ClassicFeatureEngine", "safe_last", "AnomalyResult"]
