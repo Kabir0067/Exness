@@ -1291,18 +1291,44 @@ class MultiAssetTradingEngine:
         if spread_bps > max_spread_bps_for_multi:
             return 1
 
-        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.965, 0.985, 0.993)) or (0.965, 0.985, 0.993))
+        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.85, 0.90, 0.90)) or (0.85, 0.90, 0.90))
         tiers = sorted([float(x) for x in tiers if x is not None])
+
+        # Simple confidence-based multi-order logic:
+        # 80-85% confidence → 1 order
+        # 85-90% confidence → 2 orders
+        # 90-100% confidence → 3 orders
+        
+        # Extract net_norm for minimal safety check
+        net_norm_abs = 0.0
+        try:
+            reasons = getattr(cand, "reasons", []) or []
+            for r in reasons:
+                if "net:" in str(r):
+                    try:
+                        net_val = float(str(r).split("net:")[1].strip())
+                        net_norm_abs = abs(net_val)
+                        break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Minimal safety: require at least some net_norm strength (signals already filtered by signal_engine)
+        min_net_norm = float(getattr(cfg, "net_norm_signal_threshold", 0.10) or 0.10)
+        if net_norm_abs < min_net_norm * 0.8:  # Allow 80% of minimum threshold
+            return 1  # Safety fallback: if net_norm is too weak, only 1 order
 
         if regime.lower().startswith("range"):
             tiers = [min(0.999, t + 0.004) for t in tiers]
 
         n = 1
-        if tiers and conf >= tiers[0]:
+        # Confidence-based logic:
+        # tiers[0] = 0.85 → 2 orders at 85%+
+        # tiers[1] = 0.90 → 3 orders at 90%+
+        if tiers and conf >= tiers[0]:  # >= 0.85
             n = 2
-        if len(tiers) >= 2 and conf >= tiers[1]:
-            n = 3
-        if len(tiers) >= 3 and conf >= tiers[2]:
+        if len(tiers) >= 2 and conf >= tiers[1]:  # >= 0.90
             n = 3
 
         return int(min(max_orders, max(1, n)))
@@ -1830,23 +1856,44 @@ class MultiAssetTradingEngine:
                     continue
 
                 # Hard stop: lock trading but do NOT stop engine or set manual_stop
+                # Log only when state changes (not every loop iteration)
                 try:
-                    if self._xau.risk and hasattr(self._xau.risk, "requires_hard_stop") and self._xau.risk.requires_hard_stop():
+                    xau_hard_stop = bool(
+                        self._xau.risk 
+                        and hasattr(self._xau.risk, "requires_hard_stop") 
+                        and self._xau.risk.requires_hard_stop()
+                    )
+                    xau_was_notified = self._hard_stop_notified.get("XAU", False)
+                    
+                    if xau_hard_stop and not xau_was_notified:
+                        # State changed: now in hard stop
                         log_health.info("HARD_STOP_TRIGGERED | asset=XAU (trade_locked)")
-                        if self._engine_stop_notifier and not self._hard_stop_notified.get("XAU", False):
+                        if self._engine_stop_notifier:
                             reason = self._phase_reason(self._xau.risk, "C")
                             self._engine_stop_notifier("XAU", reason)
-                            self._hard_stop_notified["XAU"] = True
-                    else:
+                        self._hard_stop_notified["XAU"] = True
+                    elif not xau_hard_stop and xau_was_notified:
+                        # State changed: hard stop cleared
+                        log_health.info("HARD_STOP_CLEARED | asset=XAU (trading_resumed)")
                         self._hard_stop_notified["XAU"] = False
 
-                    if self._btc.risk and hasattr(self._btc.risk, "requires_hard_stop") and self._btc.risk.requires_hard_stop():
+                    btc_hard_stop = bool(
+                        self._btc.risk 
+                        and hasattr(self._btc.risk, "requires_hard_stop") 
+                        and self._btc.risk.requires_hard_stop()
+                    )
+                    btc_was_notified = self._hard_stop_notified.get("BTC", False)
+                    
+                    if btc_hard_stop and not btc_was_notified:
+                        # State changed: now in hard stop
                         log_health.info("HARD_STOP_TRIGGERED | asset=BTC (trade_locked)")
-                        if self._engine_stop_notifier and not self._hard_stop_notified.get("BTC", False):
+                        if self._engine_stop_notifier:
                             reason = self._phase_reason(self._btc.risk, "C")
                             self._engine_stop_notifier("BTC", reason)
-                            self._hard_stop_notified["BTC"] = True
-                    else:
+                        self._hard_stop_notified["BTC"] = True
+                    elif not btc_hard_stop and btc_was_notified:
+                        # State changed: hard stop cleared
+                        log_health.info("HARD_STOP_CLEARED | asset=BTC (trading_resumed)")
                         self._hard_stop_notified["BTC"] = False
                 except Exception:
                     pass

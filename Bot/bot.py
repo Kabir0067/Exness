@@ -309,7 +309,11 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
         sl = float(getattr(intent, "sl", 0.0) or 0.0)
         tp = float(getattr(intent, "tp", 0.0) or 0.0)
         conf = float(getattr(intent, "confidence", 0.0) or 0.0)
-        conf_pct = max(0.0, min(1.0, conf)) * 100.0
+        # Normalize confidence to 0-1 range if needed, then cap at 0.96 (96%) to prevent showing 100%
+        if conf > 1.0:
+            conf = conf / 100.0
+        conf = max(0.0, min(0.96, conf))  # Cap at 96% (never show 100%)
+        conf_pct = conf * 100.0
 
         sltp = f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0 and tp > 0) else "-"
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

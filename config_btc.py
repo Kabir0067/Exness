@@ -3,13 +3,20 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover (env mismatch fallback)
+    def load_dotenv(*_args: object, **_kwargs: object) -> bool:  # type: ignore[misc]
+        return False
+
 from log_config import get_log_path
 
-load_dotenv()
+# Load .env once at import (secrets-only). Does not override already-set env vars.
+load_dotenv(override=False)
 
 # =============================================================================
 # BTC ONLY / 24-7 ONLY
@@ -39,39 +46,46 @@ def _env_required(name: str) -> str:
 
 
 def _env_int(name: str, default: Optional[int] = None) -> int:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
         if default is None:
             raise RuntimeError(f".env error: missing/empty variable → {name}")
         return int(default)
+
+    s = str(raw).strip()
     try:
-        return int(str(val).strip())
+        return int(s)
     except ValueError as exc:
-        raise RuntimeError(f".env error: invalid int for {name} = {val!r}") from exc
+        raise RuntimeError(f".env error: invalid int for {name} = {raw!r}") from exc
 
 
 def _env_float(name: str, default: Optional[float] = None) -> float:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
         if default is None:
             raise RuntimeError(f".env error: missing/empty variable → {name}")
         return float(default)
+
+    s = str(raw).strip()
     try:
-        return float(str(val).strip())
+        return float(s)
     except ValueError as exc:
-        raise RuntimeError(f".env error: invalid float for {name} = {val!r}") from exc
+        raise RuntimeError(f".env error: invalid float for {name} = {raw!r}") from exc
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None or not str(val).strip():
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
         return bool(default)
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _validate_tf(tf: str, field_name: str) -> None:
     if tf not in TF_MAP:
-        raise RuntimeError(f"config error: invalid {field_name}={tf!r}. Allowed={list(TF_MAP.keys())}")
+        allowed = ", ".join(TF_MAP.keys())
+        raise RuntimeError(
+            f"config error: invalid {field_name}={tf!r}. Allowed=[{allowed}]"
+        )
 
 
 def _parse_sessions(raw: str) -> List[Tuple[int, int]]:
@@ -84,14 +98,29 @@ def _parse_sessions(raw: str) -> List[Tuple[int, int]]:
     parts = [p.strip() for p in str(raw).split(",") if p.strip()]
     for p in parts:
         if "-" not in p:
-            raise RuntimeError(f"config error: bad session item {p!r}, expected 'start-end'")
-        a, b = [x.strip() for x in p.split("-", 1)]
-        out.append((int(a), int(b)))
+            raise RuntimeError(
+                f"config error: bad session item {p!r}, expected 'start-end'"
+            )
+        a_str, b_str = [x.strip() for x in p.split("-", 1)]
+        try:
+            a = int(a_str)
+            b = int(b_str)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"config error: bad session item {p!r}, hours must be integers"
+            ) from exc
+
+        if not (0 <= a < b <= 24):
+            raise RuntimeError(
+                f"config error: bad session range {p!r}, expected 0<=start<end<=24"
+            )
+        out.append((a, b))
     return out
 
 
 def _validate_sessions_24_7(sessions: List[Tuple[int, int]]) -> None:
-    if sessions != [(0, 24)]:
+    norm = [(int(a), int(b)) for a, b in (sessions or [])]
+    if len(norm) != 1 or norm[0] != (0, 24):
         raise RuntimeError("config error: BTC must run 24/7. Set ACTIVE_SESSIONS=0-24")
 
 
@@ -122,22 +151,11 @@ class SymbolParams:
 
     pullback_atr_mult: float = 0.30
 
-    # -------------------------------------------------------------------------
     # Regime detection (BTC volatility thresholds)
-    # atr_rel_hi       -> ATR/price ratio for breakout detection (1%)
-    # bb_width_range_max -> Bollinger Band width for range detection (0.8%)
-    # -------------------------------------------------------------------------
     atr_rel_hi: float = 0.0100
     bb_width_range_max: float = 0.0080
 
-    # -------------------------------------------------------------------------
     # Spread caps (CRITICAL FOR BTC)
-    # spread_limit_pct  -> trade filter gate (soft)
-    # spread_cb_pct     -> circuit breaker threshold (hard)
-    #
-    # 0.0050 = 0.50%  (at 100,000 => $500 max spread for trading)
-    # 0.0075 = 0.75%  (hard breaker)
-    # -------------------------------------------------------------------------
     spread_limit_pct: float = 0.0050
 
     def symbol(self) -> str:
@@ -146,7 +164,9 @@ class SymbolParams:
     def validate(self) -> None:
         sym = self.symbol()
         if sym not in ALLOWED_SYMBOLS:
-            raise RuntimeError(f"config error: symbol must be BTCUSDm only. Got={sym!r}")
+            raise RuntimeError(
+                f"config error: symbol must be BTCUSDm only. Got={sym!r}"
+            )
 
         _validate_tf(self.tf_primary, "tf_primary")
         _validate_tf(self.tf_confirm, "tf_confirm")
@@ -155,14 +175,32 @@ class SymbolParams:
         if self.entry_mode != "market":
             raise RuntimeError("config error: entry_mode only supports 'market'")
 
-        if self.micro_window_sec <= 0:
+        if int(self.micro_window_sec) <= 0:
             raise RuntimeError("config error: micro_window_sec must be > 0")
-        if self.micro_min_tps <= 0 or self.micro_max_tps <= 0:
+
+        mn = float(self.micro_min_tps)
+        mx = float(self.micro_max_tps)
+        if mn <= 0.0 or mx <= 0.0:
             raise RuntimeError("config error: micro_min_tps/micro_max_tps must be > 0")
-        if self.micro_min_tps >= self.micro_max_tps:
+        if mn >= mx:
             raise RuntimeError("config error: micro_min_tps must be < micro_max_tps")
 
-        if not (0.0 < float(self.spread_limit_pct) < 0.05):
+        imb = float(self.micro_imb_thresh)
+        if not (0.0 < imb < 1.0):
+            raise RuntimeError("config error: micro_imb_thresh must be in (0..1)")
+
+        if float(self.micro_spread_med_x) <= 0.0:
+            raise RuntimeError("config error: micro_spread_med_x must be > 0")
+
+        if int(self.quote_flips_max) < 0:
+            raise RuntimeError("config error: quote_flips_max must be >= 0")
+
+        tstat = float(self.micro_tstat_thresh)
+        if tstat <= 0.0:
+            raise RuntimeError("config error: micro_tstat_thresh must be > 0")
+
+        sp = float(self.spread_limit_pct)
+        if not (0.0 < sp < 0.05):
             raise RuntimeError("config error: spread_limit_pct out of range (0..0.05)")
 
 
@@ -183,7 +221,9 @@ class EngineConfig:
 
     # Runtime
     tz_local: str = "Asia/Dushanbe"
-    active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(0, 24)])
+    active_sessions: List[Tuple[int, int]] = field(
+        default_factory=lambda: [(0, 24)]
+    )
 
     # MT5 control (used by mt5_client.py)
     mt5_path: Optional[str] = None
@@ -194,12 +234,8 @@ class EngineConfig:
     # BTC is 24/7: no overnight block
     overnight_block_hours: float = 0.0
 
-    # -------------------------------------------------------------------------
     # Risk (BTC scalping)
-    # Fix #2: daily loss vs drawdown ratio must be sane.
-    # daily loss <= 3%, max drawdown ~ 12% (portfolio)
-    # -------------------------------------------------------------------------
-    daily_target_pct: float = 0.10
+    daily_target_pct: float = 0.20  # Phase B starts at 20% profit (was 10%)
     max_daily_loss_pct: float = 0.03
     protect_drawdown_from_peak_pct: float = 0.30
     max_drawdown: float = 0.12
@@ -212,12 +248,12 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.74
-    ultra_confidence_min: float = 0.90
+    min_confidence_signal: float = 0.75
+    ultra_confidence_min: float = 0.92
     confidence_bias: float = 50.0
     confidence_gain: float = 120.0
-    net_norm_signal_threshold: float = 0.08
-    strong_conf_min: int = 88
+    net_norm_signal_threshold: float = 0.12
+    strong_conf_min: int = 90
 
     # Indicators
     ema_short: int = 9
@@ -272,23 +308,23 @@ class EngineConfig:
     poll_seconds_fast: float = 0.05
     decision_debounce_ms: float = 20.0
     analysis_cooldown_sec: float = 0.0
-    cooldown_seconds: float = 0.0  # No wait between order openings
+    cooldown_seconds: float = 0.0
     signal_cooldown_sec_override: Optional[float] = None
 
     # Position sizing (force fixed volume for scalping stability)
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
-    max_positions: int = 3  # Scalp stability cap
+    max_positions: int = 3
 
     # Multi-order shaping
     multi_order_tp_bonus_pct: float = 0.12
     multi_order_sl_tighten_pct: float = 0.00
-    multi_order_confidence_tiers: Tuple[float, float, float] = (0.92, 0.95, 0.97)
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)
     multi_order_max_orders: int = 3
     max_spread_bps_for_multi: float = 6.0
 
     # Limits (24/7 BTC)
-    max_trades_per_hour: int = 100  # Increased
+    max_trades_per_hour: int = 100
     max_signals_per_day: int = 0
 
     # SL/TP (ATR)
@@ -315,10 +351,7 @@ class EngineConfig:
         }
     )
 
-    # -------------------------------------------------------------------------
-    # Fix #3: Trailing / BE (scalping must lock profit)
-    # These names match what most MT5 bots use in RiskManager/engine.
-    # -------------------------------------------------------------------------
+    # Trailing / BE
     be_trigger_R: float = 0.70
     be_lock_spread_mult: float = 1.20
     trail_atr_mult: float = 0.95
@@ -334,10 +367,7 @@ class EngineConfig:
     rtt_cb_ms: int = 650
     slippage_backoff: float = 0.5
 
-    # -------------------------------------------------------------------------
     # Execution quality monitoring (BTC scalping)
-    # Used by RiskManager.ExecutionQualityMonitor for anomaly detection
-    # -------------------------------------------------------------------------
     exec_window: int = 300
     exec_max_p95_latency_ms: float = 650.0
     exec_max_p95_slippage_points: float = 30.0
@@ -354,9 +384,7 @@ class EngineConfig:
     # Optional spread cap (points) - None = disabled
     max_spread_points: Optional[float] = None
 
-    # -------------------------------------------------------------------------
     # Crypto-specific blackouts (BTC 24/7 with optional maintenance windows)
-    # -------------------------------------------------------------------------
     crypto_blackout_windows_utc: Optional[List[Dict[str, int]]] = None
     rollover_blackout_sec: float = 0.0
 
@@ -373,7 +401,9 @@ class EngineConfig:
     hedge_flip_enabled: bool = False
     pyramid_enabled: bool = False
 
-    log_csv_path: str = field(default_factory=lambda: str(get_log_path("signals_error_only_btc.csv")))
+    log_csv_path: str = field(
+        default_factory=lambda: str(get_log_path("signals_error_only_btc.csv"))
+    )
 
     # Policy toggles
     ignore_sessions: bool = True
@@ -416,22 +446,32 @@ class EngineConfig:
         self.symbol_params.validate()
         _validate_sessions_24_7(self.active_sessions)
 
-        if not (0.0 < float(self.max_risk_per_trade) <= 0.10):
+        m = float(self.max_risk_per_trade)
+        if not (0.0 < m <= 0.10):
             raise RuntimeError("config error: max_risk_per_trade out of range (0..0.10]")
+
         if int(self.max_positions) <= 0:
             raise RuntimeError("config error: max_positions must be > 0")
-        if float(self.poll_seconds_fast) <= 0:
+
+        if float(self.poll_seconds_fast) <= 0.0:
             raise RuntimeError("config error: poll_seconds_fast must be > 0")
-        if float(self.fixed_volume) <= 0:
+
+        if float(self.fixed_volume) <= 0.0:
             raise RuntimeError("config error: fixed_volume must be > 0")
+
         if not (0.0 < float(self.min_confidence_signal) <= 1.0):
             raise RuntimeError("config error: min_confidence_signal must be in (0..1]")
+
         if not (0.0 < float(self.ultra_confidence_min) <= 1.0):
             raise RuntimeError("config error: ultra_confidence_min must be in (0..1]")
 
         if not (0.0 < float(self.max_daily_loss_pct) < float(self.max_drawdown)):
             raise RuntimeError("config error: max_daily_loss_pct must be < max_drawdown")
 
+        _validate_tf(self.anom_tf_for_block, "anom_tf_for_block")
+
+        if float(self.spread_cb_pct) <= 0.0 or float(self.spread_cb_pct) >= 0.05:
+            raise RuntimeError("config error: spread_cb_pct out of range (0..0.05)")
 
     @property
     def indicator(self) -> Dict[str, int]:
@@ -457,10 +497,6 @@ def get_config_from_env() -> EngineConfig:
         admin_id=_env_int("ADMIN_ID"),
     )
 
-    # All other params are now defaults in the class definition.
-    # Env overrides can be re-enabled here if strictly necessary,
-    # but based on requirements we stick to variables/code defaults.
-
     cfg.validate()
     return cfg
 
@@ -468,12 +504,16 @@ def get_config_from_env() -> EngineConfig:
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
+
     cfg.min_confidence_signal = 0.82
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05
+
+    # Ensure independent list instance (avoid accidental shared mutations)
     cfg.active_sessions = [(0, 24)]
     cfg.overnight_block_hours = 0.0
+
     cfg.trail_on_entry = True
     cfg.ignore_microstructure = True
     cfg.use_squeeze_filter = False

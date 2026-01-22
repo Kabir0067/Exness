@@ -20,9 +20,11 @@ This README is aligned with the current codebase. Environment variables are used
 - Produces **Signal + SL/TP/Lot** via the risk layer, then executes orders in MT5.
 - Includes a **Telegram bot** for supervision and control.
 - Writes **health + diagnostic logs** into `Logs/`.
-- Opens **1–3 orders** depending on signal confidence (lot splitting; **SL is never tightened**).
-- Continues analyzing **even while positions are open**.
-- BTC is **24/7**; XAU is **24/5** (controlled by `market_open_24_5`).
+- Opens **1–3 orders** depending on signal confidence tiers (lot splitting; **SL is never tightened**).
+- **Dynamic confidence calculation** (70-96%) based on signal strength, not fixed values.
+- Continues analyzing **even while positions are open** (except in Phase C, where analysis is skipped).
+- BTC is **24/7**; XAU is **24/5** (controlled by `market_open_24_5`, closed on weekends).
+- **Automatic daily reset** — Phase C resets to Phase A at UTC midnight.
 
 ---
 
@@ -181,26 +183,63 @@ Implemented in:
 * `StrategiesXau/risk_management.py`
 * `StrategiesBtc/risk_management.py`
 
+### Phase A/B/C Regimes (Automatic Daily Reset)
+
+The system operates in three risk regimes that automatically reset at the start of each UTC day:
+
+#### **Phase A (Normal Trading)**
+- **Activation**: Default state, or when daily return < target
+- **Confidence Threshold**: 
+  - XAU: 80% (`min_confidence_signal`)
+  - BTC: 75% (`min_confidence_signal`)
+- **Behavior**: Standard trading with normal risk parameters
+
+#### **Phase B (Conservative/Protection Mode)**
+- **Activation Conditions**:
+  1. Daily profit ≥ `daily_target_pct` (default: 20%) → Profit protection
+  2. Daily loss ≤ `-daily_loss_b_pct` (default: -2%) → Loss protection
+- **Confidence Threshold**: 
+  - XAU: 90% (`ultra_confidence_min`)
+  - BTC: 92% (`ultra_confidence_min`)
+- **Behavior**: Only high-confidence signals allowed, reduced risk
+
+#### **Phase C (Hard Stop)**
+- **Activation**: Daily loss ≤ `-daily_loss_c_pct` (default: -5%)
+- **Behavior**: 
+  - **Trading completely blocked** (no orders, no signal analysis)
+  - `plan_order()` returns `None, None, None, None`
+  - `can_trade()` and `can_emit_signal()` return `False`
+  - Analysis skipped to save CPU resources
+- **Reset**: Automatically resets to Phase A at start of new UTC day
+
+### Daily Target Lock (Profit Protection)
+
+If daily profit:
+1. Reaches ≥ `daily_target_pct` (e.g., 20%) → Phase B activated
+2. Exceeds target by ≥ 0.5% (e.g., 20.5%) → Peak tracked
+3. Falls back to ≤ target (e.g., 20%) → **Hard stop triggered** (Phase C)
+
+This protects profits by locking trading when gains are given back.
+
+### Key Safety Features
+
 Includes:
 
-* Regimes **A/B/C** (resets on new day)
-* Signal throttling (hour/day)
+* **Phase-based confidence thresholds** (A/B/C)
+* Signal throttling (hour/day limits)
 * Latency + spread breakers
 * Execution quality monitor
 * Optional session filtering
 * Cooldowns after fill or high latency
+* **Automatic daily reset** (Phase C → Phase A at UTC midnight)
+* **Early Phase C check** in signal engine (skips analysis to save CPU)
 
 Important rules:
 
 * **Hard-stop does NOT stop the engine** — it only **locks trading** (trade-lock).
-* Full engine stop happens only via the **“Stop Trading”** control.
-
----
-
-## Core Daily Profit-Lock Rule
-
-If daily profit exceeds **10%**, and then **returns back to 10% or below**, the system triggers **trade-lock**.
-Trade-lock remains active until the end of the **UTC day**, then resets automatically on the new day.
+* **Phase C blocks analysis** — no CPU waste on signals that can't trade.
+* Full engine stop happens only via the **"Stop Trading"** control.
+* **Daily reset is automatic** — no manual intervention needed.
 
 ---
 
@@ -208,19 +247,45 @@ Trade-lock remains active until the end of the **UTC day**, then resets automati
 
 Computed by `RiskManager`:
 
-* Initial SL/TP comes from micro-zones or ATR logic.
+### Lot Size Calculation
+
+**XAU (Gold)**:
+- **Balance-based tiered system**:
+  - Balance < 200$: `lot = 0.02`, `TP = 2 USD`
+  - Balance 200-299$: `lot = 0.03`, `TP = 3 USD`
+  - Balance 300-399$: `lot = 0.04`, `TP = 4 USD`
+  - Each +100$ balance: `+0.01 lot`, `+1 USD TP`
+- Formula: `lot = 0.02 + (step × 0.01)`, `TP = 2 + (step × 1)`
+- Example: 4000$ balance → `lot = 0.41`, `TP = 41 USD`
+
+**BTC (Bitcoin)**:
+- Similar balance-based tiered system (see `btc_lot_and_takeprofit()` function)
+
+### SL/TP Calculation
+
+* Initial SL/TP comes from **ATR-based logic** (primary) or micro-zones (fallback).
 * Then enforced with:
 
-  * **min distance**
-  * **cost floor**
-  * **ATR floor**
+  * **min distance** (broker stops_level + freeze_level + padding)
+  * **cost floor** (spread + slippage + market noise)
+  * **ATR floor** (minimum ATR multiples)
 * Broker constraints (stop/freeze levels) are always respected.
-* Lot sizing is computed from **equity × max_risk_per_trade**, then translated via `mt5.order_calc_profit`.
-* Multi-order behavior:
+* **USD-based TP**: TP is calculated in USD based on balance tiers, then converted to price.
+* **Dynamic SL**: SL uses ATR multiples, adjusted for trend/range regime.
 
-  * TP may receive a bonus
-  * SL is never tightened
-  * lots are split when allowed
+### Multi-Order Behavior
+
+Orders are opened based on **confidence tiers**:
+
+* **1 order**: `confidence >= 80%` (XAU) or `>= 75%` (BTC)
+* **2 orders**: `confidence >= 85%`
+* **3 orders**: `confidence >= 90%`
+
+Additional safety:
+* Requires minimum `net_norm` strength (80% of threshold)
+* TP may receive a bonus for multi-orders
+* **SL is never tightened** for multi-orders
+* Lots are split when allowed
 
 ---
 
@@ -231,16 +296,78 @@ Main config files:
 * `config_xau.py` (Gold)
 * `config_btc.py` (Bitcoin)
 
-Key parameters:
+### Key Risk Parameters
 
-* `daily_target_pct=0.10` → 10% daily target (profit-lock logic)
-* `daily_loss_b_pct=0.02` and `daily_loss_c_pct=0.05` → regimes B/C
+**Daily Targets & Limits**:
+* `daily_target_pct=0.20` → 20% daily target (Phase B activation, profit-lock logic)
+* `daily_loss_b_pct=0.02` → 2% loss threshold (Phase A → B)
+* `daily_loss_c_pct=0.05` → 5% loss threshold (Phase → C, hard stop)
+* `max_daily_loss_pct=0.10` (XAU) / `0.03` (BTC) → Maximum daily loss before hard stop
 * `enforce_daily_limits=True` → enables A/B/C regime logic
 * `ignore_daily_stop_for_trading=False` → enables trade-lock (engine continues, trading locked)
-* `multi_order_confidence_tiers` + `multi_order_max_orders` → 1–3 orders based on signal confidence
-* `max_signals_per_day=0` → unlimited
+
+**Signal Quality**:
+* `min_confidence_signal=0.80` (XAU) / `0.75` (BTC) → Minimum confidence for Phase A
+* `ultra_confidence_min=0.90` (XAU) / `0.92` (BTC) → Minimum confidence for Phase B
+* `net_norm_signal_threshold=0.10` (XAU) / `0.12` (BTC) → Minimum signal strength
+* `confidence_gain=70.0` (XAU) / `120.0` (BTC) → Confidence calculation multiplier
+* `confidence_bias=50.0` → Base confidence value
+
+**Multi-Order Logic**:
+* `multi_order_confidence_tiers=(0.85, 0.90, 0.90)` → Confidence thresholds for 1/2/3 orders
+* `multi_order_max_orders=3` → Maximum simultaneous orders
+* Multi-order behavior:
+  - 80-85% confidence → 1 order
+  - 85-90% confidence → 2 orders
+  - 90-100% confidence → 3 orders
+
+**Other Important Settings**:
+* `max_signals_per_day=0` → unlimited (set > 0 to limit)
 * `ignore_external_positions=True` → manual trades do not affect regime/risk state
 * `magic=777001` → magic number to identify bot positions
+* `protect_drawdown_from_peak_pct=0.30` → Peak drawdown protection (30%)
+
+### Dynamic Confidence System
+
+The system calculates confidence **dynamically** based on signal strength:
+
+* **Not fixed at 96%** — confidence varies from 70-96% based on:
+  - `net_norm` strength (signal quality)
+  - Spread penalties
+  - Tick quality penalties
+  - Strength-based caps (granular tiers)
+* **Granular caps** prevent weak signals from showing high confidence
+* **Strong signals** can reach 96%, but only for extremely strong signals (rare)
+
+---
+
+## Recent Improvements & Fixes
+
+### Phase A/B/C Regimes
+- ✅ **Fully functional** — automatic transitions based on daily P&L
+- ✅ **Phase C blocks analysis** — saves CPU by skipping signal generation
+- ✅ **Automatic daily reset** — Phase C → Phase A at UTC midnight
+- ✅ **Proper confidence thresholds** — Phase A (80%/75%), Phase B (90%/92%), Phase C (blocked)
+
+### Dynamic Confidence
+- ✅ **Variable confidence** (70-96%) based on signal strength
+- ✅ **Granular caps** prevent weak signals from showing high confidence
+- ✅ **Not fixed at 96%** — confidence reflects actual signal quality
+
+### Risk Management
+- ✅ **Balance-based lot/TP calculation** — deterministic, tiered system
+- ✅ **Phase C blocking** — `plan_order()` and `calculate_position_size()` check Phase C
+- ✅ **Improved state management** — dataclass structures for better maintainability
+- ✅ **Graceful shutdown** — critical data flushed on exit via `atexit`
+
+### Signal Quality
+- ✅ **Stricter filters** — additional quality checks (ADX, spread, net_norm)
+- ✅ **Multi-order logic** — based on confidence tiers (80-85%: 1, 85-90%: 2, 90%+: 3)
+- ✅ **Reduced logging spam** — Phase C state changes logged only when state changes
+
+### Market Hours
+- ✅ **BTC 24/7** — trades continuously
+- ✅ **XAU 24/5** — trades Mon-Fri, closed on weekends (correct behavior)
 
 ---
 
@@ -249,6 +376,7 @@ Key parameters:
 * If MT5 does not deliver fresh bars → trading is blocked.
 * If spread is too high → trading is blocked.
 * If M5/M15 are unavailable → system operates on **M1**.
+* **Phase C blocks all trading** until daily reset (UTC midnight).
 
 ---
 
@@ -311,3 +439,17 @@ Exness/
 ├── config_btc.py
 └── main.py
 
+
+---
+
+## 👨‍💻 Connect with me
+| Profession | Specialized In | Markets |
+| :--- | :--- | :--- |
+| **Python Developer** | Django Back-end | XAU - BTC - USD |
+| **Trade Analyst** | Exness MT5 | Global Markets |
+
+**Contact:**
+[![Telegram](https://img.shields.io/badge/-Telegram-0088cc?style=flat&logo=telegram&logoColor=white)](https://t.me/kabir_0067)
+[![Instagram](https://img.shields.io/badge/-Instagram-E1306C?style=flat&logo=instagram&logoColor=white)](https://instagram.com/kabir.gafurov)
+
+Developed with ❤️ by Gafurov Kabir 📅 2026 | 🇹🇯 Tajikistan

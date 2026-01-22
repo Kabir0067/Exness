@@ -196,7 +196,7 @@ class EngineConfig:
     mt5_autostart: bool = True
     mt5_timeout_ms: int = 30_000
 
-    daily_target_pct: float = 0.10
+    daily_target_pct: float = 0.20  # Phase B starts at 20% profit (was 10%)
     ultra_confidence_min: float = 0.90
     protect_drawdown_from_peak_pct: float = 0.30
     max_daily_loss_pct: float = 0.10
@@ -208,14 +208,14 @@ class EngineConfig:
     ignore_external_positions: bool = True
     magic: int = 777001
 
-    min_confidence_signal: float = 0.80
-    conf_min: int = 84
-    conf_min_low: int = 80
-    conf_min_high: int = 93
+    min_confidence_signal: float = 0.80  # Allow signals from 80% (80-85%: 1 order, 85-90%: 2 orders, 90-100%: 3 orders)
+    conf_min: int = 80  # Allow from 80% (adjusted for new multi-order logic)
+    conf_min_low: int = 80  # Low threshold
+    conf_min_high: int = 90  # High threshold
     confidence_bias: float = 50.0
     confidence_gain: float = 70.0
-    net_norm_signal_threshold: float = 0.06
-    strong_conf_min: int = 88
+    net_norm_signal_threshold: float = 0.10  # STRICT: require stronger net_norm
+    strong_conf_min: int = 90  # Higher strong signal threshold
     require_ema_stack: bool = True
 
     adx_trend_lo: float = 16.0
@@ -258,7 +258,7 @@ class EngineConfig:
     # --- Multi-order tuning (SAFE scalping) ---
     multi_order_tp_bonus_pct: float = 0.12
     multi_order_sl_tighten_pct: float = 0.00
-    multi_order_confidence_tiers: Tuple[float, float, float] = (0.965, 0.985, 0.993)
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)  # 80-85%: 1 order, 85-90%: 2 orders, 90-100%: 3 orders
     multi_order_max_orders: int = 3
     max_spread_bps_for_multi: float = 6.0
 
@@ -333,12 +333,12 @@ class EngineConfig:
 
     ultimate_mode: bool = True
     ensemble_w: Tuple[float, float, float] = (0.55, 0.33, 0.12)
-    meta_barrier_R: float = 0.65
+    meta_barrier_R: float = 0.55  # Reduced from 0.65 to allow more signals (was too strict)
     meta_h_bars: int = 6
     conformal_window: int = 300
     conformal_q: float = 0.88
     brier_window: int = 800
-    tc_bps: float = 1.5
+    tc_bps: float = 1.2  # Reduced from 1.5 to allow more signals (was too strict)
     rtt_cb_ms: int = 450
     spread_cb_pct: float = 0.0010
     slippage_backoff: float = 0.5

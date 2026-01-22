@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import logging
 import math
-import traceback
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,10 +16,10 @@ try:
 except Exception:
     talib = None  # type: ignore
 
-
-# Prefer your BTC-only config module name.
 from config_btc import EngineConfig
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
+
+
 
 # =============================================================================
 # Logging (ERROR only)
@@ -30,8 +30,12 @@ logger = logging.getLogger("feature_engine_btc")
 logger.setLevel(logging.ERROR)
 logger.propagate = False
 
-if not logger.handlers:
-    fh = logging.FileHandler(str(get_log_path("feature_engine_btc.log")), encoding="utf-8")
+if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+    fh = logging.FileHandler(
+        str(get_log_path("feature_engine_btc.log")),
+        encoding="utf-8",
+        delay=True,
+    )
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(fh)
@@ -43,9 +47,12 @@ if not logger.handlers:
 def safe_last(arr: np.ndarray, default: float = 0.0) -> float:
     """Return last finite value from array; else default."""
     try:
-        if arr is None or len(arr) == 0:
+        if arr is None:
             return float(default)
-        v = float(arr[-1])
+        a = np.asarray(arr, dtype=np.float64)
+        if a.size == 0:
+            return float(default)
+        v = float(a[-1])
         return v if np.isfinite(v) else float(default)
     except Exception:
         return float(default)
@@ -71,11 +78,11 @@ def _clip01(x: float) -> float:
 
 
 # =============================================================================
-# Indicator backend (TA-Lib + robust fallback)
+# Indicator backend (TA-Lib + robust fast fallback)
 # =============================================================================
 class _Indicators:
     """
-    TA-Lib backend with safe fallback to pandas/numpy.
+    TA-Lib backend with safe fallback to numpy (fast, deterministic).
     Fallback is used if talib is missing OR talib throws.
     """
 
@@ -83,15 +90,79 @@ class _Indicators:
         self._has_talib = talib is not None
 
     @staticmethod
-    def _ema(x: np.ndarray, period: int) -> np.ndarray:
-        s = pd.Series(_to_f64(x))
-        return s.ewm(span=int(period), adjust=False).mean().to_numpy(dtype=np.float64)
+    def _ema_alpha(span: int) -> float:
+        s = int(max(1, span))
+        return 2.0 / (float(s) + 1.0)
 
     @staticmethod
-    def _wilder_ema(x: np.ndarray, period: int) -> np.ndarray:
-        s = pd.Series(_to_f64(x))
-        alpha = 1.0 / max(1, int(period))
-        return s.ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float64)
+    def _ema_rec(x: np.ndarray, alpha: float) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        n = int(x.size)
+        if n == 0:
+            return x
+        out = np.empty(n, dtype=np.float64)
+        out[0] = float(x[0])
+        a = float(alpha)
+        ia = 1.0 - a
+        for i in range(1, n):
+            out[i] = a * float(x[i]) + ia * float(out[i - 1])
+        return out
+
+    @staticmethod
+    def _wilder_rec(x: np.ndarray, period: int) -> np.ndarray:
+        p = int(max(1, period))
+        alpha = 1.0 / float(p)
+        return _Indicators._ema_rec(x, alpha)
+
+    @staticmethod
+    def _sma_fast(x: np.ndarray, period: int) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        n = int(x.size)
+        if n == 0:
+            return x
+        p = int(max(1, period))
+        idx = np.arange(n, dtype=np.int64)
+        start = idx - (p - 1)
+        start = np.maximum(start, 0)
+
+        cs = np.cumsum(x, dtype=np.float64)
+        cs0 = np.empty(n + 1, dtype=np.float64)
+        cs0[0] = 0.0
+        cs0[1:] = cs
+
+        s = cs0[idx + 1] - cs0[start]
+        cnt = (idx - start + 1).astype(np.float64)
+        return (s / cnt).astype(np.float64)
+
+    @staticmethod
+    def _std_fast(x: np.ndarray, period: int) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        n = int(x.size)
+        if n == 0:
+            return x
+        p = int(max(1, period))
+        idx = np.arange(n, dtype=np.int64)
+        start = idx - (p - 1)
+        start = np.maximum(start, 0)
+
+        cs = np.cumsum(x, dtype=np.float64)
+        css = np.cumsum(x * x, dtype=np.float64)
+
+        cs0 = np.empty(n + 1, dtype=np.float64)
+        css0 = np.empty(n + 1, dtype=np.float64)
+        cs0[0] = 0.0
+        css0[0] = 0.0
+        cs0[1:] = cs
+        css0[1:] = css
+
+        s = cs0[idx + 1] - cs0[start]
+        ss = css0[idx + 1] - css0[start]
+        cnt = (idx - start + 1).astype(np.float64)
+
+        mean = s / cnt
+        var = (ss / cnt) - (mean * mean)
+        var = np.maximum(var, 0.0)
+        return np.sqrt(var, dtype=np.float64)
 
     def EMA(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -99,7 +170,7 @@ class _Indicators:
                 return talib.EMA(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        return self._ema(x, period)
+        return self._ema_rec(_to_f64(x), self._ema_alpha(int(period)))
 
     def SMA(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -107,8 +178,7 @@ class _Indicators:
                 return talib.SMA(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        s = pd.Series(_to_f64(x))
-        return s.rolling(int(period), min_periods=1).mean().to_numpy(dtype=np.float64)
+        return self._sma_fast(_to_f64(x), int(period))
 
     def STDDEV(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -116,8 +186,7 @@ class _Indicators:
                 return talib.STDDEV(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        s = pd.Series(_to_f64(x))
-        return s.rolling(int(period), min_periods=1).std(ddof=0).fillna(0.0).to_numpy(dtype=np.float64)
+        return self._std_fast(_to_f64(x), int(period))
 
     def ATR(self, h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -129,10 +198,11 @@ class _Indicators:
         h = _to_f64(h)
         l = _to_f64(l)
         c = _to_f64(c)
+
         prev_c = np.roll(c, 1)
         prev_c[0] = c[0]
         tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
-        return self._wilder_ema(tr, period)
+        return self._wilder_rec(tr, int(period))
 
     def RSI(self, c: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -145,8 +215,10 @@ class _Indicators:
         delta = np.diff(c, prepend=c[0])
         gain = np.maximum(delta, 0.0)
         loss = np.maximum(-delta, 0.0)
-        avg_gain = self._wilder_ema(gain, period)
-        avg_loss = self._wilder_ema(loss, period)
+
+        avg_gain = self._wilder_rec(gain, int(period))
+        avg_loss = self._wilder_rec(loss, int(period))
+
         rs = avg_gain / np.maximum(1e-12, avg_loss)
         rsi = 100.0 - (100.0 / (1.0 + rs))
         return rsi.astype(np.float64)
@@ -165,26 +237,32 @@ class _Indicators:
         prev_h = np.roll(h, 1)
         prev_l = np.roll(l, 1)
         prev_c = np.roll(c, 1)
-        prev_h[0], prev_l[0], prev_c[0] = h[0], l[0], c[0]
+        prev_h[0] = h[0]
+        prev_l[0] = l[0]
+        prev_c[0] = c[0]
 
         up_move = h - prev_h
         down_move = prev_l - l
 
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
 
         tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+        atr = self._wilder_rec(tr, int(period))
 
-        atr = self._wilder_ema(tr, period)
-        plus_di = 100.0 * (self._wilder_ema(plus_dm, period) / np.maximum(1e-12, atr))
-        minus_di = 100.0 * (self._wilder_ema(minus_dm, period) / np.maximum(1e-12, atr))
+        plus_di = 100.0 * (self._wilder_rec(plus_dm, int(period)) / np.maximum(1e-12, atr))
+        minus_di = 100.0 * (self._wilder_rec(minus_dm, int(period)) / np.maximum(1e-12, atr))
 
         dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(1e-12, (plus_di + minus_di)))
-        adx = self._wilder_ema(dx, period)
+        adx = self._wilder_rec(dx, int(period))
         return adx.astype(np.float64)
 
     def MACD(
-        self, c: np.ndarray, fastperiod: int, slowperiod: int, signalperiod: int
+        self,
+        c: np.ndarray,
+        fastperiod: int,
+        slowperiod: int,
+        signalperiod: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         try:
             if self._has_talib:
@@ -198,15 +276,19 @@ class _Indicators:
             pass
 
         c = _to_f64(c)
-        fast = self._ema(c, fastperiod)
-        slow = self._ema(c, slowperiod)
+        fast = self._ema_rec(c, self._ema_alpha(int(fastperiod)))
+        slow = self._ema_rec(c, self._ema_alpha(int(slowperiod)))
         macd = fast - slow
-        signal = self._ema(macd, signalperiod)
+        signal = self._ema_rec(macd, self._ema_alpha(int(signalperiod)))
         hist = macd - signal
         return macd.astype(np.float64), signal.astype(np.float64), hist.astype(np.float64)
 
     def BBANDS(
-        self, c: np.ndarray, timeperiod: int, nbdevup: float, nbdevdn: float
+        self,
+        c: np.ndarray,
+        timeperiod: int,
+        nbdevup: float,
+        nbdevdn: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         try:
             if self._has_talib:
@@ -220,12 +302,12 @@ class _Indicators:
         except Exception:
             pass
 
-        s = pd.Series(_to_f64(c))
-        mid = s.rolling(int(timeperiod), min_periods=1).mean()
-        std = s.rolling(int(timeperiod), min_periods=1).std(ddof=0).fillna(0.0)
+        x = _to_f64(c)
+        mid = self._sma_fast(x, int(timeperiod))
+        std = self._std_fast(x, int(timeperiod))
         upper = mid + float(nbdevup) * std
         lower = mid - float(nbdevdn) * std
-        return upper.to_numpy(dtype=np.float64), mid.to_numpy(dtype=np.float64), lower.to_numpy(dtype=np.float64)
+        return upper.astype(np.float64), mid.astype(np.float64), lower.astype(np.float64)
 
 
 # =============================================================================
@@ -269,28 +351,26 @@ class Classic_FeatureEngine:
 
         self.ind = _Indicators()
 
+        ind_cfg = self.cfg.indicator  # validated dict
+
+        # pre-read periods (avoid dict lookup in hot path)
+        self._ema_short_p = int(ind_cfg["ema_short"])
+        self._ema_mid_p = int(ind_cfg["ema_mid"])
+        self._ema_long_p = int(ind_cfg["ema_long"])
+        self._ema_vlong_p = int(ind_cfg["ema_vlong"])
+        self._atr_p = int(ind_cfg["atr_period"])
+        self._rsi_p = int(ind_cfg["rsi_period"])
+        self._adx_p = int(ind_cfg["adx_period"])
+        self._vol_lb = int(ind_cfg["vol_lookback"])
+
         # ---------------- BTC tuned thresholds (config-driven; strong defaults) ----------------
-        # ADX: for BTC M1 you need lower "trend min" vs FX, but still filter chop
         self.adx_trend_min = float(getattr(cfg, "adx_trend_lo", 22.0) or 22.0)
-        # impulse means "too hot" (news spike / squeeze release)
         self.adx_impulse_hi = float(getattr(cfg, "adx_impulse_hi", 42.0) or 42.0)
-
-        # Volume z-score hot threshold
         self.z_vol_hot = float(getattr(cfg, "z_vol_hot", 2.2) or 2.2)
-
-        # BB width used for regime classification
         self.bb_width_range_max = float(getattr(cfg, "bb_width_range_max", 0.0080) or 0.0080)
-
-        # Round-number step for BTC scalping (USD distance). Use cfg.rn_step if provided.
         self.rn_step = float(getattr(cfg, "rn_step", 100.0) or 100.0)
-
-        # FVG sensitivity (BTC needs smaller threshold than XAU)
         self.fvg_min_atr_mult = float(getattr(cfg, "fvg_min_atr_mult", 0.35) or 0.35)
-
-        # Liquidity sweep sensitivity
         self.sweep_min_atr_mult = float(getattr(cfg, "sweep_min_atr_mult", 0.15) or 0.15)
-
-        # VWAP window (M1)
         self.vwap_window = int(getattr(cfg, "vwap_window", 30) or 30)
 
         # ---------------- anomaly config ----------------
@@ -348,24 +428,25 @@ class Classic_FeatureEngine:
             computed_cache_key: Optional[Tuple[Any, ...]] = None
             try:
                 key_parts: List[Tuple[str, int, int]] = []
+                sh = int(shift)
                 for tf in frames:
                     df = df_dict.get(tf)
                     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                         key_parts.append((tf, -1, 0))
                         continue
-                    if len(df) < (int(shift) + 2):
+                    if len(df) < (sh + 2):
                         key_parts.append((tf, -1, int(len(df))))
                         continue
 
                     if "time" in df.columns:
-                        t = df["time"].iloc[-1 - int(shift)]
+                        t = df["time"].iloc[-1 - sh]
                         ts_ns = int(pd.Timestamp(t).value)
                     else:
                         ts_ns = int(len(df))
 
                     key_parts.append((tf, ts_ns, int(len(df))))
 
-                computed_cache_key = (int(shift), tuple(key_parts))
+                computed_cache_key = (sh, tuple(key_parts))
 
                 if self._cache_key == computed_cache_key and self._cache_out is not None:
                     if self._cache_min_interval_ms <= 0.0:
@@ -389,7 +470,12 @@ class Classic_FeatureEngine:
 
                 required = self._min_bars(tf)
                 if len(df) < (required + shift):
-                    logger.error("Data insufficient for %s: len=%s < required+shift=%s", tf, len(df), required + shift)
+                    logger.error(
+                        "Data insufficient for %s: len=%s < required+shift=%s",
+                        tf,
+                        len(df),
+                        required + shift,
+                    )
                     continue
 
                 tf_out, inc, anom = self._compute_tf(tf=tf, df=df, shift=shift)
@@ -450,26 +536,30 @@ class Classic_FeatureEngine:
     # ------------------------------------------------------------------
     def _compute_tf(self, *, tf: str, df: pd.DataFrame, shift: int) -> Tuple[Optional[Dict[str, Any]], float, AnomalyResult]:
         try:
-            dfp = df.iloc[:-shift]
+            sh = int(shift)
+            if sh <= 0:
+                sh = 1
+
+            dfp = df.iloc[:-sh]
             required = self._min_bars(tf)
             if len(dfp) < required:
                 return None, 0.0, AnomalyResult(0.0, [], False, "OK")
 
-            c = dfp["close"].to_numpy(dtype=np.float64)
-            h = dfp["high"].to_numpy(dtype=np.float64)
-            l = dfp["low"].to_numpy(dtype=np.float64)
-            o = dfp["open"].to_numpy(dtype=np.float64)
-            v = self._ensure_volume(dfp).astype(np.float64)
+            c = dfp["close"].to_numpy(dtype=np.float64, copy=False)
+            h = dfp["high"].to_numpy(dtype=np.float64, copy=False)
+            l = dfp["low"].to_numpy(dtype=np.float64, copy=False)
+            o = dfp["open"].to_numpy(dtype=np.float64, copy=False)
+            v = self._ensure_volume(dfp)  # already float64
 
-            # --- core indicators (config-driven periods) ---
-            ema9 = self.ind.EMA(c, int(self.cfg.indicator["ema_short"]))
-            ema21 = self.ind.EMA(c, int(self.cfg.indicator["ema_mid"]))
-            ema50 = self.ind.EMA(c, int(self.cfg.indicator["ema_long"]))
-            ema200 = self.ind.EMA(c, int(self.cfg.indicator["ema_vlong"]))
+            # --- core indicators (periods are pre-cached) ---
+            ema9 = self.ind.EMA(c, self._ema_short_p)
+            ema21 = self.ind.EMA(c, self._ema_mid_p)
+            ema50 = self.ind.EMA(c, self._ema_long_p)
+            ema200 = self.ind.EMA(c, self._ema_vlong_p)
 
-            atr = self.ind.ATR(h, l, c, int(self.cfg.indicator["atr_period"]))
-            rsi = self.ind.RSI(c, int(self.cfg.indicator["rsi_period"]))
-            adx = self.ind.ADX(h, l, c, int(self.cfg.indicator["adx_period"]))
+            atr = self.ind.ATR(h, l, c, self._atr_p)
+            rsi = self.ind.RSI(c, self._rsi_p)
+            adx = self.ind.ADX(h, l, c, self._adx_p)
 
             macd, macd_signal, macd_hist = self.ind.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
             bb_u, bb_m, bb_l = self.ind.BBANDS(c, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
@@ -477,29 +567,37 @@ class Classic_FeatureEngine:
             # --- derived features (BTC scalping-critical) ---
             close_last = float(c[-1])
             atr_last = float(safe_last(atr, 0.0))
-            atr_pct = float(atr_last / close_last) if close_last > 0 and atr_last > 0 else 0.0
+            atr_pct = float(atr_last / close_last) if close_last > 0.0 and atr_last > 0.0 else 0.0
 
             bb_mid = float(safe_last(bb_m, close_last))
-            bb_std = float((float(safe_last(bb_u, close_last)) - float(safe_last(bb_l, close_last))) / 4.0) if bb_mid > 0 else 0.0
-            bb_width = float((4.0 * bb_std / bb_mid) if bb_mid > 0 else 0.0)
+            bb_u_last = float(safe_last(bb_u, close_last))
+            bb_l_last = float(safe_last(bb_l, close_last))
+            # bb_width = (upper - lower) / mid  (stable, avoids extra ops)
+            bb_width = float((bb_u_last - bb_l_last) / bb_mid) if bb_mid > 0.0 else 0.0
 
-            ret1 = float((close_last / float(c[-2]) - 1.0)) if len(c) >= 2 and float(c[-2]) > 0 else 0.0
-            ret3 = float((close_last / float(c[-4]) - 1.0)) if len(c) >= 4 and float(c[-4]) > 0 else 0.0
+            ret1 = float((close_last / float(c[-2]) - 1.0)) if c.size >= 2 and float(c[-2]) > 0.0 else 0.0
+            ret3 = float((close_last / float(c[-4]) - 1.0)) if c.size >= 4 and float(c[-4]) > 0.0 else 0.0
 
-            ema21_slope = float((float(ema21[-1]) - float(ema21[-4])) / max(1e-9, atr_last)) if len(ema21) >= 4 and atr_last > 0 else 0.0
-            rsi_slope = float(float(rsi[-1]) - float(rsi[-4])) if len(rsi) >= 4 else 0.0
-            macd_hist_slope = float(float(macd_hist[-1]) - float(macd_hist[-4])) if len(macd_hist) >= 4 else 0.0
+            if ema21.size >= 4 and atr_last > 0.0:
+                ema21_slope = float((float(ema21[-1]) - float(ema21[-4])) / max(1e-9, atr_last))
+            else:
+                ema21_slope = 0.0
+
+            rsi_slope = float(float(rsi[-1]) - float(rsi[-4])) if rsi.size >= 4 else 0.0
+            macd_hist_slope = float(float(macd_hist[-1]) - float(macd_hist[-4])) if macd_hist.size >= 4 else 0.0
 
             # VWAP (tick_volume-based; best available in MT5 bars)
             vwap = self._vwap_from_bars(dfp, window=self.vwap_window)
-            vwap_dist_atr = float((close_last - vwap) / max(1e-9, atr_last)) if _finite(vwap) and atr_last > 0 else 0.0
+            vwap_dist_atr = float((close_last - vwap) / max(1e-9, atr_last)) if _finite(vwap) and atr_last > 0.0 else 0.0
 
-            # --- z-volume ---
-            vol_lookback = int(self.cfg.indicator["vol_lookback"])
-            vol_ma = self.ind.SMA(v, vol_lookback)
-            vol_std = self.ind.STDDEV(v, vol_lookback)
+            # --- z-volume (FIXED: no invalid nan_to_num with array nan=...) ---
+            vol_ma = self.ind.SMA(v, self._vol_lb)
+            vol_std = self.ind.STDDEV(v, self._vol_lb)
             vol_std_safe = np.maximum(np.nan_to_num(vol_std, nan=0.0), 1e-9)
-            z_vol_series = (v - np.nan_to_num(vol_ma, nan=v)) / vol_std_safe
+
+            # replace non-finite vol_ma elementwise with v (fast + correct)
+            vol_ma_safe = np.where(np.isfinite(vol_ma), vol_ma, v)
+            z_vol_series = (v - vol_ma_safe) / vol_std_safe
             zv = float(safe_last(z_vol_series, 0.0))
 
             # --- patterns / logic (BTC tuned) ---
@@ -510,7 +608,7 @@ class Classic_FeatureEngine:
             near_rn = self._near_round_number(price=close_last, atr=atr_last)
 
             rsi_div = self._detect_divergence_swings(ind=rsi, price=c)
-            macd_div = self._detect_divergence_swings(ind=macd_hist, price=c)  # hist divergence is cleaner for BTC scalps
+            macd_div = self._detect_divergence_swings(ind=macd_hist, price=c)
 
             trend = self._determine_trend(c, ema21, ema50, ema200, adx)
 
@@ -558,9 +656,9 @@ class Classic_FeatureEngine:
                 "macd_signal": float(safe_last(macd_signal)),
                 "macd_hist": float(safe_last(macd_hist)),
 
-                "bb_upper": float(safe_last(bb_u)),
-                "bb_mid": float(safe_last(bb_m)),
-                "bb_lower": float(safe_last(bb_l)),
+                "bb_upper": float(bb_u_last),
+                "bb_mid": float(bb_mid),
+                "bb_lower": float(bb_l_last),
                 "bb_width": float(bb_width),
 
                 # derived (scalping)
@@ -616,13 +714,11 @@ class Classic_FeatureEngine:
         adx_val = float(safe_last(adx))
         adx_min = float(self.adx_trend_min)
 
-        # BTC: trend means EMA stacking + ADX gate
         if c[-1] > ema21[-1] > ema50[-1] and adx_val >= adx_min:
             return "strong_up"
         if c[-1] < ema21[-1] < ema50[-1] and adx_val >= adx_min:
             return "strong_down"
 
-        # softer bias relative to EMA200 (keeps you from fighting major drift)
         if c[-1] >= ema200[-1]:
             return "weak_up"
         if c[-1] < ema200[-1]:
@@ -637,8 +733,11 @@ class Classic_FeatureEngine:
             sub = df.iloc[-w:]
             if not _require_cols(sub, ("high", "low", "close")):
                 return float("nan")
-            tp = (sub["high"].to_numpy(dtype=np.float64) + sub["low"].to_numpy(dtype=np.float64) + sub["close"].to_numpy(dtype=np.float64)) / 3.0
-            vol = self._ensure_volume(sub).astype(np.float64)
+            high = sub["high"].to_numpy(dtype=np.float64, copy=False)
+            low = sub["low"].to_numpy(dtype=np.float64, copy=False)
+            close = sub["close"].to_numpy(dtype=np.float64, copy=False)
+            tp = (high + low + close) / 3.0
+            vol = self._ensure_volume(sub)
             vol_sum = float(np.sum(vol))
             if vol_sum <= 1e-9:
                 return float(np.mean(tp))
@@ -659,13 +758,6 @@ class Classic_FeatureEngine:
         bb_width: float,
         vwap_dist_atr: float,
     ) -> float:
-        """
-        BTC scalping weighting:
-          - FVG + Sweep + OB are structure events
-          - Divergence adds quality (avoid late entries)
-          - z_volume hot confirms impulse (but we also penalize ultra-wide BB)
-          - VWAP distance too large reduces quality (mean-reversion snap risk)
-        """
         inc = 0.0
 
         if has_fvg:
@@ -682,15 +774,13 @@ class Classic_FeatureEngine:
         if float(z_volume) >= float(self.z_vol_hot):
             inc += 0.8
 
-        # regime-based shaping
         if bb_width > float(self.bb_width_range_max) * 1.8:
-            inc -= 0.5  # too expanded: higher whip risk for scalps
+            inc -= 0.5
 
-        # VWAP distance shaping
         if vwap_dist_atr >= 2.2:
-            inc -= 0.6  # stretched -> snapback risk
+            inc -= 0.6
         elif vwap_dist_atr <= 0.6:
-            inc += 0.3  # close to VWAP -> cleaner scalps
+            inc += 0.3
 
         if "strong_" in trend:
             inc += 0.4
@@ -730,7 +820,6 @@ class Classic_FeatureEngine:
         if bearish >= math.ceil(total * 0.67):
             return True
 
-        # allow "bias + range" alignment
         if (bullish + rng) >= math.ceil(total * 0.84):
             return True
         if (bearish + rng) >= math.ceil(total * 0.84):
@@ -741,16 +830,15 @@ class Classic_FeatureEngine:
     def _ensure_volume(self, df: pd.DataFrame) -> np.ndarray:
         try:
             if "tick_volume" in df.columns:
-                return df["tick_volume"].fillna(0).to_numpy(dtype=np.float64)
+                return df["tick_volume"].fillna(0).to_numpy(dtype=np.float64, copy=False)
             if "real_volume" in df.columns:
-                return df["real_volume"].fillna(0).to_numpy(dtype=np.float64)
+                return df["real_volume"].fillna(0).to_numpy(dtype=np.float64, copy=False)
 
-            # fallback synthetic volume
-            hl_range = (df["high"] - df["low"]).fillna(0).to_numpy(dtype=np.float64)
-            close = df["close"].fillna(0).to_numpy(dtype=np.float64)
+            hl_range = (df["high"] - df["low"]).fillna(0).to_numpy(dtype=np.float64, copy=False)
+            close = df["close"].fillna(0).to_numpy(dtype=np.float64, copy=False)
             close_diff = np.abs(np.diff(close, prepend=close[0]))
             synth = (hl_range + close_diff) * 5000.0
-            return synth.astype(np.float64)
+            return synth.astype(np.float64, copy=False)
         except Exception as exc:
             logger.error("_ensure_volume error: %s | tb=%s", exc, traceback.format_exc())
             return np.zeros(len(df), dtype=np.float64)
@@ -767,17 +855,17 @@ class Classic_FeatureEngine:
             if len(dfp) < max(80, lb + persist_bars + 5):
                 return AnomalyResult(0.0, [], False, "OK")
 
-            o = dfp["open"].to_numpy(dtype=np.float64)
-            h = dfp["high"].to_numpy(dtype=np.float64)
-            l = dfp["low"].to_numpy(dtype=np.float64)
-            c = dfp["close"].to_numpy(dtype=np.float64)
+            o = dfp["open"].to_numpy(dtype=np.float64, copy=False)
+            h = dfp["high"].to_numpy(dtype=np.float64, copy=False)
+            l = dfp["low"].to_numpy(dtype=np.float64, copy=False)
+            c = dfp["close"].to_numpy(dtype=np.float64, copy=False)
 
             atr_series = np.asarray(atr_series, dtype=np.float64)
-            if len(atr_series) != len(c):
+            if atr_series.size != c.size:
                 atr_series = np.full_like(c, float(safe_last(atr_series, default=0.0)))
 
             z_vol_series = np.asarray(z_vol_series, dtype=np.float64)
-            if len(z_vol_series) != len(c):
+            if z_vol_series.size != c.size:
                 z_vol_series = np.zeros_like(c)
 
             hit_reasons: Dict[str, int] = {}
@@ -786,10 +874,13 @@ class Classic_FeatureEngine:
 
             for k in range(1, persist_bars + 1):
                 atr = float(atr_series[-k])
-                if not _finite(atr) or atr <= 0:
+                if not _finite(atr) or atr <= 0.0:
                     continue
 
-                o1, h1, l1, c1 = float(o[-k]), float(h[-k]), float(l[-k]), float(c[-k])
+                o1 = float(o[-k])
+                h1 = float(h[-k])
+                l1 = float(l[-k])
+                c1 = float(c[-k])
                 prev_close = float(c[-k - 1])
 
                 z_k = float(z_vol_series[-k])
@@ -799,51 +890,43 @@ class Classic_FeatureEngine:
                 rng = (h1 - l1)
                 wick_up = h1 - max(o1, c1)
                 wick_dn = min(o1, c1) - l1
-                wick_dom = (max(wick_up, wick_dn) / max(1e-9, rng)) if rng > 0 else 0.0
+                wick_dom = (max(wick_up, wick_dn) / max(1e-9, rng)) if rng > 0.0 else 0.0
 
                 s = 0.0
                 reasons_bar: List[str] = []
 
-                # range spike: BTC news bars / liquidation cascades
                 if rng >= float(self._anom_range_atr) * atr:
                     reasons_bar.append("range_spike")
                     s += 1.1
 
-                # wick spike: stop hunts, liquidation wicks
                 if wick_dom >= float(self._anom_wick_ratio) and rng >= 1.2 * atr:
                     reasons_bar.append("wick_spike")
                     s += 1.2
 
-                # gap/jump between bars (crypto can jump even without session gaps)
                 if abs(o1 - prev_close) >= float(self._anom_gap_atr) * atr:
                     reasons_bar.append("gap_jump")
                     s += 1.0
 
-                # stoprun detection vs recent extremes
                 end = len(h) - k
                 start = end - lb
                 if start >= 0 and (end - start) >= max(6, lb // 2):
                     prev_high = float(np.max(h[start:end]))
                     prev_low = float(np.min(l[start:end]))
 
-                    # sweep high then reject
                     if (h1 > prev_high) and (c1 < prev_high):
                         if (z_k >= float(self._anom_stoprun_zvol)) or (wick_dom >= 0.6):
                             reasons_bar.append("stoprun_high_reject")
                             s += 1.6
 
-                    # sweep low then reject
                     if (l1 < prev_low) and (c1 > prev_low):
                         if (z_k >= float(self._anom_stoprun_zvol)) or (wick_dom >= 0.6):
                             reasons_bar.append("stoprun_low_reject")
                             s += 1.6
 
-                # impulse ADX spike (market too hot)
                 if float(adx) >= float(self.adx_impulse_hi) and rng >= 1.7 * atr:
                     reasons_bar.append("impulse_adx_spike")
                     s += 0.7
 
-                # thin liquidity spike (large range but low z-vol)
                 if rng >= 1.8 * atr and float(z_k) < 0.4:
                     reasons_bar.append("thin_liquidity_spike")
                     s += 0.7
@@ -867,7 +950,6 @@ class Classic_FeatureEngine:
             blocked = False
             level = "OK"
 
-            # BTC: block only if persistent AND strong score
             if score >= float(self._anom_block_score) and persistent:
                 if has_stoprun:
                     blocked = True
@@ -889,20 +971,15 @@ class Classic_FeatureEngine:
     # Patterns (BTC tuned)
     # ------------------------------------------------------------------
     def _detect_fvg(self, df: pd.DataFrame, atr: np.ndarray) -> Tuple[bool, bool]:
-        """
-        3-bar FVG:
-          bull: low[-1] > high[-3] by >= fvg_min_atr_mult * ATR
-          bear: low[-3] > high[-1] by >= fvg_min_atr_mult * ATR
-        """
         try:
             if len(df) < 5:
                 return False, False
             atr_last = float(safe_last(atr))
-            if not _finite(atr_last) or atr_last <= 0:
+            if not _finite(atr_last) or atr_last <= 0.0:
                 return False, False
 
-            h = df["high"].to_numpy(dtype=np.float64)
-            l = df["low"].to_numpy(dtype=np.float64)
+            h = df["high"].to_numpy(dtype=np.float64, copy=False)
+            l = df["low"].to_numpy(dtype=np.float64, copy=False)
 
             high_m3 = float(h[-3])
             low_m3 = float(l[-3])
@@ -913,30 +990,21 @@ class Classic_FeatureEngine:
             bear_gap = low_m3 - high_last
 
             thr = float(self.fvg_min_atr_mult) * atr_last
-            bull_fvg = bull_gap >= thr
-            bear_fvg = bear_gap >= thr
-            return bool(bull_fvg), bool(bear_fvg)
+            return bool(bull_gap >= thr), bool(bear_gap >= thr)
         except Exception as exc:
             logger.error("_detect_fvg error: %s | tb=%s", exc, traceback.format_exc())
             return False, False
 
     def _liquidity_sweep(self, df: pd.DataFrame, *, atr_last: float, z_volume: float, adx: np.ndarray) -> Tuple[str, str]:
-        """
-        BTC sweep definition (cleaner):
-          - Break recent high/low by >= sweep_min_atr_mult * ATR
-          - Close returns inside prior range (rejection)
-          - z_volume confirms activity
-          - ADX must indicate at least some directional participation
-        """
         try:
             if len(df) < 30:
                 return "", ""
-            if not _finite(atr_last) or atr_last <= 0:
+            if not _finite(atr_last) or atr_last <= 0.0:
                 return "", ""
 
-            h = df["high"].to_numpy(dtype=np.float64)
-            l = df["low"].to_numpy(dtype=np.float64)
-            c = df["close"].to_numpy(dtype=np.float64)
+            h = df["high"].to_numpy(dtype=np.float64, copy=False)
+            l = df["low"].to_numpy(dtype=np.float64, copy=False)
+            c = df["close"].to_numpy(dtype=np.float64, copy=False)
 
             look = 24
             prev_high = float(np.max(h[-look:-1]))
@@ -949,19 +1017,17 @@ class Classic_FeatureEngine:
 
             adx_val = float(safe_last(adx))
             adx_min = float(self.adx_trend_min)
-            z_hot = float(self.z_vol_hot) * 0.85  # BTC: allow slightly lower vol confirmations
+            z_hot = float(self.z_vol_hot) * 0.85
 
             thr = float(self.sweep_min_atr_mult) * float(atr_last)
 
             sweep = ""
             bos_choch = ""
 
-            # sweep high then reject -> bearish sweep
             if (curr_high >= (prev_high + thr)) and (c1 < prev_high) and (float(z_volume) >= z_hot) and (adx_val >= adx_min):
                 sweep = "bear"
                 bos_choch = "BOS_down" if c1 < c0 else "CHOCH_down"
 
-            # sweep low then reject -> bullish sweep
             if (curr_low <= (prev_low - thr)) and (c1 > prev_low) and (float(z_volume) >= z_hot) and (adx_val >= adx_min):
                 sweep = "bull"
                 bos_choch = "BOS_up" if c1 > c0 else "CHOCH_up"
@@ -972,19 +1038,14 @@ class Classic_FeatureEngine:
             return "", ""
 
     def _order_block(self, df: pd.DataFrame, *, atr_last: float, v: np.ndarray, z_vol_series: np.ndarray) -> str:
-        """
-        BTC OB heuristic (scalping-safe):
-          - Find a strong impulse candle (body >= 0.9*ATR) with elevated z-vol
-          - If price re-enters that candle zone in the opposite direction -> label OB
-        """
         try:
-            if len(df) < 40 or len(v) < 40:
+            if len(df) < 40:
                 return ""
-            if not _finite(atr_last) or atr_last <= 0:
+            if not _finite(atr_last) or atr_last <= 0.0:
                 return ""
 
-            o = df["open"].to_numpy(dtype=np.float64)
-            c = df["close"].to_numpy(dtype=np.float64)
+            o = df["open"].to_numpy(dtype=np.float64, copy=False)
+            c = df["close"].to_numpy(dtype=np.float64, copy=False)
 
             look = 18
             o_s = o[-look:]
@@ -995,23 +1056,18 @@ class Classic_FeatureEngine:
             body_thr = 0.9 * float(atr_last)
             z_thr = max(1.2, float(self.z_vol_hot) * 0.65)
 
-            # candidate impulse candles
             impulse = (body >= body_thr) & (z_s >= z_thr)
             if not bool(np.any(impulse)):
                 return ""
 
-            # pick strongest body
             idx = int(np.argmax(np.where(impulse, body, -1e18)))
             imp_open = float(o_s[idx])
             imp_close = float(c_s[idx])
 
             last_close = float(c[-1])
 
-            # If impulse was bearish (close < open) and now price reclaims above its open -> bullish OB
             if imp_close < imp_open and last_close > imp_open:
                 return "bull_ob"
-
-            # If impulse was bullish and now price loses below its open -> bearish OB
             if imp_close > imp_open and last_close < imp_open:
                 return "bear_ob"
 
@@ -1021,28 +1077,20 @@ class Classic_FeatureEngine:
             return ""
 
     def _near_round_number(self, *, price: float, atr: float) -> bool:
-        """
-        BTC round-number proximity:
-          - Uses cfg.rn_step (default 100)
-          - Also checks major psychological levels (1k, 5k) when price is high
-          - Buffer uses max(0.35*ATR, price*rn_buffer_pct)
-        """
         try:
-            if not _finite(price) or price <= 0:
+            if not _finite(price) or price <= 0.0:
                 return False
 
-            step = float(self.rn_step)
-            if step <= 0:
-                step = 100.0
+            step = float(self.rn_step) if float(self.rn_step) > 0.0 else 100.0
+            rn_buffer_pct = float(getattr(self.cfg, "rn_buffer_pct", 0.0012) or 0.0012)
 
-            rn_buffer_pct = float(getattr(self.cfg, "rn_buffer_pct", 0.0012) or 0.0012)  # 0.12% default
-            buf = 0.35 * float(atr) if _finite(atr) and atr > 0 else float(price) * rn_buffer_pct
+            buf = 0.35 * float(atr) if _finite(atr) and atr > 0.0 else float(price) * rn_buffer_pct
             buf = float(max(10.0, buf, float(price) * rn_buffer_pct))
 
             steps: List[float] = [step]
-            if price >= 20_000:
+            if price >= 20_000.0:
                 steps += [250.0, 500.0, 1000.0]
-            if price >= 60_000:
+            if price >= 60_000.0:
                 steps += [2000.0, 5000.0]
 
             for st in steps:
@@ -1059,33 +1107,25 @@ class Classic_FeatureEngine:
     # Divergence (swing-based, not naive diffs)
     # ------------------------------------------------------------------
     def _detect_divergence_swings(self, *, ind: np.ndarray, price: np.ndarray) -> str:
-        """
-        Swing-based divergence:
-          - find two recent swing lows/highs in last N bars
-          - bullish: price makes lower low, indicator makes higher low
-          - bearish: price makes higher high, indicator makes lower high
-        """
         try:
-            N = 35
+            n = 35
             min_sep = 4
-            if len(price) < N or len(ind) < N:
+            if len(price) < n or len(ind) < n:
                 return "none"
 
-            p = price[-N:].astype(np.float64, copy=False)
-            i = ind[-N:].astype(np.float64, copy=False)
+            p = np.asarray(price[-n:], dtype=np.float64)
+            i = np.asarray(ind[-n:], dtype=np.float64)
             if not np.all(np.isfinite(p)) or not np.all(np.isfinite(i)):
                 return "none"
 
             lows = self._swing_points(p, mode="low", min_sep=min_sep)
             highs = self._swing_points(p, mode="high", min_sep=min_sep)
 
-            # bullish divergence
             if len(lows) >= 2:
                 a, b = lows[-2], lows[-1]
                 if p[b] < p[a] and i[b] > i[a]:
                     return "bullish"
 
-            # bearish divergence
             if len(highs) >= 2:
                 a, b = highs[-2], highs[-1]
                 if p[b] > p[a] and i[b] < i[a]:
@@ -1097,27 +1137,22 @@ class Classic_FeatureEngine:
             return "none"
 
     def _swing_points(self, x: np.ndarray, *, mode: str, min_sep: int) -> List[int]:
-        """
-        Lightweight swing detector:
-          - swing low: x[k] is min in [k-2..k+2]
-          - swing high: x[k] is max in [k-2..k+2]
-        Enforces minimum separation.
-        """
         out: List[int] = []
         try:
             n = len(x)
             if n < 7:
                 return out
             w = 2
+            sep = int(max(1, min_sep))
             for k in range(w, n - w):
                 seg = x[k - w : k + w + 1]
                 if mode == "low":
                     if x[k] <= float(np.min(seg)):
-                        if not out or (k - out[-1]) >= int(min_sep):
+                        if not out or (k - out[-1]) >= sep:
                             out.append(k)
                 else:
                     if x[k] >= float(np.max(seg)):
-                        if not out or (k - out[-1]) >= int(min_sep):
+                        if not out or (k - out[-1]) >= sep:
                             out.append(k)
             return out
         except Exception:

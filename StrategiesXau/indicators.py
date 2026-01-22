@@ -1,10 +1,10 @@
-# Strategies/feature_engine.py  (PRODUCTION-GRADE, FIXED)
+# Strategies/feature_engine.py  (PRODUCTION-GRADE, OPTIMIZED / NO-STRUCTURE-CHANGE)
 from __future__ import annotations
 
 import logging
 import math
-import traceback
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,7 +29,7 @@ logger.setLevel(logging.ERROR)
 logger.propagate = False
 
 if not logger.handlers:
-    fh = logging.FileHandler(str(get_log_path("feature_engine.log")), encoding="utf-8")
+    fh = logging.FileHandler(str(get_log_path("feature_engine.log")), encoding="utf-8", delay=True)
     fh.setLevel(logging.ERROR)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(fh)
@@ -65,28 +65,86 @@ def _to_f64(a: Any) -> np.ndarray:
 
 
 # =========================
-# Indicator backend (TA-Lib + fallback)
+# Indicator backend (TA-Lib + fast numpy fallback)
 # =========================
 class _Indicators:
     """
-    TA-Lib backend with safe fallback to pandas/numpy.
-    Fallback is only used if talib is missing OR talib throws.
+    TA-Lib backend with fast NumPy fallback.
+    Fallback is used if talib is missing OR talib throws.
+
+    Goals:
+      - no pandas overhead in fallback (scalping-speed)
+      - stable for NaN/inf (failsafe clamps)
     """
 
     def __init__(self) -> None:
         self._has_talib = talib is not None
 
     @staticmethod
-    def _ema(x: np.ndarray, period: int) -> np.ndarray:
-        s = pd.Series(_to_f64(x))
-        return s.ewm(span=int(period), adjust=False).mean().to_numpy(dtype=np.float64)
+    def _ema_np(x: np.ndarray, period: int, *, wilder: bool = False) -> np.ndarray:
+        x = _to_f64(x)
+        n = int(max(1, period))
+        out = np.empty_like(x, dtype=np.float64)
+        if x.size == 0:
+            return out
+
+        alpha = (1.0 / n) if wilder else (2.0 / (n + 1.0))
+        one_m = 1.0 - alpha
+
+        v0 = float(x[0])
+        if not np.isfinite(v0):
+            v0 = 0.0
+        out[0] = v0
+
+        for i in range(1, x.size):
+            xi = float(x[i])
+            if not np.isfinite(xi):
+                xi = float(out[i - 1])
+            out[i] = alpha * xi + one_m * out[i - 1]
+        return out
 
     @staticmethod
-    def _wilder_ema(x: np.ndarray, period: int) -> np.ndarray:
-        # Wilder smoothing uses alpha = 1/period
-        s = pd.Series(_to_f64(x))
-        alpha = 1.0 / max(1, int(period))
-        return s.ewm(alpha=alpha, adjust=False).mean().to_numpy(dtype=np.float64)
+    def _sma_np(x: np.ndarray, period: int) -> np.ndarray:
+        x = _to_f64(x)
+        n = int(max(1, period))
+        out = np.empty_like(x, dtype=np.float64)
+        if x.size == 0:
+            return out
+
+        cs = np.cumsum(np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), dtype=np.float64)
+        for i in range(x.size):
+            if i < n:
+                out[i] = cs[i] / float(i + 1)
+            else:
+                out[i] = (cs[i] - cs[i - n]) / float(n)
+        return out
+
+    @staticmethod
+    def _std_np(x: np.ndarray, period: int) -> np.ndarray:
+        x = _to_f64(x)
+        n = int(max(1, period))
+        out = np.empty_like(x, dtype=np.float64)
+        if x.size == 0:
+            return out
+
+        x0 = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        cs = np.cumsum(x0, dtype=np.float64)
+        cs2 = np.cumsum(x0 * x0, dtype=np.float64)
+
+        for i in range(x.size):
+            if i < n:
+                m = cs[i] / float(i + 1)
+                v = (cs2[i] / float(i + 1)) - (m * m)
+            else:
+                s = cs[i] - cs[i - n]
+                s2 = cs2[i] - cs2[i - n]
+                m = s / float(n)
+                v = (s2 / float(n)) - (m * m)
+
+            if v < 0.0:
+                v = 0.0
+            out[i] = math.sqrt(v)
+        return out
 
     def EMA(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -94,7 +152,7 @@ class _Indicators:
                 return talib.EMA(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        return self._ema(x, period)
+        return self._ema_np(x, int(period), wilder=False)
 
     def SMA(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -102,8 +160,7 @@ class _Indicators:
                 return talib.SMA(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        s = pd.Series(_to_f64(x))
-        return s.rolling(int(period), min_periods=1).mean().to_numpy(dtype=np.float64)
+        return self._sma_np(x, int(period))
 
     def STDDEV(self, x: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -111,8 +168,7 @@ class _Indicators:
                 return talib.STDDEV(_to_f64(x), int(period))  # type: ignore[attr-defined]
         except Exception:
             pass
-        s = pd.Series(_to_f64(x))
-        return s.rolling(int(period), min_periods=1).std(ddof=0).fillna(0.0).to_numpy(dtype=np.float64)
+        return self._std_np(x, int(period))
 
     def ATR(self, h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -124,10 +180,15 @@ class _Indicators:
         h = _to_f64(h)
         l = _to_f64(l)
         c = _to_f64(c)
-        prev_c = np.roll(c, 1)
+        if c.size == 0:
+            return np.asarray(c, dtype=np.float64)
+
+        prev_c = np.empty_like(c)
         prev_c[0] = c[0]
+        prev_c[1:] = c[:-1]
+
         tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
-        return self._wilder_ema(tr, period)
+        return self._ema_np(tr, int(period), wilder=True)
 
     def RSI(self, c: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -137,14 +198,22 @@ class _Indicators:
             pass
 
         c = _to_f64(c)
-        delta = np.diff(c, prepend=c[0])
+        if c.size == 0:
+            return np.asarray(c, dtype=np.float64)
+
+        delta = np.empty_like(c)
+        delta[0] = 0.0
+        delta[1:] = c[1:] - c[:-1]
+
         gain = np.maximum(delta, 0.0)
         loss = np.maximum(-delta, 0.0)
-        avg_gain = self._wilder_ema(gain, period)
-        avg_loss = self._wilder_ema(loss, period)
+
+        avg_gain = self._ema_np(gain, int(period), wilder=True)
+        avg_loss = self._ema_np(loss, int(period), wilder=True)
+
         rs = avg_gain / np.maximum(1e-12, avg_loss)
         rsi = 100.0 - (100.0 / (1.0 + rs))
-        return rsi.astype(np.float64)
+        return rsi.astype(np.float64, copy=False)
 
     def ADX(self, h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int) -> np.ndarray:
         try:
@@ -156,56 +225,75 @@ class _Indicators:
         h = _to_f64(h)
         l = _to_f64(l)
         c = _to_f64(c)
+        n = c.size
+        if n == 0:
+            return np.asarray(c, dtype=np.float64)
 
-        prev_h = np.roll(h, 1)
-        prev_l = np.roll(l, 1)
-        prev_c = np.roll(c, 1)
+        prev_h = np.empty_like(h)
+        prev_l = np.empty_like(l)
+        prev_c = np.empty_like(c)
         prev_h[0], prev_l[0], prev_c[0] = h[0], l[0], c[0]
+        prev_h[1:], prev_l[1:], prev_c[1:] = h[:-1], l[:-1], c[:-1]
 
         up_move = h - prev_h
         down_move = prev_l - l
 
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
 
         tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
 
-        atr = self._wilder_ema(tr, period)
-        plus_di = 100.0 * (self._wilder_ema(plus_dm, period) / np.maximum(1e-12, atr))
-        minus_di = 100.0 * (self._wilder_ema(minus_dm, period) / np.maximum(1e-12, atr))
+        atr = self._ema_np(tr, int(period), wilder=True)
+        plus_di = 100.0 * (self._ema_np(plus_dm, int(period), wilder=True) / np.maximum(1e-12, atr))
+        minus_di = 100.0 * (self._ema_np(minus_dm, int(period), wilder=True) / np.maximum(1e-12, atr))
 
         dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(1e-12, (plus_di + minus_di)))
-        adx = self._wilder_ema(dx, period)
-        return adx.astype(np.float64)
+        adx = self._ema_np(dx, int(period), wilder=True)
+        return adx.astype(np.float64, copy=False)
 
-    def MACD(self, c: np.ndarray, fastperiod: int, slowperiod: int, signalperiod: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def MACD(
+        self, c: np.ndarray, fastperiod: int, slowperiod: int, signalperiod: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         try:
             if self._has_talib:
-                return talib.MACD(_to_f64(c), fastperiod=int(fastperiod), slowperiod=int(slowperiod), signalperiod=int(signalperiod))  # type: ignore[attr-defined]
+                return talib.MACD(  # type: ignore[attr-defined]
+                    _to_f64(c),
+                    fastperiod=int(fastperiod),
+                    slowperiod=int(slowperiod),
+                    signalperiod=int(signalperiod),
+                )
         except Exception:
             pass
 
         c = _to_f64(c)
-        fast = self._ema(c, fastperiod)
-        slow = self._ema(c, slowperiod)
+        fast = self._ema_np(c, int(fastperiod), wilder=False)
+        slow = self._ema_np(c, int(slowperiod), wilder=False)
         macd = fast - slow
-        signal = self._ema(macd, signalperiod)
+        signal = self._ema_np(macd, int(signalperiod), wilder=False)
         hist = macd - signal
-        return macd.astype(np.float64), signal.astype(np.float64), hist.astype(np.float64)
+        return macd.astype(np.float64, copy=False), signal.astype(np.float64, copy=False), hist.astype(np.float64, copy=False)
 
-    def BBANDS(self, c: np.ndarray, timeperiod: int, nbdevup: float, nbdevdn: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def BBANDS(
+        self, c: np.ndarray, timeperiod: int, nbdevup: float, nbdevdn: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         try:
             if self._has_talib:
-                return talib.BBANDS(_to_f64(c), timeperiod=int(timeperiod), nbdevup=float(nbdevup), nbdevdn=float(nbdevdn), matype=0)  # type: ignore[attr-defined]
+                return talib.BBANDS(  # type: ignore[attr-defined]
+                    _to_f64(c),
+                    timeperiod=int(timeperiod),
+                    nbdevup=float(nbdevup),
+                    nbdevdn=float(nbdevdn),
+                    matype=0,
+                )
         except Exception:
             pass
 
-        s = pd.Series(_to_f64(c))
-        mid = s.rolling(int(timeperiod), min_periods=1).mean()
-        std = s.rolling(int(timeperiod), min_periods=1).std(ddof=0).fillna(0.0)
+        c = _to_f64(c)
+        mid = self._sma_np(c, int(timeperiod))
+        std = self._std_np(c, int(timeperiod))
         upper = mid + float(nbdevup) * std
         lower = mid - float(nbdevdn) * std
-        return upper.to_numpy(dtype=np.float64), mid.to_numpy(dtype=np.float64), lower.to_numpy(dtype=np.float64)
+        return upper.astype(np.float64, copy=False), mid.astype(np.float64, copy=False), lower.astype(np.float64, copy=False)
 
 
 @dataclass(frozen=True)
@@ -245,11 +333,16 @@ class Classic_FeatureEngine:
 
         self.ind = _Indicators()
 
-        # ---------- thresholds (NO magic numbers; config-driven defaults) ----------
+        # ---------- thresholds (config-driven; backward compatible keys) ----------
         self.rn_step_xau = float(getattr(cfg, "rn_step_xau", 5.0) or 5.0)
 
-        self.adx_trend_min = float(getattr(cfg, "adx_trend_min", 25.0) or 25.0)
-        self.adx_impulse_hi = float(getattr(cfg, "adx_impulse_hi", 45.0) or 45.0)
+        # prefer config_xau fields if present
+        self.adx_trend_min = float(
+            getattr(cfg, "adx_trend_min", getattr(cfg, "adx_trend_hi", 25.0)) or 25.0
+        )
+        self.adx_impulse_hi = float(
+            getattr(cfg, "adx_impulse_hi", max(40.0, float(getattr(cfg, "adx_trend_hi", 25.0)) + 15.0)) or 45.0
+        )
 
         self.z_vol_hot = float(getattr(cfg, "z_vol_hot", 2.5) or 2.5)
         self.bb_width_range_max = float(getattr(cfg, "bb_width_range_max", 0.005) or 0.005)
@@ -302,7 +395,7 @@ class Classic_FeatureEngine:
                 logger.error("compute_indicators: no known timeframes in df_dict")
                 return None
 
-            # ---- cache key (FIXED: frames exists here) ----
+            # ---- cache key (fast) ----
             computed_cache_key: Optional[Tuple[Any, ...]] = None
             try:
                 key_parts: List[Tuple[str, int, int]] = []
@@ -315,12 +408,11 @@ class Classic_FeatureEngine:
                         key_parts.append((tf, -1, int(len(df))))
                         continue
 
-                    # prefer 'time' if present, else fallback to index
                     if "time" in df.columns:
                         t = df["time"].iloc[-1 - int(shift)]
                         ts_ns = int(pd.Timestamp(t).value)
                     else:
-                        ts_ns = int(len(df))  # stable fallback
+                        ts_ns = int(len(df))
 
                     key_parts.append((tf, ts_ns, int(len(df))))
 
@@ -332,11 +424,10 @@ class Classic_FeatureEngine:
                     if (time.time() - float(self._cache_ts)) * 1000.0 < float(self._cache_min_interval_ms):
                         return self._cache_out
             except Exception:
-                computed_cache_key = None  # best-effort only
+                computed_cache_key = None
 
             out: Dict[str, Any] = {}
             confluence_score = 0.0
-
             block_tf_anom: Optional[AnomalyResult] = None
 
             for tf in frames:
@@ -374,7 +465,6 @@ class Classic_FeatureEngine:
             signal_strength = self._determine_signal_strength(confluence_score, m1_data)
 
             if block_tf_anom is None:
-                # fallback to M1 anomaly always
                 block_tf_anom = AnomalyResult(
                     score=float(m1_data.get("anomaly_score", 0.0)),
                     reasons=list(m1_data.get("anomaly_reasons", []))[:50],
@@ -406,21 +496,23 @@ class Classic_FeatureEngine:
             logger.error("compute_indicators error: %s | tb=%s", exc, traceback.format_exc())
             return None
 
-    # ------------------- per-tf compute (refactor; not monolithic) -------------------
+    # ------------------- per-tf compute -------------------
     def _compute_tf(self, *, tf: str, df: pd.DataFrame, shift: int) -> Tuple[Optional[Dict[str, Any]], float, AnomalyResult]:
         try:
+            # NOTE: slice without copy; pandas gives a view-like object often
             dfp = df.iloc[:-shift]
             required = self._min_bars(tf)
             if len(dfp) < required:
                 return None, 0.0, AnomalyResult(0.0, [], False, "OK")
 
-            c = dfp["close"].to_numpy(dtype=np.float64)
-            h = dfp["high"].to_numpy(dtype=np.float64)
-            l = dfp["low"].to_numpy(dtype=np.float64)
-            o = dfp["open"].to_numpy(dtype=np.float64)
-            v = self._ensure_volume(dfp).astype(np.float64)
+            # numpy views (fast)
+            c = dfp["close"].to_numpy(dtype=np.float64, copy=False)
+            h = dfp["high"].to_numpy(dtype=np.float64, copy=False)
+            l = dfp["low"].to_numpy(dtype=np.float64, copy=False)
+            o = dfp["open"].to_numpy(dtype=np.float64, copy=False)
+            v = self._ensure_volume(dfp).astype(np.float64, copy=False)
 
-            # core indicators (talib or fallback)
+            # core indicators
             ema9 = self.ind.EMA(c, int(self.cfg.indicator["ema_short"]))
             ema21 = self.ind.EMA(c, int(self.cfg.indicator["ema_mid"]))
             ema50 = self.ind.EMA(c, int(self.cfg.indicator["ema_long"]))
@@ -433,7 +525,7 @@ class Classic_FeatureEngine:
             macd, macd_signal, macd_hist = self.ind.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
             bb_u, bb_m, bb_l = self.ind.BBANDS(c, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
 
-            # z-volume
+            # z-volume (rolling mean/std) – fast numpy fallback
             vol_lookback = int(self.cfg.indicator["vol_lookback"])
             vol_ma = self.ind.SMA(v, vol_lookback)
             vol_std = self.ind.STDDEV(v, vol_lookback)
@@ -512,7 +604,6 @@ class Classic_FeatureEngine:
 
     # ------------------- core helpers -------------------
     def _min_bars(self, timeframe: str) -> int:
-        # can be overridden by config if you want
         if timeframe == "M1":
             return int(getattr(self.cfg, "min_bars_m1", 220) or 220)
         if timeframe in {"M5", "M15"}:
@@ -522,13 +613,19 @@ class Classic_FeatureEngine:
     def _determine_trend(self, c: np.ndarray, ema21: np.ndarray, ema50: np.ndarray, ema200: np.ndarray, adx: np.ndarray) -> str:
         adx_val = float(safe_last(adx))
         adx_min = float(self.adx_trend_min)
-        if c[-1] > ema21[-1] > ema50[-1] and adx_val > adx_min:
+
+        c1 = float(c[-1])
+        e21 = float(safe_last(ema21))
+        e50 = float(safe_last(ema50))
+        e200 = float(safe_last(ema200))
+
+        if c1 > e21 > e50 and adx_val > adx_min:
             return "strong_up"
-        if c[-1] < ema21[-1] < ema50[-1] and adx_val > adx_min:
+        if c1 < e21 < e50 and adx_val > adx_min:
             return "strong_down"
-        if c[-1] > ema200[-1]:
+        if c1 > e200:
             return "weak_up"
-        if c[-1] < ema200[-1]:
+        if c1 < e200:
             return "weak_down"
         return "range"
 
@@ -586,16 +683,15 @@ class Classic_FeatureEngine:
     def _ensure_volume(self, df: pd.DataFrame) -> np.ndarray:
         try:
             if "tick_volume" in df.columns:
-                return df["tick_volume"].fillna(0).to_numpy(dtype=np.float64)
+                return df["tick_volume"].fillna(0).to_numpy(dtype=np.float64, copy=False)
             if "real_volume" in df.columns:
-                return df["real_volume"].fillna(0).to_numpy(dtype=np.float64)
+                return df["real_volume"].fillna(0).to_numpy(dtype=np.float64, copy=False)
 
-            # fallback synthetic volume
-            hl_range = (df["high"] - df["low"]).fillna(0).to_numpy(dtype=np.float64)
-            close = df["close"].fillna(0).to_numpy(dtype=np.float64)
+            hl_range = (df["high"] - df["low"]).fillna(0).to_numpy(dtype=np.float64, copy=False)
+            close = df["close"].fillna(0).to_numpy(dtype=np.float64, copy=False)
             close_diff = np.abs(np.diff(close, prepend=close[0]))
             synth = (hl_range + close_diff) * 5000.0
-            return synth.astype(np.float64)
+            return synth.astype(np.float64, copy=False)
         except Exception as exc:
             logger.error("_ensure_volume error: %s | tb=%s", exc, traceback.format_exc())
             return np.zeros(len(df), dtype=np.float64)
@@ -610,18 +706,18 @@ class Classic_FeatureEngine:
             if len(dfp) < max(60, lb + persist_bars + 5):
                 return AnomalyResult(0.0, [], False, "OK")
 
-            o = dfp["open"].to_numpy(dtype=np.float64)
-            h = dfp["high"].to_numpy(dtype=np.float64)
-            l = dfp["low"].to_numpy(dtype=np.float64)
-            c = dfp["close"].to_numpy(dtype=np.float64)
+            o = dfp["open"].to_numpy(dtype=np.float64, copy=False)
+            h = dfp["high"].to_numpy(dtype=np.float64, copy=False)
+            l = dfp["low"].to_numpy(dtype=np.float64, copy=False)
+            c = dfp["close"].to_numpy(dtype=np.float64, copy=False)
 
             atr_series = np.asarray(atr_series, dtype=np.float64)
             if len(atr_series) != len(c):
-                atr_series = np.full_like(c, float(safe_last(atr_series, default=0.0)))
+                atr_series = np.full_like(c, float(safe_last(atr_series, default=0.0)), dtype=np.float64)
 
             z_vol_series = np.asarray(z_vol_series, dtype=np.float64)
             if len(z_vol_series) != len(c):
-                z_vol_series = np.zeros_like(c)
+                z_vol_series = np.zeros_like(c, dtype=np.float64)
 
             hit_reasons: Dict[str, int] = {}
             score_sum = 0.0
@@ -629,7 +725,7 @@ class Classic_FeatureEngine:
 
             for k in range(1, persist_bars + 1):
                 atr = float(atr_series[-k])
-                if not _finite(atr) or atr <= 0:
+                if not _finite(atr) or atr <= 0.0:
                     continue
 
                 o1, h1, l1, c1 = float(o[-k]), float(h[-k]), float(l[-k]), float(c[-k])
@@ -642,7 +738,7 @@ class Classic_FeatureEngine:
                 rng = (h1 - l1)
                 wick_up = h1 - max(o1, c1)
                 wick_dn = min(o1, c1) - l1
-                wick_dom = (max(wick_up, wick_dn) / max(1e-9, rng)) if rng > 0 else 0.0
+                wick_dom = (max(wick_up, wick_dn) / max(1e-9, rng)) if rng > 0.0 else 0.0
 
                 s = 0.0
                 reasons_bar: List[str] = []
@@ -725,11 +821,11 @@ class Classic_FeatureEngine:
             if len(df) < 5:
                 return False, False
             atr_last = float(safe_last(atr))
-            if not _finite(atr_last) or atr_last <= 0:
+            if not _finite(atr_last) or atr_last <= 0.0:
                 return False, False
 
-            h = df["high"].to_numpy(dtype=np.float64)
-            l = df["low"].to_numpy(dtype=np.float64)
+            h = df["high"].to_numpy(dtype=np.float64, copy=False)
+            l = df["low"].to_numpy(dtype=np.float64, copy=False)
 
             high_m3 = float(h[-3])
             low_m3 = float(l[-3])
@@ -751,9 +847,9 @@ class Classic_FeatureEngine:
             if len(df) < 25:
                 return "", ""
 
-            h = df["high"].to_numpy(dtype=np.float64)
-            l = df["low"].to_numpy(dtype=np.float64)
-            closes = df["close"].to_numpy(dtype=np.float64)
+            h = df["high"].to_numpy(dtype=np.float64, copy=False)
+            l = df["low"].to_numpy(dtype=np.float64, copy=False)
+            closes = df["close"].to_numpy(dtype=np.float64, copy=False)
 
             prev_high = float(np.max(h[-20:-1]))
             prev_low = float(np.min(l[-20:-1]))
@@ -788,17 +884,17 @@ class Classic_FeatureEngine:
                 return ""
 
             slice_size = 10
-            o_vals = df["open"].to_numpy(dtype=np.float64)[-slice_size:]
-            c_vals = df["close"].to_numpy(dtype=np.float64)[-slice_size:]
-            v_slice = v[-slice_size:].astype(np.float64)
+            o_vals = df["open"].to_numpy(dtype=np.float64, copy=False)[-slice_size:]
+            c_vals = df["close"].to_numpy(dtype=np.float64, copy=False)[-slice_size:]
+            v_slice = v[-slice_size:].astype(np.float64, copy=False)
 
             atr_last = float(safe_last(atr))
-            if not _finite(atr_last) or atr_last <= 0:
+            if not _finite(atr_last) or atr_last <= 0.0:
                 return ""
 
-            v_ma = self.ind.SMA(v_slice, slice_size)
-            v_ma = np.nan_to_num(v_ma, nan=float(np.mean(v_slice) if len(v_slice) else 0.0))
-            vol_ok = v_slice[:-1] > 1.5 * np.maximum(1e-9, v_ma[:-1])
+            # fast: compare with slice mean (stable + scalable)
+            v_mean = float(np.mean(v_slice)) if v_slice.size else 0.0
+            vol_ok = v_slice[:-1] > 1.5 * max(1e-9, v_mean)
 
             bear_body = (o_vals[:-1] - c_vals[:-1])
             bull_body = (c_vals[:-1] - o_vals[:-1])
@@ -826,17 +922,18 @@ class Classic_FeatureEngine:
                 return False
 
             step = float(self.rn_step_xau)
-            if step <= 0:
+            if step <= 0.0:
                 return False
 
-            base = math.floor(float(price) / 100.0) * 100.0
-            levels = np.arange(base - 200.0, base + 200.0, step, dtype=np.float64)
+            # O(1) nearest-multiple check (faster than arange)
+            # distance to nearest multiple of step
+            rem = math.fmod(float(price), step)
+            rem = abs(rem)
+            dist = min(rem, abs(step - rem))
 
-            buf = float(atr) * 0.5 if _finite(atr) and atr > 0 else float(price) * 0.001
+            buf = float(atr) * 0.5 if _finite(atr) and atr > 0.0 else float(price) * 0.001
             buf = float(max(0.05, buf))
-
-            diffs = np.abs(float(price) - levels)
-            return bool(np.any(diffs <= buf))
+            return bool(dist <= buf)
         except Exception as exc:
             logger.error("_near_round_number error: %s | tb=%s", exc, traceback.format_exc())
             return False
@@ -846,16 +943,16 @@ class Classic_FeatureEngine:
             if len(ind) < 6 or len(price) < 6:
                 return "none"
 
-            p = price[-5:].astype(np.float64)
-            i = ind[-5:].astype(np.float64)
+            p = price[-5:].astype(np.float64, copy=False)
+            i = ind[-5:].astype(np.float64, copy=False)
             if not np.all(np.isfinite(p)) or not np.all(np.isfinite(i)):
                 return "none"
 
             p_diffs = np.diff(p)
             i_diffs = np.diff(i)
 
-            bull = int(np.sum((p_diffs < 0) & (i_diffs > 0)))
-            bear = int(np.sum((p_diffs > 0) & (i_diffs < 0)))
+            bull = int(np.sum((p_diffs < 0.0) & (i_diffs > 0.0)))
+            bear = int(np.sum((p_diffs > 0.0) & (i_diffs < 0.0)))
 
             if bull > bear and bull >= 2:
                 return "bullish"
@@ -868,3 +965,4 @@ class Classic_FeatureEngine:
 
 
 __all__ = ["Classic_FeatureEngine", "safe_last", "AnomalyResult"]
+

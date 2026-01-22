@@ -823,6 +823,7 @@ class RiskManager:
 
     # ------------------- state evaluation -------------------
     def evaluate_account_state(self) -> None:
+        """Evaluate account state and update Phase A/B/C based on daily P&L."""
         try:
             if self._utc_date() != self.daily_date:
                 self._reset_daily_state()
@@ -840,29 +841,47 @@ class RiskManager:
             if self.daily_start_balance > 0:
                 daily_return = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
+            old_phase = str(self.current_phase)
+            
+            # Phase B: Daily target reached (profit protection mode)
             if (not self._target_breached) and daily_return >= float(self.cfg.daily_target_pct):
-                self.current_phase = "B"
-                self._target_breached = True
-                self._target_breached_return = float(daily_return)
-                self._phase_reason_last = "daily_target_reached"
+                if self.current_phase != "B":
+                    self.current_phase = "B"
+                    self._target_breached = True
+                    self._target_breached_return = float(daily_return)
+                    self._phase_reason_last = "daily_target_reached"
+                    log_risk.error("PHASE_CHANGE | A->B | reason=daily_target_reached daily_return=%.4f target=%.4f", 
+                                 daily_return, float(self.cfg.daily_target_pct))
 
+            # Phase transitions based on daily loss (only if enforce_daily_limits=True)
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
                 loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
                 loss_c = float(getattr(self.cfg, "daily_loss_c_pct", 0.0) or 0.0)
+                
+                # Phase A -> B: Daily loss >= loss_b threshold
                 if loss_b > 0 and daily_return <= -loss_b:
                     if self.current_phase == "A":
                         self.current_phase = "B"
                         self._phase_reason_last = "daily_loss_b"
+                        log_risk.error("PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f", 
+                                     daily_return, -loss_b)
+                
+                # Phase -> C: Daily loss >= loss_c threshold (hard stop)
                 if loss_c > 0 and daily_return <= -loss_c:
                     if self.current_phase != "C":
                         self.current_phase = "C"
                         self._phase_reason_last = "daily_loss_c"
+                        log_risk.error("PHASE_CHANGE | ->C | reason=daily_loss_c daily_return=%.4f loss_c=%.4f", 
+                                     daily_return, -loss_c)
 
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
                 if self._target_breached and self.current_phase == "B":
                     self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
-                    if self._target_breached_return > float(self.cfg.daily_target_pct):
-                        if daily_return <= float(self.cfg.daily_target_pct):
+                    # Lock only if we've exceeded target by at least 0.5% AND dropped back to target or below
+                    target_pct = float(self.cfg.daily_target_pct)
+                    lock_threshold = target_pct + 0.005  # 0.5% above target (e.g., 10.5%)
+                    if self._target_breached_return >= lock_threshold:
+                        if daily_return <= target_pct:
                             self._enter_hard_stop("daily_target_lock")
         except Exception as exc:
             log_risk.error("evaluate_account_state error: %s | tb=%s", exc, traceback.format_exc())
@@ -970,6 +989,15 @@ class RiskManager:
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
 
+            # Phase-based protection in guard_decision (CRITICAL: must check phases here too!)
+            if self.current_phase == "C":
+                reasons.append("phase_c_protect")
+            
+            # Phase B: require higher confidence (checked in can_trade, but also log here for clarity)
+            if self.current_phase == "B":
+                # Phase B requires ultra_confidence_min (checked in can_trade/can_emit_signal)
+                pass  # Already checked in can_trade/can_emit_signal
+
             if bool(getattr(self.cfg, "enforce_drawdown_limits", False)) and drawdown_exceeded:
                 reasons.append("max_drawdown")
 
@@ -1013,18 +1041,23 @@ class RiskManager:
             return RiskDecision(allowed=False, reasons=["guard_error"])
 
     def can_trade(self, confidence: float, signal_type: str) -> RiskDecision:
+        """Check if trading is allowed based on current phase and risk limits."""
         try:
             _ = signal_type
 
             reasons: List[str] = []
-            self.evaluate_account_state()
+            self.evaluate_account_state()  # CRITICAL: Update phase before checking
 
+            phase = str(self.current_phase or "A")
+            
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
                 return RiskDecision(False, reasons)
 
-            if self.current_phase == "C":
+            # Phase C: Hard stop - no trading allowed
+            if phase == "C":
                 reasons.append("phase_c_protect")
+                return RiskDecision(False, reasons)
 
             if not self.market_open_24_5():
                 reasons.append("session_closed")
@@ -1032,11 +1065,17 @@ class RiskManager:
             if self.rollover_blackout():
                 reasons.append("rollover_blackout")
 
-            if float(confidence) < float(self.cfg.min_confidence_signal):
-                reasons.append("low_confidence")
-
-            if self.current_phase == "B" and float(confidence) < float(self.cfg.ultra_confidence_min):
-                reasons.append("not_ultra_confidence")
+            # Phase A: Normal trading (min_confidence_signal threshold)
+            # Phase B: Conservative trading (ultra_confidence_min threshold)
+            if phase == "A":
+                if float(confidence) < float(self.cfg.min_confidence_signal):
+                    reasons.append("low_confidence")
+            elif phase == "B":
+                # Phase B requires ultra_confidence_min (stricter)
+                ultra_min = float(self.cfg.ultra_confidence_min)
+                if float(confidence) < ultra_min:
+                    reasons.append(f"not_ultra_confidence (phase_b requires {ultra_min:.2f}, got {float(confidence):.2f})")
+            # Phase C already handled above
 
             if not self.can_analyze():
                 reasons.append("analysis_cooldown")
@@ -1076,21 +1115,32 @@ class RiskManager:
             return RiskDecision(allowed=False, reasons=["can_trade_error"])
 
     def can_emit_signal(self, confidence: int, tz) -> Tuple[bool, List[str]]:
+        """Check if signal emission is allowed based on current phase."""
         try:
             _ = tz
-            self.evaluate_account_state()
+            self.evaluate_account_state()  # CRITICAL: Update phase before checking
 
             reasons: List[str] = []
             conf_f = float(confidence) / 100.0
+            phase = str(self.current_phase or "A")
 
-            if conf_f < float(self.cfg.min_confidence_signal):
-                reasons.append("low_confidence")
+            # Phase C: No signals allowed
+            if phase == "C":
+                reasons.append("phase_c_protect")
+                return False, reasons
 
             if not self.can_analyze():
                 reasons.append("analysis_cooldown")
 
-            if self.current_phase == "B" and conf_f < float(self.cfg.ultra_confidence_min):
-                reasons.append("not_ultra_confidence")
+            # Phase A: Normal threshold (min_confidence_signal)
+            # Phase B: Stricter threshold (ultra_confidence_min)
+            if phase == "A":
+                if conf_f < float(self.cfg.min_confidence_signal):
+                    reasons.append("low_confidence")
+            elif phase == "B":
+                ultra_min = float(self.cfg.ultra_confidence_min)
+                if conf_f < ultra_min:
+                    reasons.append(f"not_ultra_confidence (phase_b requires {ultra_min:.2f}, got {conf_f:.2f})")
 
             if bool(getattr(self.cfg, "enforce_drawdown_limits", False)):
                 if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
@@ -1171,6 +1221,11 @@ class RiskManager:
             must return 0.0 (skip trade) instead of crashing or blindly opening min-lot.
         """
         try:
+            # CRITICAL: Phase C block - return 0.0 (no lot size)
+            self.evaluate_account_state()  # Update phase before checking
+            if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
+                return 0.0
+
             side_n = _side_norm(side)
             if side_n not in ("Buy", "Sell"):
                 return 0.0
@@ -1305,6 +1360,9 @@ class RiskManager:
         max_positions: int = 3,
         unrealized_pl: float = 0.0,
     ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """
+        Plan order (entry/sl/tp/lot) - CRITICAL: Must block in Phase C!
+        """
         try:
             _ = (ind, ticks)
 
@@ -1312,6 +1370,12 @@ class RiskManager:
             if side_n not in ("Buy", "Sell"):
                 return None, None, None, None
             if not self._ensure_ready():
+                return None, None, None, None
+
+            # CRITICAL: Phase C block - NO trading allowed (must return None, None, None, None)
+            self.evaluate_account_state()  # Update phase before checking
+            if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
+                log_risk.error("plan_order BLOCKED | phase=C | reason=%s", self._phase_reason_last or "phase_c")
                 return None, None, None, None
 
             if entry is None:
@@ -1422,8 +1486,22 @@ class RiskManager:
                 return None, None, None, None
             use_usd_tp = False
             balance = float(self._get_balance())
+            # CRITICAL: Double-check Phase C before calculating lot/TP (safety net)
+            self.evaluate_account_state()
+            phase = str(self.current_phase or "A")
+            if phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
+                log_risk.error("plan_order BLOCKED (lot/TP calc) | phase=C | balance=%.2f reason=%s", 
+                             balance, self._phase_reason_last or "phase_c")
+                return None, None, None, None
+            
+            # Calculate lot and TP based on balance (deterministic, not random)
             base_lot, tp_usd = gold_lot_and_takeprofit(balance) if balance > 0 else (0.0, 0.0)
             base_lot = self._normalize_volume_floor(float(base_lot or 0.0))
+            
+            # Log for debugging (only if values are calculated)
+            if base_lot > 0 and tp_usd > 0:
+                log_risk.error("plan_order LOT/TP | phase=%s balance=%.2f base_lot=%.4f tp_usd=%.2f", 
+                             phase, balance, base_lot, tp_usd)
 
             if base_lot > 0 and float(tp_usd or 0.0) > 0.0:
                 tp_price = self._tp_usd_to_price(entry_price, side_n, base_lot, float(tp_usd))

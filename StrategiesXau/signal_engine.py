@@ -180,7 +180,19 @@ class SignalEngine:
             tick_stats: TickStats = self.feed.tick_stats(dfp)
             ingest_ms = (time.perf_counter() - t0) * 1000.0
 
-            # 3) Guards
+            # 3) Early Phase C check (skip analysis if hard stop active - save CPU)
+            self.risk.evaluate_account_state()  # Update phase
+            if self.risk.current_phase == "C" and not bool(getattr(self.risk.cfg, "ignore_daily_stop_for_trading", False)):
+                return self._neutral(
+                    sym,
+                    ["phase_c_protect"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
+
+            # 4) Guards
             if not self.risk.market_open_24_5():
                 return self._neutral(
                     sym,
@@ -258,11 +270,22 @@ class SignalEngine:
             ema_s, ema_m = self._ema_s_m(indp, close_p)
             require_stack = bool(getattr(self.cfg, "require_ema_stack", True))
 
-            trend_ok_buy = (adx_l >= adx_lo and close_p > ema50_l * 0.999)
-            trend_ok_sell = (adx_l >= adx_lo and close_p < ema50_l * 1.001)
+            trend_l = str(indl.get("trend", "") or "")
+            bias_up = ("up" in trend_l)
+            bias_dn = ("down" in trend_l)
+
+            # Relaxed trend alignment: Allow Sell signals in downtrends even if price is near EMA50
+            # For Buy: require price above EMA50 or strong uptrend bias
+            trend_ok_buy = (close_p > ema50_l * 0.998) and (adx_l >= adx_lo or bias_up)
+            # For Sell: MUCH MORE RELAXED - allow if price is below EMA50 OR if we have ANY downtrend bias OR if ADX is low (ranging market)
+            # This allows Sell signals in bearish markets and ranging markets
+            trend_ok_sell = (close_p < ema50_l * 1.005) or bias_dn or (adx_l < adx_lo * 1.2)
+            
             if require_stack:
+                # For Buy: require EMA stack alignment
                 trend_ok_buy = trend_ok_buy and (close_p > ema_s > ema_m)
-                trend_ok_sell = trend_ok_sell and (close_p < ema_s < ema_m)
+                # For Sell: MUCH MORE RELAXED - allow if EMA stack is bearish OR if we have downtrend OR if ranging (no clear stack)
+                trend_ok_sell = trend_ok_sell and ((close_p < ema_s < ema_m) or bias_dn or (adx_l < adx_lo * 1.2) or not (close_p > ema_s > ema_m))
 
             # 7) Ensemble score
             book = self.feed.fetch_book() or {}
@@ -286,20 +309,48 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
+            # Cap confidence boost: only boost if net_norm is strong enough
+            # Prevent weak signals from getting 100% confidence
+            net_norm_abs = abs(net_norm)
             if sweep or div != "none":
-                conf = min(100, int(conf * 1.15))
+                # Only boost if net_norm shows real strength (not just noise)
+                if net_norm_abs >= 0.12:
+                    conf = min(92, int(conf * 1.10))  # Reduced boost, capped at 92
+                elif net_norm_abs >= 0.08:
+                    conf = min(88, int(conf * 1.06))  # Smaller boost for moderate signals
+                elif net_norm_abs >= 0.05:
+                    conf = min(85, int(conf * 1.03))  # Very small boost for weak signals
+                # If net_norm is very weak, don't boost at all
+            # Reduce near_rn penalty if net_norm is very strong (allow strong signals near round numbers)
             if near_rn and not (sweep or div != "none"):
-                conf = max(0, int(conf * 0.75))
+                if net_norm_abs >= 0.15:  # Very strong signal: minimal penalty
+                    conf = max(0, int(conf * 0.95))
+                elif net_norm_abs >= 0.10:  # Strong signal: moderate penalty
+                    conf = max(0, int(conf * 0.85))
+                else:  # Weak signal: full penalty
+                    conf = max(0, int(conf * 0.75))
+            
+            # STRICT cap: if net_norm is weak, don't allow high confidence
+            if net_norm_abs < 0.08:
+                conf = min(conf, 80)  # Cap at 80 for weak signals
+            elif net_norm_abs < 0.12:
+                conf = min(conf, 88)  # Cap at 88 for moderate signals
+            elif net_norm_abs < 0.18:
+                conf = min(conf, 95)  # Cap at 95 for good signals
+            # Only allow 95+ for very strong signals (net_norm >= 0.18)
 
             # 9) Decide signal
             signal = "Neutral"
             blocked_by_htf = False
-            conf_min = int(adapt.get("conf_min", 98) or 98)
+            # Use conf_min from adaptive params (correctly calculated based on Phase A/B/C)
+            conf_min = int(adapt.get("conf_min", 80) or 80)  # Default to 80 (Phase A), not 98!
 
-            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.05) or 0.05)
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.10) or 0.10)
+            min_net_norm_for_signal = float(net_thr)  # Use same threshold as minimum requirement
             regime = str(adapt.get("regime", "trend") or "trend").lower()
             if regime.startswith("range"):
                 net_thr += 0.03
+                min_net_norm_for_signal = net_thr  # Update for range regime
                 if not (near_rn or sweep or div != "none"):
                     return self._neutral(
                         sym,
@@ -311,13 +362,20 @@ class SignalEngine:
                         trade_blocked=True,
                     )
 
-            if conf >= conf_min:
+            # STRICT: Require BOTH high confidence AND strong net_norm for any signal
+            # This prevents weak signals from opening orders
+            net_norm_abs = abs(net_norm)
+            
+            if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
                 if net_norm > net_thr and trend_ok_buy:
                     signal = "Buy"
                 elif net_norm < -net_thr and trend_ok_sell:
                     signal = "Sell"
                 else:
                     blocked_by_htf = True
+            else:
+                # Block if confidence OR net_norm is too weak
+                blocked_by_htf = True
 
             # 10) Advanced filters
             if signal != "Neutral" and not self._conformal_ok(dfp):
@@ -362,9 +420,13 @@ class SignalEngine:
             if (now_ms - self._last_decision_ms) < self._debounce_ms:
                 return self._neutral(sym, ["debounce"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
 
-            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 90) or 90)
+            # Relaxed stability check: only block if signal is truly unchanged AND confidence is low
+            # This prevents blocking valid signals that are just slightly similar
+            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 88) or 88)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
-                if conf < strong_conf_min:
+                # Only block if confidence is low AND we're in the same signal
+                # Allow if confidence is high enough or if net_norm changed meaningfully
+                if conf < strong_conf_min and abs(net_norm) < 0.12:
                     return self._neutral(
                         sym,
                         ["stable"],
@@ -378,8 +440,66 @@ class SignalEngine:
             self._last_net_norm = float(net_norm)
             self._last_signal = str(signal)
 
+            # 11.5) STRICT final quality check before opening order
+            # Block weak signals even if they passed previous filters
+            if signal in ("Buy", "Sell"):
+                net_norm_abs = abs(net_norm)
+                min_net_threshold = float(getattr(self.cfg, "net_norm_signal_threshold", 0.10) or 0.10)
+                
+                # Require minimum net_norm strength for ANY order
+                if net_norm_abs < min_net_threshold:
+                    return self._neutral(
+                        sym,
+                        ["weak_net_norm"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+                
+                # Require minimum confidence even after all boosts
+                if conf < conf_min:
+                    return self._neutral(
+                        sym,
+                        ["low_confidence_final"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+                
+                # STRICT: Additional quality checks for scalping safety
+                adx_p = float(indp.get("adx", 0.0) or 0.0)
+                adx_lo = float(getattr(self.cfg, "adx_trend_lo", 16.0) or 16.0)
+                # Require minimum ADX for trend confirmation (prevent choppy market trades)
+                if adx_p < adx_lo * 0.85:  # 85% of minimum ADX
+                    return self._neutral(
+                        sym,
+                        ["weak_adx"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+                
+                # Check spread is reasonable (already checked earlier, but double-check)
+                if spread_pct is not None and spread_pct > float(self.sp.spread_limit_pct) * 1.3:
+                    return self._neutral(
+                        sym,
+                        ["excessive_spread"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
             # 12) Finalize (plan only)
             reasons: List[str] = []
+            phase = str(adapt.get("phase", "A") or "A")
             if sweep:
                 reasons.append(f"sweep:{sweep}")
             if div != "none":
@@ -387,7 +507,14 @@ class SignalEngine:
             if near_rn:
                 reasons.append("near_rn")
             reasons.append(f"net:{net_norm:.3f}")
+            reasons.append(f"phase:{phase}")  # Log current phase for debugging
 
+            # FINAL cap: ensure confidence never exceeds 96% (prevent 100% signals)
+            # BUT: allow confidence to be calculated dynamically based on net_norm
+            # Only cap if it exceeds 96, don't force it to 96
+            if conf > 96:
+                conf = 96
+            
             return self._finalize(
                 sym=sym,
                 signal=signal,
@@ -500,9 +627,37 @@ class SignalEngine:
                 pass
 
         # Fallback if adaptive params missing
-        conf_min = int(getattr(self.cfg, "conf_min", 94) or 94)
-        if phase not in ("A", "B"):
-            conf_min = min(100, conf_min + 2)
+        # Phase-based confidence thresholds:
+        # Phase A: Normal trading (use config conf_min or min_confidence_signal)
+        # Phase B: More conservative (higher conf_min)
+        # Phase C: Hard stop (should not trade, but keep logic for safety)
+        # Use min_confidence_signal from config if available, otherwise conf_min
+        base_conf_min_raw = getattr(self.cfg, "min_confidence_signal", None)
+        if base_conf_min_raw is None:
+            base_conf_min_raw = getattr(self.cfg, "conf_min", 84)
+        # Convert to 0-100 scale if it's 0-1
+        base_conf_min = float(base_conf_min_raw)
+        if base_conf_min <= 1.0:
+            base_conf_min = int(base_conf_min * 100)
+        else:
+            base_conf_min = int(base_conf_min)
+        
+        if phase == "A":
+            conf_min = base_conf_min
+        elif phase == "B":
+            # Phase B: require ultra_confidence_min if available, otherwise add 8
+            ultra_min = getattr(self.cfg, "ultra_confidence_min", None)
+            if ultra_min is not None:
+                ultra_val = float(ultra_min)
+                if ultra_val <= 1.0:
+                    ultra_val = int(ultra_val * 100)
+                else:
+                    ultra_val = int(ultra_val)
+                conf_min = max(ultra_val, base_conf_min + 8)
+            else:
+                conf_min = min(100, base_conf_min + 8)  # More conservative in Phase B
+        else:  # Phase C or unknown
+            conf_min = min(100, base_conf_min + 15)  # Very conservative - should rarely trade
         # ALWAYS inject ATR so RiskManager can plan SL/TP scientifically
         try:
             atr_p = float(indp.get("atr", 0.0) or 0.0)
@@ -610,9 +765,38 @@ class SignalEngine:
 
             net_norm = float(np.sum(scores * weights))
             conf_bias = float(getattr(self.cfg, "confidence_bias", 50.0) or 50.0)
-            conf_gain = float(getattr(self.cfg, "confidence_gain", 30.0) or 30.0)
-            base_conf = conf_bias + (net_norm * conf_gain)
-            conf = int(_clamp(base_conf, 10.0, 99.0))
+            conf_gain = float(getattr(self.cfg, "confidence_gain", 70.0) or 70.0)  # Use config value (70.0 for XAU)
+            
+            # More conservative confidence calculation
+            # Cap base confidence based on net_norm strength
+            # FIXED: More granular caps to allow dynamic confidence variation (not always 96)
+            net_norm_abs = abs(net_norm)
+            if net_norm_abs < 0.08:
+                # Weak signal: cap at 70
+                max_base = 70.0
+            elif net_norm_abs < 0.12:
+                # Moderate signal: cap at 80
+                max_base = 80.0
+            elif net_norm_abs < 0.18:
+                # Good signal: cap at 88
+                max_base = 88.0
+            elif net_norm_abs < 0.30:
+                # Strong signal: allow up to 92 (reduced from 95)
+                max_base = 92.0
+            elif net_norm_abs < 0.45:
+                # Very strong signal: allow up to 94
+                max_base = 94.0
+            elif net_norm_abs < 0.60:
+                # Extremely strong signal: allow up to 95
+                max_base = 95.0
+            else:
+                # Ultra strong signal (net_norm > 0.60): allow up to 96 (rare)
+                max_base = 96.0
+            
+            # Reduce confidence_gain slightly to allow more variation
+            conf_gain_adj = conf_gain * 0.85  # Reduce by 15% for more dynamic range
+            base_conf = conf_bias + (net_norm * conf_gain_adj)
+            conf = int(_clamp(base_conf, 10.0, max_base))
             return net_norm, conf
         except Exception as exc:
             log.error("_ensemble_score crash: %s | tb=%s", exc, traceback.format_exc())
@@ -632,18 +816,21 @@ class SignalEngine:
             adx_lo = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
 
             sc = 0.0
+            # FIXED: Better bearish detection - give stronger negative scores for downtrends
             if adx_l >= adx_lo:
                 if close_p > ema50_l * 0.999:
                     sc += 1.0
+                elif close_p < ema50_l * 0.995:  # More sensitive to bearish conditions
+                    sc -= 1.2  # Stronger negative score for clear downtrends
                 elif close_p < ema50_l * 1.001:
-                    sc -= 1.0
+                    sc -= 0.8  # Moderate negative for slight bearishness
 
             if regime == "trend":
                 ema_s, ema_m = self._ema_s_m(indp, close_p)
                 if close_p > ema_s > ema_m:
                     sc += 0.5
                 elif close_p < ema_s < ema_m:
-                    sc -= 0.5
+                    sc -= 0.7  # Stronger negative for bearish EMA stack
             return float(sc)
         except Exception:
             return 0.0
@@ -822,13 +1009,21 @@ class SignalEngine:
             ema_s, ema_m = self._ema_s_m(ind, close_p)
 
             if signal == "Buy" and close_p > ema_s > ema_m:
-                conf = min(100, conf + 10)
+                conf = conf + 10
+                if conf > 96:  # Only cap if exceeds 96, don't force to 96
+                    conf = 96
             if signal == "Sell" and close_p < ema_s < ema_m:
-                conf = min(100, conf + 10)
+                conf = conf + 10
+                if conf > 96:  # Only cap if exceeds 96, don't force to 96
+                    conf = 96
 
-            return signal, int(conf)
+            # Cap at 96 only if exceeds, allow lower values to pass through
+            conf = int(_clamp(float(conf), 0.0, 96.0))
+            return signal, conf
         except Exception:
-            return signal, int(conf)
+            # On error, preserve original confidence if possible
+            conf = int(_clamp(float(conf), 0.0, 96.0))
+            return signal, conf
     def _finalize(
         self,
         *,
@@ -901,7 +1096,7 @@ class SignalEngine:
             return SignalResult(
                 symbol=sym,
                 signal=signal,
-                confidence=int(conf),
+                confidence=int(_clamp(float(conf), 0.0, 96.0)),  # Cap at 96 only if exceeds, preserve calculated value
                 regime=regime,
                 reasons=reasons[:25],
                 spread_bps=float(spread_pct) * 10000.0,

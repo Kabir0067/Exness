@@ -165,6 +165,10 @@ class SignalEngine:
                 {"trend": 0.55, "momentum": 0.27, "meanrev": 0.10, "structure": 0.05, "volume": 0.03},
             )
 
+        # cache base weights for speed
+        self._w_sig: Tuple[Tuple[str, float], ...] = tuple()
+        self._w_base = np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+
     # --------------------------- public
     def compute(self, execute: bool = False) -> SignalResult:
         """
@@ -203,7 +207,19 @@ class SignalEngine:
             tick_stats: TickStats = self.feed.tick_stats(dfp)
             ingest_ms = (time.perf_counter() - t0) * 1000.0
 
-            # 3) Hard market gate (BTC is 24/7, but can be close-only/disabled/maintenance)
+            # 3) Early Phase C check (skip analysis if hard stop active - save CPU)
+            self.risk.evaluate_account_state()  # Update phase
+            if self.risk.current_phase == "C" and not bool(getattr(self.risk.cfg, "ignore_daily_stop_for_trading", False)):
+                return self._neutral(
+                    sym,
+                    ["phase_c_protect"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    trade_blocked=True,
+                )
+
+            # 4) Hard market gate (BTC is 24/7, but can be close-only/disabled/maintenance)
             if not self.risk.market_open_24_5():
                 return self._neutral(
                     sym,
@@ -217,7 +233,7 @@ class SignalEngine:
             # 4) Guards (risk-level)
             in_session = self._in_active_session()  # optional policy gate (cfg.active_sessions)
             drawdown_exceeded = self._check_drawdown()
-            latency_ok = bool(self.risk.latency_cooldown())
+            latency_flag = bool(self.risk.latency_cooldown())
 
             decision = self.risk.guard_decision(
                 spread_pct=spread_pct,
@@ -227,7 +243,7 @@ class SignalEngine:
                 last_bar_age=float(last_age),
                 in_session=bool(in_session),
                 drawdown_exceeded=bool(drawdown_exceeded),
-                latency_cooldown=bool(latency_ok),
+                latency_cooldown=bool(latency_flag),
                 tz=getattr(self.feed, "tz", None),
             )
             if not getattr(decision, "allowed", False):
@@ -288,18 +304,44 @@ class SignalEngine:
             # 6) Adaptive params
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
-            # 7) HTF alignment (BTC: allow EMA bias even when ADX is soft)
+            # 7) HTF alignment (BTC tuned): allow Buy earlier using RSI/MACD support, not only ADX.
             close_p = float(indp.get("close", 0.0) or 0.0)
             ema50_l = float(indl.get("ema50", close_p) or close_p)
             adx_l = float(indl.get("adx", 0.0) or 0.0)
-            adx_lo = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
+            adx_lo_ltf = float(getattr(self.cfg, "adx_trend_lo", 16.0) or 16.0)
             trend_l = str(indl.get("trend", "") or "")
-            bias_up = ("up" in trend_l)
-            bias_dn = ("down" in trend_l)
+            bias_up = ("up" in trend_l.lower())
+            bias_dn = ("down" in trend_l.lower())
 
-            # 8) Ensemble score
+            rsi_p = float(indp.get("rsi", 50.0) or 50.0)
+            macd_hist_p = float(indp.get("macd_hist", 0.0) or 0.0)
+
+            # Bearish context detector (used to block weak Buy)
+            is_bearish = (close_p < ema50_l * 0.994) or (rsi_p < 45.0 and macd_hist_p < 0.0) or bias_dn
+
+            # Buy alignment: require price above EMA50 (slightly), and either ADX or momentum support.
+            trend_ok_buy = (
+                (close_p > ema50_l * 0.9975)
+                and (not is_bearish)
+                and (
+                    bias_up
+                    or (adx_l >= adx_lo_ltf * 0.75)
+                    or (rsi_p >= 52.0 and macd_hist_p >= 0.0)
+                )
+            )
+
+            # Sell alignment: allow bearish, or below EMA50 with weak momentum
+            trend_ok_sell = (
+                is_bearish
+                or (close_p < ema50_l * 1.0025)
+                or bias_dn
+                or (rsi_p <= 48.0 and macd_hist_p <= 0.0)
+            )
+
+            # 8) Ensemble score (net_norm + confidence)
             book = self.feed.fetch_book() or {}
             net_norm, conf = self._ensemble_score(indp, indc, indl, book, adapt, spread_pct, tick_stats)
+            net_norm_abs = abs(net_norm)
 
             # 9) Confluence layer
             ext = self._extreme_flag(dfp, indp)
@@ -319,27 +361,49 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
+            # Conservative micro-boosts (only if net_norm is not weak)
             if sweep or div != "none":
-                conf = min(100, int(conf * 1.15))
-            if near_rn and not (sweep or div != "none"):
-                conf = max(0, int(conf * 0.75))
+                if net_norm_abs >= 0.14:
+                    conf = min(92, int(conf * 1.06))
+                elif net_norm_abs >= 0.10:
+                    conf = min(88, int(conf * 1.03))
 
-            # 10) Decide signal
+            # Reduce near_rn penalty if net_norm is very strong (allow strong signals near round numbers)
+            if near_rn and not (sweep or div != "none"):
+                if net_norm_abs >= 0.15:  # Very strong signal: minimal penalty
+                    conf = max(0, int(conf * 0.95))
+                elif net_norm_abs >= 0.10:  # Strong signal: moderate penalty
+                    conf = max(0, int(conf * 0.85))
+                else:  # Weak signal: full penalty
+                    conf = max(0, int(conf * 0.75))
+
+            # Strength-based caps (single consistent function)
+            conf = self._cap_conf_by_strength(int(conf), net_norm_abs)
+
+            # 10) Decide signal (uses adaptive conf_min)
             signal = "Neutral"
             blocked_by_htf = False
-            conf_min = int(adapt.get("conf_min", 98) or 98)
+            conf_min = int(adapt.get("conf_min", 78) or 78)
+            conf_min = int(_clamp(float(conf_min), 50.0, 96.0))
 
-            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.05) or 0.05)
-            trend_ok_buy = (close_p > ema50_l * 0.999) and (adx_l >= adx_lo or bias_up)
-            trend_ok_sell = (close_p < ema50_l * 1.001) and (adx_l >= adx_lo or bias_dn)
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.12) or 0.12)
+            min_net_norm_for_signal = float(net_thr)
 
-            if conf >= conf_min:
-                if net_norm > net_thr and trend_ok_buy:
-                    signal = "Buy"
-                elif net_norm < -net_thr and trend_ok_sell:
-                    signal = "Sell"
+            if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
+                if net_norm > net_thr:
+                    if trend_ok_buy:
+                        signal = "Buy"
+                    else:
+                        blocked_by_htf = True
+                elif net_norm < -net_thr:
+                    if trend_ok_sell:
+                        signal = "Sell"
+                    else:
+                        blocked_by_htf = True
                 else:
                     blocked_by_htf = True
+            else:
+                blocked_by_htf = True
 
             # 11) Advanced filters
             if signal != "Neutral" and not self._conformal_ok(dfp):
@@ -364,13 +428,61 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
-            signal, conf = self._apply_filters(signal, conf, indp)
+            signal, conf = self._apply_filters(signal, int(conf), indp)
 
             if signal == "Neutral" and blocked_by_htf:
-                conf = min(conf, max(0, conf_min - 1))
+                # keep confidence just below threshold for UI clarity
+                conf = min(int(conf), max(0, conf_min - 1))
+
+            # STRICT final quality check before opening order
+            if signal in ("Buy", "Sell"):
+                if net_norm_abs < min_net_norm_for_signal:
+                    return self._neutral(
+                        sym,
+                        ["weak_net_norm"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+                if conf < conf_min:
+                    return self._neutral(
+                        sym,
+                        ["low_confidence_final"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
+                adx_p = float(indp.get("adx", 0.0) or 0.0)
+                adx_lo_p = float(getattr(self.cfg, "adx_trend_lo", 22.0) or 22.0)
+                if adx_p < adx_lo_p * 0.75:
+                    return self._neutral(
+                        sym,
+                        ["weak_adx"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
+                if spread_pct is not None and spread_pct > float(self.sp.spread_limit_pct) * 1.3:
+                    return self._neutral(
+                        sym,
+                        ["excessive_spread"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
 
             # 12) Risk-level emission gate (after we have confidence)
-            ok_emit, emit_reasons = self.risk.can_emit_signal(conf, getattr(self.feed, "tz", None))
+            ok_emit, emit_reasons = self.risk.can_emit_signal(int(conf), getattr(self.feed, "tz", None))
             if (signal in ("Buy", "Sell")) and (not ok_emit):
                 return self._neutral(
                     sym,
@@ -385,11 +497,18 @@ class SignalEngine:
             # 13) Debounce + stability
             now_ms = time.monotonic() * 1000.0
             if (now_ms - self._last_decision_ms) < self._debounce_ms:
-                return self._neutral(sym, ["debounce"], t0, spread_pct=spread_pct, bar_key=bar_key, regime=str(adapt.get("regime")))
+                return self._neutral(
+                    sym,
+                    ["debounce"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                )
 
-            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 88) or 88)
+            strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 85) or 85)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
-                if conf < strong_conf_min:
+                if int(conf) < strong_conf_min and abs(net_norm) < 0.15:
                     return self._neutral(
                         sym,
                         ["stable"],
@@ -412,11 +531,12 @@ class SignalEngine:
             if near_rn:
                 reasons.append("near_rn")
             reasons.append(f"net:{net_norm:.3f}")
+            reasons.append(f"conf:{int(conf)}")
 
             return self._finalize(
                 sym=sym,
                 signal=signal,
-                conf=conf,
+                conf=int(conf),
                 indp=indp,
                 adapt=adapt,
                 spread_pct=spread_pct,
@@ -555,10 +675,30 @@ class SignalEngine:
             except Exception:
                 pass
 
-        # Fallback if adaptive params missing
-        # Use config-based min confidence (default 0.90 -> 90)
-        base_min = int(float(getattr(self.cfg, "min_confidence_signal", 0.90) or 0.90) * 100)
-        conf_min = base_min if phase in ("A", "B") else min(100, base_min + 2)
+        base_conf_min_raw = getattr(self.cfg, "min_confidence_signal", None)
+        if base_conf_min_raw is None:
+            base_conf_min_raw = getattr(self.cfg, "conf_min", 74)
+        base_conf_min = float(base_conf_min_raw)
+        if base_conf_min <= 1.0:
+            base_conf_min = int(base_conf_min * 100)
+        else:
+            base_conf_min = int(base_conf_min)
+
+        if phase == "A":
+            conf_min = base_conf_min
+        elif phase == "B":
+            ultra_min = getattr(self.cfg, "ultra_confidence_min", None)
+            if ultra_min is not None:
+                ultra_val = float(ultra_min)
+                if ultra_val <= 1.0:
+                    ultra_val = int(ultra_val * 100)
+                else:
+                    ultra_val = int(ultra_val)
+                conf_min = max(ultra_val, base_conf_min + 10)
+            else:
+                conf_min = min(96, base_conf_min + 10)
+        else:
+            conf_min = min(96, base_conf_min + 15)
 
         return {
             "conf_min": int(conf_min),
@@ -632,7 +772,92 @@ class SignalEngine:
         except Exception:
             return True, []
 
-    # --------------------------- ensemble scoring
+    # --------------------------- ensemble scoring (FIXED)
+    def _get_base_weights(self) -> np.ndarray:
+        """
+        Cache normalized base weights from cfg.weights. Keeps structure, improves speed.
+        """
+        try:
+            w = getattr(self.cfg, "weights", {}) or {}
+            sig = (
+                ("trend", float(w.get("trend", 0.55))),
+                ("momentum", float(w.get("momentum", 0.27))),
+                ("meanrev", float(w.get("meanrev", 0.10))),
+                ("structure", float(w.get("structure", 0.05))),
+                ("volume", float(w.get("volume", 0.03))),
+            )
+            if sig != self._w_sig:
+                arr = np.array([sig[0][1], sig[1][1], sig[2][1], sig[3][1], sig[4][1]], dtype=np.float64)
+                s = float(np.sum(arr))
+                if s <= 0:
+                    arr = np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+                    s = float(np.sum(arr))
+                self._w_base = arr / max(1e-12, s)
+                self._w_sig = sig
+            return self._w_base
+        except Exception:
+            return np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+
+    def _conf_from_strength(self, net_abs: float, spread_pct: float, tick_stats: TickStats) -> float:
+        """
+        Deterministic probability-like confidence (0..96).
+        FIXED: based on |net_norm| (strength), not signed net_norm.
+        Includes small penalties for bad spread/ticks.
+        """
+        conf_bias = float(getattr(self.cfg, "confidence_bias", 52.0) or 52.0)
+
+        # Ensure gain is strong enough for BTC scalping (otherwise Buy never reaches conf_min)
+        # BUT: Reduce gain to allow more dynamic confidence variation (not always 96)
+        gain_cfg = float(getattr(self.cfg, "confidence_gain", 220.0) or 220.0)
+        conf_gain = max(150.0, min(200.0, gain_cfg))  # Reduced from 180-220 to 150-200 for more variation
+
+        base = conf_bias + (net_abs * conf_gain)
+
+        # spread penalty (soft; hard blocks happen in RiskManager.guard_decision)
+        try:
+            sp_lim = float(getattr(self.sp, "spread_limit_pct", 0.0) or 0.0)
+            if sp_lim > 0.0 and spread_pct > 0.0:
+                ratio = spread_pct / max(1e-12, sp_lim)
+                if ratio > 0.75:
+                    base -= min(18.0, (ratio - 0.75) * 24.0)
+        except Exception:
+            pass
+
+        # tick penalty
+        try:
+            ok = bool(getattr(tick_stats, "ok", True))
+            if not ok:
+                base -= 14.0
+        except Exception:
+            pass
+
+        return float(base)
+
+    def _cap_conf_by_strength(self, conf: int, net_abs: float) -> int:
+        """
+        Single consistent cap: prevents weak signals from showing high %,
+        without killing valid Buy opportunities.
+        FIXED: More granular caps to allow dynamic confidence variation.
+        """
+        try:
+            if net_abs < 0.06:
+                cap = 72
+            elif net_abs < 0.10:
+                cap = 80
+            elif net_abs < 0.14:
+                cap = 86
+            elif net_abs < 0.18:
+                cap = 90  # Reduced from 92 to allow more variation
+            elif net_abs < 0.22:
+                cap = 93  # New tier for very strong signals
+            elif net_abs < 0.30:
+                cap = 95  # New tier for extremely strong signals
+            else:
+                cap = 96  # Only the strongest signals reach 96
+            return int(_clamp(float(min(int(conf), int(cap))), 0.0, 96.0))
+        except Exception:
+            return int(_clamp(float(conf), 0.0, 96.0))
+
     def _ensemble_score(
         self,
         indp: Dict[str, Any],
@@ -644,28 +869,31 @@ class SignalEngine:
         tick_stats: TickStats,
     ) -> Tuple[float, int]:
         try:
-            _ = (book, spread_pct, tick_stats)
+            _ = (book,)
 
+            # weights (cached base * adaptive multipliers)
+            w_base = self._get_base_weights()
             w_mul = adapt.get("w_mul") or {}
-            w = getattr(self.cfg, "weights", {}) or {}
-            weights = np.array(
+            mul = np.array(
                 [
-                    float(w.get("trend", 0.55)) * float(w_mul.get("trend", 1.0)),
-                    float(w.get("momentum", 0.27)) * float(w_mul.get("momentum", 1.0)),
-                    float(w.get("meanrev", 0.10)) * float(w_mul.get("meanrev", 1.0)),
-                    float(w.get("structure", 0.05)) * float(w_mul.get("structure", 1.0)),
-                    float(w.get("volume", 0.03)) * float(w_mul.get("volume", 1.0)),
+                    float(w_mul.get("trend", 1.0)),
+                    float(w_mul.get("momentum", 1.0)),
+                    float(w_mul.get("meanrev", 1.0)),
+                    float(w_mul.get("structure", 1.0)),
+                    float(w_mul.get("volume", 1.0)),
                 ],
                 dtype=np.float64,
             )
+            weights = w_base * mul
             s = float(np.sum(weights))
             if s <= 0:
-                weights = np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+                weights = w_base
             else:
                 weights = weights / s
 
             regime = str(adapt.get("regime", "trend") or "trend")
 
+            # scores (keep structure)
             scores = np.zeros(5, dtype=np.float64)
             scores[0] = float(self._trend_score(indp, indc, indl, regime))
             scores[1] = float(self._momentum_score(indp, indc))
@@ -675,12 +903,17 @@ class SignalEngine:
             z_vol = float(indp.get("z_vol", indp.get("z_volume", 0.0)) or 0.0)
             scores[4] = float(np.tanh(z_vol / 3.0))
 
-            net_norm = float(np.sum(scores * weights))
-            conf_bias = float(getattr(self.cfg, "confidence_bias", 50.0) or 50.0)
-            conf_gain = float(getattr(self.cfg, "confidence_gain", 30.0) or 30.0)
-            base_conf = conf_bias + (net_norm * conf_gain)
-            conf = int(_clamp(base_conf, 10.0, 99.0))
-            return net_norm, conf
+            net_norm = float(np.dot(scores, weights))
+            net_abs = abs(net_norm)
+
+            # FIXED confidence
+            base_conf = self._conf_from_strength(net_abs, float(spread_pct), tick_stats)
+            conf = int(_clamp(base_conf, 10.0, 96.0))
+
+            # strength caps (consistent)
+            conf = self._cap_conf_by_strength(conf, net_abs)
+
+            return float(net_norm), int(conf)
         except Exception as exc:
             log.error("_ensemble_score crash: %s | tb=%s", exc, traceback.format_exc())
             return 0.0, 0
@@ -702,15 +935,17 @@ class SignalEngine:
             if adx_l >= adx_lo:
                 if close_p > ema50_l * 0.999:
                     sc += 1.0
+                elif close_p < ema50_l * 0.995:
+                    sc -= 1.2
                 elif close_p < ema50_l * 1.001:
-                    sc -= 1.0
+                    sc -= 0.8
 
             if regime == "trend":
                 ema_s, ema_m = self._ema_s_m(indp, close_p)
                 if close_p > ema_s > ema_m:
                     sc += 0.5
                 elif close_p < ema_s < ema_m:
-                    sc -= 0.5
+                    sc -= 0.7
             return float(sc)
         except Exception:
             return 0.0
@@ -877,14 +1112,14 @@ class SignalEngine:
             ema_s, ema_m = self._ema_s_m(ind, close_p)
 
             if signal == "Buy" and close_p > ema_s > ema_m:
-                conf = min(100, conf + 10)
+                conf = conf + 10
             if signal == "Sell" and close_p < ema_s < ema_m:
-                conf = min(100, conf + 10)
+                conf = conf + 10
 
-            conf = int(_clamp(float(conf), 0.0, 100.0))
+            conf = int(_clamp(float(conf), 0.0, 96.0))
             return signal, conf
         except Exception:
-            conf = int(_clamp(float(conf), 0.0, 100.0))
+            conf = int(_clamp(float(conf), 0.0, 96.0))
             return signal, conf
 
     # --------------------------- finalize / planning
@@ -912,7 +1147,6 @@ class SignalEngine:
             entry_val = sl_val = tp_val = lot_val = None
 
             if signal in ("Buy", "Sell") and execute:
-                # Final trade gate (includes exec breaker / hard stops / confidence rules)
                 trade_dec = self.risk.can_trade(float(conf) / 100.0, signal)
                 if not trade_dec.allowed:
                     return self._neutral(
@@ -929,7 +1163,6 @@ class SignalEngine:
                 tick_vol = float(getattr(tick_stats, "volatility", 0.0) or 0.0)
                 open_pos, unreal_pl = self._position_context(sym)
 
-                # IMPORTANT: do NOT pass candle close as entry; let RiskManager use bid/ask tick
                 entry_val, sl_val, tp_val, lot_val = self.risk.plan_order(
                     signal,
                     float(conf) / 100.0,
@@ -955,13 +1188,12 @@ class SignalEngine:
                         trade_blocked=True,
                     )
 
-                # Count only when we actually produced a tradeable plan
                 self.risk.register_signal_emitted()
 
             return SignalResult(
                 symbol=sym,
                 signal=signal,
-                confidence=int(_clamp(float(conf), 0.0, 100.0)),
+                confidence=int(_clamp(float(conf), 0.0, 96.0)),
                 regime=regime,
                 reasons=(reasons or ["signal"])[:25],
                 spread_bps=float(spread_pct) * 10000.0,
