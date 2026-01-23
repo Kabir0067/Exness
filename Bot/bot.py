@@ -279,6 +279,31 @@ _blocked_chat_cache = TTLCache(maxsize=512, ttl_sec=12 * 3600)
 _typing_cache = TTLCache(maxsize=2048, ttl_sec=1.2)
 
 
+def _format_datetime(dt: Optional[datetime] = None, show_date: bool = False, show_time: bool = True) -> str:
+    """Форматирование даты и времени в красивом HTML формате."""
+    if dt is None:
+        dt = datetime.now()
+    
+    parts = []
+    if show_date:
+        parts.append(f"<b>{dt.strftime('%Y-%m-%d')}</b>")
+    if show_time:
+        parts.append(f"<code>{dt.strftime('%H:%M:%S')}</code>")
+    
+    return " ".join(parts) if parts else ""
+
+
+def _format_time_only() -> str:
+    """Только время в красивом формате."""
+    return f"<code>{datetime.now().strftime('%H:%M:%S')}</code>"
+
+
+def _format_date_time() -> str:
+    """Дата и время в красивом формате."""
+    now = datetime.now()
+    return f"<b>{now.strftime('%Y-%m-%d')}</b> <code>{now.strftime('%H:%M:%S')}</code>"
+
+
 def _extract_chat_id_from_call(
     fn_name: str,
     args: tuple[Any, ...],
@@ -471,18 +496,15 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
         conf_pct = conf * 100.0
 
         sltp = f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0 and tp > 0) else "-"
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        direction_emoji = "🟢" if str(intent.signal).lower() == "buy" else "🔴"
+        currency = "USD"
+        time_str = _format_time_only()
+        
         msg = (
-            "✅ <b>Ордер кушода шуд</b>\n"
-            f"📌 Ассет: <b>{intent.asset}</b> | Символ: <b>{intent.symbol}</b>\n"
-            f"📍 Самт: <b>{intent.signal}</b>\n"
-            f"📦 Лот: <b>{float(intent.lot):.4f}</b>\n"
-            f"🏷 Нарх: <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b>\n"
-            f"🛡 SL/TP: <b>{sltp}</b>\n"
-            f"🎯 Дақиқӣ: <b>{conf_pct:.1f}%</b>\n"
-            f"🆔 ID: <code>{intent.order_id}</code>\n"
-            f"⏱ Вақт: {ts}"
+            f"{direction_emoji} <b>{intent.signal.upper()}</b> | <b>{intent.asset}</b>\n"
+            f"📌 {intent.symbol} | #{intent.order_id} | Lot: <b>{float(intent.lot):.4f}</b>\n"
+            f"🏷 <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | 🛡 {sltp}\n"
+            f"🧠 <b>{conf_pct:.1f}%</b> | {time_str}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -496,14 +518,11 @@ def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str
     try:
         if not is_admin_chat(ADMIN):
             return
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        reason_line = f"🧾 Сабаб: <b>{reason}</b>\n" if reason else ""
+        reason_line = f" | <b>{reason}</b>" if reason else ""
+        time_str = _format_time_only()
         msg = (
-            "🧭 <b>Тағйири режим</b>\n"
-            f"📌 Ассет: <b>{asset}</b>\n"
-            f"🔁 Аз <b>{old_phase}</b> → <b>{new_phase}</b>\n"
-            f"{reason_line}"
-            f"⏱ Вақт: {ts}"
+            f"🔄 <b>{asset}</b>: <b>{old_phase}</b> → <b>{new_phase}</b>{reason_line}\n"
+            f"{time_str}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -517,14 +536,12 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
     try:
         if not is_admin_chat(ADMIN):
             return
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        reason_line = f"🧾 Сабаб: <b>{reason}</b>\n" if reason else ""
+        reason_line = f" | <b>{reason}</b>" if reason else ""
+        time_str = _format_time_only()
         msg = (
-            "🛑 <b>Трейд қатъ шуд</b>\n"
-            f"📌 Ассет: <b>{asset}</b>\n"
-            f"{reason_line}"
-            "✅ Барои оғоз аз нав: /buttons → «🚀 Оғози Тиҷорат»\n"
-            f"⏱ Вақт: {ts}"
+            f"🛑 <b>{asset}</b> қатъ шуд{reason_line}\n"
+            f"✅ Барои оғоз: /buttons → «🚀 Оғози Тиҷорат»\n"
+            f"{time_str}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -538,13 +555,11 @@ def _notify_daily_start(asset: str, day: str) -> None:
     try:
         if not is_admin_chat(ADMIN):
             return
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        time_str = _format_time_only()
         msg = (
-            "🌅 <b>Оғози рӯзи нав</b>\n"
-            f"📌 Ассет: <b>{asset}</b>\n"
-            f"📅 Рӯз: <b>{day}</b>\n"
-            "✅ Лимитҳо аз нав ҳисоб шуданд.\n"
-            f"⏱ Вақт: {ts}"
+            f"🌅 <b>{asset}</b> | Рӯзи нав: <b>{day}</b>\n"
+            f"✅ Лимитҳо ва омор аз нав ҳисоб шуданд\n"
+            f"{time_str}"
         )
         bot.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
@@ -656,23 +671,31 @@ def _format_status_message(status: Any) -> str:
     if active_label == "NONE" and getattr(status, "trading", False):
         active_label = "✅ SCANNING (XAU + BTC)"
 
+    active_icon = "🟢" if getattr(status, "trading", False) else "🔴"
+    trading_status = "ON" if getattr(status, "trading", False) else "OFF"
+    mt5_status = "✓" if getattr(status, "connected", False) else "✗"
+    balance = float(getattr(status, "balance", 0.0))
+    equity = float(getattr(status, "equity", 0.0))
+    today_pnl = float(getattr(status, "today_pnl", 0.0))
+    dd_pct = float(getattr(status, "dd_pct", 0.0))
+    open_xau = int(getattr(status, "open_trades_xau", 0))
+    open_btc = int(getattr(status, "open_trades_btc", 0))
+    sig_xau = str(getattr(status, "last_signal_xau", "Neutral"))
+    sig_btc = str(getattr(status, "last_signal_btc", "Neutral"))
+    queue = int(getattr(status, "exec_queue_size", 0))
+    
     return (
-        "⚙️ <b>Статуси Portfolio Bot (XAU + BTC)</b>\n"
-        f"🔗 MT5: {'✅' if getattr(status, 'connected', False) else '❌'}\n"
-        f"📈 Trading: {'✅' if getattr(status, 'trading', False) else '❌'}\n"
-        f"⛔ Manual Stop: {'✅' if getattr(status, 'manual_stop', False) else '❌'}\n"
-        f"🎯 Режим: {active_label}\n"
-        f"💰 Balance: <b>{float(getattr(status, 'balance', 0.0)):.2f}$</b>\n"
-        f"📊 Equity: <b>{float(getattr(status, 'equity', 0.0)):.2f}$</b>\n"
-        f"📉 DD: <b>{float(getattr(status, 'dd_pct', 0.0)):.2%}</b>\n"
-        f"📆 Today PnL: <b>{float(getattr(status, 'today_pnl', 0.0)):+.2f}$</b>\n"
-        f"📂 Open XAU: <b>{int(getattr(status, 'open_trades_xau', 0))}</b>\n"
-        f"📂 Open BTC: <b>{int(getattr(status, 'open_trades_btc', 0))}</b>\n"
-        f"📊 Total: <b>{int(getattr(status, 'open_trades_total', 0))}</b>\n"
-        f"🛎 XAU: <b>{str(getattr(status, 'last_signal_xau', 'Neutral'))}</b>\n"
-        f"🛎 BTC: <b>{str(getattr(status, 'last_signal_btc', 'Neutral'))}</b>\n"
-        f"🎲 Last Selected: <b>{str(getattr(status, 'last_selected_asset', 'NONE'))}</b>\n"
-        f"📥 Queue: <b>{int(getattr(status, 'exec_queue_size', 0))}</b>\n"
+        f"{active_icon} <b>Система</b> | Trading: <b>{trading_status}</b> | MT5: <b>{mt5_status}</b>\n"
+        f"💰 <b>{balance:.2f}$</b> | Equity: <b>{equity:.2f}$</b>"
+    ) + (
+        f" | PnL: <b>{today_pnl:+.2f}$</b>\n" if today_pnl != 0 else "\n"
+    ) + (
+        f"📉 DD: <b>{dd_pct:.2%}</b>\n" if dd_pct > 0 else ""
+    ) + (
+        f"🔹 XAU: <b>{open_xau}</b> | {sig_xau} | "
+        f"🔸 BTC: <b>{open_btc}</b> | {sig_btc}"
+    ) + (
+        f" | 📥 <b>{queue}</b>\n" if queue > 0 else "\n"
     )
 
 
@@ -720,7 +743,7 @@ def buttons_func(message: types.Message) -> None:
 
     bot.send_message(
         message.chat.id,
-        "📋 <b>Менюи Асосӣ</b>\nАмалиётро интихоб кунед ⬇️",
+        "🎛 <b>Бот Control Panel</b>\nЛутфан амалиётро интихоб кунед ⬇️",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -743,20 +766,15 @@ def _format_tp_result(usd: float, res: dict) -> str:
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
 
-    status = "✅ <b>ИҶРО ШУД</b>" if ok else "⚠️ <b>ҚИСМАН / ХАТО</b>"
+    status_emoji = "✅" if ok else "⚠️"
     lines = [
-        status,
-        f"🎯 TP барои ҳамаи позицияҳо: <b>{usd:.0f}$</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        f"📌 Ҳамагӣ: <b>{total}</b>",
-        f"✅ Навсозӣ: <b>{updated}</b>",
-        f"⏭️ Skip: <b>{skipped}</b>",
+        f"{status_emoji} <b>TP: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"
     ]
-
+    if skipped > 0:
+        lines.append(f"⏭️ Skip: <b>{skipped}</b>")
     if errors:
-        preview = "\n".join(f"• {e}" for e in errors[:10])
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━", "🧾 <b>Хатоҳо (10-тои аввал)</b>:", f"<code>{preview}</code>"]
-
+        preview = " | ".join(e[:30] for e in errors[:3])
+        lines.append(f"⚠️ <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -833,18 +851,15 @@ def _format_sl_result(usd: float, res: dict) -> str:
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
 
-    status = "✅ <b>ИҶРО ШУД</b>" if ok else "⚠️ <b>ҚИСМАН / ХАТО</b>"
+    status_emoji = "✅" if ok else "⚠️"
     lines = [
-        status,
-        f"🛡 SL барои ҳамаи позицияҳо: <b>{usd:.0f}$</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        f"📌 Ҳамагӣ: <b>{total}</b>",
-        f"✅ Навсозӣ: <b>{updated}</b>",
-        f"⏭️ Skip: <b>{skipped}</b>",
+        f"{status_emoji} <b>SL: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"
     ]
+    if skipped > 0:
+        lines.append(f"⏭️ Skip: <b>{skipped}</b>")
     if errors:
-        preview = "\n".join(f"• {e}" for e in errors[:10])
-        lines += ["━━━━━━━━━━━━━━━━━━━━━━", "🧾 <b>Хатоҳо (10-тои аввал)</b>:", f"<code>{preview}</code>"]
+        preview = " | ".join(e[:30] for e in errors[:3])
+        lines.append(f"⚠️ <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -909,34 +924,37 @@ _summary_cache = TTLCache(maxsize=4, ttl_sec=3.0)
 
 def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     text = (
-        "📜 <b>Ҳисоботи Имрӯза</b>\n"
-        f"📅 Рӯз: <code>{summary.get('date', '-')}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📜 <b>DAILY TRADING SUMMARY</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 Date: <b>{summary.get('date', '-')}</b>\n"
     )
 
     total_closed = int(summary.get("total_closed", 0) or 0)
     total_open = int(summary.get("total_open", 0) or 0)
 
     if total_closed > 0:
+        net = float(summary.get('net', 0.0) or 0.0)
+        wins = int(summary.get('wins', 0) or 0)
+        losses = int(summary.get('losses', 0) or 0)
+        profit = float(summary.get('profit', 0.0) or 0.0)
+        loss = float(summary.get('loss', 0.0) or 0.0)
+        win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
+        pnl_emoji = "🟢" if net >= 0 else "🔴"
+        
         text += (
-            f"✅ Бурд: <b>{int(summary.get('wins', 0) or 0)}</b>\n"
-            f"❌ Бохт: <b>{int(summary.get('losses', 0) or 0)}</b>\n"
-            f"📋 Ҷамъ баста: <b>{total_closed}</b>\n\n"
-            f"💹 Фоида: <b>{float(summary.get('profit', 0.0) or 0.0):.2f}$</b>\n"
-            f"📉 Зарар: <b>{float(summary.get('loss', 0.0) or 0.0):.2f}$</b>\n"
-            f"📊 Нетто: <b>{float(summary.get('net', 0.0) or 0.0):+.2f}$</b>\n\n"
+            f"\n{pnl_emoji} <b>P&L: {net:+.2f}$</b>\n"
+            f"📊 {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>\n"
+            f"💹 +{profit:.2f}$ | 📉 -{loss:.2f}$\n"
         )
     else:
-        text += "📋 Ордерҳои басташуда: <b>0</b>\n\n"
+        text += "\n🚫 Ордерҳои басташуда: 0\n"
 
     if total_open > 0:
-        text += (
-            f"🔓 Кушода: <b>{total_open}</b>\n"
-            f"💰 P&L нореалӣ: <b>{float(summary.get('unrealized_pnl', 0.0) or 0.0):+.2f}$</b>\n\n"
-        )
+        unrealized = float(summary.get('unrealized_pnl', 0.0) or 0.0)
+        text += f"🔓 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized:+.2f}$</b>\n"
 
-    text += f"💰 Баланс: <b>{float(summary.get('balance', 0.0) or 0.0):.2f}$</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+    balance = float(summary.get('balance', 0.0) or 0.0)
+    text += f"\n💰 <b>{balance:.2f}$</b>\n"
     return text
 
 
@@ -972,9 +990,9 @@ def start_handler(message: types.Message) -> None:
     if not is_admin_chat(message.chat.id):
         deny(message)
         return
-    bot.send_message(
+        bot.send_message(
         message.chat.id,
-        "👋 <b>Хуш омадед!</b>\nБарои идоракунӣ менюро истифода баред.",
+        "👋 <b>Хуш омадед!</b>\nБарои идоракунӣ менюро истифода баред: /buttons",
         parse_mode="HTML",
     )
     buttons_func(message)
@@ -998,41 +1016,30 @@ def history_handler(message: types.Message) -> None:
         # Добавляем детальную информацию об открытых позициях
         open_positions = report.get("open_positions", [])
         if open_positions and len(open_positions) > 0:
-            text += "\n<b>Ордерҳои кушода:</b>\n"
-            for pos in open_positions[:10]:  # Показываем максимум 10
+            text += "\n<b>Кушода:</b> "
+            for i, pos in enumerate(open_positions[:5]):  # Показываем максимум 5
+                if i > 0:
+                    text += " | "
                 ticket = pos.get("ticket", 0)
                 symbol = pos.get("symbol", "")
-                volume = pos.get("volume", 0.0)
                 profit = pos.get("profit", 0.0)
-                text += f"#{ticket} {symbol} {volume:.2f} | P&L: {profit:+.2f}\n"
-            if len(open_positions) > 10:
-                text += f"... ва {len(open_positions) - 10} дигарон\n"
+                text += f"#{ticket} {symbol} <b>{profit:+.2f}$</b>"
+            if len(open_positions) > 5:
+                text += f" | +{len(open_positions) - 5}"
             text += "\n"
 
         if acc_info:
             login = acc_info.get("login", 0)
-            server = acc_info.get("server", "")
-            company = acc_info.get("company", "")
-            currency = acc_info.get("currency", "USD")
             balance = acc_info.get("balance", 0.0)
             equity = acc_info.get("equity", 0.0)
-            margin = acc_info.get("margin", 0.0)
-            free_margin = acc_info.get("free_margin", 0.0)
-            margin_level = acc_info.get("margin_level", 0.0)
             profit = acc_info.get("profit", 0.0)
+            margin_level = acc_info.get("margin_level", 0.0)
 
-            # Компактная информация
-            text += f"<b>Аккаунт:</b> {login} | {server}\n"
-            text += f"<b>Баланс:</b> {balance:.2f} | <b>Equity:</b> {equity:.2f}"
+            text += f"\n💰 <b>{balance:.2f}$</b> | Equity: <b>{equity:.2f}$</b>"
             if profit != 0:
-                text += f" | <b>Profit:</b> {profit:+.2f}\n"
-            else:
-                text += "\n"
-            text += f"<b>Margin:</b> {margin:.2f} | <b>Free:</b> {free_margin:.2f}"
+                text += f" | P&L: <b>{profit:+.2f}$</b>"
             if margin_level:
-                text += f" | <b>ML:</b> {margin_level:.2f}%\n"
-            else:
-                text += "\n"
+                text += f" | ML: <b>{margin_level:.1f}%</b>"
             text += "\n"
 
         total_closed = int(report.get("total_closed", 0) or 0)
@@ -1044,16 +1051,12 @@ def history_handler(message: types.Message) -> None:
         if total_closed > 0:
             win_rate = (wins / total_closed) * 100.0
             profit_factor = total_profit / total_loss if total_loss > 0 else (total_profit if total_profit > 0 else 0.0)
-
-            # Компактная статистика
-            text += f"<b>WR:</b> {win_rate:.1f}%"
+            text += f"📊 WR: <b>{win_rate:.1f}%</b>"
             if profit_factor:
-                text += f" | <b>PF:</b> {profit_factor:.2f}"
+                text += f" | PF: <b>{profit_factor:.2f}</b>"
             text += "\n"
-        elif total_closed == 0:
-            text += "<i>Ҳеҷ ордери басташуда дар ин давра нест</i>\n"
 
-        text += f"<i>{datetime.now().strftime('%H:%M:%S')}</i>\n"
+        text += f"\n{_format_time_only()}\n"
 
         bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=_rk_remove())
     except Exception as exc:
@@ -1106,17 +1109,18 @@ _orders_kb_cache = TTLCache(maxsize=256, ttl_sec=120.0)
 
 
 def format_order(order_data: Dict[str, Any]) -> str:
-    direction = "🟢 <b>BUY</b>" if order_data.get("type") == "BUY" else "🔴 <b>SELL</b>"
+    direction_emoji = "🟢" if order_data.get("type") == "BUY" else "🔴"
+    direction_text = "BUY" if order_data.get("type") == "BUY" else "SELL"
+    ticket = order_data.get('ticket', '-')
+    symbol = order_data.get('symbol', '-')
+    volume = float(order_data.get('volume', 0.0) or 0.0)
+    price = float(order_data.get('price', 0.0) or 0.0)
     profit = float(order_data.get("profit", 0.0) or 0.0)
-    profit_sign = "+" if profit >= 0 else ""
+    profit_emoji = "🟢" if profit >= 0 else "🔴"
+    
     return (
-        f"<b>🎫 Ордери Кушода</b>\n\n"
-        f"🔹 Ticket: <code>{order_data.get('ticket', '-')}</code>\n"
-        f"🔹 Символ: <code>{order_data.get('symbol', '-')}</code>\n"
-        f"🔹 Самт: {direction}\n"
-        f"🔹 Ҳаҷм: <code>{float(order_data.get('volume', 0.0) or 0.0):.2f}</code>\n"
-        f"🔹 Нарх: <code>{float(order_data.get('price', 0.0) or 0.0):.5f}</code>\n"
-        f"🔹 P&L: <code>{profit_sign}{profit:.2f}$</code>"
+        f"{direction_emoji} <b>{direction_text}</b> | <b>{symbol}</b> | #{ticket}\n"
+        f"📦 <b>{volume:.2f}</b> | 🏷 <b>{price:.5f}</b> | {profit_emoji} <b>{profit:+.2f}$</b>"
     )
 
 
@@ -1149,12 +1153,12 @@ def start_view_open_orders(message: types.Message) -> None:
         return
 
     # Clean UX: remove reply keyboard before inline navigation
-    _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>\n⌨️ Меню пӯшида шуд (inline-идоракунӣ фаъол).")
+    _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>")
 
     order_data, total = get_order_by_index(0)
 
     if not order_data or int(total or 0) == 0:
-        bot.send_message(message.chat.id, "📭 Ҳоло ордерҳои кушода вуҷуд надоранд.", parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(message.chat.id, "📭 Ордерҳои кушода нестанд.", parse_mode="HTML", reply_markup=_rk_remove())
         return
 
     text = format_order(order_data)
@@ -1226,7 +1230,7 @@ def cb_orders_close(call: types.CallbackQuery, m: re.Match[str]) -> None:
     idx = int(m.group(2))
 
     ok = close_order(ticket)
-    bot.answer_callback_query(call.id, "✅ Ордер баста шуд." if ok else "❌ Хатогӣ ҳангоми бастан.")
+    bot.answer_callback_query(call.id, "✅ Баста шуд" if ok else "❌ Хатогӣ")
 
     order_data, total = get_order_by_index(idx)
     if order_data and int(total or 0) > 0:
@@ -1243,7 +1247,7 @@ def cb_orders_close(call: types.CallbackQuery, m: re.Match[str]) -> None:
         bot.edit_message_text(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            text="📭 Ҳама ордерҳои кушода баста шуданд.",
+            text="📭 Ордерҳои кушода нестанд.",
             parse_mode="HTML",
         )
 
@@ -1253,7 +1257,7 @@ def cb_orders_close_view(call: types.CallbackQuery, m: re.Match[str]) -> None:
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        text="🔒 Намоиши ордерҳои кушода пӯшида шуд.\nБарои дидани дубора: /buttons → «📋 Дидани Ордерҳои Кушода».",
+            text="🔒 Намоиш пӯшида шуд. Барои дидани дубора: /buttons",
         parse_mode="HTML",
     )
     bot.answer_callback_query(call.id, "Намоиш пӯшида шуд.")
@@ -1274,21 +1278,32 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
             date_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
             date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Компактный заголовок
-        period_map = {"Имрӯза": "РӮЗОНА", "Ҳафтаина": "ҲАФТАИНА", "Моҳона": "МОҲОНА", "Пурра (Аз ибтидо)": "ПУРРА"}
-        title = period_map.get(period_name, period_name.upper())
+        period_map = {"Имрӯза": "📊 РӮЗОНА", "Ҳафтаина": "📊 ҲАФТАИНА", "Моҳона": "📊 МОҲОНА", "Пурра (Аз ибтидо)": "📊 ПУРРА"}
+        title = period_map.get(period_name, f"📊 {period_name.upper()}")
+        
         text = f"<b>{title}</b>\n"
 
-        # Даты компактно
         if date_from and date_to:
-            if period_name == "Пурра (Аз ибтидо)":
-                # Показываем диапазон для полного отчета
-                text += f"<code>{date_from}</code> → <code>{date_to}</code>\n"
-                text += f"<i>Давра: 1 сол (365 рӯз)</i>\n\n"
-            else:
-                text += f"<code>{date_from}</code> → <code>{date_to}</code>\n\n"
+            # Форматируем даты красиво
+            try:
+                if period_name == "Пурра (Аз ибтидо)":
+                    # Для полного отчета показываем только даты
+                    df = date_from.split()[0] if ' ' in date_from else date_from
+                    dt = date_to.split()[0] if ' ' in date_to else date_to
+                    text += f"<b>{df}</b> → <b>{dt}</b>\n"
+                else:
+                    # Для других периодов показываем дату и время
+                    df = date_from.split()[0] if ' ' in date_from else date_from
+                    dt_time = date_to.split()[1] if ' ' in date_to else ""
+                    dt_date = date_to.split()[0] if ' ' in date_to else date_to
+                    if dt_time:
+                        text += f"<b>{df}</b> <code>{date_from.split()[1] if ' ' in date_from else ''}</code> → <b>{dt_date}</b> <code>{dt_time}</code>\n"
+                    else:
+                        text += f"<b>{df}</b> → <b>{dt_date}</b>\n"
+            except Exception:
+                text += f"<b>{date_from}</b> → <b>{date_to}</b>\n"
         elif date_str:
-            text += f"<code>{date_str}</code>\n\n"
+            text += f"<b>{date_str}</b>\n"
 
         total_closed = int(report.get("total_closed", 0) or 0)
         total_open = int(report.get("total_open", 0) or 0)
@@ -1299,18 +1314,23 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
         net_pnl = float(report.get("net", 0.0) or 0.0)
         unrealized_pnl = float(report.get("unrealized_pnl", 0.0) or 0.0)
 
-        # Главный результат - компактно
         if total_closed > 0:
-            net_sign = "+" if net_pnl > 0 else ""
-            text += f"<b>P&L: {net_sign}{net_pnl:.2f} USD</b>\n"
+            pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
             win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
-            text += f"WR: {win_rate:.1f}% | {wins}W/{losses}L | {total_closed}T\n"
-            text += f"Profit: {profit:.2f} | Loss: {loss:.2f}\n\n"
+            profit_factor = profit / loss if loss > 0 else (profit if profit > 0 else 0.0)
+            
+            text += (
+                f"\n{pnl_emoji} <b>P&L: {net_pnl:+.2f}$</b>\n"
+                f"📊 {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>"
+            )
+            if profit_factor > 0:
+                text += f" | PF: <b>{profit_factor:.2f}</b>"
+            text += f"\n💹 +{profit:.2f}$ | 📉 -{loss:.2f}$\n"
         else:
-            text += "Ордерҳо: 0\n\n"
+            text += "\n🚫 Ордерҳои басташуда: 0\n"
 
         if total_open > 0:
-            text += f"Кушода: {total_open} | P&L: {unrealized_pnl:+.2f}\n"
+            text += f"🔓 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized_pnl:+.2f}$</b>\n"
 
         return text
     except Exception as exc:
@@ -1345,7 +1365,7 @@ def handle_profit_week(message: types.Message) -> None:
                 text += f" | <b>PF:</b> {profit_factor:.2f}"
             text += "\n"
 
-        text += f"<i>{datetime.now().strftime('%H:%M:%S')}</i>\n"
+        text += f"\n{_format_time_only()}\n"
 
         bot.send_message(message.chat.id, text, parse_mode="HTML")
     except Exception as exc:
@@ -1371,7 +1391,7 @@ def handle_profit_month(message: types.Message) -> None:
                 text += f" | <b>PF:</b> {profit_factor:.2f}"
             text += "\n"
 
-        text += f"<i>{datetime.now().strftime('%H:%M:%S')}</i>\n"
+        text += f"\n{_format_time_only()}\n"
 
         bot.send_message(message.chat.id, text, parse_mode="HTML")
     except Exception as exc:
@@ -1384,32 +1404,28 @@ def handle_open_orders(message: types.Message) -> None:
 
 def handle_close_all(message: types.Message) -> None:
     res = close_all_position()
+    closed = int(res.get('closed', 0) or 0)
+    canceled = int(res.get('canceled', 0) or 0)
+    ok = res.get('ok', False)
+    status_emoji = "✅" if ok else "⚠️"
+    
     lines = [
-        "🧹 <b>Натиҷаи «Ҳамаи ордерҳоро бастан»</b>",
-        f"✅ Муваффақ: <b>{'ҳа' if res.get('ok') else 'не'}</b>",
-        f"🔒 Баста: <b>{int(res.get('closed', 0) or 0)}</b>",
-        f"🗑️ Бекор: <b>{int(res.get('canceled', 0) or 0)}</b>",
+        f"{status_emoji} <b>Баста: {closed}</b>"
     ]
-
+    if canceled > 0:
+        lines.append(f"🗑️ Бекор: <b>{canceled}</b>")
+    
     errs = list(res.get("errors") or [])
     if errs:
-        err_lines = "\n".join(f"• {e}" for e in errs[:15])
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append("⚠️ <b>Хатогиҳо</b>:")
-        lines.append(f"<code>{err_lines}</code>")
-    else:
-        lines.append("⚠️ Хатогиҳо: <b>нест</b>")
-
-    last_err = res.get("last_error")
-    if last_err:
-        lines.append(f"🛠 last_error: <code>{last_err}</code>")
+        preview = " | ".join(e[:25] for e in errs[:2])
+        lines.append(f"⚠️ <code>{preview}</code>")
 
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
 
 
 def handle_positions_summary(message: types.Message) -> None:
     summary = get_positions_summary()
-    bot.send_message(message.chat.id, f"📊 <b>Хулосаи Позицияҳо</b>\n{format_usdt(summary)}", parse_mode="HTML")
+    bot.send_message(message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML")
 
 
 def handle_balance(message: types.Message) -> None:
@@ -1421,7 +1437,7 @@ def handle_trade_start(message: types.Message) -> None:
     try:
         st = engine.status()
         if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
-            bot.send_message(message.chat.id, "ℹ️ Мотор аллакай фаъол аст.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "ℹ️ Система аллакай фаъол аст.", parse_mode="HTML")
             return
 
         if engine.manual_stop_active():
@@ -1431,11 +1447,11 @@ def handle_trade_start(message: types.Message) -> None:
 
         st_after = engine.status()
         if bool(getattr(st_after, "manual_stop", False)):
-            bot.send_message(message.chat.id, "⚠️ Тиҷорат дар реҷаи дастӣ қатъ аст. Аввал аз manual stop бароед.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "⚠️ Manual stop фаъол аст. Аввал онро хомӯш кунед.", parse_mode="HTML")
         elif bool(getattr(st_after, "trading", False)):
-            bot.send_message(message.chat.id, "🚀 <b>Тиҷорат оғоз шуд</b>\n✅ Мотор фаъол аст.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "🚀 <b>Система оғоз шуд</b> | ✅ Фаъол", parse_mode="HTML")
         else:
-            bot.send_message(message.chat.id, "⚠️ Мотор оғоз нашуд. MT5-ро санҷед.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "⚠️ Оғоз нашуд. MT5-ро санҷед.", parse_mode="HTML")
     except Exception as exc:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
 
@@ -1445,11 +1461,11 @@ def handle_trade_stop(message: types.Message) -> None:
         st = engine.status()
         was_active = engine.request_manual_stop()
         if was_active:
-            bot.send_message(message.chat.id, "🛑 <b>Тиҷорат қатъ шуд</b>\n⛔ Manual stop фаъол гардид.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "🛑 <b>Система қатъ шуд</b> | ⛔ Manual stop", parse_mode="HTML")
         elif bool(getattr(st, "manual_stop", False)):
             bot.send_message(message.chat.id, "ℹ️ Manual stop аллакай фаъол аст.", parse_mode="HTML")
         else:
-            bot.send_message(message.chat.id, "ℹ️ Мотор аллакай қатъ буд.", parse_mode="HTML")
+            bot.send_message(message.chat.id, "ℹ️ Система аллакай қатъ аст.", parse_mode="HTML")
     except Exception as exc:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
 

@@ -685,6 +685,13 @@ class RiskManager:
             tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
             digits = int(getattr(info, "digits", 5) or 5)
 
+            if tick_value <= 0.0:
+                # Fallback for BTCUSDm if broker returns 0
+                if tick_size > 0:
+                    tick_value = tick_size
+                else:
+                    return None
+
             if tick_value <= 0.0 or tick_size <= 0.0:
                 return None
 
@@ -1493,6 +1500,7 @@ class RiskManager:
             if (self._soft_stop_until > 0 and time.time() < self._soft_stop_until) or (
                 self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False))
             ):
+                log_risk.info("plan_order blocked: phase_c/soft_stop phase=%s reason=%s", self.current_phase, self._phase_reason_last)
                 return None, None, None, None
 
             ok, reason = self._trade_mode_state()
@@ -1526,13 +1534,16 @@ class RiskManager:
                 sl, tp = self._fallback_atr_sl_tp(side_n, entry_price, adapt)
 
             if not _is_finite(sl, tp) or sl == entry_price or tp == entry_price:
+                log_risk.info("plan_order blocked: invalid_sl_tp sl=%s tp=%s entry=%s", sl, tp, entry_price)
                 return None, None, None, None
 
             sl, tp = self._apply_broker_constraints(side_n, entry_price, float(sl), float(tp))
 
             if side_n == "Buy" and not (sl < entry_price < tp):
+                log_risk.info("plan_order blocked: bad_buy_limits sl=%s entry=%s tp=%s", sl, entry_price, tp)
                 return None, None, None, None
             if side_n == "Sell" and not (tp < entry_price < sl):
+                log_risk.info("plan_order blocked: bad_sell_limits tp=%s entry=%s sl=%s", tp, entry_price, sl)
                 return None, None, None, None
 
             use_usd_tp = False
@@ -1579,8 +1590,24 @@ class RiskManager:
                                 tp = self._normalize_price(entry_price - min_tp)
                         sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
-                lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
+                # Check if fixed_volume should be used (from config or adapt)
+                use_dynamic_sizing = bool(adapt.get("use_dynamic_sizing", True))
+                fixed_vol = float(getattr(self.cfg, "fixed_volume", 0.0) or 0.0)
+                
+                if not use_dynamic_sizing and fixed_vol > 0:
+                    # Use fixed volume directly when dynamic sizing is disabled
+                    lot = self._normalize_volume_floor(fixed_vol)
+                else:
+                    # Try dynamic sizing first
+                    lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
+                    
+                    # Fallback to fixed_volume if dynamic sizing fails or returns 0
+                    if (lot <= 0 or not _is_finite(lot)) and fixed_vol > 0:
+                        log_risk.info("plan_order: dynamic sizing failed (lot=%s), using fixed_volume=%s", lot, fixed_vol)
+                        lot = self._normalize_volume_floor(fixed_vol)
+                
                 if lot <= 0 or not _is_finite(lot):
+                    log_risk.info("plan_order blocked: zero_lot lot=%s conf=%.2f fixed_vol=%s", lot, confidence, fixed_vol)
                     return None, None, None, None
 
             if (

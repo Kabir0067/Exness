@@ -53,11 +53,11 @@ _TICK_CACHE_TTL_SEC = 0.20
 # =============================================================================
 # Logging (ERROR-only, rotating)
 # =============================================================================
-_ORDERS_LOG_PATH = get_log_path("orders.log")
+_ORDERS_LOG_PATH = get_log_path("functions.log")
 
 
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
-    logger.setLevel(level)
+    logger.setLevel(level)  
     logger.propagate = False
 
     for h in list(logger.handlers):
@@ -470,6 +470,23 @@ def get_all_open_positions() -> List[Any]:
     except Exception as exc:
         log_orders.error("get_all_open_positions error: %s | last_error=%s", exc, _safe_last_error())
         return []
+
+
+def has_open_positions() -> bool:
+    """
+    Санҷад дар аккаунт ягон ордер кушода аст ё не.
+    
+    Returns:
+        bool: True агар ягон ордер кушода бошад, False агар не.
+    """
+    try:
+        _ensure_mt5_connected()
+        with MT5_LOCK:
+            positions = mt5.positions_get() or []
+        return len(positions) > 0
+    except Exception as exc:
+        log_orders.error("has_open_positions error: %s | last_error=%s", exc, _safe_last_error())
+        return False
 
 
 # =============================================================================
@@ -1417,6 +1434,7 @@ __all__ = [
     "get_positions_summary",
     "get_order_by_index",
     "get_all_open_positions",
+    "has_open_positions",
     "close_order",
     "close_all_position",
     "set_takeprofit_all_positions_usd",

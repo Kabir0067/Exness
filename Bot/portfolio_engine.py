@@ -29,7 +29,7 @@ from ExnessAPI.order_execution import (
     OrderResult as ExecOrderResult,
     log_health as exec_health_log,
 )
-from ExnessAPI.functions import close_all_position
+from ExnessAPI.functions import close_all_position, has_open_positions
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 # -------------------- XAU stack --------------------
@@ -37,18 +37,18 @@ from config_xau import EngineConfig as XauConfig
 from config_xau import apply_high_accuracy_mode as xau_apply_high_accuracy_mode
 from config_xau import get_config_from_env as get_xau_config
 from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
-from StrategiesXau.indicators import Classic_FeatureEngine as XauFeatureEngine
-from StrategiesXau.risk_management import RiskManager as XauRiskManager
-from StrategiesXau.signal_engine import SignalEngine as XauSignalEngine
+from StrategiesXau.xau_indicators import Classic_FeatureEngine as XauFeatureEngine
+from StrategiesXau.xau_risk_management import RiskManager as XauRiskManager
+from StrategiesXau.xau_signal_engine import SignalEngine as XauSignalEngine
 
 # -------------------- BTC stack --------------------
 from config_btc import EngineConfig as BtcConfig
 from config_btc import apply_high_accuracy_mode as btc_apply_high_accuracy_mode
 from config_btc import get_config_from_env as get_btc_config
 from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
-from StrategiesBtc.indicators import Classic_FeatureEngine as BtcFeatureEngine
-from StrategiesBtc.risk_management import RiskManager as BtcRiskManager
-from StrategiesBtc.signal_engine import SignalEngine as BtcSignalEngine
+from StrategiesBtc.btc_indicators import Classic_FeatureEngine as BtcFeatureEngine
+from StrategiesBtc.btc_risk_management import RiskManager as BtcRiskManager
+from StrategiesBtc.btc_signal_engine import SignalEngine as BtcSignalEngine
 
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
@@ -554,6 +554,7 @@ class _AssetPipeline:
 
     def compute_candidate(self) -> Optional[AssetCandidate]:
         try:
+            # execute=True now SAFE (no side effects) -> calculates lot/sl/tp
             res = self.signal.compute(execute=True)
 
             signal = str(getattr(res, "signal", "Neutral") or "Neutral")
@@ -1260,11 +1261,18 @@ class MultiAssetTradingEngine:
         self._mark_seen(cand.asset, cand.signal_id, now)
         self._last_selected_asset = cand.asset
 
-        if risk and hasattr(risk, "track_signal_survival"):
-            try:
-                risk.track_signal_survival(order_id, cand.signal, price, cand.sl, cand.tp, now, cand.confidence)
-            except Exception:
-                pass
+        if risk:
+            # REGISTER SIGNAL HERE (once per accepted unique signal)
+            if hasattr(risk, "register_signal_emitted"):
+                try:
+                    risk.register_signal_emitted()
+                except Exception:
+                    pass
+            if hasattr(risk, "track_signal_survival"):
+                try:
+                    risk.track_signal_survival(order_id, cand.signal, price, cand.sl, cand.tp, now, cand.confidence)
+                except Exception:
+                    pass
 
         return True, order_id
 
@@ -1968,6 +1976,17 @@ class MultiAssetTradingEngine:
                 self._active_asset = self._select_active_asset(open_xau, open_btc)
 
                 self._heartbeat(open_xau, open_btc)
+
+                # ------------------- SAFETY: PAUSE ON ACTIVE POSITIONS -------------------
+                # "Serial Trade" Logic: If ANY position is open, do not analyze new signals.
+                # This prevents over-trading and enforces strict risk management.
+                if has_open_positions():
+                    if (now_ts - self._last_pipeline_log_ts) > 60.0:  # Log specific pause reason occasionally
+                        log_health.info("ANALYSIS_PAUSED | reason=open_positions_detected (serial_mode_active)")
+                    # Skip signal generation (candidates)
+                    time.sleep(1.0) # Yield CPU
+                    continue
+                # -------------------------------------------------------------------------
 
                 # Compute candidates
                 cand_x = self._xau.compute_candidate() if x_ok else None

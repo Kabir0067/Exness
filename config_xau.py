@@ -239,9 +239,10 @@ class EngineConfig:
     vol_lookback: int = 80
     rn_step: float = 20.0
 
-    poll_seconds_fast: float = 0.05
-    decision_debounce_ms: float = 20.0
-    analysis_cooldown_sec: float = 0.0
+    poll_seconds_fast: float = 0.25
+    poll_seconds_slow: float = 0.90
+    decision_debounce_ms: float = 350.0
+    analysis_cooldown_sec: float = 0.80
     cooldown_seconds: float = 0.0
     overnight_block_hours: float = 3.0
     signal_cooldown_sec_override: Optional[float] = None
@@ -350,6 +351,14 @@ class EngineConfig:
     rtt_cb_ms: int = 400  # Ислоҳ: Аз 450 ба 400
     spread_cb_pct: float = 0.0008  # Ислоҳ: Аз 0.0010 ба 0.0008 барои спред беҳтар
     slippage_backoff: float = 0.4  # Ислоҳ: Аз 0.5 ба 0.4
+
+    # Execution quality
+    exec_window: int = 300
+    exec_max_p95_latency_ms: float = 550.0
+    exec_max_p95_slippage_points: float = 20.0
+    exec_max_spread_points: float = 500.0  # limit 500 points (0.50 USD)
+    exec_max_ewma_slippage_points: float = 15.0
+    exec_breaker_sec: float = 120.0
 
     # Policy toggles
     ignore_sessions: bool = True

@@ -40,7 +40,7 @@ log_risk.propagate = False
 
 if not any(isinstance(h, RotatingFileHandler) for h in log_risk.handlers):
     fh = RotatingFileHandler(
-        filename=str(get_log_path("risk_manager.log")),
+        filename=str(get_log_path("risk_manager_xau.log")),
         maxBytes=5 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -858,8 +858,21 @@ class RiskManager:
         return float(eq)
 
     # ------------------- state evaluation (Phase A/B/C) -------------------
+    def _roll_daily_anchor(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if getattr(self, "_day_anchor", None) != today:
+            self._day_anchor = today
+            self.daily_start_balance = 0.0
+            self._target_breached = False
+            self._target_breached_return = 0.0
+            self._soft_stop_until = 0.0
+            self._soft_stop_reason = None
+            self.daily_peak_equity = 0.0
+
     def evaluate_account_state(self) -> None:
         try:
+            self._roll_daily_anchor()
+
             if self._utc_date() != self.daily_date:
                 self._reset_daily_state()
 
@@ -1648,7 +1661,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "execution_quality.csv"
+                csv_file = LOG_DIR / "execution_quality_xau.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
@@ -1656,7 +1669,7 @@ class RiskManager:
                         writer.writeheader()
                     writer.writerow(metrics)
 
-                jsonl_file = LOG_DIR / "execution_metrics.jsonl"
+                jsonl_file = LOG_DIR / "execution_metrics_xau.jsonl"
                 with open(jsonl_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
@@ -1700,7 +1713,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "execution_failures.csv"
+                csv_file = LOG_DIR / "execution_failures_xau.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
@@ -1759,7 +1772,7 @@ class RiskManager:
 
             with _FILE_LOCK:
                 # slippage histogram
-                slippage_file = LOG_DIR / "slippage_histogram.csv"
+                slippage_file = LOG_DIR / "slippage_histogram_xau.csv"
                 bins = self._slip_bins()
                 if self._hist_slip_counts is None:
                     self._hist_slip_counts = self._load_histogram_counts(slippage_file, bins)
@@ -1772,7 +1785,7 @@ class RiskManager:
                 self._write_histogram_counts_atomic(slippage_file, self._hist_slip_counts)
 
                 # fill delay histogram
-                delay_file = LOG_DIR / "fill_delay_histogram.csv"
+                delay_file = LOG_DIR / "fill_delay_histogram_xau.csv"
                 dbins = self._delay_bins()
                 if self._hist_delay_counts is None:
                     self._hist_delay_counts = self._load_histogram_counts(delay_file, dbins)
@@ -1789,7 +1802,7 @@ class RiskManager:
 
     def _update_rejection_analysis(self, reason: str) -> None:
         try:
-            reject_file = LOG_DIR / "reject_rate_analysis.csv"
+            reject_file = LOG_DIR / "reject_rate_analysis_xau.csv"
             with _FILE_LOCK:
                 if self._reject_counts is None:
                     self._reject_counts = {}
@@ -1833,10 +1846,10 @@ class RiskManager:
 
     # ------------------- signal survival -------------------
     def _survival_paths(self) -> Tuple[Path, Path, Path]:
-        final_csv = Path(getattr(self.cfg, "signal_survival_log_file", str(LOG_DIR / "signal_survival_final.csv")))
-        active_json = Path(getattr(self.cfg, "signal_survival_active_file", str(LOG_DIR / "signal_survival_active.json")))
+        final_csv = Path(getattr(self.cfg, "signal_survival_log_file", str(LOG_DIR / "signal_survival_final_xau.csv")))
+        active_json = Path(getattr(self.cfg, "signal_survival_active_file", str(LOG_DIR / "signal_survival_active_xau.json")))
         updates_jsonl = Path(
-            getattr(self.cfg, "signal_survival_updates_jsonl_file", str(LOG_DIR / "signal_survival_updates.jsonl"))
+            getattr(self.cfg, "signal_survival_updates_jsonl_file", str(LOG_DIR / "signal_survival_updates_xau.jsonl"))
         )
         return final_csv, active_json, updates_jsonl
 
@@ -2154,7 +2167,7 @@ class RiskManager:
             }
 
             with _FILE_LOCK:
-                csv_file = LOG_DIR / "slippage_model.csv"
+                csv_file = LOG_DIR / "slippage_model_xau.csv"
                 write_header = not csv_file.exists()
                 with open(csv_file, "a", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=list(data.keys()))
@@ -2169,7 +2182,7 @@ class RiskManager:
 
     # ------------------- state persistence -------------------
     def _state_path(self) -> Path:
-        return Path(getattr(self.cfg, "risk_state_file", str(LOG_DIR / "risk_state.json")))
+        return Path(getattr(self.cfg, "risk_state_file", str(LOG_DIR / "risk_state_xau.json")))
 
     def save_state(self) -> None:
         p = self._state_path()

@@ -20,8 +20,8 @@ except Exception:  # pragma: no cover
 from config_btc import EngineConfig, SymbolParams
 from DataFeed.btc_market_feed import MarketFeed, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
-from StrategiesBtc.indicators import Classic_FeatureEngine, safe_last
-from StrategiesBtc.risk_management import RiskManager
+from StrategiesBtc.btc_indicators import Classic_FeatureEngine, safe_last
+from StrategiesBtc.btc_risk_management import RiskManager
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
 # ============================================================
@@ -700,6 +700,14 @@ class SignalEngine:
         else:
             conf_min = min(96, base_conf_min + 15)
 
+        # Check if fixed_volume is set - if so, prefer fixed volume over dynamic sizing
+        fixed_vol = float(getattr(self.cfg, "fixed_volume", 0.0) or 0.0)
+        use_dynamic = True  # Default to dynamic sizing
+        if fixed_vol > 0:
+            # If fixed_volume is set, we'll use it as fallback, but still try dynamic first
+            # This allows dynamic sizing to work when it can, but falls back to fixed_volume
+            use_dynamic = True  # Still try dynamic, but will fallback to fixed_vol if it fails
+        
         return {
             "conf_min": int(conf_min),
             "sl_mult": float(getattr(self.cfg, "sl_atr_mult_trend", 1.35) or 1.35),
@@ -708,6 +716,8 @@ class SignalEngine:
             "w_mul": {"trend": 1.0, "momentum": 1.0, "meanrev": 1.0, "structure": 1.0, "volume": 1.0},
             "regime": "trend",
             "phase": phase,
+            "use_dynamic_sizing": bool(use_dynamic),
+            "fixed_volume": float(fixed_vol),
         }
 
     # --------------------------- confluence helpers
@@ -799,21 +809,16 @@ class SignalEngine:
             return np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
 
     def _conf_from_strength(self, net_abs: float, spread_pct: float, tick_stats: TickStats) -> float:
-        """
-        Deterministic probability-like confidence (0..96).
-        FIXED: based on |net_norm| (strength), not signed net_norm.
-        Includes small penalties for bad spread/ticks.
-        """
         conf_bias = float(getattr(self.cfg, "confidence_bias", 52.0) or 52.0)
 
-        # Ensure gain is strong enough for BTC scalping (otherwise Buy never reaches conf_min)
-        # BUT: Reduce gain to allow more dynamic confidence variation (not always 96)
-        gain_cfg = float(getattr(self.cfg, "confidence_gain", 220.0) or 220.0)
-        conf_gain = max(150.0, min(200.0, gain_cfg))  # Reduced from 180-220 to 150-200 for more variation
+        # AFTER (FIX): respect config; only safety clamp
+        gain_cfg = float(getattr(self.cfg, "confidence_gain", 70.0) or 70.0)
+        conf_gain = float(_clamp(gain_cfg, 30.0, 140.0))
 
+        net_abs = float(_clamp(net_abs, 0.0, 1.0))
         base = conf_bias + (net_abs * conf_gain)
 
-        # spread penalty (soft; hard blocks happen in RiskManager.guard_decision)
+        # spread penalty (same as before)
         try:
             sp_lim = float(getattr(self.sp, "spread_limit_pct", 0.0) or 0.0)
             if sp_lim > 0.0 and spread_pct > 0.0:
@@ -823,7 +828,7 @@ class SignalEngine:
         except Exception:
             pass
 
-        # tick penalty
+        # tick penalty (same as before)
         try:
             ok = bool(getattr(tick_stats, "ok", True))
             if not ok:
@@ -831,7 +836,7 @@ class SignalEngine:
         except Exception:
             pass
 
-        return float(base)
+        return float(_clamp(base, 0.0, 96.0))
 
     def _cap_conf_by_strength(self, conf: int, net_abs: float) -> int:
         """
@@ -1188,7 +1193,8 @@ class SignalEngine:
                         trade_blocked=True,
                     )
 
-                self.risk.register_signal_emitted()
+                # SIDE-EFFECT REMOVED: Moved to PortfolioEngine._enqueue_order
+                # self.risk.register_signal_emitted()
 
             return SignalResult(
                 symbol=sym,

@@ -20,8 +20,8 @@ from config_xau import EngineConfig, SymbolParams
 from DataFeed.xau_market_feed import MarketFeed, TickStats
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 from mt5_client import MT5_LOCK
-from StrategiesXau.indicators import Classic_FeatureEngine, safe_last
-from StrategiesXau.risk_management import RiskManager
+from StrategiesXau.xau_indicators import Classic_FeatureEngine, safe_last
+from StrategiesXau.xau_risk_management import RiskManager
 
 # ============================================================
 # ERROR-only logging (isolated file, no collision)
@@ -33,7 +33,7 @@ log.setLevel(logging.ERROR)
 log.propagate = False
 
 if not log.handlers:
-    fh = logging.FileHandler(str(get_log_path("signal_engine.log")), encoding="utf-8", delay=True)
+    fh = logging.FileHandler(str(get_log_path("signal_engine_xau.log")), encoding="utf-8", delay=True)
     fh.setLevel(logging.ERROR)
     fh.setFormatter(
         logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s")
