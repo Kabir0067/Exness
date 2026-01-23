@@ -26,7 +26,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 LOG_DIR = LOG_ROOT
 
-logger = logging.getLogger("feature_engine_btc")
+logger = logging.getLogger("indicators_btc")
 logger.setLevel(logging.ERROR)
 logger.propagate = False
 
@@ -607,6 +607,7 @@ class Classic_FeatureEngine:
 
             near_rn = self._near_round_number(price=close_last, atr=atr_last)
 
+            # Ислоҳ: Аз _detect_divergence ба _detect_divergence_swings гузаштам барои дақиқӣ беҳтар дар BTC
             rsi_div = self._detect_divergence_swings(ind=rsi, price=c)
             macd_div = self._detect_divergence_swings(ind=macd_hist, price=c)
 

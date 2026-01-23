@@ -144,7 +144,7 @@ class SymbolParams:
     micro_tstat_thresh: float = 0.50
 
     pullback_atr_mult: float = 0.28
-    spread_limit_pct: float = 0.00025
+    spread_limit_pct: float = 0.00025  # Ислоҳ: Кам карда шуд барои филтри спреди тангтар дар тилло (зиёнҳо кам мешаванд)
 
     def validate(self) -> None:
         sym = self.resolved or self.base
@@ -196,10 +196,14 @@ class EngineConfig:
     mt5_autostart: bool = True
     mt5_timeout_ms: int = 30_000
 
-    daily_target_pct: float = 0.20  # Phase B starts at 20% profit (was 10%)
+    # ---------------------------------------------------------------------------
+    daily_target_pct: float = 0.10  # Phase B starts at 20% profit (was 10%)
+    # ---------------------------------------------------------------------------
+
+
     ultra_confidence_min: float = 0.90
-    protect_drawdown_from_peak_pct: float = 0.30
-    max_daily_loss_pct: float = 0.10
+    protect_drawdown_from_peak_pct: float = 0.20  # Ислоҳ: Аз 0.30 ба 0.20 кам карда шуд барои ҳимояи зудтар аз зиёнҳо
+    max_daily_loss_pct: float = 0.05  # Ислоҳ: Аз 0.10 ба 0.05 кам карда шуд барои лимити зиёнҳои рӯзона (фоидаоварӣ беҳтар мешавад)
     daily_loss_b_pct: float = 0.02
     daily_loss_c_pct: float = 0.05
     enforce_daily_limits: bool = True
@@ -208,14 +212,14 @@ class EngineConfig:
     ignore_external_positions: bool = True
     magic: int = 777001
 
-    min_confidence_signal: float = 0.80  # Allow signals from 80% (80-85%: 1 order, 85-90%: 2 orders, 90-100%: 3 orders)
-    conf_min: int = 80  # Allow from 80% (adjusted for new multi-order logic)
-    conf_min_low: int = 80  # Low threshold
-    conf_min_high: int = 90  # High threshold
+    min_confidence_signal: float = 0.85  # Ислоҳ: Аз 0.80 ба 0.85 баланд карда шуд барои сигналҳои дақиқтар (сигналҳои иштибоҳ кам мешаванд)
+    conf_min: int = 85  # Ислоҳ: Аз 80 ба 85
+    conf_min_low: int = 85  # Ислоҳ: Аз 80 ба 85
+    conf_min_high: int = 90
     confidence_bias: float = 50.0
     confidence_gain: float = 70.0
-    net_norm_signal_threshold: float = 0.10  # STRICT: require stronger net_norm
-    strong_conf_min: int = 90  # Higher strong signal threshold
+    net_norm_signal_threshold: float = 0.15  # Ислоҳ: Аз 0.10 ба 0.15 баланд карда шуд барои сигналҳои қавитар
+    strong_conf_min: int = 90
     require_ema_stack: bool = True
 
     adx_trend_lo: float = 16.0
@@ -253,12 +257,16 @@ class EngineConfig:
 
     fixed_volume: Optional[float] = None
     max_risk_per_trade: float = 0.02
+
+    # ---------------------------------------------------------------------------   
     max_positions: int = 3
+    # ---------------------------------------------------------------------------
+
 
     # --- Multi-order tuning (SAFE scalping) ---
-    multi_order_tp_bonus_pct: float = 0.12
+    multi_order_tp_bonus_pct: float = 0.15  # Ислоҳ: Аз 0.12 ба 0.15 баланд карда шуд барои фоидаи зиёдтар дар мулти-ордерҳо
     multi_order_sl_tighten_pct: float = 0.00
-    multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)  # 80-85%: 1 order, 85-90%: 2 orders, 90-100%: 3 orders
+    multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)  # Ислоҳ: Аз (0.85, 0.90, 0.90) ба ҳамин, аммо бо min_confidence мувофиқ
     multi_order_max_orders: int = 3
     max_spread_bps_for_multi: float = 6.0
 
@@ -269,11 +277,11 @@ class EngineConfig:
     max_trades_per_hour: int = 20
     max_signals_per_day: int = 0
 
-    sl_atr_mult_trend: float = 1.25
-    tp_atr_mult_trend: float = 2.5
-    sl_atr_mult_range: float = 1.45
-    tp_atr_mult_range: float = 1.8
-    tp_rr_cap: float = 1.8
+    sl_atr_mult_trend: float = 1.15  # Ислоҳ: Аз 1.25 ба 1.15 кам карда шуд барои SL тангтар дар тренд (зиёнҳо кам)
+    tp_atr_mult_trend: float = 2.7  # Ислоҳ: Аз 2.5 ба 2.7 баланд карда шуд барои TP калонтар (фоида зиёд)
+    sl_atr_mult_range: float = 1.35  # Ислоҳ: Аз 1.45 ба 1.35
+    tp_atr_mult_range: float = 2.0  # Ислоҳ: Аз 1.8 ба 2.0
+    tp_rr_cap: float = 2.0  # Ислоҳ: Аз 1.8 ба 2.0 барои RR беҳтар
     min_rr: float = 1.05
     sltp_cost_spread_mult: float = 1.8
     sltp_cost_slip_mult: float = 1.0
@@ -286,11 +294,11 @@ class EngineConfig:
 
     signal_amplification: float = 1.25
     weights: Dict[str, float] = field(default_factory=lambda: {
-        "trend": 0.55,
-        "momentum": 0.27,
+        "trend": 0.50,  # Ислоҳ: Аз 0.55 ба 0.50 кам карда шуд (барои баланси беҳтар дар тилло)
+        "momentum": 0.25,  # Аз 0.27 ба 0.25
         "meanrev": 0.10,
-        "structure": 0.05,
-        "volume": 0.03,
+        "structure": 0.10,  # Аз 0.05 ба 0.10 баланд карда шуд (тилло ба структура вобаста аст)
+        "volume": 0.05,  # Аз 0.03 ба 0.05
     })
 
     adaptive_enabled: bool = True
@@ -327,21 +335,21 @@ class EngineConfig:
     atr_percentile_lookback: int = 1000
     tod_boost_minutes: int = 120
     slippage_window: int = 40
-    slippage_limit_ticks: float = 15.0
-    latency_rtt_ms_limit: int = 300
+    slippage_limit_ticks: float = 12.0  # Ислоҳ: Аз 15.0 ба 12.0 кам карда шуд барои лимити slippage тангтар
+    latency_rtt_ms_limit: int = 250  # Ислоҳ: Аз 300 ба 250 барои latency беҳтар
     cooldown_after_latency_s: int = 300
 
     ultimate_mode: bool = True
     ensemble_w: Tuple[float, float, float] = (0.55, 0.33, 0.12)
-    meta_barrier_R: float = 0.55  # Reduced from 0.65 to allow more signals (was too strict)
+    meta_barrier_R: float = 0.50  # Ислоҳ: Аз 0.55 ба 0.50 кам карда шуд барои сигналҳои зиёдтар (аммо дақиқ)
     meta_h_bars: int = 6
     conformal_window: int = 300
-    conformal_q: float = 0.88
+    conformal_q: float = 0.90  # Ислоҳ: Аз 0.88 ба 0.90 барои conformal беҳтар
     brier_window: int = 800
-    tc_bps: float = 1.2  # Reduced from 1.5 to allow more signals (was too strict)
-    rtt_cb_ms: int = 450
-    spread_cb_pct: float = 0.0010
-    slippage_backoff: float = 0.5
+    tc_bps: float = 1.0  # Ислоҳ: Аз 1.2 ба 1.0 кам карда шуд
+    rtt_cb_ms: int = 400  # Ислоҳ: Аз 450 ба 400
+    spread_cb_pct: float = 0.0008  # Ислоҳ: Аз 0.0010 ба 0.0008 барои спред беҳтар
+    slippage_backoff: float = 0.4  # Ислоҳ: Аз 0.5 ба 0.4
 
     # Policy toggles
     ignore_sessions: bool = True
@@ -405,10 +413,10 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
     # Keep your original behavior; only clean assignments.
-    cfg.min_confidence_signal = 0.78
+    cfg.min_confidence_signal = 0.85  # Ислоҳ: Аз 0.78 ба 0.85 (дар high_accuracy ҳам)
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.02
-    cfg.tp_atr_mult_trend = 2.5
+    cfg.tp_atr_mult_trend = 2.7  # Ислоҳ: Аз 2.5 ба 2.7
     cfg.use_squeeze_filter = False
     cfg.hedge_flip_enabled = False
     cfg.pyramid_enabled = False

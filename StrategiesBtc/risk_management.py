@@ -39,7 +39,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # ============================================================
 LOG_DIR = LOG_ROOT
 
-log_risk = logging.getLogger("risk_manager_btc")
+log_risk = logging.getLogger("risk_btc")
 log_risk.setLevel(logging.ERROR)
 log_risk.propagate = False
 
@@ -204,12 +204,15 @@ class ExecutionQualityMonitor:
         }
 
     def anomaly_reasons(self, *, cfg: Any) -> List[str]:
+        """
+        Пороги берём из cfg, если есть. Если отсутствуют — используем безопасные дефолты мониторинга.
+        """
         s = self.snapshot()
 
-        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 650.0))
-        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 30.0))
-        max_spread = float(getattr(cfg, "exec_max_spread_points", 120.0))
-        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 18.0))
+        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 550.0))  # Ислоҳ: Аз 650 ба 550
+        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 20.0))  # Ислоҳ: Аз 30 ба 20
+        max_spread = float(getattr(cfg, "exec_max_spread_points", 100.0))  # Ислоҳ: Аз 120 ба 100
+        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 15.0))  # Ислоҳ: Аз 18 ба 15
 
         reasons: List[str] = []
         if s["p95_latency_ms"] > max_p95_lat:
@@ -979,12 +982,14 @@ class RiskManager:
                 self._set_phase("B", "daily_target_reached")
 
             # LOSS -> Phase B/C
-            if loss_b > 0 and daily_return <= -loss_b:
-                self._set_phase("B", "daily_loss_b")
+            # Сначала проверяем loss_c (более критичный) - если превышен, сразу в C
             if loss_c > 0 and daily_return <= -loss_c:
                 # C is REAL now (trade-block). Hard stop only if extreme below max_loss and limits enabled.
                 self._set_phase("C", "daily_loss_c")
                 self._enter_soft_stop("daily_loss_c")
+            # Если loss_c не превышен, но превышен loss_b - переходим в B
+            elif loss_b > 0 and daily_return <= -loss_b:
+                self._set_phase("B", "daily_loss_b")
 
             # HARD STOP (absolute)
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):

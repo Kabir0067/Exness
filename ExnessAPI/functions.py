@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""ExnessAPI/orders.py (PRODUCTION-GRADE)
+"""ExnessAPI/functions.py (PRODUCTION-GRADE)
 
 Ин модул танҳо як кор мекунад: идоракунии позицияҳо дар MT5.
 
@@ -9,7 +9,9 @@ from __future__ import annotations
 - health-cache + symbol-info/tick micro-cache (камфишор ба терминал)
 - group-by-symbol дар close_all_position (тик 1x барои ҳар symbol)
 - numpy хориҷ (сабуктар/тезтар)
-- retry backoff хурд ва муайян (бе спам)
+- retry backoff хурд ва муайян (бе спам), fail-fast барои retcode-ҳои доимӣ
+- retry бо refresh-и price барои close (requote/price_changed/off_quotes)
+- SL/TP stop-distance enforcement барои SL ва TP
 """
 
 import logging
@@ -79,7 +81,7 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
     logger.addHandler(h)
 
 
-log_orders = logging.getLogger("orders")
+log_orders = logging.getLogger("functions")
 _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 
 # =============================================================================
@@ -90,11 +92,10 @@ def _mono() -> float:
 
 
 def _sleep_backoff(attempt: int, base: float, cap: float) -> None:
-    # deterministic exponential backoff
+    # deterministic exponential backoff: base * 2^attempt (attempt starts at 0)
     a = int(attempt)
-    delay = base * (2.0 ** a)
-    delay = min(cap, delay)
-    time.sleep(delay)
+    delay = float(base) * (2.0 ** a)
+    time.sleep(min(float(cap), delay))
 
 
 # =============================================================================
@@ -228,6 +229,20 @@ def _tick_cached(symbol: str) -> Any:
     return tick
 
 
+def _tick_refresh(symbol: str) -> Any:
+    # Force refresh (still updates cache). Use on retry for requote/price changes.
+    now = _mono()
+    with MT5_LOCK:
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+        except Exception:
+            tick = None
+    e = _get_sym_entry(symbol)
+    e.tick = tick
+    e.tick_ts = now
+    return tick
+
+
 def _best_filling_type(symbol: str) -> int:
     """
     Барои устуворӣ: IOC/FOK/RETURN интихоб мекунад.
@@ -237,15 +252,12 @@ def _best_filling_type(symbol: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_IOC
 
-    # 1) filling_mode (агар вуҷуд дошта бошад)
     fm = getattr(info, "filling_mode", None)
     if isinstance(fm, int) and fm in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
         return int(fm)
 
-    # 2) trade_fill_flags (агар bitmask бошад)
     flags = getattr(info, "trade_fill_flags", None)
     if isinstance(flags, int) and flags > 0:
-        # афзалият: IOC -> FOK -> RETURN
         if flags & mt5.ORDER_FILLING_IOC:
             return mt5.ORDER_FILLING_IOC
         if flags & mt5.ORDER_FILLING_FOK:
@@ -254,6 +266,39 @@ def _best_filling_type(symbol: str) -> int:
             return mt5.ORDER_FILLING_RETURN
 
     return mt5.ORDER_FILLING_IOC
+
+
+def _digits_point_stops(symbol: str) -> Tuple[int, float, int]:
+    info = _symbol_info_cached(symbol)
+    if not info:
+        return 5, 0.0, 0
+    digits = int(getattr(info, "digits", 5) or 5)
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    stops = int(getattr(info, "trade_stops_level", 0) or 0)
+    return digits, point, stops
+
+
+# =============================================================================
+# Retcode sets (fail-fast & safe retries)
+# =============================================================================
+def _mt5_const(name: str, default: int = -1) -> int:
+    v = getattr(mt5, name, None)
+    return int(v) if isinstance(v, int) else int(default)
+
+
+_TRANSIENT_RETCODES: Tuple[int, ...] = tuple(
+    r for r in (
+        _mt5_const("TRADE_RETCODE_REQUOTE"),
+        _mt5_const("TRADE_RETCODE_TIMEOUT"),
+        _mt5_const("TRADE_RETCODE_OFF_QUOTES"),
+        _mt5_const("TRADE_RETCODE_PRICE_CHANGED"),
+        _mt5_const("TRADE_RETCODE_PRICE_OFF"),
+        _mt5_const("TRADE_RETCODE_CONNECTION"),
+        _mt5_const("TRADE_RETCODE_NO_CONNECTION"),
+        _mt5_const("TRADE_RETCODE_SERVER_DISABLES_AT"),
+    )
+    if r >= 0
+)
 
 
 # =============================================================================
@@ -266,20 +311,33 @@ def _send_with_retries(
     success_retcodes: Tuple[int, ...],
     sleep_base: float,
     sleep_cap: float,
+    retry_retcodes: Tuple[int, ...] = _TRANSIENT_RETCODES,
+    refresh_before_send: Optional["callable[[Dict[str, Any], int], None]"] = None,
 ) -> Tuple[bool, Optional[Any], Optional[int]]:
     r = max(1, int(retries))
     last_res = None
     last_ret: Optional[int] = None
 
     for attempt in range(r):
+        if refresh_before_send is not None:
+            try:
+                refresh_before_send(req, attempt)
+            except Exception:
+                # refresh must never break execution
+                pass
+
         with MT5_LOCK:
             last_res = mt5.order_send(req)
+
         last_ret = int(getattr(last_res, "retcode", -1)) if last_res else None
 
         if last_res and (last_ret in success_retcodes):
             return True, last_res, last_ret
 
+        # fail-fast for non-transient errors (reduces spam, speeds up)
         if attempt < r - 1:
+            if last_ret is not None and last_ret not in retry_retcodes:
+                break
             _sleep_backoff(attempt, base=float(sleep_base), cap=float(sleep_cap))
 
     return False, last_res, last_ret
@@ -308,6 +366,36 @@ def get_balance() -> float:
     except Exception as exc:
         log_orders.error("get_balance error: %s | last_error=%s", exc, _safe_last_error())
         return 0.0
+
+
+def get_account_info() -> Dict[str, Any]:
+    """
+    Получить полную информацию об аккаунте.
+    """
+    try:
+        _ensure_mt5_connected()
+        with MT5_LOCK:
+            acc = mt5.account_info()
+
+        if acc is None:
+            log_orders.error("get_account_info failed | last_error=%s", _safe_last_error())
+            return {}
+
+        return {
+            "login": int(getattr(acc, "login", 0) or 0),
+            "server": str(getattr(acc, "server", "") or ""),
+            "balance": float(getattr(acc, "balance", 0.0) or 0.0),
+            "equity": float(getattr(acc, "equity", 0.0) or 0.0),
+            "margin": float(getattr(acc, "margin", 0.0) or 0.0),
+            "free_margin": float(getattr(acc, "margin_free", 0.0) or 0.0),
+            "margin_level": float(getattr(acc, "margin_level", 0.0) or 0.0),
+            "profit": float(getattr(acc, "profit", 0.0) or 0.0),
+            "currency": str(getattr(acc, "currency", "USD") or "USD"),
+            "company": str(getattr(acc, "company", "") or ""),
+        }
+    except Exception as exc:
+        log_orders.error("get_account_info error: %s | last_error=%s", exc, _safe_last_error())
+        return {}
 
 
 def get_positions_summary(symbol: Optional[str] = None) -> float:
@@ -397,9 +485,10 @@ def close_order(
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
+        # direct lookup (faster, less memory)
         with MT5_LOCK:
-            positions = mt5.positions_get() or []
-        pos = next((p for p in positions if int(getattr(p, "ticket", -1)) == int(ticket)), None)
+            pos_list = mt5.positions_get(ticket=int(ticket)) or []
+        pos = pos_list[0] if pos_list else None
 
         if not pos:
             log_orders.error("close_order: position not found ticket=%s", ticket)
@@ -414,24 +503,16 @@ def close_order(
             return False
 
         _symbol_select(symbol)
-        tick = _tick_cached(symbol)
-        if tick is None:
-            log_orders.error("close_order: tick_missing symbol=%s ticket=%s", symbol, ticket)
-            return False
 
         close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
-        if price <= 0:
-            log_orders.error("close_order: bad_price symbol=%s ticket=%s", symbol, ticket)
-            return False
 
-        req = {
+        req: Dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": float(volume),
             "type": int(close_type),
             "position": int(ticket),
-            "price": float(price),
+            "price": 0.0,  # will be refreshed
             "deviation": int(deviation),
             "magic": int(magic),
             "comment": "manual_close",
@@ -439,21 +520,33 @@ def close_order(
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
+        def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
+            # attempt 0 uses cached tick; retries force refresh
+            tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+            if tick is None:
+                return
+            price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
+            if price > 0:
+                rq["price"] = float(price)
+
         ok, res, last_ret = _send_with_retries(
             req,
             retries=max(1, int(retries)),
             success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
             sleep_base=_CLOSE_RETRY_BASE_SEC,
             sleep_cap=_CLOSE_RETRY_CAP_SEC,
+            refresh_before_send=_refresh_price,
         )
+
         if ok:
             return True
 
         log_orders.error(
-            "close_order failed ticket=%s symbol=%s ret=%s last_error=%s",
+            "close_order failed ticket=%s symbol=%s ret=%s res=%s last_error=%s",
             ticket,
             symbol,
             last_ret,
+            getattr(res, "comment", None),
             _safe_last_error(),
         )
         return False
@@ -469,7 +562,7 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
-        # 1) Close positions (group by symbol -> 1 tick per symbol)
+        # 1) Close positions (group by symbol -> 1 tick per symbol + refresh on retry)
         with MT5_LOCK:
             positions = mt5.positions_get() or []
 
@@ -482,16 +575,16 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
         for symbol, plist in by_symbol.items():
             try:
                 _symbol_select(symbol)
-                tick = _tick_cached(symbol)
-                if tick is None:
+                tick0 = _tick_cached(symbol)
+                if tick0 is None:
                     for pos in plist:
                         ticket = int(getattr(pos, "ticket", 0) or 0)
                         out["errors"].append(f"{ticket}: tick_missing")
                     continue
 
-                bid = float(getattr(tick, "bid", 0.0) or 0.0)
-                ask = float(getattr(tick, "ask", 0.0) or 0.0)
-                if bid <= 0 or ask <= 0:
+                bid0 = float(getattr(tick0, "bid", 0.0) or 0.0)
+                ask0 = float(getattr(tick0, "ask", 0.0) or 0.0)
+                if bid0 <= 0 or ask0 <= 0:
                     for pos in plist:
                         ticket = int(getattr(pos, "ticket", 0) or 0)
                         out["errors"].append(f"{ticket}: bad_tick")
@@ -508,15 +601,14 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                         continue
 
                     close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                    price = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
 
-                    req = {
+                    req: Dict[str, Any] = {
                         "action": mt5.TRADE_ACTION_DEAL,
                         "symbol": symbol,
                         "volume": float(volume),
                         "type": int(close_type),
                         "position": int(ticket),
-                        "price": float(price),
+                        "price": float(bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0),
                         "deviation": int(deviation),
                         "magic": int(magic),
                         "comment": "close_all",
@@ -524,13 +616,25 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                         "type_time": mt5.ORDER_TIME_GTC,
                     }
 
+                    def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
+                        tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                        if tick is None:
+                            return
+                        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                        if bid <= 0 or ask <= 0:
+                            return
+                        rq["price"] = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
+
                     ok, _, last_ret = _send_with_retries(
                         req,
                         retries=5,
                         success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
                         sleep_base=_CLOSE_RETRY_BASE_SEC,
                         sleep_cap=_CLOSE_RETRY_CAP_SEC,
+                        refresh_before_send=_refresh_price,
                     )
+
                     if ok:
                         out["closed"] += 1
                     else:
@@ -598,8 +702,14 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
         if info is None:
             return None
 
-        tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
-        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        tick_value = float(
+            (getattr(info, "trade_tick_value", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_value_profit", 0.0) or 0.0)
+        )
+        tick_size = float(
+            (getattr(info, "trade_tick_size", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_size_profit", 0.0) or 0.0)
+        )
         digits = int(getattr(info, "digits", 5) or 5)
 
         if tick_value <= 0.0 or tick_size <= 0.0:
@@ -634,8 +744,14 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         if info is None:
             return None
 
-        tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
-        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        tick_value = float(
+            (getattr(info, "trade_tick_value", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_value_profit", 0.0) or 0.0)
+        )
+        tick_size = float(
+            (getattr(info, "trade_tick_size", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_size_profit", 0.0) or 0.0)
+        )
         digits = int(getattr(info, "digits", 5) or 5)
 
         if tick_value <= 0.0 or tick_size <= 0.0:
@@ -666,19 +782,12 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
 
 def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> float:
     try:
-        info = _symbol_info_cached(symbol)
+        digits, point, stops_level = _digits_point_stops(symbol)
         tick = _tick_cached(symbol)
-        if not info or not tick:
-            return float(sl_price)
-
-        point = float(getattr(info, "point", 0.0) or 0.0)
-        digits = int(getattr(info, "digits", 5) or 5)
-        stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
-
-        if point <= 0.0 or stops_level <= 0:
+        if point <= 0.0 or stops_level <= 0 or not tick:
             return round(float(sl_price), digits)
 
-        min_dist = float(stops_level) * point
+        min_dist = float(stops_level) * float(point)
         bid = float(getattr(tick, "bid", 0.0) or 0.0)
         ask = float(getattr(tick, "ask", 0.0) or 0.0)
         if bid <= 0.0 or ask <= 0.0:
@@ -695,6 +804,32 @@ def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> f
 
     except Exception:
         return float(sl_price)
+
+
+def _enforce_stop_distance_for_tp(symbol: str, ptype: int, tp_price: float) -> float:
+    try:
+        digits, point, stops_level = _digits_point_stops(symbol)
+        tick = _tick_cached(symbol)
+        if point <= 0.0 or stops_level <= 0 or not tick:
+            return round(float(tp_price), digits)
+
+        min_dist = float(stops_level) * float(point)
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        if bid <= 0.0 or ask <= 0.0:
+            return round(float(tp_price), digits)
+
+        if ptype == mt5.POSITION_TYPE_BUY:
+            min_allowed = ask + min_dist
+            tp_adj = max(float(tp_price), float(min_allowed))
+        else:
+            max_allowed = bid - min_dist
+            tp_adj = min(float(tp_price), float(max_allowed))
+
+        return round(float(tp_adj), digits)
+
+    except Exception:
+        return float(tp_price)
 
 
 # =============================================================================
@@ -724,14 +859,28 @@ def set_takeprofit_all_positions_usd(
         for pos in positions:
             ticket = int(getattr(pos, "ticket", 0) or 0)
             symbol = str(getattr(pos, "symbol", ""))
+            ptype = int(getattr(pos, "type", 0) or 0)
 
             cur_sl = float(getattr(pos, "sl", 0.0) or 0.0)
             cur_tp = float(getattr(pos, "tp", 0.0) or 0.0)
+
+            if not symbol or ticket <= 0:
+                out["skipped"] += 1
+                out["errors"].append(f"{ticket}:{symbol}: invalid_position")
+                continue
+
+            _symbol_select(symbol)
 
             tp_price = _usd_to_tp_price_for_position(pos, float(usd_profit))
             if tp_price is None:
                 out["skipped"] += 1
                 out["errors"].append(f"{ticket}:{symbol}: tp_calc_failed")
+                continue
+
+            tp_price = _enforce_stop_distance_for_tp(symbol, ptype, float(tp_price))
+            if tp_price <= 0:
+                out["skipped"] += 1
+                out["errors"].append(f"{ticket}:{symbol}: tp_invalid_after_enforce")
                 continue
 
             if cur_tp > 0 and abs(cur_tp - tp_price) < 1e-10:
@@ -802,6 +951,13 @@ def set_stoploss_all_positions_usd(
             cur_sl = float(getattr(pos, "sl", 0.0) or 0.0)
             cur_tp = float(getattr(pos, "tp", 0.0) or 0.0)
 
+            if not symbol or ticket <= 0:
+                out["skipped"] += 1
+                out["errors"].append(f"{ticket}:{symbol}: invalid_position")
+                continue
+
+            _symbol_select(symbol)
+
             sl_price = _usd_to_sl_price_for_position(pos, float(usd_loss))
             if sl_price is None:
                 out["skipped"] += 1
@@ -853,9 +1009,411 @@ def set_stoploss_all_positions_usd(
         return out
 
 
+# =============================================================================
+# History reports (full detailed reports for day/week/month)
+# =============================================================================
+def get_full_report_day(force_refresh: bool = True) -> Dict[str, Any]:
+    """
+    Полный отчет за день (как view_all_history_dict, но только за сегодня).
+    Возвращает полную структуру с wins, losses, profit, loss, net, balance и т.д.
+    """
+    try:
+        from ExnessAPI.history import view_all_history_dict, _local_now, _day_start_local
+        from datetime import datetime
+
+        summary = view_all_history_dict(force_refresh=force_refresh)
+        local_now = _local_now()
+        day_start = _day_start_local(local_now)
+        
+        # Добавляем даты периода
+        summary["date_from"] = day_start.strftime("%Y-%m-%d %H:%M:%S")
+        summary["date_to"] = local_now.strftime("%Y-%m-%d %H:%M:%S")
+        summary["period"] = "day"
+        
+        return summary
+    except Exception as exc:
+        log_orders.error("get_full_report_day error: %s", exc)
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "date": "",
+            "date_from": now_str,
+            "date_to": now_str,
+            "period": "day",
+            "wins": 0,
+            "losses": 0,
+            "total_closed": 0,
+            "total_open": 0,
+            "unrealized_pnl": 0.0,
+            "profit": 0.0,
+            "loss": 0.0,
+            "net": 0.0,
+            "balance": 0.0,
+            "records": [],
+        }
+
+
+def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
+    """
+    Полный отчет за неделю (с начала недели до сейчас).
+    """
+    try:
+        from ExnessAPI.history import _connect, _day_start_local, _local_now, _naive_local
+        from datetime import timedelta
+
+        if not _connect():
+            return {
+                "period": "week",
+                "wins": 0,
+                "losses": 0,
+                "total_closed": 0,
+                "total_open": 0,
+                "unrealized_pnl": 0.0,
+                "profit": 0.0,
+                "loss": 0.0,
+                "net": 0.0,
+                "balance": 0.0,
+            }
+
+        local_now = _local_now()
+        week_start = local_now - timedelta(days=int(local_now.weekday()))
+        week_start = _day_start_local(week_start)
+
+        with MT5_LOCK:
+            deals = mt5.history_deals_get(_naive_local(week_start), _naive_local(local_now))
+            open_positions = mt5.positions_get() or []
+            acc = mt5.account_info()
+
+        balance = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
+
+        wins = 0
+        losses = 0
+        total_profit = 0.0
+        total_loss = 0.0
+        unrealized_pnl = 0.0
+
+        entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
+        if deals:
+            for d in deals:
+                try:
+                    if getattr(d, "entry", None) != entry_out:
+                        continue
+                    p = float(getattr(d, "profit", 0.0) or 0.0)
+                    if p > 0.0:
+                        wins += 1
+                        total_profit += p
+                    elif p < 0.0:
+                        losses += 1
+                        total_loss += abs(p)
+                except Exception:
+                    continue
+
+        for p in open_positions:
+            try:
+                unrealized_pnl += float(getattr(p, "profit", 0.0) or 0.0)
+            except Exception:
+                continue
+
+        return {
+            "period": "week",
+            "date_from": week_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "date_to": local_now.strftime("%Y-%m-%d %H:%M:%S"),
+            "wins": int(wins),
+            "losses": int(losses),
+            "total_closed": int(wins + losses),
+            "total_open": int(len(open_positions)),
+            "unrealized_pnl": round(float(unrealized_pnl), 2),
+            "profit": round(float(total_profit), 2),
+            "loss": round(float(total_loss), 2),
+            "net": round(float(total_profit - total_loss), 2),
+            "balance": round(float(balance), 2),
+        }
+    except Exception as exc:
+        log_orders.error("get_full_report_week error: %s", exc)
+        return {
+            "period": "week",
+            "wins": 0,
+            "losses": 0,
+            "total_closed": 0,
+            "total_open": 0,
+            "unrealized_pnl": 0.0,
+            "profit": 0.0,
+            "loss": 0.0,
+            "net": 0.0,
+            "balance": 0.0,
+        }
+
+
+def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
+    """
+    Полный отчет за весь период (с самого начала аккаунта до сейчас).
+    """
+    try:
+        from ExnessAPI.history import _connect, _local_now, _naive_local
+        from datetime import datetime, timedelta
+
+        if not _connect():
+            return {
+                "period": "all",
+                "date_from": "",
+                "date_to": "",
+                "wins": 0,
+                "losses": 0,
+                "total_closed": 0,
+                "total_open": 0,
+                "unrealized_pnl": 0.0,
+                "profit": 0.0,
+                "loss": 0.0,
+                "net": 0.0,
+                "balance": 0.0,
+            }
+
+        local_now = _local_now()
+        # Используем 1 год назад для получения истории
+        from datetime import timedelta
+        from_date = local_now - timedelta(days=365)
+
+        deals = None
+        with MT5_LOCK:
+            try:
+                # Получаем все сделки с самого начала
+                deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(local_now))
+                # Проверяем на ошибку MT5
+                if deals is None:
+                    err = mt5.last_error()
+                    if err and err[0] != 1:  # 1 = Success
+                        log_orders.error("history_deals_get failed: code=%s desc=%s", err[0] if err else "?", err[1] if err and len(err) > 1 else "?")
+                        deals = []
+            except Exception as exc:
+                log_orders.error("history_deals_get exception: %s", exc)
+                deals = []
+            
+            try:
+                open_positions = mt5.positions_get() or []
+            except Exception:
+                open_positions = []
+            
+            try:
+                acc = mt5.account_info()
+            except Exception:
+                acc = None
+
+        balance = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
+
+        # Находим реальную дату первой сделки (самую раннюю)
+        first_deal_date = None
+        if deals and len(deals) > 0:
+            try:
+                # Сортируем сделки по времени (самая ранняя первая)
+                deals_sorted = sorted(deals, key=lambda d: getattr(d, "time", 0) or 0)
+                first_deal = deals_sorted[0]
+                first_deal_time = getattr(first_deal, "time", None)
+                if first_deal_time:
+                    # Преобразуем в datetime если нужно
+                    if isinstance(first_deal_time, datetime):
+                        first_deal_date = first_deal_time
+                    else:
+                        # Если это timestamp (секунды с 1970)
+                        try:
+                            first_deal_date = datetime.fromtimestamp(int(first_deal_time))
+                        except (ValueError, OSError):
+                            # Если timestamp в миллисекундах
+                            try:
+                                first_deal_date = datetime.fromtimestamp(int(first_deal_time) / 1000)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        wins = 0
+        losses = 0
+        total_profit = 0.0
+        total_loss = 0.0
+        unrealized_pnl = 0.0
+
+        entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
+        if deals:
+            for d in deals:
+                try:
+                    if getattr(d, "entry", None) != entry_out:
+                        continue
+                    p = float(getattr(d, "profit", 0.0) or 0.0)
+                    if p > 0.0:
+                        wins += 1
+                        total_profit += p
+                    elif p < 0.0:
+                        losses += 1
+                        total_loss += abs(p)
+                except Exception:
+                    continue
+
+        # Обрабатываем открытые позиции
+        open_positions_info = []
+        for p in open_positions:
+            try:
+                ticket = int(getattr(p, "ticket", 0) or 0)
+                symbol = str(getattr(p, "symbol", "") or "")
+                volume = float(getattr(p, "volume", 0.0) or 0.0)
+                profit_val = float(getattr(p, "profit", 0.0) or 0.0)
+                unrealized_pnl += profit_val
+                open_positions_info.append({
+                    "ticket": ticket,
+                    "symbol": symbol,
+                    "volume": volume,
+                    "profit": profit_val
+                })
+            except Exception:
+                continue
+
+        # Форматируем даты - показываем реальную дату первой сделки или дату начала периода
+        date_from_str = ""
+        if first_deal_date:
+            try:
+                if first_deal_date.tzinfo is None:
+                    date_from_str = first_deal_date.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    date_from_str = first_deal_date.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                date_from_str = from_date.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            # Если нет сделок, показываем дату начала периода (1 год назад)
+            date_from_str = from_date.strftime("%Y-%m-%d %H:%M:%S")
+
+        return {
+            "period": "all",
+            "date_from": date_from_str,
+            "date_to": local_now.strftime("%Y-%m-%d %H:%M:%S"),
+            "wins": int(wins),
+            "losses": int(losses),
+            "total_closed": int(wins + losses),
+            "total_open": int(len(open_positions)),
+            "open_positions": open_positions_info,
+            "unrealized_pnl": round(float(unrealized_pnl), 2),
+            "profit": round(float(total_profit), 2),
+            "loss": round(float(total_loss), 2),
+            "net": round(float(total_profit - total_loss), 2),
+            "balance": round(float(balance), 2),
+        }
+    except Exception as exc:
+        log_orders.error("get_full_report_all error: %s", exc)
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "period": "all",
+            "date_from": "",
+            "date_to": now_str,
+            "wins": 0,
+            "losses": 0,
+            "total_closed": 0,
+            "total_open": 0,
+            "unrealized_pnl": 0.0,
+            "profit": 0.0,
+            "loss": 0.0,
+            "net": 0.0,
+            "balance": 0.0,
+        }
+
+
+def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
+    """
+    Полный отчет за месяц (с начала месяца до сейчас).
+    """
+    try:
+        from ExnessAPI.history import _connect, _day_start_local, _local_now, _naive_local
+        from datetime import datetime
+
+        if not _connect():
+            return {
+                "period": "month",
+                "wins": 0,
+                "losses": 0,
+                "total_closed": 0,
+                "total_open": 0,
+                "unrealized_pnl": 0.0,
+                "profit": 0.0,
+                "loss": 0.0,
+                "net": 0.0,
+                "balance": 0.0,
+            }
+
+        local_now = _local_now()
+        try:
+            month_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            month_start = datetime(local_now.year, local_now.month, 1, 0, 0, 0)
+
+        # keep _day_start_local import for compatibility (structure), even if not used directly here
+        _ = _day_start_local  # noqa: F841
+
+        with MT5_LOCK:
+            deals = mt5.history_deals_get(_naive_local(month_start), _naive_local(local_now))
+            open_positions = mt5.positions_get() or []
+            acc = mt5.account_info()
+
+        balance = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
+
+        wins = 0
+        losses = 0
+        total_profit = 0.0
+        total_loss = 0.0
+        unrealized_pnl = 0.0
+
+        entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
+        if deals:
+            for d in deals:
+                try:
+                    if getattr(d, "entry", None) != entry_out:
+                        continue
+                    p = float(getattr(d, "profit", 0.0) or 0.0)
+                    if p > 0.0:
+                        wins += 1
+                        total_profit += p
+                    elif p < 0.0:
+                        losses += 1
+                        total_loss += abs(p)
+                except Exception:
+                    continue
+
+        for p in open_positions:
+            try:
+                unrealized_pnl += float(getattr(p, "profit", 0.0) or 0.0)
+            except Exception:
+                continue
+
+        return {
+            "period": "month",
+            "date_from": month_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "date_to": local_now.strftime("%Y-%m-%d %H:%M:%S"),
+            "wins": int(wins),
+            "losses": int(losses),
+            "total_closed": int(wins + losses),
+            "total_open": int(len(open_positions)),
+            "unrealized_pnl": round(float(unrealized_pnl), 2),
+            "profit": round(float(total_profit), 2),
+            "loss": round(float(total_loss), 2),
+            "net": round(float(total_profit - total_loss), 2),
+            "balance": round(float(balance), 2),
+        }
+    except Exception as exc:
+        log_orders.error("get_full_report_month error: %s", exc)
+        return {
+            "period": "month",
+            "wins": 0,
+            "losses": 0,
+            "total_closed": 0,
+            "total_open": 0,
+            "unrealized_pnl": 0.0,
+            "profit": 0.0,
+            "loss": 0.0,
+            "net": 0.0,
+            "balance": 0.0,
+        }
+
+
 __all__ = [
     "enable_trading",
     "get_balance",
+    "get_account_info",
     "get_positions_summary",
     "get_order_by_index",
     "get_all_open_positions",
@@ -863,4 +1421,9 @@ __all__ = [
     "close_all_position",
     "set_takeprofit_all_positions_usd",
     "set_stoploss_all_positions_usd",
+    "get_full_report_day",
+    "get_full_report_week",
+    "get_full_report_month",
+    "get_full_report_all",
 ]
+

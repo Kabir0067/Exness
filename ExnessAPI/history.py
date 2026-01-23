@@ -2,10 +2,14 @@ from typing import Literal, Dict, Any
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import time
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import MetaTrader5 as mt5
 
 from mt5_client import ensure_mt5, MT5_LOCK
+from log_config import get_log_path
 
 
 _cache: Dict[str, Any] | None = None
@@ -22,6 +26,40 @@ _TZ: ZoneInfo | None = None
 _CACHE_TTL_SEC = 5.0
 _CONN_TTL_SEC = 1.0
 _PRINT_THROTTLE_SEC = 60.0
+
+# =============================================================================
+# Logging (ERROR-only, rotating)
+# =============================================================================
+_HISTORY_LOG_PATH = get_log_path("history.log")
+
+
+def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
+    logger.setLevel(level)
+    logger.propagate = False
+
+    for h in list(logger.handlers):
+        if isinstance(h, RotatingFileHandler):
+            try:
+                if Path(getattr(h, "baseFilename", "")).resolve() == path.resolve():
+                    h.setLevel(level)
+                    return
+            except Exception:
+                continue
+
+    h = RotatingFileHandler(
+        filename=str(path),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+        delay=True,
+    )
+    h.setLevel(level)
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
+    logger.addHandler(h)
+
+
+log_history = logging.getLogger("history")
+_ensure_rotating_handler(log_history, _HISTORY_LOG_PATH, logging.ERROR)
 
 
 def _local_now() -> datetime:

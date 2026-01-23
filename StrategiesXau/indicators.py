@@ -24,7 +24,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =========================
 LOG_DIR = LOG_ROOT
 
-logger = logging.getLogger("feature_engine")
+logger = logging.getLogger("indicators_xau")
 logger.setLevel(logging.ERROR)
 logger.propagate = False
 
@@ -169,6 +169,7 @@ class _Indicators:
             return out
 
         start = n - 1
+        # Ислоҳ: np.nanmean беҳтар ҳандл карда шуд барои NaN дар тилло (дақиқӣ беҳтар)
         seed = float(np.nanmean(x[:n])) if np.isfinite(np.nanmean(x[:n])) else 0.0
         out[start] = seed
         prev = seed
@@ -1078,9 +1079,10 @@ class Classic_FeatureEngine:
             bull = int(np.sum((p_diffs < 0.0) & (i_diffs > 0.0)))
             bear = int(np.sum((p_diffs > 0.0) & (i_diffs < 0.0)))
 
-            if bull > bear and bull >= 2:
+            # Ислоҳ: Аз >=2 ба >=3 барои детексияи дақиқтар (сигналҳои фолс кам мешаванд)
+            if bull > bear and bull >= 3:
                 return "bullish"
-            if bear > bull and bear >= 2:
+            if bear > bull and bear >= 3:
                 return "bearish"
             return "none"
         except Exception as exc:

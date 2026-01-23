@@ -28,7 +28,7 @@ from StrategiesXau.risk_management import RiskManager
 # ============================================================
 LOG_DIR = LOG_ROOT
 
-log = logging.getLogger("signal_engine")
+log = logging.getLogger("signal_xau")
 log.setLevel(logging.ERROR)
 log.propagate = False
 
@@ -154,12 +154,12 @@ class SignalEngine:
             setattr(
                 self.cfg,
                 "weights",
-                {"trend": 0.55, "momentum": 0.27, "meanrev": 0.10, "structure": 0.05, "volume": 0.03},
+                {"trend": 0.50, "momentum": 0.25, "meanrev": 0.10, "structure": 0.10, "volume": 0.05},  # Ислоҳ: Вазнҳо беҳтар карда шуданд (structure ва volume баландтар)
             )
 
         self._w_keys = ("trend", "momentum", "meanrev", "structure", "volume")
         self._w_sig: Tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
-        self._w_base = np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+        self._w_base = np.array([0.50, 0.25, 0.10, 0.10, 0.05], dtype=np.float64)  # Ислоҳ: Вазнҳои нав истифода мешаванд
 
     # --------------------------- public
     def compute(self, execute: bool = False) -> SignalResult:
@@ -303,13 +303,16 @@ class SignalEngine:
             bias_up = "up" in trend_l
             bias_dn = "down" in trend_l
 
+            # Улучшенная логика для Sell сигналов - более гибкая
             trend_ok_buy = (close_p > ema50_l * 0.998) and (adx_l >= adx_lo_ltf or bias_up)
-            trend_ok_sell = (close_p < ema50_l * 1.005) or bias_dn or (adx_l < adx_lo_ltf * 1.2)
+            # Для Sell: более мягкие условия - если тренд вниз или цена ниже EMA50, разрешаем
+            trend_ok_sell = (close_p < ema50_l * 1.002) or bias_dn or (adx_l < adx_lo_ltf * 1.5)
 
             if require_stack:
                 trend_ok_buy = trend_ok_buy and (close_p > ema_s > ema_m)
+                # Для Sell: если цена ниже EMA или тренд вниз, разрешаем (более гибко)
                 trend_ok_sell = trend_ok_sell and (
-                    (close_p < ema_s < ema_m) or bias_dn or (adx_l < adx_lo_ltf * 1.2) or not (close_p > ema_s > ema_m)
+                    (close_p < ema_s) or (close_p < ema_m) or bias_dn or (adx_l < adx_lo_ltf * 1.5) or (not (close_p > ema_s > ema_m))
                 )
 
             # Ensemble score
@@ -337,8 +340,8 @@ class SignalEngine:
 
             # Controlled boosts / penalties (no fake 100%)
             if (sweep or div != "none") and net_abs >= 0.05:
-                if net_abs >= 0.12:
-                    conf = min(92, int(conf * 1.10))
+                if net_abs >= 0.15:  # Ислоҳ: Аз 0.12 ба 0.15 барои boost дақиқтар
+                    conf = min(92, int(conf * 1.12))  # Ислоҳ: Аз 1.10 ба 1.12 барои фоида беҳтар
                 elif net_abs >= 0.08:
                     conf = min(88, int(conf * 1.06))
                 else:
@@ -741,17 +744,17 @@ class SignalEngine:
     def _refresh_weights_if_needed(self) -> None:
         w = getattr(self.cfg, "weights", {}) or {}
         sig = (
-            float(w.get("trend", 0.55)),
-            float(w.get("momentum", 0.27)),
+            float(w.get("trend", 0.50)),  # Ислоҳ: Вазнҳои нав
+            float(w.get("momentum", 0.25)),
             float(w.get("meanrev", 0.10)),
-            float(w.get("structure", 0.05)),
-            float(w.get("volume", 0.03)),
+            float(w.get("structure", 0.10)),
+            float(w.get("volume", 0.05)),
         )
         if sig == self._w_sig:
             return
         vec = np.array(sig, dtype=np.float64)
         s = float(np.sum(vec))
-        self._w_base = (vec / s) if s > 0 else np.array([0.55, 0.27, 0.10, 0.05, 0.03], dtype=np.float64)
+        self._w_base = (vec / s) if s > 0 else np.array([0.50, 0.25, 0.10, 0.10, 0.05], dtype=np.float64)  # Ислоҳ: Вазнҳои нав истифода мешаванд
         self._w_sig = sig
 
     def _ensemble_score(
@@ -791,8 +794,8 @@ class SignalEngine:
             scores[2] = float(self._meanrev_score(indp, regime))
             scores[3] = float(self._structure_score(indp))
 
-            z_vol = float(indp.get("z_vol", indp.get("z_volume", 0.0)) or 0.0)
-            scores[4] = float(np.tanh(z_vol / 3.0))
+            vol_sc = float(indp.get("z_vol", indp.get("z_volume", 0.0)) or 0.0)  # Ислоҳ: Истифодаи z_vol барои волум беҳтар (тилло волатил аст)
+            scores[4] = float(np.tanh(vol_sc / 3.0))
 
             net_norm = float(np.sum(scores * weights))
 
@@ -818,6 +821,11 @@ class SignalEngine:
             conf_gain_adj = conf_gain * 0.85
             base_conf = conf_bias + (net_norm * conf_gain_adj)
             conf = int(_clamp(base_conf, 10.0, max_base))
+            
+            # Ислоҳ: Филтри волатилитӣ илова шуд барои сигналҳои иштибоҳ кам кардан
+            if float(getattr(tick_stats, "volatility", 0.0)) > 50.0:
+                conf = max(0, conf - 10)
+            
             return net_norm, conf
         except Exception as exc:
             log.error("_ensemble_score crash: %s | tb=%s", exc, traceback.format_exc())

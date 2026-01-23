@@ -24,7 +24,7 @@ from mt5_client import MT5_LOCK, ensure_mt5
 # =============================================================================
 LOG_DIR = LOG_ROOT
 
-log_feed = logging.getLogger("market_feed")
+log_feed = logging.getLogger("feed_xau")
 log_feed.setLevel(logging.ERROR)
 log_feed.propagate = False
 

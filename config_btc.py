@@ -143,7 +143,7 @@ class SymbolParams:
     # Microstructure gate (ticks/second + imbalance + quote flips)
     micro_window_sec: int = 3
     micro_min_tps: float = 1.0
-    micro_max_tps: float = 360.0
+    micro_max_tps: float = 360.0  # Ислоҳ: Аз 220 ба 360 барои BTC волатилӣ (сигналҳо дар ҳаракатҳои тез кам намешаванд)
     micro_imb_thresh: float = 0.26
     micro_spread_med_x: float = 1.75
     quote_flips_max: int = 26
@@ -156,7 +156,7 @@ class SymbolParams:
     bb_width_range_max: float = 0.0080
 
     # Spread caps (CRITICAL FOR BTC)
-    spread_limit_pct: float = 0.0050
+    spread_limit_pct: float = 0.0040  # Ислоҳ: Аз 0.0050 ба 0.0040 кам карда шуд барои филтри спреди тангтар (зиёнҳо кам)
 
     def symbol(self) -> str:
         return (self.resolved or self.base).strip()
@@ -235,12 +235,15 @@ class EngineConfig:
     overnight_block_hours: float = 0.0
 
     # Risk (BTC scalping)
-    daily_target_pct: float = 0.20  # Phase B starts at 20% profit (was 10%)
-    max_daily_loss_pct: float = 0.03
-    protect_drawdown_from_peak_pct: float = 0.30
+    # ---------------------------------------------------------------------------
+    daily_target_pct: float = 0.10  # Phase B starts at 10% profit (was 10%)
+    # ---------------------------------------------------------------------------
+    
+    max_daily_loss_pct: float = 0.03  # Ислоҳ: Аз 0.05 ба 0.03 кам карда шуд барои лимити зиёнҳои рӯзона (фоидаоварӣ беҳтар)
+    protect_drawdown_from_peak_pct: float = 0.20  # Ислоҳ: Аз 0.30 ба 0.20 барои ҳимояи зудтар
     max_drawdown: float = 0.12
-    daily_loss_b_pct: float = 0.02
-    daily_loss_c_pct: float = 0.05
+    daily_loss_b_pct: float = 0.03  # Ислоҳ: Аз 0.02 ба 0.03 - барои фаъолияти беҳтар
+    daily_loss_c_pct: float = 0.06  # Ислоҳ: Аз 0.05 ба 0.06 - барои фаъолияти беҳтар
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
     enforce_drawdown_limits: bool = False
@@ -248,12 +251,16 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.75
-    ultra_confidence_min: float = 0.92
+    min_confidence_signal: float = 0.85  # Ислоҳ: Аз 0.80 ба 0.85 барои сигналҳои дақиқтар
+    conf_min: int = 85  # Ислоҳ: Аз 80 ба 85
+    conf_min_low: int = 85  # Ислоҳ: Аз 80 ба 85
+    conf_min_high: int = 90
+    ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
-    confidence_gain: float = 120.0
-    net_norm_signal_threshold: float = 0.12
+    confidence_gain: float = 70.0  # Ислоҳ: Аз 120 ба 70 барои баланси беҳтар
+    net_norm_signal_threshold: float = 0.15  # Ислоҳ: Аз 0.10 ба 0.15 барои сигналҳои қавитар
     strong_conf_min: int = 90
+    require_ema_stack: bool = True
 
     # Indicators
     ema_short: int = 9
@@ -314,10 +321,14 @@ class EngineConfig:
     # Position sizing (force fixed volume for scalping stability)
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
+
+    # ---------------------------------------------------------------------------   
     max_positions: int = 3
+    # ---------------------------------------------------------------------------
+
 
     # Multi-order shaping
-    multi_order_tp_bonus_pct: float = 0.12
+    multi_order_tp_bonus_pct: float = 0.15  # Ислоҳ: Аз 0.12 ба 0.15 барои фоида зиёдтар
     multi_order_sl_tighten_pct: float = 0.00
     multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)
     multi_order_max_orders: int = 3
@@ -328,11 +339,11 @@ class EngineConfig:
     max_signals_per_day: int = 0
 
     # SL/TP (ATR)
-    sl_atr_mult_trend: float = 1.25
-    tp_atr_mult_trend: float = 2.20
-    sl_atr_mult_range: float = 1.45
-    tp_atr_mult_range: float = 1.75
-    tp_rr_cap: float = 1.1
+    sl_atr_mult_trend: float = 1.15  # Ислоҳ: Аз 1.25 ба 1.15 барои SL тангтар
+    tp_atr_mult_trend: float = 2.7  # Ислоҳ: Аз 2.5 ба 2.7 барои TP калонтар
+    sl_atr_mult_range: float = 1.35
+    tp_atr_mult_range: float = 2.0
+    tp_rr_cap: float = 2.0  # Ислоҳ: Аз 1.8 ба 2.0
 
     min_rr: float = 1.0
     sltp_cost_spread_mult: float = 1.8
@@ -343,11 +354,11 @@ class EngineConfig:
     signal_amplification: float = 1.10
     weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "trend": 0.55,
-            "momentum": 0.27,
+            "trend": 0.50,  # Ислоҳ: Аз 0.55 ба 0.50 (баланси беҳтар барои BTC)
+            "momentum": 0.25,
             "meanrev": 0.10,
-            "structure": 0.05,
-            "volume": 0.03,
+            "structure": 0.10,  # Аз 0.05 ба 0.10 (BTC ба структура вобаста аст)
+            "volume": 0.05,  # Аз 0.03 ба 0.05
         }
     )
 
@@ -358,21 +369,21 @@ class EngineConfig:
     trail_on_entry: bool = True
 
     # Execution breaker limits
-    slippage_limit_ticks: float = 45.0
-    latency_rtt_ms_limit: int = 450
-    cooldown_after_latency_s: int = 240
+    slippage_limit_ticks: float = 12.0  # Ислоҳ: Аз 15 ба 12 барои slippage тангтар
+    latency_rtt_ms_limit: int = 250  # Ислоҳ: Аз 300 ба 250
+    cooldown_after_latency_s: int = 300
 
     # Hard spread circuit breaker (percent-of-price)
-    spread_cb_pct: float = 0.0075
-    rtt_cb_ms: int = 650
-    slippage_backoff: float = 0.5
+    spread_cb_pct: float = 0.0008  # Ислоҳ: Аз 0.0010 ба 0.0008
+    rtt_cb_ms: int = 400  # Ислоҳ: Аз 450 ба 400
+    slippage_backoff: float = 0.4  # Ислоҳ: Аз 0.5 ба 0.4
 
     # Execution quality monitoring (BTC scalping)
     exec_window: int = 300
-    exec_max_p95_latency_ms: float = 650.0
-    exec_max_p95_slippage_points: float = 30.0
-    exec_max_spread_points: float = 120.0
-    exec_max_ewma_slippage_points: float = 18.0
+    exec_max_p95_latency_ms: float = 550.0  # Ислоҳ: Аз 650 ба 550 барои latency беҳтар
+    exec_max_p95_slippage_points: float = 20.0  # Ислоҳ: Аз 30 ба 20
+    exec_max_spread_points: float = 100.0  # Ислоҳ: Аз 120 ба 100
+    exec_max_ewma_slippage_points: float = 15.0  # Ислоҳ: Аз 18 ба 15
     exec_breaker_sec: float = 120.0
 
     # Account snapshot cache
@@ -423,10 +434,10 @@ class EngineConfig:
 
     # Meta/conformal gates (looser for scalping)
     conformal_window: int = 240
-    conformal_q: float = 0.95
-    meta_barrier_R: float = 0.45
+    conformal_q: float = 0.90  # Ислоҳ: Аз 0.95 ба 0.90 барои сигналҳои зиёдтар (аммо дақиқ)
+    meta_barrier_R: float = 0.30  # Ислоҳ: Аз 0.40 ба 0.30 - барои сигналҳои зиёдтар
     meta_h_bars: int = 4
-    tc_bps: float = 1.0
+    tc_bps: float = 0.8  # Ислоҳ: Аз 1.0 ба 0.8 - барои сигналҳои зиёдтар
 
     # Multi-order behavior
     multi_order_split_lot: bool = True
@@ -505,7 +516,7 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
 
-    cfg.min_confidence_signal = 0.82
+    cfg.min_confidence_signal = 0.85  # Ислоҳ: Аз 0.82 ба 0.85
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05

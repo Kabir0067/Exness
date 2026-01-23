@@ -29,7 +29,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # ============================================================
 LOG_DIR = LOG_ROOT
 
-log = logging.getLogger("signal_engine_btc")
+log = logging.getLogger("signal_btc")
 log.setLevel(logging.ERROR)
 log.propagate = False
 

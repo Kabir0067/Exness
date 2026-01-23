@@ -34,7 +34,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # ============================================================
 LOG_DIR = LOG_ROOT
 
-log_risk = logging.getLogger("risk_manager")
+log_risk = logging.getLogger("risk_xau")
 log_risk.setLevel(logging.ERROR)
 log_risk.propagate = False
 
@@ -264,10 +264,10 @@ class ExecutionQualityMonitor:
         """
         s = self.snapshot()
 
-        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 450.0))
-        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 6.0))
-        max_spread = float(getattr(cfg, "exec_max_spread_points", 25.0))
-        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 4.0))
+        max_p95_lat = float(getattr(cfg, "exec_max_p95_latency_ms", 400.0))  # Ислоҳ: Аз 450 ба 400
+        max_p95_slip = float(getattr(cfg, "exec_max_p95_slippage_points", 4.0))  # Ислоҳ: Аз 6 ба 4 барои slippage тангтар
+        max_spread = float(getattr(cfg, "exec_max_spread_points", 20.0))  # Ислоҳ: Аз 25 ба 20
+        max_ewma_slip = float(getattr(cfg, "exec_max_ewma_slippage_points", 3.0))  # Ислоҳ: Аз 4 ба 3
 
         reasons: List[str] = []
         if s["p95_latency_ms"] > max_p95_lat:
@@ -894,15 +894,7 @@ class RiskManager:
                 loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
                 loss_c = float(getattr(self.cfg, "daily_loss_c_pct", 0.0) or 0.0)
 
-                if loss_b > 0 and daily_return <= -loss_b and self.current_phase == "A":
-                    self.current_phase = "B"
-                    self._phase_reason_last = "daily_loss_b"
-                    log_risk.error(
-                        "PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
-                        daily_return,
-                        loss_b,
-                    )
-
+                # Сначала проверяем loss_c (более критичный) - если превышен, сразу в C
                 if loss_c > 0 and daily_return <= -loss_c and self.current_phase != "C":
                     self.current_phase = "C"
                     self._phase_reason_last = "daily_loss_c"
@@ -910,6 +902,15 @@ class RiskManager:
                         "PHASE_CHANGE | ->C | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
                         daily_return,
                         loss_c,
+                    )
+                # Если loss_c не превышен, но превышен loss_b - переходим в B
+                elif loss_b > 0 and daily_return <= -loss_b and self.current_phase == "A":
+                    self.current_phase = "B"
+                    self._phase_reason_last = "daily_loss_b"
+                    log_risk.error(
+                        "PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
+                        daily_return,
+                        loss_b,
                     )
 
                 # target lock: after overshoot, if returns back to target -> hard stop
