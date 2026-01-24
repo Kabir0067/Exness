@@ -282,9 +282,20 @@ class ExecutionQualityMonitor:
 
 
 @dataclass(slots=True)
+@dataclass
 class RiskDecision:
     allowed: bool
     reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanOrderResult:
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    lot: Optional[float] = None
+    ok: bool = False
+    reason: str = ""
 
 
 # ============================================================
@@ -926,13 +937,26 @@ class RiskManager:
                         loss_b,
                     )
 
-                # target lock: after overshoot, if returns back to target -> hard stop
+                # target lock: after overshoot, if returns back to target -> hard stop (Profit Protection)
                 if self._target_breached and self.current_phase == "B":
                     self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
                     target_pct = float(self.cfg.daily_target_pct)
-                    lock_threshold = target_pct + 0.005
-                    if self._target_breached_return >= lock_threshold and daily_return <= target_pct:
-                        self._enter_hard_stop("daily_target_lock")
+                    
+                    # 1. Standard Lock: if we went ABOVE target, and now dropped BELOW target -> STOP
+                    if self._target_breached_return > target_pct and daily_return < target_pct:
+                         self._enter_hard_stop("profit_protection_target_lost")
+
+                    # 2. Trailing Profit Stop (User Request: "if 11, 12, 13 ... and drops -> STOP")
+                    # We use protect_drawdown_from_peak_pct (e.g. 0.20 means 20% retrace of GAINS, or absolute pct drop)
+                    # Let's use strict absolute drop from peak relative to daily balance
+                    prot_pct = float(getattr(self.cfg, "protect_drawdown_from_peak_pct", 0.05) or 0.05) 
+                    
+                    # Calc drop from peak return
+                    drop_from_peak = self._target_breached_return - daily_return
+                    
+                    # Only apply if we are well into profit (above target)
+                    if self._target_breached_return > target_pct and drop_from_peak >= prot_pct:
+                        self._enter_hard_stop(f"profit_protection_drop:{drop_from_peak:.1%}")
 
         except Exception as exc:
             log_risk.error("evaluate_account_state error: %s | tb=%s", exc, traceback.format_exc())
@@ -1389,37 +1413,36 @@ class RiskManager:
         open_positions: int = 0,
         max_positions: int = 3,
         unrealized_pl: float = 0.0,
-    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    ) -> PlanOrderResult:
         """
         Plan order (entry/sl/tp/lot).
-        CRITICAL:
-          - Phase C blocks everything (returns None, None, None, None)
-          - SL/TP floors prevent too-tight stops in scalping
+        Returns PlanOrderResult(ok=False, reason="...") on failure.
         """
         try:
             _ = (ind, ticks)
 
             side_n = _side_norm(side)
             if side_n not in ("Buy", "Sell"):
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="invalid_side")
+
             if not self._ensure_ready():
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="risk_not_ready")
 
             self.evaluate_account_state()
             if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
                 log_risk.error("plan_order BLOCKED | phase=C | reason=%s", self._phase_reason_last or "phase_c")
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason=f"phase_c:{self._phase_reason_last}")
 
             if entry is None:
                 with MT5_LOCK:
                     t = mt5.symbol_info_tick(self.symbol)
                 if not t:
-                    return None, None, None, None
+                    return PlanOrderResult(ok=False, reason="no_tick_mt5")
                 entry = float(t.ask) if side_n == "Buy" else float(t.bid)
 
             entry_price = float(entry)
             if not _is_finite(entry_price) or entry_price <= 0:
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="invalid_price")
 
             # 1) ATR injection
             atr = 0.0
@@ -1481,7 +1504,7 @@ class RiskManager:
             min_tp = max(float(min_dist), entry_price * min_tp_pct, cost_floor * tp_floor_mult, min_tp_atr_floor)
 
             if not _is_finite(sl, tp):
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="sl_tp_calc_failed_nonfinite")
 
             # 5) Enforce floors
             if side_n == "Buy":
@@ -1507,14 +1530,14 @@ class RiskManager:
                         tp = min(float(tp), float(tpz))
 
             if not _is_finite(sl, tp) or sl == entry_price or tp == entry_price:
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="sl_tp_calc_failed_no_dist")
 
             sl, tp = self._apply_broker_constraints(side_n, entry_price, float(sl), float(tp))
 
             if side_n == "Buy" and not (sl < entry_price < tp):
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="invalid_sl_tp_buy")
             if side_n == "Sell" and not (tp < entry_price < sl):
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason="invalid_sl_tp_sell")
 
             # ---- lot/TP (your deterministic ladder + USD-TP conversion) ----
             self.evaluate_account_state()
@@ -1523,7 +1546,7 @@ class RiskManager:
                     "plan_order BLOCKED (lot/TP calc) | phase=C | reason=%s",
                     self._phase_reason_last or "phase_c",
                 )
-                return None, None, None, None
+                return PlanOrderResult(ok=False, reason=f"phase_c:{self._phase_reason_last}")
 
             use_usd_tp = False
             balance = float(self._get_balance())
@@ -1574,7 +1597,7 @@ class RiskManager:
 
                 lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
                 if lot <= 0 or not _is_finite(lot):
-                    return None, None, None, None
+                    return PlanOrderResult(ok=False, reason="invalid_lot_size")
 
             # multi-order logic (keep semantics; no SL tightening)
             if (
@@ -1595,11 +1618,22 @@ class RiskManager:
                     )
                     sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
-            return float(entry_price), float(sl), float(tp), float(lot)
+            # Final check
+            if not _is_finite(sl, tp, lot):
+                return PlanOrderResult(ok=False, reason="final_calc_nonfinite")
+
+            return PlanOrderResult(
+                ok=True,
+                entry=entry_price,
+                sl=float(sl),
+                tp=float(tp),
+                lot=float(lot),
+                reason="ok"
+            )
 
         except Exception as exc:
-            log_risk.error("plan_order error: %s | tb=%s", exc, traceback.format_exc())
-            return None, None, None, None
+            log_risk.error("plan_order exception: %s", exc, exc_info=True)
+            return PlanOrderResult(ok=False, reason=f"exception:{type(exc).__name__}")
 
     # ------------------- trade recording -------------------
     def record_trade(self, *args, **kwargs) -> None:

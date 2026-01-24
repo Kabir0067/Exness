@@ -29,7 +29,7 @@ from ExnessAPI.order_execution import (
     OrderResult as ExecOrderResult,
     log_health as exec_health_log,
 )
-from ExnessAPI.functions import close_all_position, has_open_positions
+from ExnessAPI.functions import close_all_position, has_open_positions, market_is_open
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 # -------------------- XAU stack --------------------
@@ -56,6 +56,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 # Logging
 # =============================================================================
+
 
 def _rotating_file_logger(
     name: str,
@@ -407,6 +408,15 @@ class _AssetPipeline:
             return None
 
     def validate_market_data(self) -> bool:
+        if not market_is_open(self.asset):
+            self.last_market_ok = False
+            self.last_market_reason = "market_closed_weekend"
+            self.last_bar_age_sec = 0.0
+            self.last_market_close = 0.0
+            self.last_market_volume = 0.0
+            self.last_market_ts = "-"
+            return False
+
         now = time.time()
 
         # Cache only SUCCESS for a short interval (prevents heavy fetch)
@@ -588,6 +598,23 @@ class _AssetPipeline:
                     tp,
                     blocked,
                     ",".join(reasons) if reasons else "-",
+                )
+
+            # Patch C: Explicit block if market closed
+            if self.asset == "XAU" and not market_is_open("XAU"):
+                return AssetCandidate(
+                    asset=self.asset,
+                    symbol=self.symbol,
+                    signal="Neutral",
+                    confidence=0.0,
+                    lot=0.0,
+                    sl=0.0,
+                    tp=0.0,
+                    latency_ms=0.0,
+                    blocked=True,
+                    reasons=("market_closed_weekend",),
+                    signal_id=f"{self.asset}_CLOSED_{int(time.time())}",
+                    raw_result=None,
                 )
 
             return AssetCandidate(
@@ -1186,12 +1213,32 @@ class MultiAssetTradingEngine:
         return True
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
+        # Patch: Prioritize BTC in weekend or if XAU closed
+        xau_open = market_is_open("XAU")
+
         if open_xau > 0 and open_btc > 0:
             return "BOTH"
+        
+        # If XAU has positions...
         if open_xau > 0:
-            return "XAU"
+            # If XAU is OPEN, it's definitely active.
+            if xau_open:
+                return "XAU"
+            # If XAU is CLOSED (weekend), but we have positions...
+            # The user says "active_asset force to BTC". 
+            # If we return BTC (and we have implied open_btc=0 here), 
+            # it means we focus on BTC.
+            return "BTC"
+
         if open_btc > 0:
             return "BTC"
+            
+        # If no positions, select based on market availability? 
+        # Or just default to NONE until signal?
+        # User said "gate might confuse BTC" if active=XAU.
+        if not xau_open:
+            return "BTC"
+
         return "NONE"
 
     def _enqueue_order(

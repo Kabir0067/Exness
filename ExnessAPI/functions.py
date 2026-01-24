@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
-import datetime
+from datetime import datetime
 
 import MetaTrader5 as mt5
 
@@ -486,7 +486,7 @@ def has_open_positions() -> bool:
         _ensure_mt5_connected()
 
         # Weekend override (local time) - выходные не важны, аналитика работает
-        wd = datetime.datetime.now().weekday()  # Mon=0 ... Sun=6
+        wd = datetime.now().weekday()  # Mon=0 ... Sun=6
         if wd in (5, 6):  # 5=Saturday, 6=Sunday
             return False  # Выходные: аналитика работает (не паузится)
 
@@ -503,6 +503,17 @@ def has_open_positions() -> bool:
             _safe_last_error(),
         )
         return False  # При ошибке считаем, что позиций нет (аналитика работает)
+
+
+
+def market_is_open(asset: str, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now()
+    wd = now.weekday()  # Mon=0..Sun=6
+    if str(asset).upper() == "BTC":
+        return True  # 24/7
+    if str(asset).upper() == "XAU":
+        return wd < 5  # Mon-Fri only
+    return True
 
 
 # =============================================================================

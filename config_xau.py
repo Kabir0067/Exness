@@ -203,9 +203,11 @@ class EngineConfig:
 
     ultra_confidence_min: float = 0.90
     protect_drawdown_from_peak_pct: float = 0.20  # Ислоҳ: Аз 0.30 ба 0.20 кам карда шуд барои ҳимояи зудтар аз зиёнҳо
+
     max_daily_loss_pct: float = 0.05  # Ислоҳ: Аз 0.10 ба 0.05 кам карда шуд барои лимити зиёнҳои рӯзона (фоидаоварӣ беҳтар мешавад)
     daily_loss_b_pct: float = 0.02
     daily_loss_c_pct: float = 0.05
+   
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
     enforce_drawdown_limits: bool = False

@@ -803,28 +803,28 @@ class SignalEngine:
             conf_gain = float(getattr(self.cfg, "confidence_gain", 70.0) or 70.0)
 
             net_abs = abs(net_norm)
-            if net_abs < 0.08:
-                max_base = 70.0
-            elif net_abs < 0.12:
-                max_base = 80.0
-            elif net_abs < 0.18:
-                max_base = 88.0
-            elif net_abs < 0.30:
-                max_base = 92.0
-            elif net_abs < 0.45:
-                max_base = 94.0
+            if net_abs < 0.15:
+                max_base = 65.0
+            elif net_abs < 0.25:
+                max_base = 75.0
+            elif net_abs < 0.40:
+                max_base = 82.0
             elif net_abs < 0.60:
-                max_base = 95.0
+                max_base = 88.0
+            elif net_abs < 0.75:
+                max_base = 92.0
+            elif net_abs < 0.88:
+                max_base = 94.0
             else:
                 max_base = 96.0
 
-            conf_gain_adj = conf_gain * 0.85
+            conf_gain_adj = conf_gain * 0.75  # Slightly reduced gain to separate weak/strong better
             base_conf = conf_bias + (net_norm * conf_gain_adj)
             conf = int(_clamp(base_conf, 10.0, max_base))
             
-            # Ислоҳ: Филтри волатилитӣ илова шуд барои сигналҳои иштибоҳ кам кардан
-            if float(getattr(tick_stats, "volatility", 0.0)) > 50.0:
-                conf = max(0, conf - 10)
+            # Volatility filter: reduce confidence if too explosive (risk of slippage/whipsaw)
+            if float(getattr(tick_stats, "volatility", 0.0)) > 60.0:
+                conf = max(0, conf - 15)
             
             return net_norm, conf
         except Exception as exc:
@@ -1083,7 +1083,7 @@ class SignalEngine:
                 except Exception:
                     pass
 
-                entry_val, sl_val, tp_val, lot_val = self.risk.plan_order(
+                plan = self.risk.plan_order(
                     signal,
                     float(conf) / 100.0,
                     indp,
@@ -1097,19 +1097,24 @@ class SignalEngine:
                     unrealized_pl=float(unreal_pl),
                 )
 
-                if entry_val is None or sl_val is None or tp_val is None or lot_val is None:
+                if not plan.ok:
                     return SignalResult(
                         symbol=sym,
                         signal="Neutral",
                         confidence=0,
                         regime=regime,
-                        reasons=["plan_order_failed"],
+                        reasons=[f"plan_reject:{plan.reason}"],
                         spread_bps=float(spread_pct) * 10000.0,
                         latency_ms=float(comp_ms),
                         timestamp=self.feed.now_local().isoformat(),
                         signal_id=self._signal_id(sym, str(self.sp.tf_primary), bar_key, "Neutral"),
                         trade_blocked=True,
                     )
+                
+                entry_val = plan.entry
+                sl_val = plan.sl
+                tp_val = plan.tp
+                lot_val = plan.lot
 
             return SignalResult(
                 symbol=sym,
