@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
+import datetime
 
 import MetaTrader5 as mt5
 
@@ -474,19 +475,34 @@ def get_all_open_positions() -> List[Any]:
 
 def has_open_positions() -> bool:
     """
-    Санҷад дар аккаунт ягон ордер кушода аст ё не.
+    Санҷад дар аккаунт ягон позиция (order/position) кушода аст ё не.
     
-    Returns:
-        bool: True агар ягон ордер кушода бошад, False агар не.
+    Логика:
+    - Шанбе/Якшанбе: новобаста аз ҳама чиз -> False (аналитика фаъол мешавад)
+    - Агар позицияҳо кушода бошанд -> True (аналитика пауза мешавад)
+    - Агар позицияҳо нест -> False (аналитика фаъол мешавад)
     """
     try:
         _ensure_mt5_connected()
+
+        # Weekend override (local time) - выходные не важны, аналитика работает
+        wd = datetime.datetime.now().weekday()  # Mon=0 ... Sun=6
+        if wd in (5, 6):  # 5=Saturday, 6=Sunday
+            return False  # Выходные: аналитика работает (не паузится)
+
         with MT5_LOCK:
             positions = mt5.positions_get() or []
-        return len(positions) > 0
+
+        has_pos = len(positions) > 0
+        return has_pos
+
     except Exception as exc:
-        log_orders.error("has_open_positions error: %s | last_error=%s", exc, _safe_last_error())
-        return False
+        log_orders.error(
+            "has_open_positions error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
+        return False  # При ошибке считаем, что позиций нет (аналитика работает)
 
 
 # =============================================================================

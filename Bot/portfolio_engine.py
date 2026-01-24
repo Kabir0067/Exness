@@ -870,6 +870,10 @@ class MultiAssetTradingEngine:
         self._last_pipeline_log_ts = 0.0
         self._last_pipeline_log_key: Tuple[Any, ...] = (None, None, None, None)
         self._last_reconcile_ts = 0.0
+        
+        # Analysis pause state tracking (для логирования изменений состояния)
+        self._last_analysis_paused_state: Optional[bool] = None
+        self._last_analysis_state_log_ts = 0.0
 
         # Recovery
         self._max_consecutive_errors = 12
@@ -1980,11 +1984,48 @@ class MultiAssetTradingEngine:
                 # ------------------- SAFETY: PAUSE ON ACTIVE POSITIONS -------------------
                 # "Serial Trade" Logic: If ANY position is open, do not analyze new signals.
                 # This prevents over-trading and enforces strict risk management.
-                if has_open_positions():
-                    if (now_ts - self._last_pipeline_log_ts) > 60.0:  # Log specific pause reason occasionally
-                        log_health.info("ANALYSIS_PAUSED | reason=open_positions_detected (serial_mode_active)")
-                    # Skip signal generation (candidates)
-                    time.sleep(1.0) # Yield CPU
+                # Выходные (суббота/воскресенье) игнорируются - аналитика работает всегда.
+                has_pos = has_open_positions()
+                
+                # Логируем изменение состояния паузы (только при изменении или раз в минуту)
+                if has_pos != self._last_analysis_paused_state or (now_ts - self._last_analysis_state_log_ts) >= 60.0:
+                    if has_pos:
+                        # Аналитика паузится: ордера открыты
+                        wd = datetime.now().weekday()
+                        weekday_name = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"][wd]
+                        log_health.info(
+                            "ANALYSIS_STATE | paused=true reason=open_positions_detected "
+                            "open_xau=%d open_btc=%d weekday=%s (serial_mode_active)",
+                            open_xau,
+                            open_btc,
+                            weekday_name,
+                        )
+                    else:
+                        # Аналитика возобновляется: ордеров нет
+                        wd = datetime.now().weekday()
+                        weekday_name = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"][wd]
+                        if wd in (5, 6):
+                            log_health.info(
+                                "ANALYSIS_STATE | paused=false reason=weekend_override "
+                                "open_xau=%d open_btc=%d weekday=%s (аналитика работает в выходные)",
+                                open_xau,
+                                open_btc,
+                                weekday_name,
+                            )
+                        else:
+                            log_health.info(
+                                "ANALYSIS_STATE | paused=false reason=no_open_positions "
+                                "open_xau=%d open_btc=%d weekday=%s (аналитика возобновлена)",
+                                open_xau,
+                                open_btc,
+                                weekday_name,
+                            )
+                    self._last_analysis_paused_state = has_pos
+                    self._last_analysis_state_log_ts = now_ts
+                
+                if has_pos:
+                    # Skip signal generation (candidates) - аналитика паузится
+                    time.sleep(1.0)  # Yield CPU
                     continue
                 # -------------------------------------------------------------------------
 
