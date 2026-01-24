@@ -1064,9 +1064,8 @@ class RiskManager:
             if self.requires_hard_stop():
                 reasons.append(self.hard_stop_reason() or "hard_stop")
 
-            if self.current_phase == "C":
+            if self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False)):
                 reasons.append("phase_c_protect")
-
             if bool(getattr(self.cfg, "enforce_drawdown_limits", False)) and drawdown_exceeded:
                 reasons.append("max_drawdown")
 

@@ -364,7 +364,7 @@ class EngineConfig:
 
     # Policy toggles
     ignore_sessions: bool = True
-    pause_analysis_on_position_open: bool = False
+    pause_analysis_on_position_open: bool = True
     ignore_microstructure: bool = True
 
     def validate(self) -> None:

@@ -440,7 +440,7 @@ class _AssetPipeline:
             if getattr(df, "empty", False) or len(df) < 80:
                 n = 0 if getattr(df, "empty", False) else int(len(df))
                 self.last_market_ok = False
-                self.last_market_reason = f"df_short:{n}"
+                self.last_market_reason = "df_short"
                 return False
 
             # Age check

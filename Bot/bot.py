@@ -1562,7 +1562,8 @@ def check_full_program() -> tuple[bool, str]:
         issues.append("Portfolio Pipelines (XAU/BTC) ҳанӯз сохта нашудаанд (Engine not started?).")
     else:
         if not xau_pipe.last_market_ok:
-            issues.append(f"XAU Market Data Error: {xau_pipe.last_market_reason}")
+            if str(xau_pipe.last_market_reason) != "market_closed_weekend":
+                issues.append(f"XAU Market Data Error: {xau_pipe.last_market_reason}")
         if not btc_pipe.last_market_ok:
             issues.append(f"BTC Market Data Error: {btc_pipe.last_market_reason}")
 

@@ -149,6 +149,14 @@ class SignalEngine:
         self.features = feature_engine
         self.risk = risk_manager
 
+        # LOGGING for verification (USER REQUEST)
+        log.info(
+            "CFG_BTC | net_thr=%.4f rn_step=%.1f rn_buf_pct=%.6f",
+            float(self.cfg.net_norm_signal_threshold),
+            float(self.cfg.rn_step),
+            float(self.cfg.rn_buffer_pct),
+        )
+
         self._last_decision_ms = 0.0
         self._last_net_norm = 0.0
         self._last_signal = "Neutral"
@@ -516,6 +524,7 @@ class SignalEngine:
                         spread_pct=spread_pct,
                         bar_key=bar_key,
                         regime=str(adapt.get("regime")),
+                        confidence=int(conf),
                     )
 
             self._last_decision_ms = now_ms
@@ -603,6 +612,7 @@ class SignalEngine:
         reasons: List[str],
         t0: float,
         *,
+        confidence: int = 0,
         spread_pct: Optional[float] = None,
         regime: Optional[str] = None,
         bar_key: str = "no_bar",
@@ -613,7 +623,7 @@ class SignalEngine:
         return SignalResult(
             symbol=sym,
             signal="Neutral",
-            confidence=0,
+            confidence=confidence,
             regime=regime,
             reasons=(reasons or ["neutral"])[:25],
             spread_bps=None if spread_pct is None else float(spread_pct) * 10000.0,

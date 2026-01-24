@@ -251,14 +251,14 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.80  # Ислоҳ: Аз 0.85 ба 0.80 барои сигналҳои зиёдтар
-    conf_min: int = 80  # Ислоҳ: Аз 85 ба 80
-    conf_min_low: int = 80  # Ислоҳ: Аз 85 ба 80
+    min_confidence_signal: float = 0.60  # Ислоҳ: Аз 0.85 ба 0.80 барои сигналҳои зиёдтар
+    conf_min: int = 60  # Ислоҳ: Аз 85 ба 80
+    conf_min_low: int = 55  # Ислоҳ: Аз 85 ба 80
     conf_min_high: int = 90
     ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
     confidence_gain: float = 70.0  # Ислоҳ: Аз 120 ба 70 барои баланси беҳтар
-    net_norm_signal_threshold: float = 0.15  # Ислоҳ: Аз 0.10 ба 0.15 барои сигналҳои қавитар
+    net_norm_signal_threshold: float = 0.10  # Ислоҳ: Аз 0.15 ба 0.10 барои сигналҳои зиёдтар (скалпинг)
     strong_conf_min: int = 90
     require_ema_stack: bool = True
 
@@ -285,7 +285,7 @@ class EngineConfig:
 
     # Pattern detection (BTC)
     rn_step: float = 100.0
-    rn_buffer_pct: float = 0.0012
+    rn_buffer_pct: float = 0.0003
     fvg_min_atr_mult: float = 0.35
     sweep_min_atr_mult: float = 0.15
     vwap_window: int = 30
@@ -382,7 +382,7 @@ class EngineConfig:
     exec_window: int = 300
     exec_max_p95_latency_ms: float = 550.0  # Ислоҳ: Аз 650 ба 550 барои latency беҳтар
     exec_max_p95_slippage_points: float = 20.0  # Ислоҳ: Аз 30 ба 20
-    exec_max_spread_points: float = 5000.0  # Ислоҳ: Аз 100.0 ба 5000.0 (барои BTC spread)
+    exec_max_spread_points: float = 2000.0  # Ислоҳ: Аз 100.0 ба 5000.0 (барои BTC spread)
     exec_max_ewma_slippage_points: float = 15.0  # Ислоҳ: Аз 18 ба 15
     exec_breaker_sec: float = 120.0
 
