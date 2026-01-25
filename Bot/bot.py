@@ -52,6 +52,7 @@ from ExnessAPI.functions import (
     get_full_report_week,
     get_full_report_month,
     get_full_report_all,
+    market_is_open,
 )
 from Bot.portfolio_engine import engine
 from mt5_client import ensure_mt5, MT5_LOCK
@@ -570,9 +571,19 @@ engine.set_daily_start_notifier(_notify_daily_start)
 
 
 def deny(message: types.Message) -> None:
+    """Отправляет многоязычное сообщение об отказе в доступе."""
+    msg = (
+        "🔒 PRIVATE ACCESS ONLY\n"
+        "— — — — — — — — — — — — —\n"
+        "🇬🇧 This bot private. Access denied.\n"
+        "🇷🇺 Бот приватный. Доступ ограничен.\n"
+        "🇹🇯 Бот хусусӣ. Дастраси маҳдуд.\n"
+        "— — — — — — — — — — — — —\n"
+        "👤 Owner: @kabir_0067"
+    )
     bot.send_message(
         message.chat.id,
-        "❌ Шумо ҳуқуқи истифодабарии ин ботро надоред.",
+        msg,
         reply_markup=_rk_remove(),
     )
 
@@ -710,7 +721,7 @@ def bot_commands() -> None:
         types.BotCommand("/buttons", "🎛️ Тугмаҳои асосӣ"),
         types.BotCommand("/status", "⚙️ Статус оператсия"),
         types.BotCommand("/tek_prof", "💰 Гузоштани тек профит"),
-        types.BotCommand("/stop_ls", "🛡 SL: гузоштан (USD 1..10)"),
+        types.BotCommand("/stop_ls", "🛡 Гузоштани Стоп Лосс"),
     ]
     ok = bot.set_my_commands(commands)
     if not ok:
@@ -1561,9 +1572,16 @@ def check_full_program() -> tuple[bool, str]:
     if not xau_pipe or not btc_pipe:
         issues.append("Portfolio Pipelines (XAU/BTC) ҳанӯз сохта нашудаанд (Engine not started?).")
     else:
+        # XAU: игнорируем ошибки в выходные дни (суббота/воскресенье)
         if not xau_pipe.last_market_ok:
-            if str(xau_pipe.last_market_reason) != "market_closed_weekend":
-                issues.append(f"XAU Market Data Error: {xau_pipe.last_market_reason}")
+            # Если рынок XAU закрыт (выходные) - это нормально, не считаем ошибкой
+            if market_is_open("XAU"):
+                # Рынок должен быть открыт, но данные плохие - это ошибка
+                reason = str(xau_pipe.last_market_reason or "")
+                issues.append(f"XAU Market Data Error: {reason}")
+            # Если market_is_open("XAU") == False (выходные) - не добавляем ошибку
+        
+        # BTC: всегда должен работать (24/7)
         if not btc_pipe.last_market_ok:
             issues.append(f"BTC Market Data Error: {btc_pipe.last_market_reason}")
 

@@ -23,7 +23,7 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 MT5_LOCK = threading.RLock()
 
-# Protect init/shutdown sequence (MT5 is not thread-safe there)
+# Protect init/shutdown sequence
 _INIT_LOCK = threading.Lock()
 
 # Internal state
@@ -35,6 +35,10 @@ _last_health_log_ts_mono: float = 0.0  # monotonic
 _lock_guard = threading.Lock()
 _lock_fp = None
 _lock_acquired = False
+
+# Auth failure throttling (prevents restart storms)
+_auth_block_until_mono: float = 0.0
+_auth_block_reason: str = ""
 
 
 # =============================================================================
@@ -49,16 +53,13 @@ class MT5Credentials:
 
 @dataclass(frozen=True)
 class MT5ClientConfig:
-    # Credentials (required)
     creds: MT5Credentials
 
-    # Terminal start/attach options
-    mt5_path: Optional[str] = None  # full path to terminal64.exe (recommended on Windows)
+    mt5_path: Optional[str] = None
     portable: bool = False
     autostart: bool = True
     require_path_on_windows: bool = True
 
-    # Robustness
     single_instance_lock: bool = True
     taskkill_on_ipc_timeout: bool = True
     timeout_ms: int = 90_000
@@ -68,21 +69,24 @@ class MT5ClientConfig:
     retry_backoff_base_sec: float = 1.2
     backoff_cap_sec: float = 12.0
 
-    # Logging
+    # NEW: if auth failed, block re-tries for N seconds (engine will stop storming)
+    auth_fail_cooldown_sec: float = 600.0
+
     log_level: int = logging.ERROR
-    log_max_bytes: int = 5_242_880  # 5MB
+    log_max_bytes: int = 5_242_880
     log_backups: int = 5
     health_log_throttle_sec: float = 15.0
 
-    # IPC timeout detection markers
     ipc_markers: Tuple[str, ...] = ("ipc timeout", "-10005", "(-10005")
-
-    # Safety: if True, validate account login must match creds.login
     require_correct_account: bool = True
 
 
+class MT5AuthError(RuntimeError):
+    """Hard error: wrong login/password/server (do not retry in a tight loop)."""
+
+
 # =============================================================================
-# Logging (ERROR-only by default)
+# Logging
 # =============================================================================
 logger = logging.getLogger("mt5")
 logger.setLevel(logging.ERROR)
@@ -118,7 +122,6 @@ def _mono() -> float:
 
 
 def _last_error() -> Tuple[int, str]:
-    # mt5.last_error() is a mt5.* call -> protect
     with MT5_LOCK:
         try:
             code, msg = mt5.last_error()
@@ -127,15 +130,18 @@ def _last_error() -> Tuple[int, str]:
             return -99999, "unknown_mt5_error"
 
 
+def _normalize_env_str(s: str) -> str:
+    # strips quotes + whitespace + CR/LF (common .env/cmd issues)
+    x = (s or "").strip()
+    if len(x) >= 2 and ((x[0] == x[-1] == '"') or (x[0] == x[-1] == "'")):
+        x = x[1:-1].strip()
+    return x.replace("\r", "").replace("\n", "")
+
+
 def _sleep_backoff(base: float, attempt: int, cap: float) -> None:
-    """
-    Deterministic exponential backoff with a tiny deterministic additive term.
-    No randomness (good for reproducible behavior in production logs).
-    """
     a = int(attempt)
     delay = float(base) * (2.0 ** a)
-    delay = min(float(cap), delay)
-    delay = delay + min(0.25, 0.03 * a)  # deterministic micro-add
+    delay = min(float(cap), delay) + min(0.25, 0.03 * a)
     time.sleep(delay)
 
 
@@ -148,7 +154,6 @@ def _throttled_health_log(cfg: MT5ClientConfig, reason: str) -> None:
 
 
 def _validate_cfg(cfg: MT5ClientConfig) -> None:
-    # Strict validation (fail fast, deterministic)
     if cfg is None:
         raise RuntimeError("MT5ClientConfig is None")
 
@@ -171,8 +176,19 @@ def _validate_cfg(cfg: MT5ClientConfig) -> None:
         raise RuntimeError("max_retries must be > 0")
 
 
+def _is_auth_failed(err: Tuple[int, str]) -> bool:
+    code, msg = int(err[0]), str(err[1]).lower()
+    if code == -6:
+        return True
+    if "authorization failed" in msg:
+        return True
+    if "invalid account" in msg:
+        return True
+    return False
+
+
 # =============================================================================
-# Single-instance lock (prevents running 2 python engines controlling MT5)
+# Single-instance lock
 # =============================================================================
 def _lock_file_path() -> Path:
     base = Path(str(LOG_ROOT)) if str(LOG_ROOT) else (Path.cwd() / "Logs")
@@ -190,10 +206,8 @@ def _read_lock_file(p: Path) -> str:
 
 
 def _write_lock_info(p: Path) -> None:
-    # Called only after lock is acquired
     try:
         info = f"pid={os.getpid()} ts={int(time.time())}\n"
-        # Keep file content minimal and deterministic
         _lock_fp.seek(0)
         _lock_fp.truncate(0)
         _lock_fp.write(info)
@@ -207,10 +221,6 @@ def _write_lock_info(p: Path) -> None:
 
 
 def _acquire_single_instance_lock(cfg: MT5ClientConfig) -> None:
-    """
-    Correctness fix:
-    - NEVER truncate/write before acquiring OS-level lock (otherwise you destroy the other process info).
-    """
     global _lock_fp, _lock_acquired
     if not cfg.single_instance_lock:
         return
@@ -294,37 +304,23 @@ def _resolve_mt5_path_windows(mt5_path: Optional[str]) -> str:
         return mt5_path
 
     candidates: list[str] = []
-
-    # Program Files candidates
     for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
         candidates += glob.glob(base + r"\MetaTrader 5*\terminal64.exe")
         candidates += glob.glob(base + r"\MetaQuotes*\terminal64.exe")
         candidates += glob.glob(base + r"\Exness*\terminal64.exe")
 
-    # AppData candidates without os.getenv
     user_home = Path.home()
-    appdata_paths = [
-        user_home / "AppData" / "Roaming",
-        user_home / "AppData" / "Local",
-    ]
-
-    for root in appdata_paths:
+    for root in (user_home / "AppData" / "Roaming", user_home / "AppData" / "Local"):
         if root.exists():
-            search_pattern = str(root / "MetaQuotes" / "Terminal" / "*" / "terminal64.exe")
-            candidates += glob.glob(search_pattern)
+            candidates += glob.glob(str(root / "MetaQuotes" / "Terminal" / "*" / "terminal64.exe"))
 
     for x in candidates:
         if x and os.path.exists(x):
             return x
-
     return ""
 
 
-# =============================================================================
-# Windows process helpers
-# =============================================================================
 def _is_terminal_running_windows() -> bool:
-    # Faster than scanning the whole tasklist output
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
@@ -360,7 +356,6 @@ def _start_terminal_windows(path: str, portable: bool) -> None:
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         creationflags = subprocess.CREATE_NO_WINDOW
 
-    # Important: set cwd to terminal directory (more stable for terminals installed under roaming paths)
     cwd = str(Path(path).resolve().parent)
     subprocess.Popen(
         cmd,
@@ -410,7 +405,6 @@ def _health(cfg: MT5ClientConfig) -> Health:
 def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
     deadline = _mono() + float(timeout_sec)
     last = "waiting"
-    # Fast readiness loop (no MT5_LOCK while sleeping)
     while _mono() < deadline:
         with MT5_LOCK:
             h = _health(cfg)
@@ -425,12 +419,6 @@ def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
 # Initialize + login (multi-fallback)
 # =============================================================================
 def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
-    """
-    Two-stage init strategy:
-      1) mt5.initialize(login, password, server, ...)
-      2) mt5.initialize(...) then mt5.login(...)
-    """
-    # Ensure clean session (do not hold MT5_LOCK while sleeping)
     with MT5_LOCK:
         try:
             mt5.shutdown()
@@ -458,7 +446,8 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
 
     e1 = _last_error()
 
-    # Attempt #2: initialize then login
+    # If auth failed here, still try the second path once (some terminals need init first),
+    # but if it fails again with auth -> hard fail.
     with MT5_LOCK:
         try:
             mt5.shutdown()
@@ -470,6 +459,8 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
         ok2 = mt5.initialize(**init_kwargs)
     if not ok2:
         e2 = _last_error()
+        if _is_auth_failed(e1) or _is_auth_failed(e2):
+            raise MT5AuthError(f"authorization_failed: init_with_creds={e1} init_no_creds={e2}")
         raise RuntimeError(f"mt5.initialize failed: {e2} | first_try={e1}")
 
     with MT5_LOCK:
@@ -486,6 +477,8 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
                 mt5.shutdown()
             except Exception:
                 pass
+        if _is_auth_failed(e1) or _is_auth_failed(e3):
+            raise MT5AuthError(f"authorization_failed: init_with_creds={e1} login={e3}")
         raise RuntimeError(f"mt5.login failed: {e3} | first_try={e1}")
 
 
@@ -517,8 +510,8 @@ def _default_config_from_env() -> MT5ClientConfig:
 
     creds = MT5Credentials(
         login=int(getattr(cfg, "login", 0) or 0),
-        password=str(getattr(cfg, "password", "") or ""),
-        server=str(getattr(cfg, "server", "") or ""),
+        password=_normalize_env_str(str(getattr(cfg, "password", "") or "")),
+        server=_normalize_env_str(str(getattr(cfg, "server", "") or "")),
     )
 
     return MT5ClientConfig(
@@ -528,6 +521,7 @@ def _default_config_from_env() -> MT5ClientConfig:
         autostart=bool(getattr(cfg, "mt5_autostart", True)),
         timeout_ms=int(getattr(cfg, "mt5_timeout_ms", 90_000) or 90_000),
         require_path_on_windows=False,
+        auth_fail_cooldown_sec=float(getattr(cfg, "mt5_auth_cooldown_sec", 600.0) or 600.0),
     )
 
 
@@ -535,22 +529,21 @@ def _default_config_from_env() -> MT5ClientConfig:
 # Public API
 # =============================================================================
 def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
-    """
-    Deterministic MT5 initializer.
-    - Single-instance safe.
-    - IPC-timeout hardened (optional taskkill on Windows).
-    - All mt5.* calls are protected by MT5_LOCK.
-    """
-    global _initialized, _last_health_reason
+    global _initialized, _last_health_reason, _auth_block_until_mono, _auth_block_reason
 
     if cfg is None:
         cfg = _default_config_from_env()
 
     _validate_cfg(cfg)
     _setup_logger(cfg)
+
+    # AUTH cooldown gate (prevents infinite storms)
+    now = _mono()
+    if now < _auth_block_until_mono:
+        raise MT5AuthError(f"auth_blocked:{_auth_block_reason}")
+
     _acquire_single_instance_lock(cfg)
 
-    # Resolve terminal path
     mt5_path = ""
     if _is_windows():
         mt5_path = _resolve_mt5_path_windows(cfg.mt5_path)
@@ -559,7 +552,6 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
     else:
         mt5_path = cfg.mt5_path or ""
 
-    # Fast path: already initialized + healthy
     with MT5_LOCK:
         if _initialized:
             h = _health(cfg)
@@ -578,14 +570,12 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
     with _INIT_LOCK:
         for attempt in range(int(cfg.max_retries)):
             try:
-                # Autostart terminal on Windows (outside MT5_LOCK)
                 if _is_windows() and cfg.autostart:
                     if not _is_terminal_running_windows():
                         _start_terminal_windows(mt5_path, portable=cfg.portable)
                         if float(cfg.start_wait_sec) > 0:
                             time.sleep(float(cfg.start_wait_sec))
                     else:
-                        # minimal settle time on first attempt
                         if attempt == 0 and float(cfg.start_wait_sec) > 0:
                             time.sleep(min(0.75, float(cfg.start_wait_sec)))
 
@@ -598,10 +588,30 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
 
                 return mt5
 
+            except MT5AuthError as exc:
+                # Hard stop + cooldown (this is ALWAYS creds/server)
+                last_exc = exc
+                _auth_block_reason = str(exc)
+                _auth_block_until_mono = _mono() + float(cfg.auth_fail_cooldown_sec)
+
+                with MT5_LOCK:
+                    try:
+                        mt5.shutdown()
+                    except Exception:
+                        pass
+                    _initialized = False
+                    _last_health_reason = "auth_failed"
+
+                logger.error(
+                    "ensure_mt5 AUTH FAILED (cooldown %.0fs) | err=%s",
+                    float(cfg.auth_fail_cooldown_sec),
+                    exc,
+                )
+                raise
+
             except Exception as exc:
                 last_exc = exc
 
-                # IPC timeout recovery on Windows
                 is_ipc = _is_windows() and bool(cfg.taskkill_on_ipc_timeout) and _is_ipc_timeout(cfg, exc)
                 if is_ipc:
                     logger.error("IPC timeout -> taskkill terminal64.exe + retry | err=%s | last_error=%s", exc, _last_error())
@@ -628,11 +638,10 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
                     _last_health_reason = f"init_failed:{type(exc).__name__}"
 
                 logger.error(
-                    "ensure_mt5 attempt %d/%d failed: %s | last_error=%s | tb=%s",
+                    "ensure_mt5 attempt %d/%d failed: %s | tb=%s",
                     attempt + 1,
                     int(cfg.max_retries),
                     exc,
-                    _last_error(),
                     traceback.format_exc(),
                 )
 
@@ -662,4 +671,4 @@ def mt5_status() -> Tuple[bool, str]:
 
 atexit.register(shutdown_mt5)
 
-__all__ = ["ensure_mt5", "shutdown_mt5", "mt5_status", "MT5_LOCK", "MT5ClientConfig", "MT5Credentials", "mt5"]
+__all__ = ["ensure_mt5", "shutdown_mt5", "mt5_status", "MT5_LOCK", "MT5ClientConfig", "MT5Credentials", "MT5AuthError", "mt5"]

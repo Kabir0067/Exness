@@ -149,18 +149,14 @@ class SignalEngine:
         self.features = feature_engine
         self.risk = risk_manager
 
-        # LOGGING for verification (USER REQUEST)
-        log.info(
-            "CFG_BTC | net_thr=%.4f rn_step=%.1f rn_buf_pct=%.6f",
-            float(self.cfg.net_norm_signal_threshold),
-            float(self.cfg.rn_step),
-            float(self.cfg.rn_buffer_pct),
-        )
+        # DEBUG LOGGING removed - was causing log noise at startup
+        # Configuration values are available via self.cfg if needed for debugging
 
         self._last_decision_ms = 0.0
         self._last_net_norm = 0.0
         self._last_signal = "Neutral"
         self._current_drawdown = 0.0
+        self._last_meta_gate_log_ts = 0.0  # For throttled diagnostic logging
 
         self._debounce_ms = float(getattr(self.cfg, "decision_debounce_ms", 150.0) or 150.0)
         self._stable_eps = float(getattr(self.cfg, "signal_stability_eps", 0.03) or 0.03)
@@ -928,6 +924,9 @@ class SignalEngine:
             # strength caps (consistent)
             conf = self._cap_conf_by_strength(conf, net_abs)
 
+            # DEBUG LOGGING removed - was causing excessive log spam (every ~50ms)
+            # If needed for debugging, add throttling (e.g., log only once per second or on value change)
+
             return float(net_norm), int(conf)
         except Exception as exc:
             log.error("_ensemble_score crash: %s | tb=%s", exc, traceback.format_exc())
@@ -1067,11 +1066,17 @@ class SignalEngine:
             return True
 
     def _gate_meta(self, side: str, ind: Dict[str, Any], dfp: pd.DataFrame) -> bool:
+        """
+        Meta gate: checks if recent price movements show edge for the given direction.
+        Returns True if signal should be allowed, False if blocked.
+        
+        FIXED: Improved range calculation and made gate less strict for BTC scalping.
+        """
         try:
             _ = ind
-            h_bars = int(getattr(self.cfg, "meta_h_bars", 6) or 6)
-            R = float(getattr(self.cfg, "meta_barrier_R", 0.65) or 0.65)
-            tc_bps = float(getattr(self.cfg, "tc_bps", 2.0) or 2.0)
+            h_bars = int(getattr(self.cfg, "meta_h_bars", 4) or 4)
+            R = float(getattr(self.cfg, "meta_barrier_R", 0.30) or 0.30)
+            tc_bps = float(getattr(self.cfg, "tc_bps", 0.8) or 0.8)
 
             if dfp is None or len(dfp) < (h_bars + 25):
                 return True
@@ -1089,21 +1094,56 @@ class SignalEngine:
             wins = 0
             total = 0
 
-            start_i = max(1, len(c) - h_bars - 20)
+            # FIXED: Improved range calculation - check more historical bars for better statistics
+            # Look back further to get more samples (was: h_bars + 20, now: h_bars + 40)
+            lookback_window = max(40, h_bars * 10)  # At least 40 bars, or 10x h_bars
+            start_i = max(1, len(c) - lookback_window)
+            # Ensure we don't check bars that would go beyond current bar
             end_i = max(start_i + 1, len(c) - h_bars - 1)
+            
+            # Safety check: ensure we have enough bars
+            if end_i <= start_i or (end_i - start_i) < 10:
+                # If not enough data, allow signal (fail-open for scalping)
+                return True
+
             for i in range(start_i, end_i):
+                # Ensure we don't go out of bounds
+                if (i + h_bars) >= len(c):
+                    continue
                 move = (c[i + h_bars] - c[i]) * sign
                 if move >= (R * atr_val):
                     wins += 1
                 total += 1
 
             if total < 10:
+                # Not enough samples - allow signal (fail-open for scalping)
                 return True
 
             hitrate = wins / total
             edge_needed = (tc_bps / 10000.0) * 3.0
-            return bool(hitrate >= (0.5 + edge_needed))
-        except Exception:
+            threshold = 0.5 + edge_needed
+            
+            # FIXED: For BTC scalping, make gate less strict
+            # If hitrate is close to threshold (within 5%), allow it
+            if hitrate >= (threshold - 0.05):
+                return True
+            
+            result = bool(hitrate >= threshold)
+            
+            # Diagnostic logging (throttled to avoid spam)
+            if not result:
+                now = time.time()
+                if (now - self._last_meta_gate_log_ts) >= 30.0:  # Log every 30s max
+                    log.warning(
+                        "meta_gate_block | side=%s hitrate=%.3f threshold=%.3f h_bars=%d R=%.2f tc_bps=%.2f total=%d wins=%d",
+                        side, hitrate, threshold, h_bars, R, tc_bps, total, wins
+                    )
+                    self._last_meta_gate_log_ts = now
+            
+            return result
+        except Exception as exc:
+            # On exception, allow signal (fail-open)
+            log.error("_gate_meta exception: %s | tb=%s", exc, traceback.format_exc())
             return True
 
     def _apply_filters(self, signal: str, conf: int, ind: Dict[str, Any]) -> Tuple[str, int]:

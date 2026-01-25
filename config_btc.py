@@ -257,8 +257,8 @@ class EngineConfig:
     conf_min_high: int = 90
     ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
-    confidence_gain: float = 70.0  # Ислоҳ: Аз 120 ба 70 барои баланси беҳтар
-    net_norm_signal_threshold: float = 0.10  # Ислоҳ: Аз 0.15 ба 0.10 барои сигналҳои зиёдтар (скалпинг)
+    confidence_gain: float = 85.0  # Ислоҳ: Аз 70 ба 85 барои сигналҳои эътимодноктар
+    net_norm_signal_threshold: float = 0.08  # Ислоҳ: Аз 0.10 ба 0.08 барои сигналҳои скалпинг
     strong_conf_min: int = 90
     require_ema_stack: bool = True
 
@@ -516,7 +516,7 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
 
-    cfg.min_confidence_signal = 0.85  # Ислоҳ: Аз 0.82 ба 0.85
+    cfg.min_confidence_signal = 0.60  # FIXED: Lowered from 0.85 to 0.60 to match expected signal strength
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05

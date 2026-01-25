@@ -2032,7 +2032,8 @@ class MultiAssetTradingEngine:
                 # "Serial Trade" Logic: If ANY position is open, do not analyze new signals.
                 # This prevents over-trading and enforces strict risk management.
                 # Выходные (суббота/воскресенье) игнорируются - аналитика работает всегда.
-                has_pos = has_open_positions()
+                # has_pos = has_open_positions()
+                has_pos = False  # FIXED: Disabled serial mode to allow concurrent XAU + BTC trading
                 
                 # Логируем изменение состояния паузы (только при изменении или раз в минуту)
                 if has_pos != self._last_analysis_paused_state or (now_ts - self._last_analysis_state_log_ts) >= 60.0:
