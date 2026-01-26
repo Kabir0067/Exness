@@ -303,17 +303,26 @@ class SignalEngine:
             bias_up = "up" in trend_l
             bias_dn = "down" in trend_l
 
-            # Улучшенная логика для Sell сигналов - более гибкая
-            trend_ok_buy = (close_p > ema50_l * 0.998) and (adx_l >= adx_lo_ltf or bias_up)
-            # Для Sell: более мягкие условия - если тренд вниз или цена ниже EMA50, разрешаем
-            trend_ok_sell = (close_p < ema50_l * 1.002) or bias_dn or (adx_l < adx_lo_ltf * 1.5)
+            # ИСЛОҲ: Шартҳои содатар барои сигналҳои Buy ва Sell
+            # Buy: Нарх аз EMA50 боло бошад ва ADX >= 16 ё тренд боло
+            trend_ok_buy = (close_p > ema50_l * 0.997) and (adx_l >= adx_lo_ltf * 0.8 or bias_up)
+            
+            # Sell: Шартҳо хело содатар - агар яке аз инҳо бошад = Sell иҷозат дорад:
+            # 1. Нарх аз EMA50 поён бошад
+            # 2. Тренд вниз бошад
+            # 3. ADX паст бошад (= боҳисобии range)
+            # 4. Нарх аз EMA_short поён бошад
+            trend_ok_sell = (
+                (close_p < ema50_l * 1.003) or 
+                bias_dn or 
+                (adx_l < adx_lo_ltf * 2.0) or
+                (close_p < ema_s)
+            )
 
             if require_stack:
-                trend_ok_buy = trend_ok_buy and (close_p > ema_s > ema_m)
-                # Для Sell: если цена ниже EMA или тренд вниз, разрешаем (более гибко)
-                trend_ok_sell = trend_ok_sell and (
-                    (close_p < ema_s) or (close_p < ema_m) or bias_dn or (adx_l < adx_lo_ltf * 1.5) or (not (close_p > ema_s > ema_m))
-                )
+                trend_ok_buy = trend_ok_buy and (close_p > ema_s * 0.999)
+                # Барои Sell: Агар нарх аз EMA поён ё тренд вниз бошад - иҷозат
+                trend_ok_sell = trend_ok_sell or (close_p < ema_m) or (not (close_p > ema_s > ema_m))
 
             # Ensemble score
             book = self.feed.fetch_book() or {}
@@ -935,7 +944,7 @@ class SignalEngine:
                 max_base = 96.0
 
             conf_gain_adj = conf_gain * 0.75  # Slightly reduced gain to separate weak/strong better
-            base_conf = conf_bias + (net_norm * conf_gain_adj)
+            base_conf = conf_bias + (net_abs * conf_gain_adj)
             conf = int(_clamp(base_conf, 10.0, max_base))
             
             # Volatility filter: reduce confidence if too explosive (risk of slippage/whipsaw)
@@ -1093,16 +1102,17 @@ class SignalEngine:
 
     def _gate_meta(self, side: str, ind: Dict[str, Any], dfp: pd.DataFrame) -> bool:
         """
-        Meta gate optimized for medium scalping (1-15 min).
+        Meta gate OPTIMIZED for Scalping 1-15 min (v4).
+        Relaxed thresholds to allow more signals while maintaining quality.
         """
         try:
             _ = ind
             h_bars = int(getattr(self.cfg, "meta_h_bars", 6) or 6)
-            R = float(getattr(self.cfg, "meta_barrier_R", 0.65) or 0.65)
-            tc_bps = float(getattr(self.cfg, "tc_bps", 2.0) or 2.0)
+            R = float(getattr(self.cfg, "meta_barrier_R", 0.50) or 0.50)  # Use config value (0.50)
+            tc_bps = float(getattr(self.cfg, "tc_bps", 1.0) or 1.0)  # Use config value (1.0)
 
-            if dfp is None or len(dfp) < (h_bars + 25):
-                return True
+            if dfp is None or len(dfp) < (h_bars + 30):
+                return True  # Fail-open for insufficient data
 
             c = dfp["close"].to_numpy(dtype=np.float64)
             h = dfp["high"].to_numpy(dtype=np.float64)
@@ -1111,38 +1121,58 @@ class SignalEngine:
             atr = _atr(h, l, c, 14)
             atr_val = float(safe_last(atr, 1.0) or 1.0)
             if atr_val <= 0:
-                return True
+                return True  # Fail-open
 
             sign = 1.0 if side == "Buy" else -1.0
-            start_i = max(1, len(c) - h_bars - 40)  # Increased lookback
+            # Optimized lookback for scalping: wider window for better statistics
+            start_i = max(1, len(c) - h_bars - 50)  # Increased from 40
             end_i = max(start_i + 1, len(c) - h_bars - 1)
 
             idx = np.arange(start_i, end_i, dtype=np.int64)
-            if idx.size < 5:  # Reduced from 10
-                return True
+            if idx.size < 3:  # Reduced from 5 for scalping
+                return True  # Fail-open for insufficient samples
 
             moves = (c[idx + h_bars] - c[idx]) * sign
             wins = int(np.sum(moves >= (R * atr_val)))
             total = int(idx.size)
 
+            if total < 3:
+                return True  # Fail-open
+
             hitrate = wins / total
-            edge_needed = (tc_bps / 10000.0) * 2.0  # Reduced from 3.0
-            threshold = 0.45 + edge_needed  # Reduced from 0.50
+            edge_needed = (tc_bps / 10000.0) * 1.5  # Reduced from 2.0 for scalping
+            threshold = 0.40 + edge_needed  # Reduced from 0.45 for scalping
             
-            # Optimized for medium scalping
-            if hitrate >= (threshold - 0.15):  # 15% margin
+            # OPTIMIZED for scalping: multiple fail-open conditions
+            # 1. If hitrate is above threshold - allow
+            if hitrate >= threshold:
                 return True
-            if hitrate >= 0.35:  # Allow if above 35%
+            
+            # 2. If hitrate is close to threshold (within 20% margin) - allow
+            if hitrate >= (threshold - 0.20):  # Increased margin from 0.15
+                return True
+            
+            # 3. If hitrate is above 30% (was 35%) - allow for scalping
+            if hitrate >= 0.30:
+                return True
+            
+            # 4. If we have very few samples but hitrate > 25% - allow
+            if total < 10 and hitrate >= 0.25:
                 return True
                 
-            return bool(hitrate >= threshold)
+            # 5. Default: block only if hitrate is very low
+            return bool(hitrate >= 0.25)  # Minimum fail-open threshold
         except Exception:
-            return True
+            return True  # Fail-open on any error
 
     def _apply_filters(self, signal: str, conf: int, ind: Dict[str, Any]) -> Tuple[str, int]:
+        """
+        OPTIMIZED filters for Scalping 1-15 min.
+        Reduced penalties to allow more signals while maintaining quality.
+        """
         try:
             if signal == "Neutral":
-                return "Neutral", int(_clamp(float(conf), 0.0, 96.0))
+                return "Neutral", int(_clamp(float(conf), 0.0, 97.0))  # Increased cap to 97
 
             atr = float(ind.get("atr", 0.0) or 0.0)
             body = float(ind.get("body", 0.0) or 0.0)
@@ -1152,22 +1182,24 @@ class SignalEngine:
                 except Exception:
                     body = 0.0
 
-            min_body_k = float(getattr(self.cfg, "min_body_pct_of_atr", 0.14) or 0.14)
+            # Reduced penalty for small body (scalping bars can be small)
+            min_body_k = float(getattr(self.cfg, "min_body_pct_of_atr", 0.09) or 0.09)
             if atr > 0 and body < (min_body_k * atr):
-                conf = max(0, conf - 25)
+                conf = max(0, conf - 15)  # Reduced penalty from 25 to 15
 
             close_p = float(ind.get("close", 0.0) or 0.0)
             ema_s, ema_m = self._ema_s_m(ind, close_p)
 
+            # Increased boost for EMA alignment (scalping benefits from alignment)
             if signal == "Buy" and close_p > ema_s > ema_m:
-                conf += 10
+                conf += 12  # Increased from 10
             elif signal == "Sell" and close_p < ema_s < ema_m:
-                conf += 10
+                conf += 12  # Increased from 10
 
-            conf = int(_clamp(float(conf), 0.0, 96.0))
+            conf = int(_clamp(float(conf), 0.0, 97.0))  # Increased cap to 97
             return signal, conf
         except Exception:
-            conf = int(_clamp(float(conf), 0.0, 96.0))
+            conf = int(_clamp(float(conf), 0.0, 97.0))
             return signal, conf
 
     def _finalize(

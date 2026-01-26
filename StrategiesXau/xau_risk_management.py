@@ -545,16 +545,48 @@ class RiskManager:
     def _reset_daily_state(self) -> None:
         self.daily_date = self._utc_date()
 
-        bal, eq = self._account_snapshot()
-        base = bal if bal > 0 else eq
+        # ИСЛОҲ: Баланс аз файл хонда мешавад барои режимҳои дуруст
+        try:
+            from ExnessAPI.daily_balance import initialize_daily_balance, get_peak_balance
+            
+            # Гирифтани баланси ҷорӣ аз MT5
+            bal, eq = self._account_snapshot()
+            current_balance = bal if bal > 0 else eq
+            
+            # Инитсиализатсияи баланси рӯзона (аз файл ё нав)
+                        # ИСЛОҲ: Баланс барои оғози рӯз аз ExnessAPI.functions.get_balance гирифта мешавад
+            try:
+                from ExnessAPI.functions import get_balance as _get_balance  # type: ignore
+            except Exception:  # pragma: no cover
+                from ExnessApi.functions import get_balance as _get_balance  # type: ignore
 
-        self.daily_start_balance = float(base if base > 0 else 0.0)
-        self.daily_peak_equity = float(max(eq, self.daily_start_balance))
+            saved_balance, saved_mode = initialize_daily_balance(float(current_balance), asset="XAU", balance_provider=_get_balance)
+
+            
+            if saved_balance > 0:
+                self.daily_start_balance = float(saved_balance)
+                self.current_phase = str(saved_mode)
+                log_risk.info(
+                    "XAU daily state loaded: start_balance=%.2f current=%.2f mode=%s",
+                    saved_balance, current_balance, saved_mode
+                )
+            else:
+                self.daily_start_balance = float(current_balance if current_balance > 0 else 0.0)
+                self.current_phase = "A"
+            
+            self.daily_peak_equity = float(max(eq, self.daily_start_balance, get_peak_balance(asset="XAU") or 0.0))
+            
+        except Exception as e:
+            log_risk.error("Error loading daily balance: %s", e)
+            bal, eq = self._account_snapshot()
+            base = bal if bal > 0 else eq
+            self.daily_start_balance = float(base if base > 0 else 0.0)
+            self.daily_peak_equity = float(max(eq, self.daily_start_balance))
+            self.current_phase = "A"
 
         self._target_breached = False
         self._target_breached_return = 0.0
         self._phase_reason_last = None
-        self.current_phase = "A"
         self._trading_disabled_until = 0.0
         self._hard_stop_reason = None
 

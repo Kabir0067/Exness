@@ -52,7 +52,6 @@ from StrategiesBtc.btc_signal_engine import SignalEngine as BtcSignalEngine
 
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 
-
 # =============================================================================
 # Logging
 # =============================================================================

@@ -267,9 +267,14 @@ class SignalEngine:
             if bid and ask:
                 spread_usd = float(ask - bid)
                 
-                # Dynamic spread limit based on price level
-                # For BTC at ~$87000, $25 spread = 0.03% (acceptable for scalping)
-                max_spread_usd = 25.0  # Increased from $5 for realistic BTC trading
+                # ИСЛОҲ: Dynamic spread limit based on price level
+                # For BTC at ~$87000-100000, $50 spread = 0.05% (realistic for crypto)
+                # ИСЛОҲ: Dynamic spread limit based on mid price + configured spread_limit_pct
+                # Prevents 'no signals' when BTC spread is briefly > $50.
+                mid_price = float((bid + ask) / 2.0)
+                sp_pct = float(getattr(self.sp, "spread_limit_pct", 0.0007) or 0.0007)
+                # allow ~1.8x configured pct, clamp to sane USD range
+                max_spread_usd = max(20.0, min(250.0, mid_price * sp_pct * 1.8))
                 
                 if spread_usd > max_spread_usd:
                      return self._neutral(
@@ -326,18 +331,21 @@ class SignalEngine:
             close_p = float(indp.get("close", 0.0) or 0.0)
             ema_s, ema_m = self._ema_s_m(indp, close_p)
             
-            # === RELAXED TREND CHECKS FOR CRYPTO VOLATILITY ===
-            # Add tolerance for crypto's fast-moving nature
-            ema_tolerance = 0.0002  # 0.02% tolerance
-            trend_ok_buy = close_p > ema_s * (1 - ema_tolerance) > ema_m * (1 - ema_tolerance)
-            trend_ok_sell = close_p < ema_s * (1 + ema_tolerance) < ema_m * (1 + ema_tolerance)
+            # === ИСЛОҲ: RELAXED TREND CHECKS FOR CRYPTO VOLATILITY ===
+            # BTC дар 24/7 савдо мешавад ва тезтар аз XAU ҳаракат мекунад
+            ema_tolerance = 0.001  # 0.1% tolerance (higher for crypto)
+            
+            # Buy: Нархи ҷорӣ аз EMA боло бошад
+            trend_ok_buy = close_p > ema_s * (1 - ema_tolerance)
+            # Sell: Нархи ҷорӣ аз EMA поён бошад
+            trend_ok_sell = close_p < ema_s * (1 + ema_tolerance)
             
             # Allow BREAKOUT trades when ADX is high (strong trend developing)
             adx_p = float(indp.get("adx", 0.0) or 0.0)
-            if adx_p > 30.0:  # Strong trend
-                if net_norm > 0.12:  # Bullish breakout
+            if adx_p > 25.0:  # Strong trend (lowered from 30)
+                if net_norm > 0.10:  # Bullish breakout (lowered from 0.12)
                     trend_ok_buy = True
-                elif net_norm < -0.12:  # Bearish breakout
+                elif net_norm < -0.10:  # Bearish breakout (lowered from -0.12)
                     trend_ok_sell = True
 
             net_norm_abs = abs(net_norm)

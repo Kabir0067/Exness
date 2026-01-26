@@ -18,7 +18,7 @@ import urllib3
 
 TG_HEALTH_NOTIFY = False
 
-from Bot.bot import ADMIN, bot, bot_commands
+from Bot.bot import bot, ADMIN, bot_commands
 from Bot.portfolio_engine import engine
 from log_config import LOG_DIR as LOG_ROOT, get_log_path, log_dir_stats
 
