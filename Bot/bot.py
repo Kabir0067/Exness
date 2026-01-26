@@ -1000,11 +1000,36 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
 def start_handler(message: types.Message) -> None:
     if not is_admin_chat(message.chat.id):
         deny(message)
+        # Notify admin about unauthorized access attempt
+        try:
+            user_id = int(message.from_user.id) if message.from_user else 0
+            username = str(message.from_user.username or "N/A") if message.from_user else "N/A"
+            chat_id = int(message.chat.id)
+            first_name = str(message.from_user.first_name or "N/A") if message.from_user else "N/A"
+            last_name = str(message.from_user.last_name or "") if message.from_user else ""
+            
+            alert_msg = (
+                "⚠️ <b>Unauthorized Access Attempt</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 User ID: <code>{user_id}</code>\n"
+                f"💬 Chat ID: <code>{chat_id}</code>\n"
+                f"📛 Username: @{username}\n"
+                f"👨‍💼 Name: {first_name} {last_name}\n"
+                f"⏰ Time: {_format_time_only()}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔒 Access denied."
+            )
+            bot.send_message(ADMIN, alert_msg, parse_mode="HTML")
+        except Exception as exc:
+            log.error("Failed to send unauthorized access alert: %s", exc)
         return
-        bot.send_message(
+    
+    # Admin access - show welcome message and menu
+    bot.send_message(
         message.chat.id,
         "👋 <b>Хуш омадед!</b>\nБарои идоракунӣ менюро истифода баред: /buttons",
         parse_mode="HTML",
+        reply_markup=_rk_remove(),
     )
     buttons_func(message)
 
