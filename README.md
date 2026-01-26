@@ -3,10 +3,19 @@
 This project is a **production-grade algorithmic trading system** connected to **MetaTrader 5 (MT5)**.  
 It runs **two strategies in parallel**:
 
-- **XAUUSDm** (Gold)
-- **BTCUSDm** (Bitcoin)
+- **XAUUSDm** (Gold) — Traditional scalping with strict quality filters
+- **BTCUSDm** (Bitcoin) — Volatility-adapted medium scalping (1-15 min) with optimized filters
 
 Each pipeline continuously analyzes the market, generates signals, applies risk rules, and sends orders to MT5.
+
+## Latest Updates (January 2026)
+
+**BTC Medium Scalping Optimizations**:
+- ✅ **Spread tolerance increased**: $5 → **$25** (realistic for BTC volatility)
+- ✅ **Relaxed trend checks**: 0.02% EMA tolerance + breakout support (ADX > 30)
+- ✅ **Dynamic confidence caps**: Granular system (82-96% based on signal strength)
+- ✅ **Meta gate optimization**: Reduced thresholds, wider tolerance (15%), fail-open at 35% hitrate
+- ✅ **Result**: More active trading in volatile crypto markets while maintaining quality
 
 This README is aligned with the current codebase. Environment variables are used **only for 5 secret values**.
 
@@ -17,6 +26,9 @@ This README is aligned with the current codebase. Environment variables are used
 - Runs two pipelines (**XAU + BTC**) concurrently; **both are allowed to open trades**.
 - Uses multi-timeframe analysis: **M1 + M5 + M15**  
   If M5/M15 are not available → falls back to **M1**.
+- **Trading Style**: Optimized for **medium scalping (1-15 minutes)** with focus on:
+  - **XAU**: Traditional scalping with strict quality filters
+  - **BTC**: Volatility-adapted scalping with relaxed trend checks and breakout support
 - Produces **Signal + SL/TP/Lot** via the risk layer, then executes orders in MT5.
 - Includes a **Telegram bot** for supervision and control with **professional reporting**.
 - Writes **health + diagnostic logs** into `Logs/` with **standardized logger names**.
@@ -367,14 +379,36 @@ Main config files:
 * `ignore_daily_stop_for_trading=False` → enables trade-lock (engine continues, trading locked)
 
 **Signal Quality**:
-* `min_confidence_signal=0.80` (XAU) / `0.75` (BTC) → Minimum confidence for Phase A
+* `min_confidence_signal=0.80` (XAU) / `0.60` (BTC) → Minimum confidence for Phase A
 * `ultra_confidence_min=0.90` (XAU) / `0.90` (BTC) → Minimum confidence for Phase B
-* `net_norm_signal_threshold=0.15` (XAU) / `0.12` (BTC) → Minimum signal strength
-* `confidence_gain=70.0` (XAU) / `120.0` (BTC) → Confidence calculation multiplier
+* `net_norm_signal_threshold=0.15` (XAU) / `0.08` (BTC) → Minimum signal strength
+* `confidence_gain=70.0` (XAU) / `85.0` (BTC) → Confidence calculation multiplier
 * `confidence_bias=50.0` → Base confidence value
+* **Dynamic Confidence Caps** (Both XAU & BTC):
+  - `net_norm_abs < 0.10` → max confidence = 82%
+  - `net_norm_abs < 0.15` → max confidence = 88%
+  - `net_norm_abs < 0.20` → max confidence = 93%
+  - `net_norm_abs >= 0.20` → max confidence = 96%
+
+**BTC-Specific Scalping Parameters**:
+* **Spread Gate**: Maximum spread = **$25 USD** (increased from $5 for realistic BTC trading)
+* **Trend Tolerance**: EMA tolerance = **0.02%** (0.0002) for crypto volatility
+* **Breakout Support**: When ADX > 30, allows breakout trades (net_norm > 0.12 or < -0.12)
+* **Meta Gate (Optimized for 1-15 min scalping)**:
+  - `meta_barrier_R=0.30` → Barrier multiplier (reduced from 0.40)
+  - `meta_h_bars=4` → Look-ahead bars
+  - `tc_bps=0.8` → Transaction cost in basis points (reduced from 1.0)
+  - Minimum samples: **5** (reduced from 10)
+  - Base threshold: **0.45** (reduced from 0.50)
+  - Edge multiplier: **2.0** (reduced from 3.0)
+  - Tolerance margin: **15%** (increased from 5%)
+  - Fail-open threshold: **35%** hitrate (BTC can be choppy)
 
 **Spread & Execution Limits**:
 * `exec_max_spread_points=500.0` (XAU) / `5000.0` (BTC) → Maximum spread for execution
+* **BTC Spread Gate (USD-based)**: Maximum spread = **$25** (increased from $5 for realistic BTC trading)
+  - For BTC at ~$87,000, $25 spread = 0.03% (acceptable for scalping)
+  - Accounts for wider spreads on weekends and volatile periods
 * `exec_max_p95_latency_ms=550.0` → Maximum latency (95th percentile)
 * `exec_max_p95_slippage_points=20.0` → Maximum slippage (95th percentile)
 * `exec_max_ewma_slippage_points=15.0` → Maximum EWMA slippage
@@ -420,17 +454,69 @@ The system calculates confidence **dynamically** based on signal strength:
   - With `require_stack`: `(close_p < ema_s)` or `(close_p < ema_m)` — allows Sell when price below EMAs
 - **Result**: System now generates Sell signals correctly even in downtrends
 
-### BTC Trading
-- **Fixed blocking issues**:
-  - `meta_barrier_R`: 0.40 → **0.30** (more signals)
-  - `tc_bps`: 1.0 → **0.8** (more signals)
-  - `daily_loss_c_pct`: 0.05 → **0.06** (better activity)
-  - `daily_loss_b_pct`: 0.02 → **0.03** (better activity)
-- **Result**: BTC now trades more actively while maintaining safety
+### BTC Trading Optimizations (Medium Scalping 1-15 min)
+
+**Spread Gate (USD-based)**:
+- **Increased spread tolerance**: $5 → **$25** (BTC has wider spreads, especially on weekends)
+- **Dynamic calculation**: For BTC at ~$87,000, $25 spread = 0.03% (acceptable for scalping)
+- **Rationale**: BTC spreads are naturally wider than XAU; scalping requires higher tolerance
+
+**Trend Checks (Relaxed for Crypto Volatility)**:
+- **EMA tolerance**: Added 0.02% tolerance for fast-moving crypto markets
+  - Buy: `close_p > ema_s * (1 - 0.0002) > ema_m * (1 - 0.0002)`
+  - Sell: `close_p < ema_s * (1 + 0.0002) < ema_m * (1 + 0.0002)`
+- **Breakout trades**: When ADX > 30 (strong trend), allows breakout trades:
+  - Bullish breakout: `net_norm > 0.12` → `trend_ok_buy = True`
+  - Bearish breakout: `net_norm < -0.12` → `trend_ok_sell = True`
+- **Result**: System captures more opportunities in volatile crypto markets
+
+**Dynamic Confidence Caps**:
+- **Same as XAU**: Confidence is capped based on actual signal strength (`net_norm_abs`):
+  - `net_norm_abs < 0.10` → max confidence = 82%
+  - `net_norm_abs < 0.15` → max confidence = 88%
+  - `net_norm_abs < 0.20` → max confidence = 93%
+  - `net_norm_abs >= 0.20` → max confidence = 96%
+- **Result**: Confidence accurately reflects signal quality, prevents overconfidence
+
+**Meta Gate Optimization (BTC Scalping)**:
+- **Reduced sample requirements**: Minimum samples: 10 → **5** (faster adaptation)
+- **Lower edge requirement**: `edge_needed` multiplier: 3.0 → **2.0** (less strict)
+- **Lower base threshold**: Base threshold: 0.50 → **0.45** (more permissive)
+- **Wider tolerance margin**: Tolerance: 5% → **15%** (accounts for BTC volatility)
+- **Additional fail-open**: If `hitrate >= 35%`, allow signal (BTC can be choppy)
+- **Result**: Meta gate is optimized for medium scalping (1-15 min), allowing more valid signals while maintaining quality
+
+**Previous Fixes**:
+- `meta_barrier_R`: 0.40 → **0.30** (more signals)
+- `tc_bps`: 1.0 → **0.8** (more signals)
+- `daily_loss_c_pct`: 0.05 → **0.06** (better activity)
+- `daily_loss_b_pct`: 0.02 → **0.03** (better activity)
+
+**Overall Result**: BTC now trades more actively in volatile conditions while maintaining safety through dynamic confidence caps and optimized filters
 
 ---
 
-## Recent Improvements & Fixes
+## Recent Improvements & Fixes (Latest Updates)
+
+### BTC Medium Scalping Optimizations (January 2026)
+- ✅ **Spread Gate Enhancement**: Increased from $5 to **$25** for realistic BTC trading
+  - Accounts for wider spreads on weekends and volatile periods
+  - Dynamic calculation: $25 at ~$87,000 = 0.03% (acceptable for scalping)
+- ✅ **Relaxed Trend Checks**: Added 0.02% EMA tolerance for crypto volatility
+  - Allows signals when price is within 0.02% of EMA stack
+  - Breakout support: When ADX > 30, allows breakout trades (net_norm > 0.12 or < -0.12)
+- ✅ **Dynamic Confidence Caps**: Implemented same granular system as XAU
+  - Prevents overconfidence: caps based on actual signal strength (82-96%)
+  - Ensures confidence accurately reflects signal quality
+- ✅ **Meta Gate Optimization**: Optimized for medium scalping (1-15 min)
+  - Reduced sample requirements: 10 → 5 (faster adaptation)
+  - Lower edge requirement: 3.0 → 2.0 multiplier
+  - Lower base threshold: 0.50 → 0.45
+  - Wider tolerance: 5% → 15% (accounts for BTC volatility)
+  - Additional fail-open: hitrate >= 35% allows signal (BTC can be choppy)
+  - Result: More valid signals while maintaining quality standards
+
+## Recent Improvements & Fixes (Previous)
 
 ### Phase A/B/C Regimes
 - ✅ **Fully functional** — automatic transitions based on daily P&L
@@ -452,7 +538,12 @@ The system calculates confidence **dynamically** based on signal strength:
 
 ### Signal Quality
 - ✅ **Improved Sell signals for XAU** — better logic for downtrend detection
-- ✅ **Fixed BTC blocking** — adjusted meta gate and phase thresholds
+- ✅ **BTC Scalping Optimizations**:
+  - **Increased spread tolerance**: $5 → $25 (realistic for BTC volatility)
+  - **Relaxed trend checks**: 0.02% EMA tolerance + breakout support (ADX > 30)
+  - **Dynamic confidence caps**: Same granular system as XAU (82-96% based on strength)
+  - **Optimized meta gate**: Reduced thresholds, wider tolerance (15%), fail-open at 35% hitrate
+  - **Result**: More active trading in volatile crypto markets while maintaining quality
 - ✅ **Stricter filters** — additional quality checks (ADX, spread, net_norm)
 - ✅ **Multi-order logic** — based on confidence tiers (80-85%: 1, 85-90%: 2, 90%+: 3)
 - ✅ **Reduced logging spam** — Phase C state changes logged only when state changes

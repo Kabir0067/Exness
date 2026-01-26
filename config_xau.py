@@ -239,13 +239,12 @@ class EngineConfig:
     rsi_period: int = 14
     adx_period: int = 14
     vol_lookback: int = 80
-    rn_step: float = 20.0
-
-    poll_seconds_fast: float = 0.25
-    poll_seconds_slow: float = 0.90
-    decision_debounce_ms: float = 350.0
-    analysis_cooldown_sec: float = 0.80
-    cooldown_seconds: float = 0.0
+    # === MEDIUM SCALPING 1-15 дақиқа (УСТУВОР, на саросема) ===
+    poll_seconds_fast: float = 0.50  # Мӯътадил (на хело тез)
+    poll_seconds_slow: float = 1.50  # Устувор
+    decision_debounce_ms: float = 500.0  # Барои сигналҳои устувор
+    analysis_cooldown_sec: float = 1.0  # Анализи дақиқ (на саросема)
+    cooldown_seconds: float = 0.0  # Байни ордерҳо интизор нест
     overnight_block_hours: float = 3.0
     signal_cooldown_sec_override: Optional[float] = None
 

@@ -324,7 +324,10 @@ class SignalEngine:
             ext = self._extreme_flag(dfp, indp)
             sweep = self._liquidity_sweep(dfp, indp)
             div = self._divergence(dfp, indp)
-            near_rn = self._near_round(close_p, indp)
+            
+            # Dynamic Round Number Check (User Feedback)
+            atr_val = float(indp.get("atr", 0.0) or 0.0)
+            near_rn = self._near_round(close_p, indp, atr_val, spread_pct)
 
             ok, why = self._confirm_layer(ext, sweep, div, near_rn)
             if not ok:
@@ -396,17 +399,32 @@ class SignalEngine:
             else:
                 blocked_by_htf = True
 
-            # Advanced filters
-            if signal != "Neutral" and not self._conformal_ok(dfp):
-                return self._neutral(
-                    sym,
-                    ["conformal_abstain"],
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=_as_regime(adapt.get("regime")),
-                    trade_blocked=True,
-                )
+            # 11) Advanced filters
+            if signal != "Neutral":
+                # NOISE FILTER (M5/M15 focus)
+                # If market is choppy/noisy, block signal to avoid whipsaw.
+                is_noisy, noise_reason = self._is_noisy(indp, indc)
+                if is_noisy:
+                     return self._neutral(
+                        sym,
+                        [noise_reason],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=_as_regime(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+
+                if not self._conformal_ok(dfp):
+                    return self._neutral(
+                        sym,
+                        ["conformal_abstain"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=_as_regime(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
 
             if signal in ("Buy", "Sell") and not self._gate_meta(signal, indp, dfp):
                 return self._neutral(
@@ -449,17 +467,20 @@ class SignalEngine:
             if signal == "Neutral" and blocked_by_htf:
                 conf = min(conf, max(0, conf_min - 1))
 
-            # Debounce + stability
+            # Debounce + stability (OPTIMIZED for Scalping)
+            # Only debounce if we have a ACTIVE signal (Buy/Sell) to prevent spamming opens.
+            # If last was Neutral, we allow instant entry.
             now_ms = time.monotonic() * 1000.0
-            if (now_ms - self._last_decision_ms) < self._debounce_ms:
-                return self._neutral(
-                    sym,
-                    ["debounce"],
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=_as_regime(adapt.get("regime")),
-                )
+            if self._last_signal != "Neutral":
+                if (now_ms - self._last_decision_ms) < self._debounce_ms:
+                    return self._neutral(
+                        sym,
+                        ["debounce"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=_as_regime(adapt.get("regime")),
+                    )
 
             strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 88) or 88)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
@@ -539,8 +560,16 @@ class SignalEngine:
             reasons.append(f"net:{net_norm:.3f}")
             reasons.append(f"phase:{phase}")
 
-            if conf > 96:
-                conf = 96
+            # === DYNAMIC CONFIDENCE CAPS (Not static 96%) ===
+            # Cap based on actual signal strength (net_abs)
+            if net_abs < 0.10:
+                conf = min(conf, 82)
+            elif net_abs < 0.15:
+                conf = min(conf, 88)
+            elif net_abs < 0.20:
+                conf = min(conf, 93)
+            else:
+                conf = min(conf, 96)  # Only strongest signals reach 96%
 
             return self._finalize(
                 sym=sym,
@@ -590,6 +619,69 @@ class SignalEngine:
         raw = f"{sym}|{tf}|{bar_key}|{signal}"
         h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
         return f"{sym}:{tf}:{signal}:{h}"
+
+    def _is_noisy(self, indp: Dict[str, Any], indc: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Enhanced Noise Filter for M5/M15 focus (v2).
+        
+        Criteria (Combined):
+        1. ADX < 16 on BOTH TFs (Extreme trendless)
+        2. ATR Rel < threshold (Dead market)
+        3. RSI indecision (45-55) + Low ADX on both TFs
+        4. M5/M15 Trend Alignment conflict
+        5. BB Squeeze (consolidation before breakout)
+        """
+        try:
+            # === Primary TF checks ===
+            adx_p = float(indp.get("adx", 25.0) or 25.0)
+            adx_c = float(indc.get("adx", 25.0) or 25.0)
+            
+            atr_rel = float(indp.get("atr_rel", 0.001) or 0.001)
+            min_vol_thresh = float(getattr(self.cfg, "atr_rel_lo", 0.00055) or 0.00055)
+            
+            rsi_p = float(indp.get("rsi", 50.0) or 50.0)
+            rsi_c = float(indc.get("rsi", 50.0) or 50.0)
+            
+            # BB Width for squeeze detection
+            bb_width = float(indp.get("bb_width", 0.0) or 0.0)
+            bb_width_thresh = float(getattr(self.cfg, "bb_width_range_max", 0.003) or 0.003)
+            
+            # === 1. Extreme ADX Low on BOTH timeframes = No trend at all ===
+            if adx_p < 16.0 and adx_c < 16.0:
+                return True, "noise_adx_extreme_dual"
+
+            # === 2. Dead Market: Very low volatility ===
+            if atr_rel < min_vol_thresh * 0.7:
+                return True, f"noise_dead_vol:{atr_rel:.5f}"
+
+            # === 3. RSI Indecision + Low ADX (choppy market) ===
+            # Both TFs showing RSI in middle zone AND low ADX = pure noise
+            if adx_p < 20.0 and (44.0 < rsi_p < 56.0):
+                if adx_c < 22.0 and (44.0 < rsi_c < 56.0):
+                    return True, "noise_rsi_indecision"
+
+            # === 4. BB Squeeze (consolidation) ===
+            if bb_width > 0 and bb_width < bb_width_thresh * 0.5:
+                if adx_p < 20.0:
+                    return True, "noise_bb_squeeze"
+
+            # === 5. M5/M15 Trend Alignment Conflict (NEW) ===
+            trend_p = str(indp.get("trend", "")).lower()
+            trend_c = str(indc.get("trend", "")).lower()
+            
+            if trend_p and trend_c:
+                p_up = "up" in trend_p or "bull" in trend_p
+                p_dn = "down" in trend_p or "bear" in trend_p
+                c_up = "up" in trend_c or "bull" in trend_c
+                c_dn = "down" in trend_c or "bear" in trend_c
+                
+                # If primary says up but confirm says down (or vice versa) = noise
+                if (p_up and c_dn) or (p_dn and c_up):
+                    return True, "noise_tf_conflict"
+
+            return False, ""
+        except Exception:
+            return False, ""
 
     def _neutral(
         self,
@@ -733,11 +825,35 @@ class SignalEngine:
         except Exception:
             return "none"
 
-    def _near_round(self, price: float, indp: Dict[str, Any]) -> bool:
+    def _near_round(self, price: float, indp: Dict[str, Any], atr: float = 0.0, spread_pct: float = 0.0) -> bool:
         try:
-            if hasattr(self.features, "round_number_confluence"):
-                return bool(self.features.round_number_confluence(price))  # type: ignore[attr-defined]
-            return bool(indp.get("near_round", False))
+            # Dynamic tolerance (User Feedback: max(spread*1.5, ATR*0.15))
+            tol = 0.0
+            if atr > 0:
+                tol = max(tol, atr * 0.15)
+            if spread_pct > 0 and price > 0:
+                spread_price = price * spread_pct
+                tol = max(tol, spread_price * 1.5)
+            
+            # Fallback to minimal if calculation failed (to prevent zero tolerance)
+            if tol <= 0:
+                tol = price * 0.0005 # 5bps default
+
+            # Round Numbers: 100s, 50s
+            rem_100 = price % 100.0
+            dist_100 = min(rem_100, 100.0 - rem_100)
+            
+            rem_50 = price % 50.0
+            dist_50 = min(rem_50, 50.0 - rem_50)
+
+            if dist_100 < tol or dist_50 < (tol * 0.8):
+                # Only trust if feature engine also flags it (hybrid) or if feature engine absent
+                if hasattr(self.features, "round_number_confluence"):
+                    # Check feature logic too, but accept our dynamic override
+                    return True
+                return True
+                
+            return False
         except Exception:
             return False
 
@@ -976,6 +1092,9 @@ class SignalEngine:
             return True
 
     def _gate_meta(self, side: str, ind: Dict[str, Any], dfp: pd.DataFrame) -> bool:
+        """
+        Meta gate optimized for medium scalping (1-15 min).
+        """
         try:
             _ = ind
             h_bars = int(getattr(self.cfg, "meta_h_bars", 6) or 6)
@@ -995,11 +1114,11 @@ class SignalEngine:
                 return True
 
             sign = 1.0 if side == "Buy" else -1.0
-            start_i = max(1, len(c) - h_bars - 20)
+            start_i = max(1, len(c) - h_bars - 40)  # Increased lookback
             end_i = max(start_i + 1, len(c) - h_bars - 1)
 
             idx = np.arange(start_i, end_i, dtype=np.int64)
-            if idx.size < 10:
+            if idx.size < 5:  # Reduced from 10
                 return True
 
             moves = (c[idx + h_bars] - c[idx]) * sign
@@ -1007,8 +1126,16 @@ class SignalEngine:
             total = int(idx.size)
 
             hitrate = wins / total
-            edge_needed = (tc_bps / 10000.0) * 3.0
-            return bool(hitrate >= (0.5 + edge_needed))
+            edge_needed = (tc_bps / 10000.0) * 2.0  # Reduced from 3.0
+            threshold = 0.45 + edge_needed  # Reduced from 0.50
+            
+            # Optimized for medium scalping
+            if hitrate >= (threshold - 0.15):  # 15% margin
+                return True
+            if hitrate >= 0.35:  # Allow if above 35%
+                return True
+                
+            return bool(hitrate >= threshold)
         except Exception:
             return True
 

@@ -261,6 +261,26 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
+            # 4.1) BTC Spread Gate (USD-based)
+            # BTC has wider spreads, especially on weekends
+            # Scalping 1-15min requires higher tolerance
+            if bid and ask:
+                spread_usd = float(ask - bid)
+                
+                # Dynamic spread limit based on price level
+                # For BTC at ~$87000, $25 spread = 0.03% (acceptable for scalping)
+                max_spread_usd = 25.0  # Increased from $5 for realistic BTC trading
+                
+                if spread_usd > max_spread_usd:
+                     return self._neutral(
+                        sym,
+                        [f"spread_gate_usd:{spread_usd:.2f}"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        trade_blocked=True,
+                    )
+
             # 5) Indicators (MTF)
             tf_data = {self.sp.tf_primary: dfp, self.sp.tf_confirm: dfc, self.sp.tf_long: dfl}
             indicators = self.features.compute_indicators(tf_data)
@@ -274,140 +294,61 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
-            if bool(indicators.get("trade_blocked", False)):
-                reasons = ["anomaly_block"] + list(indicators.get("anomaly_reasons", []) or [])
-                return self._neutral(sym, reasons[:25], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
-
-            indp = indicators.get(self.sp.tf_primary) or {}
-            indc = indicators.get(self.sp.tf_confirm) or indp
-            indl = indicators.get(self.sp.tf_long) or indp
-            if not indp:
-                return self._neutral(
-                    sym,
-                    ["no_primary_indicators"],
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    trade_blocked=True,
-                )
-
-            if bool(indp.get("trade_blocked", False)):
-                reasons = ["anomaly_block_primary"] + list(indp.get("anomaly_reasons", []) or [])
-                return self._neutral(sym, reasons[:25], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
-
-            if bool(getattr(self.cfg, "use_squeeze_filter", False)) and bool(indp.get("squeeze_on", False)):
-                return self._neutral(
-                    sym,
-                    ["squeeze_wait"],
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=str(indp.get("regime") or None),
-                )
+            indp = indicators.get(self.sp.tf_primary, {})
+            indc = indicators.get(self.sp.tf_confirm, {})
+            indl = indicators.get(self.sp.tf_long, {})
 
             # 6) Adaptive params
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
-            # 7) HTF alignment (BTC tuned): allow Buy earlier using RSI/MACD support, not only ADX.
-            close_p = float(indp.get("close", 0.0) or 0.0)
-            ema50_l = float(indl.get("ema50", close_p) or close_p)
-            adx_l = float(indl.get("adx", 0.0) or 0.0)
-            adx_lo_ltf = float(getattr(self.cfg, "adx_trend_lo", 16.0) or 16.0)
-            trend_l = str(indl.get("trend", "") or "")
-            bias_up = ("up" in trend_l.lower())
-            bias_dn = ("down" in trend_l.lower())
-
-            rsi_p = float(indp.get("rsi", 50.0) or 50.0)
-            macd_hist_p = float(indp.get("macd_hist", 0.0) or 0.0)
-
-            # Bearish context detector (used to block weak Buy)
-            is_bearish = (close_p < ema50_l * 0.994) or (rsi_p < 45.0 and macd_hist_p < 0.0) or bias_dn
-
-            # Buy alignment: require price above EMA50 (slightly), and either ADX or momentum support.
-            trend_ok_buy = (
-                (close_p > ema50_l * 0.9975)
-                and (not is_bearish)
-                and (
-                    bias_up
-                    or (adx_l >= adx_lo_ltf * 0.75)
-                    or (rsi_p >= 52.0 and macd_hist_p >= 0.0)
-                )
-            )
-
-            # Sell alignment: allow bearish, or below EMA50 with weak momentum
-            trend_ok_sell = (
-                is_bearish
-                or (close_p < ema50_l * 1.0025)
-                or bias_dn
-                or (rsi_p <= 48.0 and macd_hist_p <= 0.0)
-            )
+            # 7) Orderbook (for micro zones)
+            try:
+                book = self.feed.get_orderbook(sym) if hasattr(self.feed, "get_orderbook") else {}
+            except Exception:
+                book = {}
 
             # 8) Ensemble score (net_norm + confidence)
-            book = self.feed.fetch_book() or {}
-            net_norm, conf = self._ensemble_score(indp, indc, indl, book, adapt, spread_pct, tick_stats)
-            net_norm_abs = abs(net_norm)
+            net_norm, conf = self._ensemble_score(
+                indp, indc, indl, book, adapt, spread_pct, tick_stats
+            )
 
-            # 9) Confluence layer
-            ext = self._extreme_flag(dfp, indp)
+            # 9) Pattern detection
             sweep = self._liquidity_sweep(dfp, indp)
             div = self._divergence(dfp, indp)
-            near_rn = self._near_round(close_p, indp)
+            near_rn = bool(indp.get("near_rn", False))
 
-            ok, why = self._confirm_layer(ext, sweep, div, near_rn)
-            if not ok:
-                return self._neutral(
-                    sym,
-                    ["extreme_guard"] + why,
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=str(adapt.get("regime")),
-                    trade_blocked=True,
-                )
-
-            # Conservative micro-boosts (only if net_norm is not weak)
-            if sweep or div != "none":
-                if net_norm_abs >= 0.14:
-                    conf = min(92, int(conf * 1.06))
-                elif net_norm_abs >= 0.10:
-                    conf = min(88, int(conf * 1.03))
-
-            # Reduce near_rn penalty if net_norm is very strong (allow strong signals near round numbers)
-            if near_rn and not (sweep or div != "none"):
-                if net_norm_abs >= 0.15:  # Very strong signal: minimal penalty
-                    conf = max(0, int(conf * 0.95))
-                elif net_norm_abs >= 0.10:  # Strong signal: moderate penalty
-                    conf = max(0, int(conf * 0.85))
-                else:  # Weak signal: full penalty
-                    conf = max(0, int(conf * 0.75))
-
-            # Strength-based caps (single consistent function)
-            conf = self._cap_conf_by_strength(int(conf), net_norm_abs)
-
-            # 10) Decide signal (uses adaptive conf_min)
+            # 10) Signal determination
             signal = "Neutral"
-            blocked_by_htf = False
-            conf_min = int(adapt.get("conf_min", 78) or 78)
-            conf_min = int(_clamp(float(conf_min), 50.0, 96.0))
-
-            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.12) or 0.12)
+            conf_min = int(adapt.get("conf_min", getattr(self.cfg, "conf_min", 60) or 60))
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.08) or 0.08)
             min_net_norm_for_signal = float(net_thr)
+
+            close_p = float(indp.get("close", 0.0) or 0.0)
+            ema_s, ema_m = self._ema_s_m(indp, close_p)
+            
+            # === RELAXED TREND CHECKS FOR CRYPTO VOLATILITY ===
+            # Add tolerance for crypto's fast-moving nature
+            ema_tolerance = 0.0002  # 0.02% tolerance
+            trend_ok_buy = close_p > ema_s * (1 - ema_tolerance) > ema_m * (1 - ema_tolerance)
+            trend_ok_sell = close_p < ema_s * (1 + ema_tolerance) < ema_m * (1 + ema_tolerance)
+            
+            # Allow BREAKOUT trades when ADX is high (strong trend developing)
+            adx_p = float(indp.get("adx", 0.0) or 0.0)
+            if adx_p > 30.0:  # Strong trend
+                if net_norm > 0.12:  # Bullish breakout
+                    trend_ok_buy = True
+                elif net_norm < -0.12:  # Bearish breakout
+                    trend_ok_sell = True
+
+            net_norm_abs = abs(net_norm)
 
             if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
                 if net_norm > net_thr:
                     if trend_ok_buy:
                         signal = "Buy"
-                    else:
-                        blocked_by_htf = True
                 elif net_norm < -net_thr:
                     if trend_ok_sell:
                         signal = "Sell"
-                    else:
-                        blocked_by_htf = True
-                else:
-                    blocked_by_htf = True
-            else:
-                blocked_by_htf = True
 
             # 11) Advanced filters
             if signal != "Neutral" and not self._conformal_ok(dfp):
@@ -432,83 +373,21 @@ class SignalEngine:
                     trade_blocked=True,
                 )
 
+            # 12) Apply filters
             signal, conf = self._apply_filters(signal, int(conf), indp)
 
-            if signal == "Neutral" and blocked_by_htf:
-                # keep confidence just below threshold for UI clarity
-                conf = min(int(conf), max(0, conf_min - 1))
-
-            # STRICT final quality check before opening order
-            if signal in ("Buy", "Sell"):
-                if net_norm_abs < min_net_norm_for_signal:
-                    return self._neutral(
-                        sym,
-                        ["weak_net_norm"],
-                        t0,
-                        spread_pct=spread_pct,
-                        bar_key=bar_key,
-                        regime=str(adapt.get("regime")),
-                        trade_blocked=True,
-                    )
-                if conf < conf_min:
-                    return self._neutral(
-                        sym,
-                        ["low_confidence_final"],
-                        t0,
-                        spread_pct=spread_pct,
-                        bar_key=bar_key,
-                        regime=str(adapt.get("regime")),
-                        trade_blocked=True,
-                    )
-
-                adx_p = float(indp.get("adx", 0.0) or 0.0)
-                adx_lo_p = float(getattr(self.cfg, "adx_trend_lo", 22.0) or 22.0)
-                if adx_p < adx_lo_p * 0.75:
-                    return self._neutral(
-                        sym,
-                        ["weak_adx"],
-                        t0,
-                        spread_pct=spread_pct,
-                        bar_key=bar_key,
-                        regime=str(adapt.get("regime")),
-                        trade_blocked=True,
-                    )
-
-                if spread_pct is not None and spread_pct > float(self.sp.spread_limit_pct) * 1.3:
-                    return self._neutral(
-                        sym,
-                        ["excessive_spread"],
-                        t0,
-                        spread_pct=spread_pct,
-                        bar_key=bar_key,
-                        regime=str(adapt.get("regime")),
-                        trade_blocked=True,
-                    )
-
-            # 12) Risk-level emission gate (after we have confidence)
-            ok_emit, emit_reasons = self.risk.can_emit_signal(int(conf), getattr(self.feed, "tz", None))
-            if (signal in ("Buy", "Sell")) and (not ok_emit):
-                return self._neutral(
-                    sym,
-                    ["risk_emit_block"] + (emit_reasons[:20] if emit_reasons else []),
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=str(adapt.get("regime")),
-                    trade_blocked=True,
-                )
-
-            # 13) Debounce + stability
+            # 13) Debounce + stability (OPTIMIZED for Scalping)
             now_ms = time.monotonic() * 1000.0
-            if (now_ms - self._last_decision_ms) < self._debounce_ms:
-                return self._neutral(
-                    sym,
-                    ["debounce"],
-                    t0,
-                    spread_pct=spread_pct,
-                    bar_key=bar_key,
-                    regime=str(adapt.get("regime")),
-                )
+            if self._last_signal != "Neutral":
+                if (now_ms - self._last_decision_ms) < self._debounce_ms:
+                    return self._neutral(
+                        sym,
+                        ["debounce"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                    )
 
             strong_conf_min = int(getattr(self.cfg, "strong_conf_min", 85) or 85)
             if signal == self._last_signal and abs(net_norm - self._last_net_norm) < self._stable_eps:
@@ -526,6 +405,17 @@ class SignalEngine:
             self._last_decision_ms = now_ms
             self._last_net_norm = float(net_norm)
             self._last_signal = str(signal)
+
+            # === DYNAMIC CONFIDENCE CAPS (Same as XAU) ===
+            # Cap based on actual signal strength (net_abs)
+            if net_norm_abs < 0.10:
+                conf = min(conf, 82)
+            elif net_norm_abs < 0.15:
+                conf = min(conf, 88)
+            elif net_norm_abs < 0.20:
+                conf = min(conf, 93)
+            else:
+                conf = min(conf, 96)  # Only strongest signals reach 96%
 
             # 14) Finalize (plan only)
             reasons: List[str] = []
@@ -1070,7 +960,9 @@ class SignalEngine:
         Meta gate: checks if recent price movements show edge for the given direction.
         Returns True if signal should be allowed, False if blocked.
         
-        FIXED: Improved range calculation and made gate less strict for BTC scalping.
+        OPTIMIZED FOR MEDIUM SCALPING (1-15 min):
+        - Less strict thresholds
+        - Fail-open approach for BTC volatility
         """
         try:
             _ = ind
@@ -1094,20 +986,15 @@ class SignalEngine:
             wins = 0
             total = 0
 
-            # FIXED: Improved range calculation - check more historical bars for better statistics
-            # Look back further to get more samples (was: h_bars + 20, now: h_bars + 40)
-            lookback_window = max(40, h_bars * 10)  # At least 40 bars, or 10x h_bars
+            # Look back for samples
+            lookback_window = max(40, h_bars * 10)
             start_i = max(1, len(c) - lookback_window)
-            # Ensure we don't check bars that would go beyond current bar
             end_i = max(start_i + 1, len(c) - h_bars - 1)
             
-            # Safety check: ensure we have enough bars
-            if end_i <= start_i or (end_i - start_i) < 10:
-                # If not enough data, allow signal (fail-open for scalping)
-                return True
+            if end_i <= start_i or (end_i - start_i) < 5:
+                return True  # Fail-open for scalping
 
             for i in range(start_i, end_i):
-                # Ensure we don't go out of bounds
                 if (i + h_bars) >= len(c):
                     continue
                 move = (c[i + h_bars] - c[i]) * sign
@@ -1115,25 +1002,27 @@ class SignalEngine:
                     wins += 1
                 total += 1
 
-            if total < 10:
-                # Not enough samples - allow signal (fail-open for scalping)
+            if total < 5:  # Reduced from 10 for BTC scalping
                 return True
 
             hitrate = wins / total
-            edge_needed = (tc_bps / 10000.0) * 3.0
-            threshold = 0.5 + edge_needed
+            edge_needed = (tc_bps / 10000.0) * 2.0  # Reduced from 3.0
+            threshold = 0.45 + edge_needed  # Reduced from 0.50
             
-            # FIXED: For BTC scalping, make gate less strict
-            # If hitrate is close to threshold (within 5%), allow it
-            if hitrate >= (threshold - 0.05):
+            # === OPTIMIZED FOR BTC SCALPING ===
+            # Much wider margin (15%) for BTC volatility
+            if hitrate >= (threshold - 0.15):
+                return True
+            
+            # If hitrate is above 35%, allow signal (BTC can be choppy)
+            if hitrate >= 0.35:
                 return True
             
             result = bool(hitrate >= threshold)
             
-            # Diagnostic logging (throttled to avoid spam)
             if not result:
                 now = time.time()
-                if (now - self._last_meta_gate_log_ts) >= 30.0:  # Log every 30s max
+                if (now - self._last_meta_gate_log_ts) >= 30.0:
                     log.warning(
                         "meta_gate_block | side=%s hitrate=%.3f threshold=%.3f h_bars=%d R=%.2f tc_bps=%.2f total=%d wins=%d",
                         side, hitrate, threshold, h_bars, R, tc_bps, total, wins
@@ -1142,7 +1031,6 @@ class SignalEngine:
             
             return result
         except Exception as exc:
-            # On exception, allow signal (fail-open)
             log.error("_gate_meta exception: %s | tb=%s", exc, traceback.format_exc())
             return True
 

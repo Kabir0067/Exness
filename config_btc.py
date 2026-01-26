@@ -156,7 +156,9 @@ class SymbolParams:
     bb_width_range_max: float = 0.0080
 
     # Spread caps (CRITICAL FOR BTC)
-    spread_limit_pct: float = 0.0040  # Ислоҳ: Аз 0.0050 ба 0.0040 кам карда шуд барои филтри спреди тангтар (зиёнҳо кам)
+    # BTC has wider spreads than XAU, especially on weekends
+    # At $87,000 price, 0.05% = $43.50 max spread (realistic for scalping)
+    spread_limit_pct: float = 0.0005  # 0.05% - increased from 0.0040 for realistic BTC trading
 
     def symbol(self) -> str:
         return (self.resolved or self.base).strip()
@@ -311,10 +313,10 @@ class EngineConfig:
     min_bars_m5_m15: int = 180
     min_bars_default: int = 160
 
-    # Engine loop (BTC fast)
-    poll_seconds_fast: float = 0.05
-    decision_debounce_ms: float = 20.0
-    analysis_cooldown_sec: float = 0.0
+    # === MEDIUM SCALPING 1-15 дақиқа (УСТУВОР) ===
+    poll_seconds_fast: float = 0.50  # Мӯътадил барои BTC
+    decision_debounce_ms: float = 400.0  # Устувор (BTC тезтар аз XAU)
+    analysis_cooldown_sec: float = 0.8  # Анализи дақиқ
     cooldown_seconds: float = 0.0
     signal_cooldown_sec_override: Optional[float] = None
 

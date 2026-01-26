@@ -869,38 +869,36 @@ class RiskManager:
         return float(eq)
 
     # ------------------- state evaluation (Phase A/B/C) -------------------
-    def _roll_daily_anchor(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        if getattr(self, "_day_anchor", None) != today:
-            self._day_anchor = today
-            self.daily_start_balance = 0.0
-            self._target_breached = False
-            self._target_breached_return = 0.0
-            self._soft_stop_until = 0.0
-            self._soft_stop_reason = None
-            self.daily_peak_equity = 0.0
-
     def evaluate_account_state(self) -> None:
         try:
-            self._roll_daily_anchor()
-
-            if self._utc_date() != self.daily_date:
+            # 1. Check for Daily Reset (UTC)
+            today = self._utc_date()
+            if today != self.daily_date:
                 self._reset_daily_state()
 
+            # 2. Update snapshots
             bal, eq = self._account_snapshot()
 
+            # 3. Initialize Anchor if missing (e.g. first run of the day)
+            if self.daily_start_balance <= 0:
+                base = bal if bal > 0 else eq
+                if base > 0:
+                    self.daily_start_balance = float(base)
+                    log_risk.info("DAILY_ANCHOR_INIT | start_balance=%.2f", self.daily_start_balance)
+
+            # 4. Calculate Stats
             if bal > 0:
                 self._current_drawdown = max(0.0, float((bal - eq) / bal))
 
             self.daily_peak_equity = max(self.daily_peak_equity, eq)
-            if self.daily_start_balance <= 0 and (bal > 0 or eq > 0):
-                self.daily_start_balance = max(bal, eq)
 
             daily_return = 0.0
             if self.daily_start_balance > 0:
                 daily_return = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
-            # A -> B by daily target
+            # Log periodically (every ~1 min) or on significant change could be nice, but keep it clean for now.
+            # 5. Phase Logic
+            # A -> B (Target Reached)
             if (not self._target_breached) and daily_return >= float(self.cfg.daily_target_pct):
                 if self.current_phase != "B":
                     self.current_phase = "B"
@@ -942,20 +940,23 @@ class RiskManager:
                     self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
                     target_pct = float(self.cfg.daily_target_pct)
                     
-                    # 1. Standard Lock: if we went ABOVE target, and now dropped BELOW target -> STOP
-                    if self._target_breached_return > target_pct and daily_return < target_pct:
+                    # === FIX: Add buffer before protection kicks in ===
+                    # Only apply protection if we went MEANINGFULLY above target (>= target + 2%)
+                    profit_buffer = 0.02  # 2% buffer above target before protection kicks in
+                    
+                    # 1. Standard Lock: if we went ABOVE target+buffer, and now dropped BELOW target -> STOP
+                    if self._target_breached_return >= (target_pct + profit_buffer) and daily_return < target_pct:
                          self._enter_hard_stop("profit_protection_target_lost")
 
                     # 2. Trailing Profit Stop (User Request: "if 11, 12, 13 ... and drops -> STOP")
-                    # We use protect_drawdown_from_peak_pct (e.g. 0.20 means 20% retrace of GAINS, or absolute pct drop)
-                    # Let's use strict absolute drop from peak relative to daily balance
+                    # Only apply if we've exceeded the target by the buffer amount
                     prot_pct = float(getattr(self.cfg, "protect_drawdown_from_peak_pct", 0.05) or 0.05) 
                     
                     # Calc drop from peak return
                     drop_from_peak = self._target_breached_return - daily_return
                     
-                    # Only apply if we are well into profit (above target)
-                    if self._target_breached_return > target_pct and drop_from_peak >= prot_pct:
+                    # Only apply if we are well into profit (above target + buffer)
+                    if self._target_breached_return >= (target_pct + profit_buffer) and drop_from_peak >= prot_pct:
                         self._enter_hard_stop(f"profit_protection_drop:{drop_from_peak:.1%}")
 
         except Exception as exc:

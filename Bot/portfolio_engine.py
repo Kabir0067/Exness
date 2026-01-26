@@ -56,6 +56,48 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 # Logging
 # =============================================================================
+from datetime import timezone
+
+# =============================================================================
+# Scheduler
+# =============================================================================
+class UTCScheduler:
+    """
+    Source of Truth for Day/Time logic.
+    Weekdays (Mon-Fri): XAU + BTC
+    Weekends (Sat-Sun): BTC Only
+    """
+    @staticmethod
+    def now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def is_weekend() -> bool:
+        # 5=Sat, 6=Sun
+        return UTCScheduler.now_utc().weekday() >= 5
+
+    @staticmethod
+    def get_active_assets() -> Tuple[str, ...]:
+        if UTCScheduler.is_weekend():
+            return ("BTC",)
+        return ("XAU", "BTC")
+
+    @staticmethod
+    def market_status(asset: str) -> bool:
+        """
+        Internal market open check.
+        BTC: Always Open (24/7).
+        XAU: Weekdays only + Hours check.
+        """
+        if asset == "BTC":
+            return True
+        if asset == "XAU":
+            if UTCScheduler.is_weekend():
+                return False
+            # Simple hour check (UTC) - refined later if needed by config, but this is the hard guard
+            # Assuming logic provided in user requirement: "strictly switch modes based on server time"
+            return True
+        return False
 
 
 def _rotating_file_logger(
@@ -408,14 +450,23 @@ class _AssetPipeline:
             return None
 
     def validate_market_data(self) -> bool:
-        if not market_is_open(self.asset):
+        # Internal check first (Scheduler)
+        if not UTCScheduler.market_status(self.asset):
             self.last_market_ok = False
-            self.last_market_reason = "market_closed_weekend"
+            self.last_market_reason = "scheduler_closed"
             self.last_bar_age_sec = 0.0
             self.last_market_close = 0.0
             self.last_market_volume = 0.0
             self.last_market_ts = "-"
             return False
+
+        # Fallback to external check ONLY for XAU Weekday (to catch holidays)
+        # For BTC, we trust Scheduler (24/7)
+        if self.asset == "XAU":
+            if not market_is_open(self.asset):
+                 self.last_market_ok = False
+                 self.last_market_reason = "broker_closed"
+                 return False
 
         now = time.time()
 
@@ -1166,20 +1217,31 @@ class MultiAssetTradingEngine:
         if not last:
             return False
         last_ts, count = last
-        cooldown = self._cooldown_for_asset(asset)
-        if (now - float(last_ts)) >= cooldown:
-            return False
-        return int(count) >= int(max_orders)
+        
+        # 1. Hard cap on count
+        if int(count) >= int(max_orders):
+            return True
+            
+        # 2. Scaling throttle (Machine-gun Fix)
+        # If we already have an order (count > 0), ensure 10s gap before next scaling order
+        # This ensures First order is INSTANT, but 2nd/3rd are spaced out
+        min_scale_delay = 10.0
+        if int(count) > 0:
+            if (now - float(last_ts)) < min_scale_delay:
+                return True # Block, too soon after last order
+                
+        return False
 
     def _mark_seen(self, asset: str, signal_id: str, now: float) -> None:
         key = (asset, signal_id)
-        cooldown = self._cooldown_for_asset(asset)
+        # Refresh cooldown on every fill so scaling orders are spaced relative to the LAST one
+        # Not just the first one.
         last = self._seen_index.get(key)
         count = 0
         if last:
-            last_ts, last_count = last
-            if (now - float(last_ts)) < cooldown:
-                count = int(last_count)
+            _, last_count = last
+            count = int(last_count)
+        
         count += 1
         self._seen_index[key] = (float(now), int(count))
         self._seen.append((asset, signal_id, now))
@@ -1213,33 +1275,23 @@ class MultiAssetTradingEngine:
         return True
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
-        # Patch: Prioritize BTC in weekend or if XAU closed
-        xau_open = market_is_open("XAU")
+        # 1. Check strict Scheduler rules first
+        active_assets = UTCScheduler.get_active_assets()
+        
+        # 2. If Weekend -> BTC Only
+        if "XAU" not in active_assets:
+            return "BTC"
 
+        # 3. Weekday -> Both allowed
         if open_xau > 0 and open_btc > 0:
             return "BOTH"
-        
-        # If XAU has positions...
         if open_xau > 0:
-            # If XAU is OPEN, it's definitely active.
-            if xau_open:
-                return "XAU"
-            # If XAU is CLOSED (weekend), but we have positions...
-            # The user says "active_asset force to BTC". 
-            # If we return BTC (and we have implied open_btc=0 here), 
-            # it means we focus on BTC.
-            return "BTC"
-
+            return "XAU"
         if open_btc > 0:
             return "BTC"
-            
-        # If no positions, select based on market availability? 
-        # Or just default to NONE until signal?
-        # User said "gate might confuse BTC" if active=XAU.
-        if not xau_open:
-            return "BTC"
 
-        return "NONE"
+        # 4. If no positions, just say what's technically active
+        return "XAU+BTC"
 
     def _enqueue_order(
         self,
@@ -1280,6 +1332,21 @@ class MultiAssetTradingEngine:
         if lot_val <= 0:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset)
             return False, None
+
+        # === PHASE ENFORCEMENT POLICY ===
+        phase = str(getattr(risk, "current_phase", "A") or "A") if risk else "A"
+        
+        # Phase C: Hard kill - should not reach here (blocked earlier) but safety check
+        if phase == "C":
+            log_health.info("ENQUEUE_SKIP | asset=%s reason=phase_c_kill", cand.asset)
+            return False, None
+            
+        # Phase B: Reduce lot by 50% (protective mode)
+        if phase == "B":
+            lot_val = lot_val * 0.5
+            lot_val = max(0.01, lot_val)  # Ensure minimum lot
+            log_health.info("PHASE_B_LOT_REDUCE | asset=%s original_lot=%.4f reduced_lot=%.4f", 
+                           cand.asset, float(cand.lot), lot_val)
 
         intent = OrderIntent(
             asset=cand.asset,
@@ -1328,69 +1395,83 @@ class MultiAssetTradingEngine:
         return True, order_id
 
     def _orders_for_candidate(self, cand: AssetCandidate) -> int:
+        """
+        SAFE Multi-Order Logic (Anti-Suicide Fix v2).
+        
+        Default: 1 order (ALWAYS safe).
+        2 orders: ONLY if Phase A + no positions + conf >= 92% + net >= 0.15 + tight spread
+        3 orders: ONLY if Phase A + no positions + conf >= 95% + confluence + net >= 0.20
+        
+        Phase B: Max 1 order (strict)
+        Phase C: 0 orders (kill switch)
+        """
+        pipe = self._xau if cand.asset == "XAU" else self._btc
+        if not pipe or not pipe.risk:
+            return 1
+            
+        phase = str(getattr(pipe.risk, "current_phase", "A") or "A")
+        
+        # === PHASE C: HARD KILL ===
+        if phase == "C":
+            return 0
+            
+        # === PHASE B: MAX 1 ORDER (PROTECTIVE MODE) ===
+        if phase == "B":
+            return 1
+
+        # === PHASE A: NORMAL WITH STRICT SCALING ===
         cfg = self._xau_cfg if cand.asset == "XAU" else self._btc_cfg
-
-        max_orders = int(getattr(cfg, "multi_order_max_orders", 3) or 3)
-        max_orders = max(1, min(6, max_orders))
-
+        
+        # Check if we already have open positions - no scaling if so
+        open_pos = pipe.open_positions()
+        if open_pos > 0:
+            return 1
+        
+        # Normalize confidence
         conf = float(cand.confidence)
         if conf > 1.5:
             conf = conf / 100.0
-
-        regime = ""
+            
+        # Extract spread
         spread_bps = 0.0
         try:
-            rr = cand.raw_result
-            regime = str(getattr(rr, "regime", "") or "")
-            spread_bps = float(getattr(rr, "spread_bps", 0.0) or 0.0)
+            if cand.raw_result:
+                spread_bps = float(getattr(cand.raw_result, "spread_bps", 0.0) or 0.0)
         except Exception:
             pass
-
-        max_spread_bps_for_multi = float(getattr(cfg, "max_spread_bps_for_multi", 6.0) or 6.0)
-        if spread_bps > max_spread_bps_for_multi:
+            
+        # Spread check - must be tight for scaling
+        max_spread_for_scale = float(getattr(cfg, "max_spread_bps_for_multi", 5.0) or 5.0)
+        if spread_bps > max_spread_for_scale:
             return 1
 
-        tiers = list(getattr(cfg, "multi_order_confidence_tiers", (0.85, 0.90, 0.90)) or (0.85, 0.90, 0.90))
-        tiers = sorted([float(x) for x in tiers if x is not None])
-
-        # Simple confidence-based multi-order logic:
-        # 80-85% confidence → 1 order
-        # 85-90% confidence → 2 orders
-        # 90-100% confidence → 3 orders
-        
-        # Extract net_norm for minimal safety check
+        # Extract net strength and confluence from reasons
         net_norm_abs = 0.0
-        try:
-            reasons = getattr(cand, "reasons", []) or []
-            for r in reasons:
-                if "net:" in str(r):
-                    try:
-                        net_val = float(str(r).split("net:")[1].strip())
-                        net_norm_abs = abs(net_val)
-                        break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        confluence_strong = False
+        reasons = getattr(cand, "reasons", []) or []
+        for r in reasons:
+            s = str(r)
+            if "net:" in s:
+                try: 
+                    net_norm_abs = abs(float(s.split("net:")[1].split()[0])) 
+                except: 
+                    pass
+            if "sweep:" in s or "div:" in s:
+                confluence_strong = True
 
-        # Minimal safety: require at least some net_norm strength (signals already filtered by signal_engine)
-        min_net_norm = float(getattr(cfg, "net_norm_signal_threshold", 0.10) or 0.10)
-        if net_norm_abs < min_net_norm * 0.8:  # Allow 80% of minimum threshold
-            return 1  # Safety fallback: if net_norm is too weak, only 1 order
-
-        if regime.lower().startswith("range"):
-            tiers = [min(0.999, t + 0.004) for t in tiers]
-
-        n = 1
-        # Confidence-based logic:
-        # tiers[0] = 0.85 → 2 orders at 85%+
-        # tiers[1] = 0.90 → 3 orders at 90%+
-        if tiers and conf >= tiers[0]:  # >= 0.85
-            n = 2
-        if len(tiers) >= 2 and conf >= tiers[1]:  # >= 0.90
-            n = 3
-
-        return int(min(max_orders, max(1, n)))
+        # === STRICT SCALING TIERS ===
+        # TIER 3: Ultra-high quality only (rare)
+        # Conf >= 95% + Strong Confluence (sweep/div) + Net >= 0.20
+        if conf >= 0.95 and confluence_strong and net_norm_abs >= 0.20:
+            return 3
+            
+        # TIER 2: High quality
+        # Conf >= 92% + Net >= 0.15 (no open positions already checked)
+        if conf >= 0.92 and net_norm_abs >= 0.15:
+            return 2
+        
+        # DEFAULT: 1 order (safe)
+        return 1
 
     @staticmethod
     def _min_lot(risk: Any) -> float:
