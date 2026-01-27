@@ -56,7 +56,6 @@ _TICK_CACHE_TTL_SEC = 0.20
 # =============================================================================
 _ORDERS_LOG_PATH = get_log_path("functions.log")
 
-
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
     logger.setLevel(level)  
     logger.propagate = False
@@ -81,9 +80,10 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
     h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
     logger.addHandler(h)
 
-
 log_orders = logging.getLogger("functions")
 _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
+
+
 
 # =============================================================================
 # Time helpers
@@ -91,12 +91,12 @@ _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 def _mono() -> float:
     return time.monotonic()
 
-
 def _sleep_backoff(attempt: int, base: float, cap: float) -> None:
     # deterministic exponential backoff: base * 2^attempt (attempt starts at 0)
     a = int(attempt)
     delay = float(base) * (2.0 ** a)
     time.sleep(min(float(cap), delay))
+
 
 
 # =============================================================================
@@ -110,6 +110,7 @@ def _safe_last_error() -> str:
             return "n/a"
 
 
+
 # =============================================================================
 # MT5 health (cached)
 # =============================================================================
@@ -119,9 +120,7 @@ class _MT5HealthCache:
     ok: bool = False
     trade_allowed: bool = False
 
-
 _MT5_CACHE = _MT5HealthCache()
-
 
 def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 0.5) -> bool:
     now = _mono()
@@ -150,7 +149,6 @@ def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 
         log_orders.error("MT5 health check failed: %s | last_error=%s", exc, _safe_last_error())
         return False
 
-
 def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
     ok = _mt5_health_cached(require_trade_allowed=require_trade_allowed, ttl_sec=_MT5_HEALTH_TTL_SEC)
     if ok:
@@ -176,9 +174,7 @@ class _SymCacheEntry:
     tick: Any = None
     tick_ts: float = 0.0
 
-
 _SYM_CACHE: Dict[str, _SymCacheEntry] = {}
-
 
 def _get_sym_entry(symbol: str) -> _SymCacheEntry:
     e = _SYM_CACHE.get(symbol)
@@ -187,14 +183,12 @@ def _get_sym_entry(symbol: str) -> _SymCacheEntry:
         _SYM_CACHE[symbol] = e
     return e
 
-
 def _symbol_select(symbol: str) -> bool:
     with MT5_LOCK:
         try:
             return bool(mt5.symbol_select(symbol, True))
         except Exception:
             return False
-
 
 def _symbol_info_cached(symbol: str) -> Any:
     now = _mono()
@@ -212,7 +206,6 @@ def _symbol_info_cached(symbol: str) -> Any:
     e.info_ts = now
     return info
 
-
 def _tick_cached(symbol: str) -> Any:
     now = _mono()
     e = _get_sym_entry(symbol)
@@ -229,7 +222,6 @@ def _tick_cached(symbol: str) -> Any:
     e.tick_ts = now
     return tick
 
-
 def _tick_refresh(symbol: str) -> Any:
     # Force refresh (still updates cache). Use on retry for requote/price changes.
     now = _mono()
@@ -242,7 +234,6 @@ def _tick_refresh(symbol: str) -> Any:
     e.tick = tick
     e.tick_ts = now
     return tick
-
 
 def _best_filling_type(symbol: str) -> int:
     """
@@ -268,7 +259,6 @@ def _best_filling_type(symbol: str) -> int:
 
     return mt5.ORDER_FILLING_IOC
 
-
 def _digits_point_stops(symbol: str) -> Tuple[int, float, int]:
     info = _symbol_info_cached(symbol)
     if not info:
@@ -279,13 +269,13 @@ def _digits_point_stops(symbol: str) -> Tuple[int, float, int]:
     return digits, point, stops
 
 
+
 # =============================================================================
 # Retcode sets (fail-fast & safe retries)
 # =============================================================================
 def _mt5_const(name: str, default: int = -1) -> int:
     v = getattr(mt5, name, None)
     return int(v) if isinstance(v, int) else int(default)
-
 
 _TRANSIENT_RETCODES: Tuple[int, ...] = tuple(
     r for r in (
@@ -300,6 +290,7 @@ _TRANSIENT_RETCODES: Tuple[int, ...] = tuple(
     )
     if r >= 0
 )
+
 
 
 # =============================================================================
@@ -344,12 +335,12 @@ def _send_with_retries(
     return False, last_res, last_ret
 
 
+
 # =============================================================================
 # Public helpers
 # =============================================================================
 def enable_trading() -> None:
     _ensure_mt5_connected(require_trade_allowed=True)
-
 
 def get_balance() -> float:
     try:
@@ -367,7 +358,6 @@ def get_balance() -> float:
     except Exception as exc:
         log_orders.error("get_balance error: %s | last_error=%s", exc, _safe_last_error())
         return 0.0
-
 
 def get_account_info() -> Dict[str, Any]:
     """
@@ -398,7 +388,6 @@ def get_account_info() -> Dict[str, Any]:
         log_orders.error("get_account_info error: %s | last_error=%s", exc, _safe_last_error())
         return {}
 
-
 def get_positions_summary(symbol: Optional[str] = None) -> float:
     try:
         _ensure_mt5_connected()
@@ -418,11 +407,11 @@ def get_positions_summary(symbol: Optional[str] = None) -> float:
         return 0.0
 
 
+
 # =============================================================================
 # Positions cache (Telegram pagination)
 # =============================================================================
 _positions_cache: Dict[str, Any] = {"data": [], "ts_mono": 0.0}
-
 
 def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
     global _positions_cache
@@ -461,7 +450,6 @@ def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
         log_orders.error("get_order_by_index error: %s | last_error=%s", exc, _safe_last_error())
         return None, 0
 
-
 def get_all_open_positions() -> List[Any]:
     try:
         _ensure_mt5_connected()
@@ -471,7 +459,6 @@ def get_all_open_positions() -> List[Any]:
     except Exception as exc:
         log_orders.error("get_all_open_positions error: %s | last_error=%s", exc, _safe_last_error())
         return []
-
 
 def has_open_positions() -> bool:
     """
@@ -504,8 +491,6 @@ def has_open_positions() -> bool:
         )
         return False  # При ошибке считаем, что позиций нет (аналитика работает)
 
-
-
 def market_is_open(asset: str, now: Optional[datetime] = None) -> bool:
     now = now or datetime.now()
     wd = now.weekday()  # Mon=0..Sun=6
@@ -514,6 +499,7 @@ def market_is_open(asset: str, now: Optional[datetime] = None) -> bool:
     if str(asset).upper() == "XAU":
         return wd < 5  # Mon-Fri only
     return True
+
 
 
 # =============================================================================
@@ -598,7 +584,6 @@ def close_order(
     except Exception as exc:
         log_orders.error("close_order error ticket=%s: %s | last_error=%s", ticket, exc, _safe_last_error())
         return False
-
 
 def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAULT_MAGIC) -> Dict[str, Any]:
     out: Dict[str, Any] = {"ok": False, "closed": 0, "canceled": 0, "errors": [], "last_error": None}
@@ -729,6 +714,7 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
         return out
 
 
+
 # =============================================================================
 # USD -> TP/SL price conversion helpers
 # =============================================================================
@@ -772,7 +758,6 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
     except Exception as exc:
         log_orders.error("_usd_to_tp_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
         return None
-
 
 def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
     try:
@@ -823,7 +808,6 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         log_orders.error("_usd_to_sl_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
         return None
 
-
 def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> float:
     try:
         digits, point, stops_level = _digits_point_stops(symbol)
@@ -849,7 +833,6 @@ def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> f
     except Exception:
         return float(sl_price)
 
-
 def _enforce_stop_distance_for_tp(symbol: str, ptype: int, tp_price: float) -> float:
     try:
         digits, point, stops_level = _digits_point_stops(symbol)
@@ -874,6 +857,7 @@ def _enforce_stop_distance_for_tp(symbol: str, ptype: int, tp_price: float) -> f
 
     except Exception:
         return float(tp_price)
+
 
 
 # =============================================================================
@@ -965,7 +949,6 @@ def set_takeprofit_all_positions_usd(
         log_orders.error("set_takeprofit_all_positions_usd error: %s | last_error=%s", exc, _safe_last_error())
         return out
 
-
 def set_stoploss_all_positions_usd(
     usd_loss: float,
     *,
@@ -1053,6 +1036,7 @@ def set_stoploss_all_positions_usd(
         return out
 
 
+
 # =============================================================================
 # History reports (full detailed reports for day/week/month)
 # =============================================================================
@@ -1095,7 +1079,6 @@ def get_full_report_day(force_refresh: bool = True) -> Dict[str, Any]:
             "balance": 0.0,
             "records": [],
         }
-
 
 def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
     """
@@ -1186,7 +1169,6 @@ def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
             "net": 0.0,
             "balance": 0.0,
         }
-
 
 def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
     """
@@ -1357,7 +1339,6 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
             "balance": 0.0,
         }
 
-
 def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
     """
     Полный отчет за месяц (с начала месяца до сейчас).
@@ -1454,6 +1435,123 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
         }
 
 
+
+
+# =============================================================================
+# Fast market open: fixed lot=0.02, SL=-5 USD, TP=+5 USD, sync (no await)
+# =============================================================================
+_FIXED_LOT = 0.02
+_FIXED_SL_USD = 8.0   # -8 USD
+_FIXED_TP_USD = 5.0   # +5 USD
+_SYMBOL_BTC = "BTCUSDm"
+_SYMBOL_XAU = "XAUUSDm"
+
+def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
+    """One market order: lot=0.02, SL=-5 USD, TP=+5 USD. Sync."""
+    try:
+        _ensure_mt5_connected(require_trade_allowed=True)
+        _symbol_select(symbol)
+        tick = _tick_cached(symbol)
+        if not tick:
+            log_orders.error("_place_market_order_fixed_sltp: tick missing symbol=%s", symbol)
+            return False
+        is_buy = str(side).lower() == "buy"
+        entry = float(tick.ask if is_buy else tick.bid)
+        if entry <= 0:
+            return False
+        ptype = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
+        fake_pos = type("_Pos", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": entry, "type": ptype})()
+        sl_price = _usd_to_sl_price_for_position(fake_pos, _FIXED_SL_USD)
+        tp_price = _usd_to_tp_price_for_position(fake_pos, _FIXED_TP_USD)
+        sl = float(sl_price) if sl_price is not None and sl_price > 0 else 0.0
+        tp = float(tp_price) if tp_price is not None and tp_price > 0 else 0.0
+        order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+        req: Dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(_FIXED_LOT),
+            "type": int(order_type),
+            "position": 0,
+            "price": entry,
+            "sl": sl,
+            "tp": tp,
+            "deviation": int(DEFAULT_DEVIATION),
+            "magic": int(DEFAULT_MAGIC),
+            "comment": "open_fixed_sltp",
+            "type_filling": int(_best_filling_type(symbol)),
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+
+        def _refresh(rq: Dict[str, Any], attempt: int) -> None:
+            t = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+            if not t:
+                return
+            p = float(t.ask if is_buy else t.bid)
+            if p > 0:
+                rq["price"] = p
+                if sl > 0 or tp > 0:
+                    fp = type("_P", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": p, "type": ptype})()
+                    if sl > 0:
+                        sp = _usd_to_sl_price_for_position(fp, _FIXED_SL_USD)
+                        if sp is not None and sp > 0:
+                            rq["sl"] = float(sp)
+                    if tp > 0:
+                        top = _usd_to_tp_price_for_position(fp, _FIXED_TP_USD)
+                        if top is not None and top > 0:
+                            rq["tp"] = float(top)
+
+        ok, _, _ = _send_with_retries(
+            req,
+            retries=max(1, DEFAULT_RETRIES),
+            success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+            sleep_base=_CLOSE_RETRY_BASE_SEC,
+            sleep_cap=_CLOSE_RETRY_CAP_SEC,
+            refresh_before_send=_refresh,
+        )
+        return bool(ok)
+    except Exception as exc:
+        log_orders.error("_place_market_order_fixed_sltp error: symbol=%s side=%s %s", symbol, side, exc)
+        return False
+
+
+def open_buy_order_btc(count: int) -> int:
+    """Open `count` market BUY on BTCUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    n = 0
+    for _ in range(max(0, int(count))):
+        if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Buy"):
+            n += 1
+    return n
+
+
+def open_buy_order_xau(count: int) -> int:
+    """Open `count` market BUY on XAUUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    n = 0
+    for _ in range(max(0, int(count))):
+        if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Buy"):
+            n += 1
+    return n
+
+
+def open_sell_order_btc(count: int) -> int:
+    """Open `count` market SELL on BTCUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    n = 0
+    for _ in range(max(0, int(count))):
+        if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Sell"):
+            n += 1
+    return n
+
+
+def open_sell_order_xau(count: int) -> int:
+    """Open `count` market SELL on XAUUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    n = 0
+    for _ in range(max(0, int(count))):
+        if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Sell"):
+            n += 1
+    return n
+
+
+
+
 __all__ = [
     "enable_trading",
     "get_balance",
@@ -1470,5 +1568,11 @@ __all__ = [
     "get_full_report_week",
     "get_full_report_month",
     "get_full_report_all",
+    "open_buy_order_btc",
+    "open_buy_order_xau",
+    "open_sell_order_btc",
+    "open_sell_order_xau",
 ]
+
+
 

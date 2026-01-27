@@ -12,7 +12,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
@@ -55,7 +55,6 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 # =============================================================================
 # Logging
 # =============================================================================
-from datetime import timezone
 
 # =============================================================================
 # Scheduler
@@ -256,6 +255,32 @@ def _tf_seconds(tf: Any) -> Optional[float]:
     return None
 
 
+
+def _parse_bar_key(bar_key: str) -> Optional[datetime]:
+    """Parse SignalResult.bar_key into datetime.
+    Accepts ISO (with Z), epoch seconds, or epoch milliseconds (MT5 time).
+    Returns None on failure. Used by _baseline_gate for gap/warmup protection.
+    """
+    if not bar_key:
+        return None
+    s = str(bar_key).strip()
+
+    # 1) ISO (including Z)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    # 2) Epoch seconds / milliseconds (MT5 time)
+    if s.isdigit():
+        n = int(s)
+        if n >= 10_000_000_000:
+            return datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
+        return datetime.fromtimestamp(n, tz=timezone.utc)
+
+    return None
+
+
 # =============================================================================
 # Data models
 # =============================================================================
@@ -371,7 +396,49 @@ class _AssetPipeline:
         self._last_market_ok_ts = 0.0
         self._market_validate_every = float(getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0)
         self._last_reconcile_ts = 0.0
+        # -------------------- Baseline sync (gap-safe) --------------------
+        # Avoid opening a trade on the very first bar after a long gap/reconnect.
+        self._baseline_sync_bars = int(getattr(self.cfg, "baseline_sync_bars", 1) or 1)
+        self._baseline_gap_mult = float(getattr(self.cfg, "baseline_gap_mult", 3.0) or 3.0)
+        self._baseline_ready_bars = 0
+        self._baseline_last_key: Optional[str] = None
+        self._baseline_last_dt: Optional[datetime] = None
+
         self._reconcile_interval = float(getattr(cfg, "reconcile_interval_sec", 15.0) or 15.0)
+    def _baseline_gate(self, bar_key: str) -> Tuple[bool, str]:
+        """Return (ok, reason). If ok=False => block trade for baseline sync."""
+        dt = _parse_bar_key(bar_key)
+        if dt is None:
+            return True, "baseline_ok(parse_skip)"
+
+        sp = getattr(self.cfg, "symbol_params", None)
+        tf_sec = _tf_seconds(getattr(sp, "tf_primary", "M1") if sp else "M1") or 60.0
+        gap_limit = max(60.0, self._baseline_gap_mult * float(tf_sec))
+
+        if self._baseline_last_dt is None or self._baseline_last_key is None:
+            self._baseline_last_dt = dt
+            self._baseline_last_key = bar_key
+            self._baseline_ready_bars = 0
+            return (self._baseline_sync_bars <= 0), "baseline_warmup"
+
+        gap = (dt - self._baseline_last_dt).total_seconds()
+
+        if gap < -0.5 * float(tf_sec) or gap > gap_limit:
+            self._baseline_last_dt = dt
+            self._baseline_last_key = bar_key
+            self._baseline_ready_bars = 0
+            return (self._baseline_sync_bars <= 0), "baseline_reset_gap"
+
+        if bar_key != self._baseline_last_key:
+            self._baseline_ready_bars += 1
+            self._baseline_last_key = bar_key
+            self._baseline_last_dt = dt
+
+        if self._baseline_ready_bars < self._baseline_sync_bars:
+            return False, f"baseline_sync({self._baseline_ready_bars}/{self._baseline_sync_bars})"
+
+        return True, "baseline_ok"
+
 
     @property
     def symbol(self) -> str:
@@ -666,6 +733,11 @@ class _AssetPipeline:
                     signal_id=f"{self.asset}_CLOSED_{int(time.time())}",
                     raw_result=None,
                 )
+
+            baseline_ok, baseline_reason = self._baseline_gate(getattr(res, "bar_key", "") or "")
+            if not baseline_ok:
+                blocked = True
+                reasons = reasons + (baseline_reason,)
 
             return AssetCandidate(
                 asset=self.asset,
@@ -2238,4 +2310,3 @@ class MultiAssetTradingEngine:
 
 # Global instance (import-compatible)
 engine = MultiAssetTradingEngine(dry_run=False)
-

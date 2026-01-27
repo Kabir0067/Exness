@@ -384,7 +384,8 @@ class EngineConfig:
     exec_window: int = 300
     exec_max_p95_latency_ms: float = 550.0  # Ислоҳ: Аз 650 ба 550 барои latency беҳтар
     exec_max_p95_slippage_points: float = 20.0  # Ислоҳ: Аз 30 ба 20
-    exec_max_spread_points: float = 2000.0  # Ислоҳ: Аз 100.0 ба 5000.0 (барои BTC spread)
+    # BTC spread ~1800 pts (point=0.01 → ~$18) common; 2000 allows it. plan_order_failed/meta_gate_block often from hitrate/SL-TP, not spread.
+    exec_max_spread_points: float = 2000.0
     exec_max_ewma_slippage_points: float = 15.0  # Ислоҳ: Аз 18 ба 15
     exec_breaker_sec: float = 120.0
 
@@ -394,7 +395,7 @@ class EngineConfig:
     # ATR period for percentile calculation
     atr_period_for_percentile: int = 14
 
-    # Optional spread cap (points) - None = disabled
+    # Optional spread cap (points) - None = disabled. BTC ~1800 pts typical; keep None or >= 2000 to avoid blocking.
     max_spread_points: Optional[float] = None
 
     # Crypto-specific blackouts (BTC 24/7 with optional maintenance windows)
