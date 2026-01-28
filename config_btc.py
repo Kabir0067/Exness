@@ -253,9 +253,10 @@ class EngineConfig:
     magic: int = 777001
 
     # Signal quality
-    min_confidence_signal: float = 0.60  # Ислоҳ: Аз 0.85 ба 0.80 барои сигналҳои зиёдтар
-    conf_min: int = 60  # Ислоҳ: Аз 85 ба 80
-    conf_min_low: int = 55  # Ислоҳ: Аз 85 ба 80
+    # STRICT (to reduce false signals): only trade strong setups.
+    min_confidence_signal: float = 0.85
+    conf_min: int = 85
+    conf_min_low: int = 85
     conf_min_high: int = 90
     ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
@@ -325,7 +326,7 @@ class EngineConfig:
     max_risk_per_trade: float = 0.015
 
     # ---------------------------------------------------------------------------   
-    max_positions: int = 3
+    max_positions: int = 1
     # ---------------------------------------------------------------------------
 
 
@@ -519,7 +520,7 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
 
-    cfg.min_confidence_signal = 0.60  # FIXED: Lowered from 0.85 to 0.60 to match expected signal strength
+    cfg.min_confidence_signal = 0.85
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05

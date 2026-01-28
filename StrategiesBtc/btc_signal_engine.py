@@ -350,6 +350,12 @@ class SignalEngine:
 
             net_norm_abs = abs(net_norm)
 
+            # Ultra-confidence must be earned: require strong strength OR confluence.
+            # Prevents "fake 96%" spam in choppy conditions.
+            has_confluence = bool(sweep) or (div != "none")
+            if conf >= 90 and (not has_confluence) and net_norm_abs < 0.20:
+                conf = min(conf, 89)
+
             if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
                 if net_norm > net_thr:
                     if trend_ok_buy:

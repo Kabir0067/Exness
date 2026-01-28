@@ -569,15 +569,21 @@ class RiskManager:
             except Exception:  # pragma: no cover
                 from ExnessApi.functions import get_balance as _get_balance  # type: ignore
 
-            saved_balance, saved_mode = initialize_daily_balance(float(current_balance), asset="BTC", balance_provider=_get_balance)
+            saved_balance, _saved_mode = initialize_daily_balance(
+                float(current_balance),
+                asset="BTC",
+                balance_provider=_get_balance,
+            )
 
             
             if saved_balance > 0:
                 self.daily_start_balance = float(saved_balance)
-                self.current_phase = str(saved_mode)
+                # IMPORTANT: new UTC day always starts from Phase A
+                self.current_phase = "A"
                 log_risk.info(
-                    "BTC daily state loaded: start_balance=%.2f current=%.2f mode=%s",
-                    saved_balance, current_balance, saved_mode
+                    "BTC daily state loaded: start_balance=%.2f current=%.2f",
+                    saved_balance,
+                    current_balance,
                 )
             else:
                 self.daily_start_balance = float(current_balance if current_balance > 0 else 0.0)
@@ -974,15 +980,19 @@ class RiskManager:
             if eq > 0:
                 self.daily_peak_equity = max(self.daily_peak_equity, float(eq))
 
-            # Ensure start balance
-            if self.daily_start_balance <= 0 and (bal > 0 or eq > 0):
-                self.daily_start_balance = float(max(bal, eq))
+            # Ensure start balance (BALANCE-based so day starts at 0 return)
+            if self.daily_start_balance <= 0 and bal > 0:
+                self.daily_start_balance = float(bal)
                 self.daily_peak_equity = max(self.daily_peak_equity, self.daily_start_balance)
 
-            if self.daily_start_balance <= 0 or eq <= 0:
+            if self.daily_start_balance <= 0 or bal <= 0 or eq <= 0:
                 return
 
-            daily_return = float((eq - self.daily_start_balance) / self.daily_start_balance)
+            # Daily returns:
+            # - realized uses BALANCE (stable)
+            # - equity uses EQUITY (includes floating) for emergency stops
+            daily_realized = float((bal - self.daily_start_balance) / self.daily_start_balance)
+            daily_equity = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
             peak_return = float((self.daily_peak_equity - self.daily_start_balance) / self.daily_start_balance) if self.daily_start_balance > 0 else 0.0
             dd_from_peak = float((self.daily_peak_equity - eq) / max(1e-9, self.daily_peak_equity)) if self.daily_peak_equity > 0 else 0.0
@@ -1007,27 +1017,45 @@ class RiskManager:
                 self._soft_stop_reason = None
                 # Do not auto-downgrade phase: reset occurs next day
 
-            # PROFIT TARGET -> Phase B
-            if daily_return >= target:
+            # PROFIT TARGET -> Phase B (realized)
+            if daily_realized >= target:
+                prev_b = str(self.current_phase)
                 if not self._target_breached:
                     self._target_breached = True
-                    self._target_breached_return = float(daily_return)
-                self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
+                    self._target_breached_return = float(daily_realized)
+                self._target_breached_return = max(float(self._target_breached_return), float(daily_realized))
                 self._set_phase("B", "daily_target_reached")
+                if prev_b != self.current_phase:
+                    log_risk.error(
+                        "PHASE_CHANGE | %s->%s | reason=daily_target_reached daily_return=%.4f target=%.4f",
+                        prev_b, self.current_phase, daily_realized, target,
+                    )
 
             # LOSS -> Phase B/C
             # Сначала проверяем loss_c (более критичный) - если превышен, сразу в C
-            if loss_c > 0 and daily_return <= -loss_c:
+            if loss_c > 0 and daily_equity <= -loss_c:
+                prev_c = str(self.current_phase)
                 # C is REAL now (trade-block). Hard stop only if extreme below max_loss and limits enabled.
                 self._set_phase("C", "daily_loss_c")
                 self._enter_soft_stop("daily_loss_c")
+                if prev_c != "C":
+                    log_risk.error(
+                        "PHASE_CHANGE | %s->%s | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
+                        prev_c, self.current_phase, daily_equity, loss_c,
+                    )
             # Если loss_c не превышен, но превышен loss_b - переходим в B
-            elif loss_b > 0 and daily_return <= -loss_b:
+            elif loss_b > 0 and daily_realized <= -loss_b:
+                prev_b = str(self.current_phase)
                 self._set_phase("B", "daily_loss_b")
+                if prev_b != self.current_phase:
+                    log_risk.error(
+                        "PHASE_CHANGE | %s->%s | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
+                        prev_b, self.current_phase, daily_realized, loss_b,
+                    )
 
             # HARD STOP (absolute)
             if bool(getattr(self.cfg, "enforce_daily_limits", False)):
-                if daily_return <= -max_loss:
+                if daily_equity <= -max_loss:
                     self._enter_hard_stop("max_daily_loss")
 
             # PROFIT PROTECT: after hitting target/peak, if equity falls from peak too much -> stop trading

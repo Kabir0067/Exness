@@ -19,7 +19,22 @@ from typing import Any, Dict, Callable
 
 import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
-from ExnessAPI.functions import *
+from ExnessAPI.functions import (
+    close_all_position,
+    close_all_position_by_profit,
+    close_order,
+    get_balance,
+    get_order_by_index,
+    get_positions_summary,
+    get_full_report_all,
+    get_full_report_day,
+    get_full_report_week,
+    get_full_report_month,
+    set_takeprofit_all_positions_usd,
+    set_stoploss_all_positions_usd,
+    get_account_info,
+    open_buy_order_btc,
+)
 from ExnessAPI.history import *
 from .utils import (
     log,
@@ -53,6 +68,10 @@ from .utils import (
     _format_tp_result,
     _build_sl_usd_keyboard,
     _format_sl_result,
+    format_close_by_profit_result,
+    HELPER_CALLBACK_PREFIX,
+    build_helpers_keyboard,
+    build_helper_order_count_keyboard,
     _summary_cache,
     format_order,
     order_keyboard,
@@ -60,6 +79,10 @@ from .utils import (
     check_full_program,
     set_bot_instance,
     set_orig_send_chat_action,
+    open_sell_order_btc,
+    open_buy_order_btc,
+    open_buy_order_xau,
+    open_sell_order_xau,
 )
 
 # =============================================================================
@@ -184,8 +207,7 @@ def bot_commands() -> None:
         telebot.types.BotCommand("/balance", "💰 Дидани баланси худ"),
         telebot.types.BotCommand("/buttons", "🎛️ Тугмаҳои асосӣ"),
         telebot.types.BotCommand("/status", "⚙️ Статус оператсия"),
-        telebot.types.BotCommand("/tek_prof", "💰 Гузоштани тек профит"),
-        telebot.types.BotCommand("/stop_ls", "🛡 Гузоштани Стоп Лосс"),
+        telebot.types.BotCommand("/helpers", "🛠 Ёвариҳо"),
     ]
     ok = bot.set_my_commands(commands)
     if not ok:
@@ -197,6 +219,7 @@ def bot_commands() -> None:
 BTN_START = "🚀 Оғози Тиҷорат"
 BTN_STOP = "🛑 Қатъи Тиҷорат"
 BTN_CLOSE_ALL = "❌ Баста кардани Ҳама Ордерҳо"
+BTN_CLOSE_PROFIT = "💰 Бастани фоидадорҳо"
 BTN_OPEN_ORDERS = "📋 Дидани Ордерҳои Кушода"
 BTN_PROFIT_D = "📈 Фоидаи Имрӯза"
 BTN_PROFIT_W = "📊 Фоидаи Ҳафтаина"
@@ -209,7 +232,8 @@ BTN_FULL = "🛠 Санҷиши Пурраи Барнома"
 def buttons_func(message: telebot.types.Message) -> None:
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row(KeyboardButton(BTN_START), KeyboardButton(BTN_STOP))
-    markup.row(KeyboardButton(BTN_CLOSE_ALL), KeyboardButton(BTN_OPEN_ORDERS))
+    markup.row(KeyboardButton(BTN_CLOSE_ALL), KeyboardButton(BTN_CLOSE_PROFIT))
+    markup.row(KeyboardButton(BTN_OPEN_ORDERS))
     markup.row(KeyboardButton(BTN_BALANCE), KeyboardButton(BTN_POS))
     markup.row(KeyboardButton(BTN_ENGINE), KeyboardButton(BTN_FULL))
     markup.row(KeyboardButton(BTN_PROFIT_D), KeyboardButton(BTN_PROFIT_W), KeyboardButton(BTN_PROFIT_M))
@@ -271,6 +295,115 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
     except Exception as exc:
         bot.answer_callback_query(call.id, "Хато дар обработчик", show_alert=True)
         bot.send_message(call.message.chat.id, f"⚠️ Handler error: <code>{exc}</code>", parse_mode="HTML")
+
+# =============================================================================
+# /helpers — TP/SL + ордеркушои (2,4,6,8,10,12,14,16)
+# =============================================================================
+@bot.message_handler(commands=["helpers"])
+@admin_only_message
+def helpers_handler(message: telebot.types.Message) -> None:
+    _send_clean(message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🛠 Ёвариҳо.")
+    bot.send_message(
+        message.chat.id,
+        "🛠 <b>Ёвариҳо</b>\n\n"
+        "📈 <b>TP</b> / 🛡 <b>SL</b> — барои ҳамаи позицияҳои кушода (интихоби маблағ $).\n"
+        "🟢 <b>Харид</b> / 🔴 <b>Фурӯш</b> — аввал интихоб кунед, баъд шумораи ордерҳо: <b>2, 4, 6, 8, 10, 12, 14, 16</b> (лот 0.02, SL/TP фикси).",
+        reply_markup=build_helpers_keyboard(),
+        parse_mode="HTML",
+    )
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(HELPER_CALLBACK_PREFIX))
+@admin_only_callback
+def on_helper_click(call: telebot.types.CallbackQuery) -> None:
+    data = (call.data or "").replace(HELPER_CALLBACK_PREFIX, "", 1).strip().lower()
+    if not data:
+        bot.answer_callback_query(call.id, "Бекор")
+        return
+
+    if data == "tp":
+        bot.answer_callback_query(call.id, "📈 TP …")
+        kb = _build_tp_usd_keyboard()
+        bot.send_message(
+            call.message.chat.id,
+            "📈 <b>Take Profit (USD)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+    if data == "sl":
+        bot.answer_callback_query(call.id, "🛡 SL …")
+        kb = _build_sl_usd_keyboard()
+        bot.send_message(
+            call.message.chat.id,
+            "🛡 <b>Stop Loss (USD)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед (1..10$):",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
+    # Харид/фурӯш: аввал тугмаи алоҳида, баъд шумора (2,4,6,8,10,12,14,16) — монанд ба TP/SL
+    if data in ("buy_btc", "sell_btc", "buy_xau", "sell_xau"):
+        bot.answer_callback_query(call.id, "Шумораро интихоб кунед")
+        titles = {
+            "buy_btc": "🟢 <b>Buy BTC</b> — шумораи ордерҳо",
+            "sell_btc": "🔴 <b>Sell BTC</b> — шумораи ордерҳо",
+            "buy_xau": "🟢 <b>Buy XAU</b> — шумораи ордерҳо",
+            "sell_xau": "🔴 <b>Sell XAU</b> — шумораи ордерҳо",
+        }
+        bot.send_message(
+            call.message.chat.id,
+            titles.get(data, "Шумора:"),
+            reply_markup=build_helper_order_count_keyboard(data),
+            parse_mode="HTML",
+        )
+        return
+
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        bot.answer_callback_query(call.id, "Формат нодуруст", show_alert=True)
+        return
+    action, count_str = parts[0].strip(), parts[1].strip()
+
+    if count_str == "cancel":
+        bot.answer_callback_query(call.id, "Бекор шуд")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        count = int(count_str)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Адад нодуруст", show_alert=True)
+        return
+    if count not in (2, 4, 6, 8, 10, 12, 14, 16):
+        bot.answer_callback_query(call.id, "Адад: 2,4,6,8,10,12,14,16", show_alert=True)
+        return
+
+    if action == "buy_btc":
+        bot.answer_callback_query(call.id, f"⏳ Buy BTC ×{count} …")
+        n = open_buy_order_btc(count)
+        bot.send_message(call.message.chat.id, f"🟢 <b>Buy BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        return
+    if action == "sell_btc":
+        bot.answer_callback_query(call.id, f"⏳ Sell BTC ×{count} …")
+        n = open_sell_order_btc(count)
+        bot.send_message(call.message.chat.id, f"🔴 <b>Sell BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        return
+    if action == "buy_xau":
+        bot.answer_callback_query(call.id, f"⏳ Buy XAU ×{count} …")
+        n = open_buy_order_xau(count)
+        bot.send_message(call.message.chat.id, f"🟢 <b>Buy XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        return
+    if action == "sell_xau":
+        bot.answer_callback_query(call.id, f"⏳ Sell XAU ×{count} …")
+        n = open_sell_order_xau(count)
+        bot.send_message(call.message.chat.id, f"🔴 <b>Sell XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        return
+
+    bot.answer_callback_query(call.id, "Амал номаълум", show_alert=True)
+
 
 @bot.message_handler(commands=["stop_ls"])
 @admin_only_message
@@ -686,6 +819,10 @@ def handle_close_all(message: telebot.types.Message) -> None:
 
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
 
+def handle_close_by_profit(message: telebot.types.Message) -> None:
+    res = close_all_position_by_profit()
+    bot.send_message(message.chat.id, format_close_by_profit_result(res), parse_mode="HTML")
+
 def handle_positions_summary(message: telebot.types.Message) -> None:
     summary = get_positions_summary()
     bot.send_message(message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML")
@@ -762,6 +899,7 @@ BUTTONS: Dict[str, Callable[[telebot.types.Message], None]] = {
     BTN_PROFIT_M: handle_profit_month,
     BTN_OPEN_ORDERS: handle_open_orders,
     BTN_CLOSE_ALL: handle_close_all,
+    BTN_CLOSE_PROFIT: handle_close_by_profit,
     BTN_POS: handle_positions_summary,
     BTN_BALANCE: handle_balance,
     BTN_START: handle_trade_start,

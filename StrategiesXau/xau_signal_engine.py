@@ -375,6 +375,12 @@ class SignalEngine:
             elif net_abs < 0.18:
                 conf = min(conf, 95)
 
+            # Ultra-confidence must be earned: require strong strength OR confluence.
+            # Prevents "fake 96%" spam in choppy conditions.
+            has_confluence = bool(sweep) or (div != "none")
+            if conf >= 90 and (not has_confluence) and net_abs < 0.20:
+                conf = min(conf, 89)
+
             # Decide signal
             signal = "Neutral"
             blocked_by_htf = False

@@ -34,7 +34,9 @@ from log_config import get_log_path
 SLTPUnits = Literal["points", "usd", "price"]
 
 DEFAULT_DEVIATION = 50
-DEFAULT_MAGIC = 123456
+# IMPORTANT: Must match bot engine magic to correctly count/filter positions.
+# Engine configs use magic=777001.
+DEFAULT_MAGIC = 777001
 DEFAULT_RETRIES = 2
 
 # Sleep knobs (deterministic, low-pressure)
@@ -713,6 +715,120 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
         log_orders.error("close_all_position global error: %s | last_error=%s", exc, _safe_last_error())
         return out
 
+def close_all_position_by_profit(
+    *,
+    min_profit_usd: float = 0.01,
+    deviation: int = DEFAULT_DEVIATION,
+    magic: int = DEFAULT_MAGIC,
+) -> Dict[str, Any]:
+    """Close only positions with profit >= min_profit_usd (MT5-style «close by profit»)."""
+    out: Dict[str, Any] = {"ok": False, "closed": 0, "canceled": 0, "errors": [], "last_error": None}
+
+    try:
+        _ensure_mt5_connected(require_trade_allowed=True)
+
+        with MT5_LOCK:
+            positions = mt5.positions_get() or []
+
+        # Filter: only positions with profit >= min_profit_usd
+        profitable: List[Any] = []
+        for p in positions:
+            profit = float(getattr(p, "profit", 0.0) or 0.0)
+            swap = float(getattr(p, "swap", 0.0) or 0.0)
+            if (profit + swap) >= min_profit_usd:
+                profitable.append(p)
+
+        if not profitable:
+            out["ok"] = True
+            return out
+
+        by_symbol: Dict[str, List[Any]] = {}
+        for p in profitable:
+            s = str(getattr(p, "symbol", ""))
+            if s:
+                by_symbol.setdefault(s, []).append(p)
+
+        for symbol, plist in by_symbol.items():
+            try:
+                _symbol_select(symbol)
+                tick0 = _tick_cached(symbol)
+                if tick0 is None:
+                    for pos in plist:
+                        ticket = int(getattr(pos, "ticket", 0) or 0)
+                        out["errors"].append(f"{ticket}: tick_missing")
+                    continue
+
+                bid0 = float(getattr(tick0, "bid", 0.0) or 0.0)
+                ask0 = float(getattr(tick0, "ask", 0.0) or 0.0)
+                if bid0 <= 0 or ask0 <= 0:
+                    for pos in plist:
+                        ticket = int(getattr(pos, "ticket", 0) or 0)
+                        out["errors"].append(f"{ticket}: bad_tick")
+                    continue
+
+                filling = int(_best_filling_type(symbol))
+
+                for pos in plist:
+                    ticket = int(getattr(pos, "ticket", 0) or 0)
+                    volume = float(getattr(pos, "volume", 0.0) or 0.0)
+                    ptype = int(getattr(pos, "type", 0) or 0)
+                    if ticket <= 0 or volume <= 0:
+                        out["errors"].append(f"{ticket}: invalid_position")
+                        continue
+
+                    close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+                    req: Dict[str, Any] = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": symbol,
+                        "volume": float(volume),
+                        "type": int(close_type),
+                        "position": int(ticket),
+                        "price": float(bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0),
+                        "deviation": int(deviation),
+                        "magic": int(magic),
+                        "comment": "close_by_profit",
+                        "type_filling": filling,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                    }
+
+                    def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
+                        tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                        if tick is None:
+                            return
+                        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                        if bid <= 0 or ask <= 0:
+                            return
+                        rq["price"] = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
+
+                    ok, _, last_ret = _send_with_retries(
+                        req,
+                        retries=5,
+                        success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+                        sleep_base=_CLOSE_RETRY_BASE_SEC,
+                        sleep_cap=_CLOSE_RETRY_CAP_SEC,
+                        refresh_before_send=_refresh_price,
+                    )
+
+                    if ok:
+                        out["closed"] += 1
+                    else:
+                        out["errors"].append(f"{ticket}: close_failed retcode={last_ret}")
+
+            except Exception as exc_sym:
+                log_orders.error("close_all_position_by_profit: symbol batch error: %s | last_error=%s", exc_sym, _safe_last_error())
+                out["errors"].append("symbol_batch_exception")
+
+        out["last_error"] = _safe_last_error()
+        out["ok"] = len(out["errors"]) == 0
+        return out
+
+    except Exception as exc:
+        out["last_error"] = _safe_last_error()
+        out["errors"].append(str(exc))
+        log_orders.error("close_all_position_by_profit error: %s | last_error=%s", exc, _safe_last_error())
+        return out
 
 
 # =============================================================================

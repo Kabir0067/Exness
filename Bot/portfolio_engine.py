@@ -1050,6 +1050,9 @@ class MultiAssetTradingEngine:
         self._last_cand_xau: Optional[AssetCandidate] = None
         self._last_cand_btc: Optional[AssetCandidate] = None
 
+        # Edge-trigger: 1 signal => 1 order. Reset to Neutral when signal becomes Neutral.
+        self._edge_last_trade_signal: Dict[str, str] = {"XAU": "Neutral", "BTC": "Neutral"}
+
         self._order_notifier: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None
         self._phase_notifier: Optional[Callable[[str, str, str, str], None]] = None
         self._engine_stop_notifier: Optional[Callable[[str, str], None]] = None
@@ -1341,7 +1344,8 @@ class MultiAssetTradingEngine:
             return False
         if c.sl <= 0.0 or c.tp <= 0.0:
             return False
-        if c.confidence <= 0.0:
+        # STRICT: only trade if confidence >= 0.85 (85%+)
+        if float(c.confidence) < 0.85:
             return False
         return True
 
@@ -1373,6 +1377,12 @@ class MultiAssetTradingEngine:
         lot_override: Optional[float] = None,
     ) -> Tuple[bool, Optional[str]]:
         now = time.time()
+
+        # 1-signal = 1-order (edge trigger): block repeated same-side signals until Neutral appears
+        last_sig = str(self._edge_last_trade_signal.get(cand.asset, "Neutral") or "Neutral")
+        if cand.signal in ("Buy", "Sell") and last_sig == cand.signal:
+            log_health.info("ENQUEUE_SKIP | asset=%s reason=edge_same_signal signal=%s", cand.asset, cand.signal)
+            return False, None
 
         if self._is_duplicate(cand.asset, cand.signal_id, now, max_orders=int(order_count)):
             log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
@@ -1449,6 +1459,8 @@ class MultiAssetTradingEngine:
 
         self._mark_seen(cand.asset, cand.signal_id, now)
         self._last_selected_asset = cand.asset
+        # Update edge state on accepted enqueue
+        self._edge_last_trade_signal[cand.asset] = str(cand.signal)
 
         if risk:
             # REGISTER SIGNAL HERE (once per accepted unique signal)
@@ -1467,14 +1479,8 @@ class MultiAssetTradingEngine:
 
     def _orders_for_candidate(self, cand: AssetCandidate) -> int:
         """
-        SAFE Multi-Order Logic (Anti-Suicide Fix v2).
-        
-        Default: 1 order (ALWAYS safe).
-        2 orders: ONLY if Phase A + no positions + conf >= 92% + net >= 0.15 + tight spread
-        3 orders: ONLY if Phase A + no positions + conf >= 95% + confluence + net >= 0.20
-        
-        Phase B: Max 1 order (strict)
-        Phase C: 0 orders (kill switch)
+        STRICT: 1 signal = 1 order (no scaling).
+        Phase C: 0 orders (kill switch).
         """
         pipe = self._xau if cand.asset == "XAU" else self._btc
         if not pipe or not pipe.risk:
@@ -1485,63 +1491,6 @@ class MultiAssetTradingEngine:
         # === PHASE C: HARD KILL ===
         if phase == "C":
             return 0
-            
-        # === PHASE B: MAX 1 ORDER (PROTECTIVE MODE) ===
-        if phase == "B":
-            return 1
-
-        # === PHASE A: NORMAL WITH STRICT SCALING ===
-        cfg = self._xau_cfg if cand.asset == "XAU" else self._btc_cfg
-        
-        # Check if we already have open positions - no scaling if so
-        open_pos = pipe.open_positions()
-        if open_pos > 0:
-            return 1
-        
-        # Normalize confidence
-        conf = float(cand.confidence)
-        if conf > 1.5:
-            conf = conf / 100.0
-            
-        # Extract spread
-        spread_bps = 0.0
-        try:
-            if cand.raw_result:
-                spread_bps = float(getattr(cand.raw_result, "spread_bps", 0.0) or 0.0)
-        except Exception:
-            pass
-            
-        # Spread check - must be tight for scaling
-        max_spread_for_scale = float(getattr(cfg, "max_spread_bps_for_multi", 5.0) or 5.0)
-        if spread_bps > max_spread_for_scale:
-            return 1
-
-        # Extract net strength and confluence from reasons
-        net_norm_abs = 0.0
-        confluence_strong = False
-        reasons = getattr(cand, "reasons", []) or []
-        for r in reasons:
-            s = str(r)
-            if "net:" in s:
-                try: 
-                    net_norm_abs = abs(float(s.split("net:")[1].split()[0])) 
-                except: 
-                    pass
-            if "sweep:" in s or "div:" in s:
-                confluence_strong = True
-
-        # === STRICT SCALING TIERS ===
-        # TIER 3: Ultra-high quality only (rare)
-        # Conf >= 95% + Strong Confluence (sweep/div) + Net >= 0.20
-        if conf >= 0.95 and confluence_strong and net_norm_abs >= 0.20:
-            return 3
-            
-        # TIER 2: High quality
-        # Conf >= 92% + Net >= 0.15 (no open positions already checked)
-        if conf >= 0.92 and net_norm_abs >= 0.15:
-            return 2
-        
-        # DEFAULT: 1 order (safe)
         return 1
 
     @staticmethod
@@ -2234,6 +2183,12 @@ class MultiAssetTradingEngine:
                 cand_b = self._btc.compute_candidate() if b_ok else None
                 self._last_cand_xau = cand_x
                 self._last_cand_btc = cand_b
+
+                # Edge-trigger reset: when signal returns to Neutral, allow next Buy/Sell again
+                if cand_x and str(cand_x.signal) == "Neutral":
+                    self._edge_last_trade_signal["XAU"] = "Neutral"
+                if cand_b and str(cand_b.signal) == "Neutral":
+                    self._edge_last_trade_signal["BTC"] = "Neutral"
 
                 candidates: list[AssetCandidate] = []
                 if cand_x:

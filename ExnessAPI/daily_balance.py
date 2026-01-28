@@ -60,7 +60,8 @@ def _read_last_row(path: Path) -> Optional[DailyRow]:
         if not rows:
             return None
         r = rows[-1]
-        d = str(r.get("date_utc") or "")
+        # Be robust to accidental whitespace in CSV (prevents duplicate rows for same day)
+        d = str(r.get("date_utc") or "").strip()
         sb = _safe_float(r.get("start_balance"))
         pk = _safe_float(r.get("peak_equity"))
         if not d:
@@ -79,7 +80,7 @@ def _append_row(path: Path, row: DailyRow) -> None:
             w.writeheader()
         w.writerow(
             {
-                "date_utc": row.date_utc,
+                "date_utc": str(row.date_utc).strip(),
                 "start_balance": f"{row.start_balance:.2f}",
                 "peak_equity": f"{row.peak_equity:.2f}",
             }

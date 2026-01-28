@@ -494,8 +494,29 @@ class RiskManager:
         nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return max(0.0, (nxt - now).total_seconds())
 
+    @staticmethod
+    def _phase_rank(p: str) -> int:
+        pp = str(p or "A").upper()
+        if pp == "A":
+            return 0
+        if pp == "B":
+            return 1
+        return 2
+
+    def _set_phase(self, phase: str, reason: str) -> None:
+        """
+        Monotonic risk escalation within the day: A -> B -> C only.
+        Never downgrade (prevents C->B flip-flops).
+        """
+        ph = str(phase or "").upper()
+        if ph not in ("A", "B", "C"):
+            return
+        if self._phase_rank(ph) >= self._phase_rank(self.current_phase):
+            self.current_phase = ph
+            self._phase_reason_last = str(reason)
+
     def _enter_hard_stop(self, reason: str) -> None:
-        self.current_phase = "C"
+        self._set_phase("C", str(reason))
         self._hard_stop_reason = reason
         self._phase_reason_last = str(reason)
         self._target_breached = True
@@ -560,15 +581,21 @@ class RiskManager:
             except Exception:  # pragma: no cover
                 from ExnessApi.functions import get_balance as _get_balance  # type: ignore
 
-            saved_balance, saved_mode = initialize_daily_balance(float(current_balance), asset="XAU", balance_provider=_get_balance)
+            saved_balance, _saved_mode = initialize_daily_balance(
+                float(current_balance),
+                asset="XAU",
+                balance_provider=_get_balance,
+            )
 
             
             if saved_balance > 0:
                 self.daily_start_balance = float(saved_balance)
-                self.current_phase = str(saved_mode)
+                # IMPORTANT: new UTC day always starts from Phase A
+                self.current_phase = "A"
                 log_risk.info(
-                    "XAU daily state loaded: start_balance=%.2f current=%.2f mode=%s",
-                    saved_balance, current_balance, saved_mode
+                    "XAU daily state loaded: start_balance=%.2f current=%.2f",
+                    saved_balance,
+                    current_balance,
                 )
             else:
                 self.daily_start_balance = float(current_balance if current_balance > 0 else 0.0)
@@ -913,7 +940,8 @@ class RiskManager:
 
             # 3. Initialize Anchor if missing (e.g. first run of the day)
             if self.daily_start_balance <= 0:
-                base = bal if bal > 0 else eq
+                # Anchor must be BALANCE-based so that daily_return starts at 0 after reset
+                base = bal if bal > 0 else 0.0
                 if base > 0:
                     self.daily_start_balance = float(base)
                     log_risk.info("DAILY_ANCHOR_INIT | start_balance=%.2f", self.daily_start_balance)
@@ -924,22 +952,29 @@ class RiskManager:
 
             self.daily_peak_equity = max(self.daily_peak_equity, eq)
 
-            daily_return = 0.0
+            # Daily returns:
+            # - realized uses BALANCE (stable, does not jump with floating)
+            # - emergency uses EQUITY (includes floating, for hard protection)
+            daily_realized = 0.0
+            daily_equity = 0.0
             if self.daily_start_balance > 0:
-                daily_return = float((eq - self.daily_start_balance) / self.daily_start_balance)
+                daily_realized = float((bal - self.daily_start_balance) / self.daily_start_balance)
+                daily_equity = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
             # Log periodically (every ~1 min) or on significant change could be nice, but keep it clean for now.
             # 5. Phase Logic
             # A -> B (Target Reached)
-            if (not self._target_breached) and daily_return >= float(self.cfg.daily_target_pct):
-                if self.current_phase != "B":
-                    self.current_phase = "B"
-                    self._target_breached = True
-                    self._target_breached_return = float(daily_return)
-                    self._phase_reason_last = "daily_target_reached"
+            if (not self._target_breached) and daily_realized >= float(self.cfg.daily_target_pct):
+                prev = str(self.current_phase)
+                self._set_phase("B", "daily_target_reached")
+                self._target_breached = True
+                self._target_breached_return = float(daily_realized)
+                if prev != self.current_phase:
                     log_risk.error(
-                        "PHASE_CHANGE | A->B | reason=daily_target_reached daily_return=%.4f target=%.4f",
-                        daily_return,
+                        "PHASE_CHANGE | %s->%s | reason=daily_target_reached daily_return=%.4f target=%.4f",
+                        prev,
+                        self.current_phase,
+                        daily_realized,
                         float(self.cfg.daily_target_pct),
                     )
 
@@ -948,28 +983,33 @@ class RiskManager:
                 loss_b = float(getattr(self.cfg, "daily_loss_b_pct", 0.0) or 0.0)
                 loss_c = float(getattr(self.cfg, "daily_loss_c_pct", 0.0) or 0.0)
 
-                # Сначала проверяем loss_c (более критичный) - если превышен, сразу в C
-                if loss_c > 0 and daily_return <= -loss_c and self.current_phase != "C":
-                    self.current_phase = "C"
-                    self._phase_reason_last = "daily_loss_c"
+                # C is emergency: use EQUITY return (includes floating)
+                if loss_c > 0 and daily_equity <= -loss_c and self.current_phase != "C":
+                    prev = str(self.current_phase)
+                    self._enter_hard_stop("daily_loss_c")
                     log_risk.error(
-                        "PHASE_CHANGE | ->C | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
-                        daily_return,
+                        "PHASE_CHANGE | %s->%s | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
+                        prev,
+                        self.current_phase,
+                        daily_equity,
                         loss_c,
                     )
-                # Если loss_c не превышен, но превышен loss_b - переходим в B
-                elif loss_b > 0 and daily_return <= -loss_b and self.current_phase == "A":
-                    self.current_phase = "B"
-                    self._phase_reason_last = "daily_loss_b"
-                    log_risk.error(
-                        "PHASE_CHANGE | A->B | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
-                        daily_return,
-                        loss_b,
-                    )
+                # B-loss is protective: use BALANCE return (realized only) and only from A
+                elif loss_b > 0 and daily_realized <= -loss_b and self.current_phase == "A":
+                    prev = str(self.current_phase)
+                    self._set_phase("B", "daily_loss_b")
+                    if prev != self.current_phase:
+                        log_risk.error(
+                            "PHASE_CHANGE | %s->%s | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
+                            prev,
+                            self.current_phase,
+                            daily_realized,
+                            loss_b,
+                        )
 
                 # target lock: after overshoot, if returns back to target -> hard stop (Profit Protection)
                 if self._target_breached and self.current_phase == "B":
-                    self._target_breached_return = max(float(self._target_breached_return), float(daily_return))
+                    self._target_breached_return = max(float(self._target_breached_return), float(daily_realized))
                     target_pct = float(self.cfg.daily_target_pct)
                     
                     # === FIX: Add buffer before protection kicks in ===
@@ -977,7 +1017,7 @@ class RiskManager:
                     profit_buffer = 0.02  # 2% buffer above target before protection kicks in
                     
                     # 1. Standard Lock: if we went ABOVE target+buffer, and now dropped BELOW target -> STOP
-                    if self._target_breached_return >= (target_pct + profit_buffer) and daily_return < target_pct:
+                    if self._target_breached_return >= (target_pct + profit_buffer) and daily_realized < target_pct:
                          self._enter_hard_stop("profit_protection_target_lost")
 
                     # 2. Trailing Profit Stop (User Request: "if 11, 12, 13 ... and drops -> STOP")
@@ -985,7 +1025,7 @@ class RiskManager:
                     prot_pct = float(getattr(self.cfg, "protect_drawdown_from_peak_pct", 0.05) or 0.05) 
                     
                     # Calc drop from peak return
-                    drop_from_peak = self._target_breached_return - daily_return
+                    drop_from_peak = self._target_breached_return - daily_realized
                     
                     # Only apply if we are well into profit (above target + buffer)
                     if self._target_breached_return >= (target_pct + profit_buffer) and drop_from_peak >= prot_pct:

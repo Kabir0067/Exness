@@ -23,7 +23,14 @@ from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config_xau import get_config_from_env
-from ExnessAPI.functions import market_is_open
+from ExnessAPI.functions import (
+    market_is_open,
+    open_buy_order_btc,
+    open_sell_order_btc,
+    open_sell_order_xau,
+    open_buy_order_xau,
+    close_all_position_by_profit,
+)
 from Bot.portfolio_engine import engine
 from mt5_client import ensure_mt5, MT5_LOCK
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
@@ -75,6 +82,10 @@ TP_CALLBACK_PREFIX = "tp_usd:"
 SL_USD_MIN = 1
 SL_USD_MAX = 10
 SL_CALLBACK_PREFIX = "sl_usd:"
+
+# Helpers menu: TP/SL + open orders with count 2,4,6,8,10,12,14,16
+HELPER_CALLBACK_PREFIX = "hlp:"
+HELPER_ORDER_COUNTS = (2, 4, 6, 8, 10, 12, 14, 16)
 
 _session = requests.Session()
 _adapter = HTTPAdapter(
@@ -634,6 +645,48 @@ def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX,
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
     return kb
 
+
+def build_helpers_keyboard() -> InlineKeyboardMarkup:
+    """Ёвариҳо: TP/SL + харид/фурӯш (монанд ба TP/SL — аввал интихоб, баъд шумора)."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton(text="📈 Take Profit", callback_data=f"{HELPER_CALLBACK_PREFIX}tp"),
+        InlineKeyboardButton(text="🛡 Stop Loss", callback_data=f"{HELPER_CALLBACK_PREFIX}sl"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🟢 BTC ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_btc"),
+        InlineKeyboardButton(text="🔴 BTC ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_btc"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🟢 XAU ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_xau"),
+        InlineKeyboardButton(text="🔴 XAU ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_xau"),
+    )
+    return kb
+
+
+def build_helper_order_count_keyboard(action: str) -> InlineKeyboardMarkup:
+    """Тугмаҳои рақами 2,4,6,8,10,12,14,16 барои ордеркушои (монанд ба TP/SL)."""
+    kb = InlineKeyboardMarkup(row_width=4)
+    kb.add(*[
+        InlineKeyboardButton(text=str(c), callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:{c}")
+        for c in HELPER_ORDER_COUNTS
+    ])
+    kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel"))
+    return kb
+
+def format_close_by_profit_result(res: Dict[str, Any]) -> str:
+    """Формати натиҷаи «бастани фақат фоидадор» барои пайғоми бот."""
+    closed = int(res.get("closed", 0) or 0)
+    ok = bool(res.get("ok", False))
+    errors = res.get("errors") or []
+    status_emoji = "✅" if ok else "⚠️"
+    lines = [f"{status_emoji} <b>Бастани фоидадор:</b> <b>{closed}</b>"]
+    if errors:
+        preview = " | ".join(str(e)[:25] for e in errors[:2])
+        lines.append(f"⚠️ <code>{preview}</code>")
+    return "\n".join(lines)
+
+
 def _format_sl_result(usd: float, res: dict) -> str:
     total = int(res.get("total", 0) or 0)
     updated = int(res.get("updated", 0) or 0)
@@ -823,3 +876,8 @@ def check_full_program() -> tuple[bool, str]:
 
     ok_note = "✅ <b>Санҷиш анҷом ёфт</b>\nҲамаи модулҳо (XAU + BTC) дуруст фаъоланд."
     return True, ok_note + ("\n" + telemetry if telemetry else "")
+
+
+
+
+
