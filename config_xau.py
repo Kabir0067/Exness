@@ -259,7 +259,7 @@ class EngineConfig:
 
     max_daily_loss_pct: float = 0.05
     daily_loss_b_pct: float = 0.05
-    daily_loss_c_pct: float = 0.10
+    daily_loss_c_pct: float = 0.05
 
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
