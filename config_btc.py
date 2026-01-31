@@ -143,7 +143,7 @@ class SymbolParams:
     # Microstructure gate (ticks/second + imbalance + quote flips)
     micro_window_sec: int = 3
     micro_min_tps: float = 1.0
-    micro_max_tps: float = 360.0  # Ислоҳ: Аз 220 ба 360 барои BTC волатилӣ (сигналҳо дар ҳаракатҳои тез кам намешаванд)
+    micro_max_tps: float = 360.0
     micro_imb_thresh: float = 0.26
     micro_spread_med_x: float = 1.75
     quote_flips_max: int = 26
@@ -156,9 +156,8 @@ class SymbolParams:
     bb_width_range_max: float = 0.0080
 
     # Spread caps (CRITICAL FOR BTC)
-    # BTC has wider spreads than XAU, especially on weekends
     # At $87,000 price, 0.05% = $43.50 max spread (realistic for scalping)
-    spread_limit_pct: float = 0.0005  # 0.05% - increased from 0.0040 for realistic BTC trading
+    spread_limit_pct: float = 0.0005  # 0.05%
 
     def symbol(self) -> str:
         return (self.resolved or self.base).strip()
@@ -177,8 +176,11 @@ class SymbolParams:
         if self.entry_mode != "market":
             raise RuntimeError("config error: entry_mode only supports 'market'")
 
-        if int(self.micro_window_sec) <= 0:
+        mw = int(self.micro_window_sec)
+        if mw <= 0:
             raise RuntimeError("config error: micro_window_sec must be > 0")
+        if mw > 60:
+            raise RuntimeError("config error: micro_window_sec too large (>60)")
 
         mn = float(self.micro_min_tps)
         mx = float(self.micro_max_tps)
@@ -200,6 +202,18 @@ class SymbolParams:
         tstat = float(self.micro_tstat_thresh)
         if tstat <= 0.0:
             raise RuntimeError("config error: micro_tstat_thresh must be > 0")
+
+        pb = float(self.pullback_atr_mult)
+        if pb <= 0.0 or pb >= 3.0:
+            raise RuntimeError("config error: pullback_atr_mult out of range (0..3)")
+
+        arhi = float(self.atr_rel_hi)
+        if arhi <= 0.0 or arhi >= 0.20:
+            raise RuntimeError("config error: atr_rel_hi out of range (0..0.20)")
+
+        bbw = float(self.bb_width_range_max)
+        if bbw <= 0.0 or bbw >= 0.20:
+            raise RuntimeError("config error: bb_width_range_max out of range (0..0.20)")
 
         sp = float(self.spread_limit_pct)
         if not (0.0 < sp < 0.05):
@@ -237,15 +251,13 @@ class EngineConfig:
     overnight_block_hours: float = 0.0
 
     # Risk (BTC scalping)
-    # ---------------------------------------------------------------------------
-    daily_target_pct: float = 0.10  # Phase B starts at 10% profit (was 10%)
-    # ---------------------------------------------------------------------------
-    
-    max_daily_loss_pct: float = 0.03  # Ислоҳ: Аз 0.05 ба 0.03 кам карда шуд барои лимити зиёнҳои рӯзона (фоидаоварӣ беҳтар)
-    protect_drawdown_from_peak_pct: float = 0.20  # Ислоҳ: Аз 0.30 ба 0.20 барои ҳимояи зудтар
+    daily_target_pct: float = 0.15  # Phase B starts at 15% profit
+
+    max_daily_loss_pct: float = 0.05
+    protect_drawdown_from_peak_pct: float = 0.20
     max_drawdown: float = 0.12
-    daily_loss_b_pct: float = 0.03  # Ислоҳ: Аз 0.02 ба 0.03 - барои фаъолияти беҳтар
-    daily_loss_c_pct: float = 0.06  # Ислоҳ: Аз 0.05 ба 0.06 - барои фаъолияти беҳтар
+    daily_loss_b_pct: float = 0.05
+    daily_loss_c_pct: float = 0.10
     enforce_daily_limits: bool = True
     ignore_daily_stop_for_trading: bool = False
     enforce_drawdown_limits: bool = False
@@ -260,8 +272,8 @@ class EngineConfig:
     conf_min_high: int = 90
     ultra_confidence_min: float = 0.90
     confidence_bias: float = 50.0
-    confidence_gain: float = 85.0  # Ислоҳ: Аз 70 ба 85 барои сигналҳои эътимодноктар
-    net_norm_signal_threshold: float = 0.08  # Ислоҳ: Аз 0.10 ба 0.08 барои сигналҳои скалпинг
+    confidence_gain: float = 85.0
+    net_norm_signal_threshold: float = 0.08
     strong_conf_min: int = 90
     require_ema_stack: bool = True
 
@@ -315,9 +327,9 @@ class EngineConfig:
     min_bars_default: int = 160
 
     # === MEDIUM SCALPING 1-15 дақиқа (УСТУВОР) ===
-    poll_seconds_fast: float = 0.50  # Мӯътадил барои BTC
-    decision_debounce_ms: float = 400.0  # Устувор (BTC тезтар аз XAU)
-    analysis_cooldown_sec: float = 0.8  # Анализи дақиқ
+    poll_seconds_fast: float = 0.50
+    decision_debounce_ms: float = 400.0
+    analysis_cooldown_sec: float = 0.8
     cooldown_seconds: float = 0.0
     signal_cooldown_sec_override: Optional[float] = None
 
@@ -325,13 +337,10 @@ class EngineConfig:
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
 
-    # ---------------------------------------------------------------------------   
     max_positions: int = 1
-    # ---------------------------------------------------------------------------
-
 
     # Multi-order shaping
-    multi_order_tp_bonus_pct: float = 0.15  # Ислоҳ: Аз 0.12 ба 0.15 барои фоида зиёдтар
+    multi_order_tp_bonus_pct: float = 0.15
     multi_order_sl_tighten_pct: float = 0.00
     multi_order_confidence_tiers: Tuple[float, float, float] = (0.85, 0.90, 0.90)
     multi_order_max_orders: int = 3
@@ -342,11 +351,11 @@ class EngineConfig:
     max_signals_per_day: int = 0
 
     # SL/TP (ATR)
-    sl_atr_mult_trend: float = 1.15  # Ислоҳ: Аз 1.25 ба 1.15 барои SL тангтар
-    tp_atr_mult_trend: float = 2.7  # Ислоҳ: Аз 2.5 ба 2.7 барои TP калонтар
+    sl_atr_mult_trend: float = 1.15
+    tp_atr_mult_trend: float = 2.7
     sl_atr_mult_range: float = 1.35
     tp_atr_mult_range: float = 2.0
-    tp_rr_cap: float = 2.0  # Ислоҳ: Аз 1.8 ба 2.0
+    tp_rr_cap: float = 2.0
 
     min_rr: float = 1.0
     sltp_cost_spread_mult: float = 1.8
@@ -357,11 +366,11 @@ class EngineConfig:
     signal_amplification: float = 1.10
     weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "trend": 0.50,  # Ислоҳ: Аз 0.55 ба 0.50 (баланси беҳтар барои BTC)
+            "trend": 0.50,
             "momentum": 0.25,
             "meanrev": 0.10,
-            "structure": 0.10,  # Аз 0.05 ба 0.10 (BTC ба структура вобаста аст)
-            "volume": 0.05,  # Аз 0.03 ба 0.05
+            "structure": 0.10,
+            "volume": 0.05,
         }
     )
 
@@ -372,22 +381,21 @@ class EngineConfig:
     trail_on_entry: bool = True
 
     # Execution breaker limits
-    slippage_limit_ticks: float = 12.0  # Ислоҳ: Аз 15 ба 12 барои slippage тангтар
-    latency_rtt_ms_limit: int = 250  # Ислоҳ: Аз 300 ба 250
+    slippage_limit_ticks: float = 12.0
+    latency_rtt_ms_limit: int = 250
     cooldown_after_latency_s: int = 300
 
     # Hard spread circuit breaker (percent-of-price)
-    spread_cb_pct: float = 0.0008  # Ислоҳ: Аз 0.0010 ба 0.0008
-    rtt_cb_ms: int = 400  # Ислоҳ: Аз 450 ба 400
-    slippage_backoff: float = 0.4  # Ислоҳ: Аз 0.5 ба 0.4
+    spread_cb_pct: float = 0.0008
+    rtt_cb_ms: int = 400
+    slippage_backoff: float = 0.4
 
     # Execution quality monitoring (BTC scalping)
     exec_window: int = 300
-    exec_max_p95_latency_ms: float = 550.0  # Ислоҳ: Аз 650 ба 550 барои latency беҳтар
-    exec_max_p95_slippage_points: float = 20.0  # Ислоҳ: Аз 30 ба 20
-    # BTC spread ~1800 pts (point=0.01 → ~$18) common; 2000 allows it. plan_order_failed/meta_gate_block often from hitrate/SL-TP, not spread.
+    exec_max_p95_latency_ms: float = 550.0
+    exec_max_p95_slippage_points: float = 20.0
     exec_max_spread_points: float = 2000.0
-    exec_max_ewma_slippage_points: float = 15.0  # Ислоҳ: Аз 18 ба 15
+    exec_max_ewma_slippage_points: float = 15.0
     exec_breaker_sec: float = 120.0
 
     # Account snapshot cache
@@ -396,7 +404,7 @@ class EngineConfig:
     # ATR period for percentile calculation
     atr_period_for_percentile: int = 14
 
-    # Optional spread cap (points) - None = disabled. BTC ~1800 pts typical; keep None or >= 2000 to avoid blocking.
+    # Optional spread cap (points) - None = disabled.
     max_spread_points: Optional[float] = None
 
     # Crypto-specific blackouts (BTC 24/7 with optional maintenance windows)
@@ -438,15 +446,16 @@ class EngineConfig:
 
     # Meta/conformal gates (looser for scalping)
     conformal_window: int = 240
-    conformal_q: float = 0.90  # Ислоҳ: Аз 0.95 ба 0.90 барои сигналҳои зиёдтар (аммо дақиқ)
-    meta_barrier_R: float = 0.30  # Ислоҳ: Аз 0.40 ба 0.30 - барои сигналҳои зиёдтар
+    conformal_q: float = 0.90
+    meta_barrier_R: float = 0.30
     meta_h_bars: int = 4
-    tc_bps: float = 0.8  # Ислоҳ: Аз 1.0 ба 0.8 - барои сигналҳои зиёдтар
+    tc_bps: float = 0.8
 
     # Multi-order behavior
     multi_order_split_lot: bool = True
 
     def validate(self) -> None:
+        # --- credentials ---
         if int(self.login) <= 0:
             raise RuntimeError("config error: login must be > 0")
         if not str(self.password).strip():
@@ -458,8 +467,36 @@ class EngineConfig:
         if int(self.admin_id) <= 0:
             raise RuntimeError("config error: admin_id must be > 0")
 
+        # --- symbol + sessions ---
         self.symbol_params.validate()
         _validate_sessions_24_7(self.active_sessions)
+
+        # --- MT5 ---
+        if int(self.mt5_timeout_ms) < 1_000 or int(self.mt5_timeout_ms) > 180_000:
+            raise RuntimeError("config error: mt5_timeout_ms out of range [1000..180000]")
+
+        # --- core risk sanity ---
+        if not (0.0 < float(self.daily_target_pct) <= 1.0):
+            raise RuntimeError("config error: daily_target_pct must be in (0..1]")
+
+        if not (0.0 < float(self.max_drawdown) <= 0.95):
+            raise RuntimeError("config error: max_drawdown out of range (0..0.95]")
+
+        if not (0.0 < float(self.max_daily_loss_pct) < float(self.max_drawdown)):
+            raise RuntimeError("config error: max_daily_loss_pct must be < max_drawdown")
+
+        if not (0.0 < float(self.protect_drawdown_from_peak_pct) <= 0.95):
+            raise RuntimeError("config error: protect_drawdown_from_peak_pct out of range (0..0.95]")
+
+        dlb = float(self.daily_loss_b_pct)
+        dlc = float(self.daily_loss_c_pct)
+        if dlb <= 0.0 or dlc <= 0.0:
+            raise RuntimeError("config error: daily_loss_b_pct/daily_loss_c_pct must be > 0")
+        if dlb > dlc:
+            raise RuntimeError("config error: daily_loss_b_pct must be <= daily_loss_c_pct")
+
+        if int(self.magic) <= 0:
+            raise RuntimeError("config error: magic must be > 0")
 
         m = float(self.max_risk_per_trade)
         if not (0.0 < m <= 0.10):
@@ -468,25 +505,182 @@ class EngineConfig:
         if int(self.max_positions) <= 0:
             raise RuntimeError("config error: max_positions must be > 0")
 
+        # --- confidence gates ---
+        if not (0.0 < float(self.min_confidence_signal) <= 1.0):
+            raise RuntimeError("config error: min_confidence_signal must be in (0..1]")
+        if not (0.0 < float(self.ultra_confidence_min) <= 1.0):
+            raise RuntimeError("config error: ultra_confidence_min must be in (0..1]")
+        if float(self.ultra_confidence_min) < float(self.min_confidence_signal):
+            raise RuntimeError("config error: ultra_confidence_min must be >= min_confidence_signal")
+
+        for n in (self.conf_min, self.conf_min_low, self.conf_min_high, self.strong_conf_min):
+            if int(n) < 1 or int(n) > 100:
+                raise RuntimeError("config error: confidence integer thresholds must be in [1..100]")
+
+        if int(self.conf_min_low) > int(self.conf_min) or int(self.conf_min) > int(self.conf_min_high):
+            raise RuntimeError("config error: conf_min_low <= conf_min <= conf_min_high violated")
+
+        if int(self.strong_conf_min) < int(self.conf_min_high):
+            raise RuntimeError("config error: strong_conf_min must be >= conf_min_high")
+
+        if float(self.net_norm_signal_threshold) <= 0.0 or float(self.net_norm_signal_threshold) >= 1.0:
+            raise RuntimeError("config error: net_norm_signal_threshold must be in (0..1)")
+
+        # --- indicators sanity ---
+        if not (0 < int(self.ema_short) < int(self.ema_mid) < int(self.ema_long) < int(self.ema_vlong)):
+            raise RuntimeError("config error: EMA stack must satisfy short < mid < long < vlong")
+
+        for p_name in ("atr_period", "rsi_period", "adx_period", "vol_lookback"):
+            if int(getattr(self, p_name)) <= 0:
+                raise RuntimeError(f"config error: {p_name} must be > 0")
+
+        lo = float(self.adx_trend_lo)
+        hi = float(self.adx_trend_hi)
+        imp = float(self.adx_impulse_hi)
+        if not (0.0 < lo < hi < imp <= 100.0):
+            raise RuntimeError("config error: ADX thresholds must satisfy 0<lo<hi<imp<=100")
+
+        if float(self.atr_rel_lo) <= 0.0 or float(self.atr_rel_hi) <= 0.0:
+            raise RuntimeError("config error: atr_rel_lo/atr_rel_hi must be > 0")
+        if float(self.atr_rel_lo) >= float(self.atr_rel_hi):
+            raise RuntimeError("config error: atr_rel_lo must be < atr_rel_hi")
+
+        if float(self.min_body_pct_of_atr) <= 0.0 or float(self.min_body_pct_of_atr) >= 2.0:
+            raise RuntimeError("config error: min_body_pct_of_atr out of range (0..2)")
+
+        if int(self.min_bar_age_sec) < 0:
+            raise RuntimeError("config error: min_bar_age_sec must be >= 0")
+
+        # --- cadence / stability ---
         if float(self.poll_seconds_fast) <= 0.0:
             raise RuntimeError("config error: poll_seconds_fast must be > 0")
+        if float(self.poll_seconds_fast) < 0.02:
+            raise RuntimeError("config error: poll_seconds_fast too aggressive (<0.02) for MT5 stability")
+        if float(self.decision_debounce_ms) < 0.0 or float(self.decision_debounce_ms) > 10_000.0:
+            raise RuntimeError("config error: decision_debounce_ms out of range [0..10000]")
+        if float(self.analysis_cooldown_sec) < 0.0 or float(self.analysis_cooldown_sec) > 60.0:
+            raise RuntimeError("config error: analysis_cooldown_sec out of range [0..60]")
+        if float(self.signal_stability_eps) <= 0.0 or float(self.signal_stability_eps) >= 0.50:
+            raise RuntimeError("config error: signal_stability_eps out of range (0..0.50)")
 
+        # --- sizing ---
         if float(self.fixed_volume) <= 0.0:
             raise RuntimeError("config error: fixed_volume must be > 0")
 
-        if not (0.0 < float(self.min_confidence_signal) <= 1.0):
-            raise RuntimeError("config error: min_confidence_signal must be in (0..1]")
+        # --- multi-order ---
+        if int(self.multi_order_max_orders) <= 0:
+            raise RuntimeError("config error: multi_order_max_orders must be > 0")
+        if float(self.multi_order_tp_bonus_pct) < 0.0 or float(self.multi_order_tp_bonus_pct) > 2.0:
+            raise RuntimeError("config error: multi_order_tp_bonus_pct out of range [0..2]")
+        if float(self.max_spread_bps_for_multi) <= 0.0:
+            raise RuntimeError("config error: max_spread_bps_for_multi must be > 0")
 
-        if not (0.0 < float(self.ultra_confidence_min) <= 1.0):
-            raise RuntimeError("config error: ultra_confidence_min must be in (0..1]")
+        tiers = tuple(float(x) for x in self.multi_order_confidence_tiers)
+        if len(tiers) != 3:
+            raise RuntimeError("config error: multi_order_confidence_tiers must have 3 items")
+        if any((x <= 0.0 or x > 1.0) for x in tiers):
+            raise RuntimeError("config error: multi_order_confidence_tiers values must be in (0..1]")
+        if not (tiers[0] <= tiers[1] <= tiers[2]):
+            raise RuntimeError("config error: multi_order_confidence_tiers must be non-decreasing")
+        if tiers[0] < float(self.min_confidence_signal):
+            raise RuntimeError("config error: multi_order_confidence_tiers[0] must be >= min_confidence_signal")
 
-        if not (0.0 < float(self.max_daily_loss_pct) < float(self.max_drawdown)):
-            raise RuntimeError("config error: max_daily_loss_pct must be < max_drawdown")
+        # --- SL/TP sanity ---
+        for n in (
+            "sl_atr_mult_trend", "tp_atr_mult_trend", "sl_atr_mult_range", "tp_atr_mult_range",
+            "min_rr", "tp_rr_cap",
+            "sltp_cost_spread_mult", "sltp_cost_slip_mult", "sltp_cost_move_mult",
+            "sltp_sl_floor_mult", "sltp_tp_floor_mult",
+            "signal_amplification",
+            "be_trigger_R", "be_lock_spread_mult", "trail_atr_mult",
+        ):
+            v = float(getattr(self, n))
+            if v <= 0.0:
+                raise RuntimeError(f"config error: {n} must be > 0")
 
-        _validate_tf(self.anom_tf_for_block, "anom_tf_for_block")
+        if float(self.tp_rr_cap) < float(self.min_rr):
+            raise RuntimeError("config error: tp_rr_cap must be >= min_rr")
+
+        # --- weights ---
+        if not isinstance(self.weights, dict) or not self.weights:
+            raise RuntimeError("config error: weights must be a non-empty dict")
+
+        required_keys = {"trend", "momentum", "meanrev", "structure", "volume"}
+        if set(self.weights.keys()) != required_keys:
+            raise RuntimeError(f"config error: weights keys must be exactly {sorted(required_keys)!r}")
+
+        tot = sum(float(v) for v in self.weights.values())
+        if tot <= 0.0:
+            raise RuntimeError("config error: weights sum must be > 0")
+        if tot < 0.98 or tot > 1.02:
+            raise RuntimeError("config error: weights must sum to ~1.0 (tolerance ±2%)")
+        for k, v in self.weights.items():
+            if float(v) < 0.0:
+                raise RuntimeError(f"config error: weights[{k!r}] must be >= 0")
+
+        # --- breakers ---
+        if float(self.slippage_limit_ticks) <= 0.0:
+            raise RuntimeError("config error: slippage_limit_ticks must be > 0")
+        if int(self.latency_rtt_ms_limit) <= 0:
+            raise RuntimeError("config error: latency_rtt_ms_limit must be > 0")
+        if int(self.rtt_cb_ms) <= int(self.latency_rtt_ms_limit):
+            raise RuntimeError("config error: rtt_cb_ms must be > latency_rtt_ms_limit")
 
         if float(self.spread_cb_pct) <= 0.0 or float(self.spread_cb_pct) >= 0.05:
             raise RuntimeError("config error: spread_cb_pct out of range (0..0.05)")
+        if float(self.symbol_params.spread_limit_pct) >= float(self.spread_cb_pct):
+            raise RuntimeError("config error: spread_cb_pct must be > symbol_params.spread_limit_pct")
+
+        if float(self.slippage_backoff) <= 0.0 or float(self.slippage_backoff) > 5.0:
+            raise RuntimeError("config error: slippage_backoff out of range (0..5]")
+
+        # --- execution monitoring ---
+        if int(self.exec_window) <= 0:
+            raise RuntimeError("config error: exec_window must be > 0")
+        if float(self.exec_max_p95_latency_ms) <= 0.0:
+            raise RuntimeError("config error: exec_max_p95_latency_ms must be > 0")
+        if float(self.exec_max_p95_slippage_points) <= 0.0:
+            raise RuntimeError("config error: exec_max_p95_slippage_points must be > 0")
+        if float(self.exec_max_spread_points) <= 0.0:
+            raise RuntimeError("config error: exec_max_spread_points must be > 0")
+        if float(self.exec_max_ewma_slippage_points) <= 0.0:
+            raise RuntimeError("config error: exec_max_ewma_slippage_points must be > 0")
+        if float(self.exec_breaker_sec) <= 0.0:
+            raise RuntimeError("config error: exec_breaker_sec must be > 0")
+
+        # --- market freshness ---
+        if float(self.market_min_bar_age_sec) < 0.0:
+            raise RuntimeError("config error: market_min_bar_age_sec must be >= 0")
+        if float(self.market_max_bar_age_mult) <= 0.0:
+            raise RuntimeError("config error: market_max_bar_age_mult must be > 0")
+        if float(self.market_validate_interval_sec) <= 0.0:
+            raise RuntimeError("config error: market_validate_interval_sec must be > 0")
+
+        # --- meta/conformal ---
+        if int(self.conformal_window) < 60:
+            raise RuntimeError("config error: conformal_window too small (<60)")
+        if float(self.conformal_q) <= 0.0 or float(self.conformal_q) >= 1.0:
+            raise RuntimeError("config error: conformal_q must be in (0..1)")
+        if float(self.meta_barrier_R) <= 0.0 or float(self.meta_barrier_R) > 5.0:
+            raise RuntimeError("config error: meta_barrier_R out of range (0..5]")
+        if int(self.meta_h_bars) <= 0:
+            raise RuntimeError("config error: meta_h_bars must be > 0")
+        if float(self.tc_bps) < 0.0 or float(self.tc_bps) > 50.0:
+            raise RuntimeError("config error: tc_bps out of range [0..50]")
+
+        _validate_tf(self.anom_tf_for_block, "anom_tf_for_block")
+
+        # --- trade rate limits ---
+        if int(self.max_trades_per_hour) <= 0:
+            raise RuntimeError("config error: max_trades_per_hour must be > 0")
+        if int(self.max_signals_per_day) < 0:
+            raise RuntimeError("config error: max_signals_per_day must be >= 0")
+
+        # --- caching ---
+        if float(self.indicator_cache_min_interval_ms) < 0.0:
+            raise RuntimeError("config error: indicator_cache_min_interval_ms must be >= 0")
+        if float(self.account_snapshot_cache_sec) < 0.0:
+            raise RuntimeError("config error: account_snapshot_cache_sec must be >= 0")
 
     @property
     def indicator(self) -> Dict[str, int]:

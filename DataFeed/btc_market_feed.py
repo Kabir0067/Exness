@@ -135,8 +135,9 @@ class MarketFeed:
         self._cumulative_delta: float = 0.0
         self._last_tick_msc: int = 0  # dedup ticks + safe CVD accumulation
 
-        # Latency
+        # Latency cache
         self._last_latency: LatencyStats = LatencyStats()
+        self._last_latency_ts: float = 0.0
 
         # Symbol readiness debounce
         self._last_ready_ts: float = 0.0
@@ -175,8 +176,7 @@ class MarketFeed:
 
     def _max_bar_age_sec(self, timeframe: str) -> float:
         """
-        Correct stale threshold: timeframe_seconds * market_max_bar_age_mult,
-        bounded below by market_min_bar_age_sec.
+        Stale threshold: max(market_min_bar_age_sec, timeframe_seconds * market_max_bar_age_mult)
         """
         base = float(getattr(self.cfg, "market_min_bar_age_sec", 120.0) or 120.0)
         mult = float(getattr(self.cfg, "market_max_bar_age_mult", 2.0) or 2.0)
@@ -218,6 +218,16 @@ class MarketFeed:
             self._last_sym_info_ts = now
             return float(self._tick_size)
 
+    @staticmethod
+    def _cap_abs(x: float, cap: float) -> float:
+        if cap <= 0.0:
+            return x
+        if x > cap:
+            return cap
+        if x < -cap:
+            return -cap
+        return x
+
     def _estimate_regime(self, df_m1: Optional[pd.DataFrame], micro_trend: float) -> str:
         """
         Lightweight regime classifier:
@@ -226,13 +236,15 @@ class MarketFeed:
           - trend_up/down: micro_trend strong
         """
         try:
+            tstat_th = float(getattr(self.sp, "micro_tstat_thresh", 0.50) or 0.50)
+
             if df_m1 is None or len(df_m1) < 80:
-                if abs(micro_trend) >= float(self.sp.micro_tstat_thresh):
+                if abs(micro_trend) >= tstat_th:
                     return "trend_up" if micro_trend > 0 else "trend_down"
                 return "range"
 
             if not {"close", "high", "low"}.issubset(df_m1.columns):
-                if abs(micro_trend) >= float(self.sp.micro_tstat_thresh):
+                if abs(micro_trend) >= tstat_th:
                     return "trend_up" if micro_trend > 0 else "trend_down"
                 return "range"
 
@@ -245,17 +257,15 @@ class MarketFeed:
             l50 = l[-50:]
 
             atr_period = int(getattr(self.cfg, "atr_period", 14) or 14)
-            atr_rel_hi = float(getattr(self.cfg, "atr_rel_hi", 0.0100) or 0.0100)
+            atr_rel_hi = float(getattr(self.sp, "atr_rel_hi", getattr(self.cfg, "atr_rel_hi", 0.0100)) or 0.0100)
             bb_width_range_max = float(
-                getattr(self.cfg, "bb_width_range_max", 0.0080) or 0.0080
+                getattr(self.sp, "bb_width_range_max", getattr(self.cfg, "bb_width_range_max", 0.0080)) or 0.0080
             )
 
             prev_c = np.roll(c50, 1)
-            tr = np.maximum(h50 - l50, np.maximum(np.abs(h50 - prev_c), np.abs(l50 - prev_c)))[
-                1:
-            ]
+            tr = np.maximum(h50 - l50, np.maximum(np.abs(h50 - prev_c), np.abs(l50 - prev_c)))[1:]
             if tr.size < 2:
-                if abs(micro_trend) >= float(self.sp.micro_tstat_thresh):
+                if abs(micro_trend) >= tstat_th:
                     return "trend_up" if micro_trend > 0 else "trend_down"
                 return "range"
 
@@ -278,7 +288,7 @@ class MarketFeed:
                 return "range"
             if atr_ratio > atr_rel_hi:
                 return "breakout"
-            if abs(micro_trend) >= float(self.sp.micro_tstat_thresh):
+            if abs(micro_trend) >= tstat_th:
                 return "trend_up" if micro_trend > 0 else "trend_down"
             return "range"
         except Exception:
@@ -353,13 +363,20 @@ class MarketFeed:
     # Rates
     # ---------------------------------------------------------------------
     def _bars_for_tf(self, timeframe: str) -> int:
+        # IMPORTANT: make all optional cfg attrs None-safe
+        vol_lb = int(getattr(self.cfg, "vol_lookback", 80) or 80)
+        ext_lb = int(getattr(self.cfg, "extreme_lookback", 120) or 120)
+        conf_win = int(getattr(self.cfg, "conformal_window", 300) or 300)
+        brier_win = int(getattr(self.cfg, "brier_window", 800) or 800)
+        meta_h = int(getattr(self.cfg, "meta_h_bars", 6) or 6)
+
         need = max(
             300,
-            int(getattr(self.cfg, "vol_lookback", 80)),
-            int(getattr(self.cfg, "extreme_lookback", 120)),
-            int(getattr(self.cfg, "conformal_window", 300)),
-            int(getattr(self.cfg, "brier_window", 800)),
-            int(getattr(self.cfg, "meta_h_bars", 6)) * 50,
+            vol_lb,
+            ext_lb,
+            conf_win,
+            brier_win,
+            meta_h * 50,
         )
         cap = 2000
         if timeframe == "M1":
@@ -388,7 +405,7 @@ class MarketFeed:
             key = f"{symbol}_{timeframe}"
             max_age = self._max_bar_age_sec(timeframe)
 
-            # fast cache (correct stale threshold per timeframe)
+            # fast cache
             with self._data_lock:
                 ttl = float(self._ttl.get(key, 0.0))
                 if now < ttl and key in self._cache:
@@ -397,7 +414,6 @@ class MarketFeed:
                         if self.last_bar_age(df_cached) <= max_age:
                             return df_cached.copy(deep=False)
 
-            # refresh path
             if not self._ensure_symbol_ready():
                 with self._data_lock:
                     cached = self._cache.get(key)
@@ -407,7 +423,6 @@ class MarketFeed:
             bars = self._bars_for_tf(timeframe)
 
             rates = None
-            # Retry without sleeping (scalping-safe). Never holds MT5_LOCK across retries.
             for _ in range(3):
                 with MT5_LOCK:
                     rates = mt5.copy_rates_from_pos(symbol, tf_id, 0, bars)
@@ -426,7 +441,6 @@ class MarketFeed:
                     cached = self._cache.get(key)
                     return cached.copy(deep=False) if cached is not None else None
 
-            # UTC-aware timestamps
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             if not df["time"].is_monotonic_increasing:
                 df = df.sort_values("time").reset_index(drop=True)
@@ -441,7 +455,8 @@ class MarketFeed:
 
             ttl_sec = float(
                 self._cache_ttl_sec.get(
-                    timeframe, max(0.02, float(getattr(self.cfg, "poll_seconds_fast", 0.12) or 0.12))
+                    timeframe,
+                    max(0.02, float(getattr(self.cfg, "poll_seconds_fast", 0.12) or 0.12)),
                 )
             )
             with self._data_lock:
@@ -492,7 +507,6 @@ class MarketFeed:
         return bid, ask, mid, spr, spr_pct
 
     def spread_pct(self) -> float:
-        """Current spread as percentage of mid-price."""
         try:
             _, _, mid, spread, spr_pct = self.quote()
             if spr_pct > 0.0:
@@ -504,9 +518,6 @@ class MarketFeed:
             return 1.0
 
     def spread_ticks(self) -> float:
-        """
-        Spread in ticks using cached trade_tick_size if available; else uses point fallback.
-        """
         try:
             bid, ask, mid, spr, _ = self.quote()
             if mid <= 0.0 or spr <= 0.0 or bid <= 0.0 or ask <= 0.0:
@@ -540,7 +551,8 @@ class MarketFeed:
 
             bids: List[Tuple[float, float]] = []
             asks: List[Tuple[float, float]] = []
-            for lv in book[: max(1, int(levels)) * 4]:
+            lim = max(1, int(levels)) * 4
+            for lv in book[:lim]:
                 if lv.type == mt5.BOOK_TYPE_BUY:
                     bids.append((float(lv.price), float(lv.volume)))
                 elif lv.type == mt5.BOOK_TYPE_SELL:
@@ -567,6 +579,70 @@ class MarketFeed:
     # ---------------------------------------------------------------------
     # Ticks
     # ---------------------------------------------------------------------
+    def _ticks_to_array(self, ticks: Any) -> Optional[np.ndarray]:
+        """
+        Normalizes MT5 ticks struct-array to numeric matrix:
+          col0 time_msc, col1 bid, col2 ask, col3 volume, col4 last, col5 flags
+        Robust against brokers missing fields (flags/volume/last/time_msc).
+        """
+        try:
+            if ticks is None or len(ticks) < 2:
+                return None
+
+            names = set(getattr(ticks.dtype, "names", ()) or ())
+            if not names:
+                return None
+
+            if "time_msc" in names:
+                time_msc = ticks["time_msc"].astype(np.int64, copy=False)
+            elif "time" in names:
+                # seconds -> ms
+                time_msc = (ticks["time"].astype(np.int64, copy=False) * 1000).astype(np.int64, copy=False)
+            else:
+                return None
+
+            bid = ticks["bid"].astype(np.float64, copy=False) if "bid" in names else None
+            ask = ticks["ask"].astype(np.float64, copy=False) if "ask" in names else None
+            if bid is None or ask is None:
+                return None
+
+            if "volume" in names:
+                vol = ticks["volume"].astype(np.float64, copy=False)
+            elif "volume_real" in names:
+                vol = ticks["volume_real"].astype(np.float64, copy=False)
+            else:
+                vol = np.ones_like(bid, dtype=np.float64)
+
+            if "last" in names:
+                last = ticks["last"].astype(np.float64, copy=False)
+            else:
+                last = (bid + ask) * 0.5
+
+            if "flags" in names:
+                flags = ticks["flags"].astype(np.uint32, copy=False)
+            else:
+                flags = np.zeros_like(time_msc, dtype=np.uint32)
+
+            arr = np.column_stack(
+                (
+                    time_msc.astype(np.float64, copy=False),
+                    bid,
+                    ask,
+                    vol,
+                    last,
+                    flags.astype(np.float64, copy=False),
+                )
+            ).astype(np.float64, copy=False)
+
+            if arr.shape[0] >= 2:
+                # enforce time monotonic (important for window math)
+                if not np.all(arr[1:, 0] >= arr[:-1, 0]):
+                    arr = arr[np.argsort(arr[:, 0])]
+
+            return arr
+        except Exception:
+            return None
+
     def _sync_ticks(self, symbol: str, n_ticks: int = 1600) -> Optional[np.ndarray]:
         """
         Bounded tick sync; debounced by poll_seconds_fast.
@@ -588,21 +664,9 @@ class MarketFeed:
             with MT5_LOCK:
                 ticks = mt5.copy_ticks_from(symbol, since, int(n_ticks), mt5.COPY_TICKS_ALL)
 
-            if ticks is None or len(ticks) < 2:
+            arr = self._ticks_to_array(ticks)
+            if arr is None or len(arr) < 2:
                 return None
-
-            # Keep numeric matrix for fast ops:
-            # col0 time_msc, col1 bid, col2 ask, col3 volume, col4 last, col5 flags
-            arr = np.column_stack(
-                (
-                    ticks["time_msc"].astype(np.int64, copy=False),
-                    ticks["bid"].astype(np.float64, copy=False),
-                    ticks["ask"].astype(np.float64, copy=False),
-                    ticks["volume"].astype(np.float64, copy=False),
-                    ticks["last"].astype(np.float64, copy=False),
-                    ticks["flags"].astype(np.uint32, copy=False),
-                )
-            ).astype(np.float64, copy=False)
 
             with self._data_lock:
                 self._tick_cache[symbol] = arr
@@ -623,6 +687,7 @@ class MarketFeed:
                     try:
                         BUY_FLAG = int(getattr(mt5, "TICK_FLAG_BUY", 128))
                         SELL_FLAG = int(getattr(mt5, "TICK_FLAG_SELL", 64))
+
                         flags = new_arr[:, 5].astype(np.uint32, copy=False)
                         vols = new_arr[:, 3].astype(np.float64, copy=False)
 
@@ -645,10 +710,13 @@ class MarketFeed:
     def tick_stats(self, df_m1: Optional[pd.DataFrame] = None) -> TickStats:
         """
         BTC scalping gate:
-          - Liquidity: TPS within [micro_min_tps .. micro_max_tps]
-          - Noise: quote flips <= quote_flips_max
-          - Spread: soft cap spread_limit_pct, hard breaker spread_cb_pct
-          - Optional regime estimation using ATR ratio + BB width
+          - HARD breaker: spread_cb_pct (always enforced)
+          - Soft spread cap: sp.spread_limit_pct
+          - Liquidity: TPS within [micro_min_tps .. micro_max_tps] (stable TPS = ticks/window_sec)
+          - Noise: quote flips <= quote_flips_max (thresholded by tick_size)
+          - Spread spike: current spread <= median_spread * micro_spread_med_x
+          - Edge: require imbalance OR delta OR micro_trend above thresholds (prevents false signals)
+          - Stale ticks protection (prevents using old tick window)
         """
         try:
             ignore_micro = bool(getattr(self.cfg, "ignore_microstructure", False))
@@ -663,7 +731,7 @@ class MarketFeed:
             with self._data_lock:
                 cumulative_delta = float(self._cumulative_delta)
 
-            # Always enforce HARD spread breaker (safety)
+            # HARD breaker first (safety)
             if spread_pct > spread_cb_pct:
                 return TickStats(
                     ok=False,
@@ -705,23 +773,39 @@ class MarketFeed:
             self._sync_ticks(self.symbol, n_ticks=2000)
             book = self.fetch_book(levels=20)
 
+            micro_win_sec = float(max(1, int(self.sp.micro_window_sec)))
+            win_ms = micro_win_sec * 1000.0
+
             with self._data_lock:
-                min_ticks = int(max(12, float(self.sp.micro_min_tps) * float(self.sp.micro_window_sec) * 2.0))
+                # Prevent insane min_ticks which can lock the system in quiet markets
+                min_ticks = int(
+                    max(
+                        12,
+                        float(self.sp.micro_min_tps) * micro_win_sec * 2.0,
+                    )
+                )
+                min_ticks = int(min(220, max(12, min_ticks)))  # hard cap to avoid permanent block
+
                 if len(self._tick_deque) < min_ticks:
                     return TickStats(ok=False, reason=f"low_ticks_buf:{len(self._tick_deque)}/{min_ticks}")
                 arr = np.asarray(self._tick_deque, dtype=np.float64)
 
-            if arr.ndim != 2 or arr.shape[1] < 6:
+            if arr.ndim != 2 or arr.shape[1] < 6 or arr.shape[0] < 2:
                 return TickStats(ok=False, reason="bad_tick_shape")
 
-            now_ms = float(time.time() * 1000.0)
-            win_ms = float(max(1, int(self.sp.micro_window_sec)) * 1000.0)
-            w = arr[arr[:, 0] >= (now_ms - win_ms)]
+            # Window end based on LAST tick time (prevents clock-skew false windows)
+            end_ms = float(arr[-1, 0])
+            start_ms = end_ms - win_ms
+            w = arr[arr[:, 0] >= start_ms]
 
             if w.shape[0] < min_ticks:
                 return TickStats(ok=False, reason=f"low_ticks:{int(w.shape[0])}/{min_ticks}")
 
-            times = w[:, 0] / 1000.0
+            # Stale tick window protection
+            tick_age_ms = (time.time() * 1000.0) - end_ms
+            if tick_age_ms > max(2500.0, win_ms * 2.0):
+                return TickStats(ok=False, reason="stale_ticks")
+
             bids = w[:, 1]
             asks = w[:, 2]
             vols = w[:, 3]
@@ -737,22 +821,40 @@ class MarketFeed:
             spread_pct2 = float(spread2 / mid2) if mid2 > 0.0 else 1.0
             spread_ticks2 = float(spread2 / tick_size) if (tick_size > 0.0 and spread2 > 0.0) else 0.0
 
-            # TPS
-            horizon = max(1e-6, float(times[-1] - times[0]))
-            tps = float(w.shape[0] / horizon)
+            # HARD breaker again on last tick snapshot
+            if spread_pct2 > spread_cb_pct:
+                return TickStats(
+                    ok=False,
+                    reason="spread_cb",
+                    bid=last_bid,
+                    ask=last_ask,
+                    mid=mid2,
+                    spread=spread2,
+                    spread_pct=spread_pct2,
+                    spread_ticks=spread_ticks2,
+                    cumulative_delta=cumulative_delta,
+                    regime=self._estimate_regime(df_m1, 0.0),
+                )
+
+            # Stable TPS: ticks per configured window (NOT per horizon, prevents false tps_spike)
+            tps = float(w.shape[0] / micro_win_sec)
 
             # Volatility on mids
             mids = (bids + asks) * 0.5
             mid_diff = np.diff(mids)
             volatility = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
 
-            # Quote flips
+            # Quote flips: thresholded by tick_size to avoid counting micro-noise
             flips = 0
-            if mid_diff.size > 2:
-                s = np.sign(mid_diff)
-                s = s[s != 0]
-                if s.size > 2:
-                    flips = int(np.sum(s[:-1] != s[1:]))
+            if mid_diff.size > 2 and tick_size > 0.0:
+                # ignore tiny moves (< 0.25 tick)
+                thr = 0.25 * tick_size
+                d = mid_diff[np.abs(mid_diff) >= thr]
+                if d.size > 2:
+                    s = np.sign(d)
+                    s = s[s != 0]
+                    if s.size > 2:
+                        flips = int(np.sum(s[:-1] != s[1:]))
 
             # Delta (best-effort via MT5 tick flags)
             BUY_FLAG = int(getattr(mt5, "TICK_FLAG_BUY", 128))
@@ -779,34 +881,54 @@ class MarketFeed:
                 total_book = max(1e-6, float(np.sum(bid_vols) + np.sum(ask_vols)))
                 imb = float((np.sum(bid_vols) - np.sum(ask_vols)) / total_book)
 
-            # Micro-trend (t-stat like)
+            # Micro-trend (t-stat like), capped to avoid numeric blow-up
             micro_trend = 0.0
-            if mid_diff.size > 1:
+            if mid_diff.size > 6:
                 std = float(np.std(mid_diff))
                 if std > 0.0:
                     micro_trend = float(np.mean(mid_diff) / (std / np.sqrt(float(mid_diff.size))))
+                    micro_trend = self._cap_abs(micro_trend, cap=12.0)
 
             regime = self._estimate_regime(df_m1, micro_trend)
 
-            # Guards priority: HARD spread breaker -> liquidity -> spread soft -> noise -> tps spike
+            # Spread spike vs median in-window
+            spread_spike_ok = True
+            spreads_win = asks - bids
+            if spreads_win.size >= 8:
+                med_sp = float(np.median(spreads_win))
+                if med_sp > 0.0:
+                    x = float(getattr(self.sp, "micro_spread_med_x", 1.75) or 1.75)
+                    spread_spike_ok = bool(spread2 <= (med_sp * x))
+
+            # Edge gating (prevents false signals in balanced/no-edge micro)
+            imb_th = float(getattr(self.sp, "micro_imb_thresh", 0.26) or 0.26)
+            tstat_th = float(getattr(self.sp, "micro_tstat_thresh", 0.50) or 0.50)
+
+            has_edge = (abs(imb) >= imb_th) or (abs(tick_delta) >= (0.50 * imb_th)) or (abs(micro_trend) >= tstat_th)
+
+            # Guards priority:
+            # HARD spread breaker -> liquidity -> soft spread -> spread spike -> noise -> tps spike -> edge
             ok = True
             reason = "ok"
 
-            if spread_pct2 > spread_cb_pct:
-                ok = False
-                reason = "spread_cb"
-            elif tps < float(self.sp.micro_min_tps):
+            if tps < float(self.sp.micro_min_tps):
                 ok = False
                 reason = "low_liquidity"
             elif spread_pct2 > spread_limit_pct:
                 ok = False
                 reason = "spread_limit"
+            elif not spread_spike_ok:
+                ok = False
+                reason = "spread_spike"
             elif flips > int(self.sp.quote_flips_max):
                 ok = False
                 reason = "noise_flips"
             elif tps > float(self.sp.micro_max_tps):
                 ok = False
                 reason = "tps_spike"
+            elif not has_edge:
+                ok = False
+                reason = "no_edge"
 
             return TickStats(
                 ok=ok,
@@ -835,7 +957,15 @@ class MarketFeed:
     # Latency
     # ---------------------------------------------------------------------
     def latency_stats(self) -> LatencyStats:
+        """
+        Cached latency to avoid MT5 overload. TTL uses account_snapshot_cache_sec (default 0.5s).
+        """
         try:
+            ttl = float(getattr(self.cfg, "account_snapshot_cache_sec", 0.5) or 0.5)
+            now = time.time()
+            if (now - self._last_latency_ts) < max(0.05, ttl):
+                return self._last_latency
+
             if not self._ensure_symbol_ready():
                 return LatencyStats()
 
@@ -849,13 +979,14 @@ class MarketFeed:
 
             with MT5_LOCK:
                 orders = mt5.orders_get()
-            queue = int(len(orders) if orders else 0)
+            q = int(len(orders) if orders else 0)
 
             self._last_latency = LatencyStats(
                 py_mt5_ms=float(py_mt5_ms),
                 mt5_ping_ms=float(mt5_ping_ms),
-                order_queue=queue,
+                order_queue=q,
             )
+            self._last_latency_ts = now
             return self._last_latency
         except Exception as exc:
             log_feed.error("latency_stats error: %s | tb=%s", exc, traceback.format_exc())

@@ -85,12 +85,13 @@ class MarketFeed:
       - ultra-short TTL caching for scalping
       - tick buffer without NumPy-view memory retention
       - UTC-aware bar timestamps
+      - HARD stale-data gating (prevents false signals on frozen/closed market)
     """
 
     def __init__(self, cfg: EngineConfig, sp: SymbolParams) -> None:
         self.cfg = cfg
         self.sp = sp
-        self.symbol = sp.resolved or sp.base
+        self.symbol = (sp.resolved or sp.base or "").strip()
         self.tz = pytz.timezone(cfg.tz_local)
 
         # Internal caches lock (never hold MT5_LOCK and _data_lock at the same time)
@@ -109,8 +110,7 @@ class MarketFeed:
         # Ticks cache
         self._tick_cache: Dict[str, np.ndarray] = {}
         self._last_tick_sync: float = 0.0
-        # IMPORTANT: store tuples (not numpy views) to avoid retaining big arrays in memory
-        self._tick_deque: deque = deque(maxlen=2000)
+        self._tick_deque: deque = deque(maxlen=2000)  # tuples only
         self._last_tick_msc: int = 0
 
         # Book cache
@@ -131,6 +131,10 @@ class MarketFeed:
     def _ensure_symbol_ready(self) -> bool:
         """Ensures MT5 is initialized/logged-in and symbol is selected."""
         try:
+            if not self.symbol:
+                log_feed.error("Empty symbol in MarketFeed")
+                return False
+
             ensure_mt5()
             with MT5_LOCK:
                 info = mt5.symbol_info(self.symbol)
@@ -188,6 +192,25 @@ class MarketFeed:
                     self._ttl.pop(k, None)
                     self._cache.pop(k, None)
 
+    def _tf_seconds(self, timeframe: str) -> float:
+        if timeframe == "M1":
+            return 60.0
+        if timeframe == "M5":
+            return 300.0
+        if timeframe == "M15":
+            return 900.0
+        if timeframe == "M30":
+            return 1800.0
+        if timeframe == "H1":
+            return 3600.0
+        return 60.0
+
+    def _max_allowed_bar_age(self, timeframe: str) -> float:
+        # Uses cfg.market_max_bar_age_mult (default 2.0) -> prevents frozen-market false signals.
+        mult = float(getattr(self.cfg, "market_max_bar_age_mult", 2.0) or 2.0)
+        mult = max(1.0, min(mult, 10.0))
+        return float(self._tf_seconds(timeframe) * mult)
+
     # --------------------------- rates ---------------------------
     def _bars_for_tf(self, timeframe: str) -> int:
         cfg = self.cfg
@@ -217,7 +240,14 @@ class MarketFeed:
         return df.copy()
 
     def get_rates(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """
+        Critical guarantees:
+          - returns None when data is stale beyond allowed threshold (prevents false signals)
+          - returns cached df only if it is ALSO within stale threshold
+          - never sleeps under MT5_LOCK
+        """
         try:
+            symbol = (symbol or "").strip()
             if not symbol or timeframe not in TF_MAP:
                 return None
 
@@ -225,21 +255,23 @@ class MarketFeed:
             self._gc_caches(now)
 
             key = f"{symbol}_{timeframe}"
+            max_age = self._max_allowed_bar_age(timeframe)
 
             # fast cache path
             with self._data_lock:
                 ttl = float(self._ttl.get(key, 0.0))
                 df_cached = self._cache.get(key)
                 if now < ttl and df_cached is not None and not df_cached.empty:
-                    # freshness gate
-                    min_bar_age_sec = float(getattr(self.cfg, "min_bar_age_sec", 60.0) or 60.0)
-                    if self.last_bar_age(df_cached) <= max(2.0, min_bar_age_sec + 2.0):
+                    if self.last_bar_age(df_cached) <= max_age:
                         return df_cached
 
             # refresh path (no _data_lock held here)
             if not self._ensure_symbol_ready():
                 with self._data_lock:
-                    return self._cache.get(key)
+                    df_cached = self._cache.get(key)
+                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
+                        return df_cached
+                return None
 
             tf_id = TF_MAP[timeframe]
             bars = self._bars_for_tf(timeframe)
@@ -256,26 +288,34 @@ class MarketFeed:
 
             if rates is None or len(rates) == 0:
                 with self._data_lock:
-                    return self._cache.get(key)
+                    df_cached = self._cache.get(key)
+                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
+                        return df_cached
+                return None
 
             df = pd.DataFrame(rates)
             required = ("time", "open", "high", "low", "close", "tick_volume")
-            if any(c not in df.columns for c in required):
+            if any(c not in df.columns for c in required) or df.empty:
                 with self._data_lock:
-                    return self._cache.get(key)
+                    df_cached = self._cache.get(key)
+                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
+                        return df_cached
+                return None
 
             # UTC-aware timestamps
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             if not df["time"].is_monotonic_increasing:
                 df = df.sort_values("time").reset_index(drop=True)
 
-            # if last bar is absurdly old -> prefer cache (if exists)
-            if self.last_bar_age(df) > 120.0:
+            # HARD stale gate
+            age = self.last_bar_age(df)
+            if age > max_age:
+                # Only return cache if it is fresh; otherwise return None.
                 with self._data_lock:
-                    cached_df = self._cache.get(key)
-                    if cached_df is not None:
-                        return cached_df
-                return df
+                    df_cached = self._cache.get(key)
+                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
+                        return df_cached
+                return None
 
             ttl_sec = float(
                 self._cache_ttl_sec.get(
@@ -292,7 +332,13 @@ class MarketFeed:
         except Exception as exc:
             log_feed.error("get_rates error: %s | tb=%s", exc, traceback.format_exc())
             with self._data_lock:
-                return self._cache.get(f"{symbol}_{timeframe}")
+                df_cached = self._cache.get(f"{symbol}_{timeframe}")
+                if df_cached is not None and not df_cached.empty:
+                    # return cache only if not stale
+                    tf = timeframe if timeframe in TF_MAP else "M1"
+                    if self.last_bar_age(df_cached) <= self._max_allowed_bar_age(tf):
+                        return df_cached
+                return None
 
     def last_bar_age(self, df: pd.DataFrame) -> float:
         """
@@ -337,7 +383,9 @@ class MarketFeed:
 
             bids: List[Tuple[float, float]] = []
             asks: List[Tuple[float, float]] = []
-            lim = max(1, int(levels)) * 4
+            levels_i = max(1, int(levels))
+            lim = levels_i * 4
+
             for lv in book[:lim]:
                 if lv.type == mt5.BOOK_TYPE_BUY:
                     bids.append((float(lv.price), float(lv.volume)))
@@ -345,8 +393,8 @@ class MarketFeed:
                     asks.append((float(lv.price), float(lv.volume)))
 
             result = {
-                "bids": sorted(bids, key=lambda x: -x[0])[:levels],
-                "asks": sorted(asks, key=lambda x: x[0])[:levels],
+                "bids": sorted(bids, key=lambda x: -x[0])[:levels_i],
+                "asks": sorted(asks, key=lambda x: x[0])[:levels_i],
             }
 
             with self._data_lock:
@@ -371,18 +419,35 @@ class MarketFeed:
             if not info:
                 return 1.0
             bid, ask = float(info.bid), float(info.ask)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                return 1.0
             mid = 0.5 * (bid + ask)
             if mid <= 0:
                 return 1.0
-            return float(abs(ask - bid) / mid)
+            return float((ask - bid) / mid)
         except Exception:
             return 1.0
 
+    def _last_quote(self) -> Tuple[float, float]:
+        bid = ask = 0.0
+        try:
+            if not self._ensure_symbol_ready():
+                return 0.0, 0.0
+            with MT5_LOCK:
+                t = mt5.symbol_info_tick(self.symbol)
+            if t:
+                bid = float(getattr(t, "bid", 0.0) or 0.0)
+                ask = float(getattr(t, "ask", 0.0) or 0.0)
+        except Exception:
+            pass
+        return bid, ask
+
     # --------------------------- ticks ---------------------------
     def _sync_ticks(self, symbol: str, n_ticks: int = 1200) -> Optional[np.ndarray]:
-        """Bounded tick sync. Debounced by cfg.poll_seconds_fast."""
+        """Bounded tick sync. Debounced by cfg.poll_seconds_fast (clamped)."""
         now = time.time()
         poll_fast = float(getattr(self.cfg, "poll_seconds_fast", 1.0) or 1.0)
+        poll_fast = max(0.05, poll_fast)  # hard clamp for stability
         if (now - self._last_tick_sync) < poll_fast:
             with self._data_lock:
                 return self._tick_cache.get(symbol)
@@ -391,18 +456,20 @@ class MarketFeed:
             return None
 
         try:
-            # incremental since: avoid reprocessing the same ticks
+            # use overlap window to avoid missing ticks on slow MT5 responses
             if self._last_tick_msc > 0:
-                since_sec = max(0.0, (self._last_tick_msc / 1000.0) - 1.0)
+                since_sec = max(0.0, (self._last_tick_msc / 1000.0) - 2.0)
                 since = datetime.utcfromtimestamp(since_sec)
             else:
-                since = datetime.utcnow() - timedelta(seconds=int(self.sp.micro_window_sec * 2))
+                lookback = max(10, int(max(1, self.sp.micro_window_sec) * 6))
+                since = datetime.utcnow() - timedelta(seconds=lookback)
 
             with MT5_LOCK:
                 ticks = mt5.copy_ticks_from(symbol, since, int(n_ticks), mt5.COPY_TICKS_ALL)
 
+            self._last_tick_sync = time.time()
+
             if ticks is None or len(ticks) < 2:
-                self._last_tick_sync = time.time()
                 return None
 
             tm = ticks["time_msc"].astype(np.int64, copy=False)
@@ -414,26 +481,22 @@ class MarketFeed:
 
             arr = np.column_stack((tm, bid, ask, vol, last, flg)).astype(np.float64, copy=False)
 
-            # filter new ticks (strictly greater than last seen)
             last_seen = int(self._last_tick_msc)
+            arr_new = None
             if last_seen > 0:
                 new_mask = tm > last_seen
                 if bool(new_mask.any()):
                     arr_new = arr[new_mask]
-                else:
-                    arr_new = None
             else:
                 arr_new = arr
 
             with self._data_lock:
                 self._tick_cache[symbol] = arr
-                self._last_tick_sync = time.time()
 
                 if arr_new is not None and len(arr_new) > 0:
                     self._last_tick_msc = int(arr_new[-1, 0])
 
                     tail = arr_new[-min(len(arr_new), 600):]
-                    # store as tuples to avoid numpy-view memory retention
                     for r in tail:
                         self._tick_deque.append(
                             (float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
@@ -449,66 +512,63 @@ class MarketFeed:
     def tick_stats(self, df_m1: Optional[pd.DataFrame] = None) -> TickStats:
         """
         Microstructure stats over last micro_window_sec seconds.
-        NumPy 2.0 safe conversion from deque.
+        Deterministic, low-latency, and NOT dependent on unreliable BUY/SELL tick flags.
         """
         try:
             ignore_micro = bool(getattr(self.cfg, "ignore_microstructure", False))
+
+            # Always get last quote first (fast & needed for spread breaker)
+            bid_q, ask_q = self._last_quote()
+            if bid_q <= 0 or ask_q <= 0 or ask_q < bid_q:
+                return TickStats(ok=False, reason="no_quote", bid=bid_q, ask=ask_q)
+
+            # Spread breaker ALWAYS enforced (prevents false trades on widened spread)
+            mid_q = 0.5 * (bid_q + ask_q)
+            sp_pct_q = float((ask_q - bid_q) / mid_q) if mid_q > 0 else 1.0
+            spread_cb_pct = float(getattr(self.cfg, "spread_cb_pct", 0.0010) or 0.0010)
+            if sp_pct_q > max(float(self.sp.spread_limit_pct), spread_cb_pct):
+                return TickStats(ok=False, reason="spread_cb", bid=bid_q, ask=ask_q)
+
+            # If microstructure is explicitly ignored, do NOT do heavy tick/book work.
+            if ignore_micro:
+                return TickStats(ok=True, reason="micro_ignored", bid=bid_q, ask=ask_q)
+
+            # Sync ticks + optional book (heavy)
             self._sync_ticks(self.symbol, n_ticks=1600)
             book = self.fetch_book(levels=20)
 
-            def _fallback_tick(reason: str) -> TickStats:
-                bid = ask = 0.0
-                try:
-                    with MT5_LOCK:
-                        t = mt5.symbol_info_tick(self.symbol)
-                    if t:
-                        bid = float(getattr(t, "bid", 0.0) or 0.0)
-                        ask = float(getattr(t, "ask", 0.0) or 0.0)
-                except Exception:
-                    pass
-                return TickStats(ok=True, reason=reason, bid=bid, ask=ask)
-
             with self._data_lock:
-                min_ticks = int(
-                    max(
-                        10,
-                        float(self.sp.micro_min_tps) * float(self.sp.micro_window_sec) * 2.0,
-                    )
-                )
+                micro_w = max(1, int(self.sp.micro_window_sec))
+                min_ticks = int(max(10, float(self.sp.micro_min_tps) * float(micro_w) * 2.0))
                 buf_len = len(self._tick_deque)
                 if buf_len < min_ticks:
-                    if ignore_micro:
-                        return _fallback_tick(f"low_ticks_buf_ignored:{buf_len}/{min_ticks}")
-                    return TickStats(ok=False, reason=f"low_ticks_buf:{buf_len}/{min_ticks}")
-                rows = list(self._tick_deque)
+                    return TickStats(ok=False, reason=f"low_ticks_buf:{buf_len}/{min_ticks}", bid=bid_q, ask=ask_q)
 
-                # cumulative delta read/write protected
+                rows = list(self._tick_deque)
                 cumulative_delta_prev = float(self._cumulative_delta)
 
             arr = np.asarray(rows, dtype=np.float64)
             if arr.ndim != 2 or arr.shape[1] < 6:
-                return TickStats(ok=False, reason="bad_tick_shape")
+                return TickStats(ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q)
 
             now_ms = float(time.time() * 1000.0)
-            win_ms = float(max(1, int(self.sp.micro_window_sec)) * 1000.0)
+            win_ms = float(micro_w * 1000.0)
 
-            mask = arr[:, 0] >= (now_ms - win_ms)
-            w = arr[mask]
+            w = arr[arr[:, 0] >= (now_ms - win_ms)]
             w_n = int(w.shape[0])
             if w_n < min_ticks:
-                if ignore_micro:
-                    return _fallback_tick(f"low_ticks_ignored:{w_n}/{min_ticks}")
-                return TickStats(ok=False, reason=f"low_ticks:{w_n}/{min_ticks}")
+                return TickStats(ok=False, reason=f"low_ticks:{w_n}/{min_ticks}", bid=bid_q, ask=ask_q)
 
             times = w[:, 0] / 1000.0
             bids = w[:, 1]
             asks = w[:, 2]
-
-            last_bid = float(bids[-1]) if bids.size else 0.0
-            last_ask = float(asks[-1]) if asks.size else 0.0
-
             vols = w[:, 3]
-            flags = w[:, 5].astype(np.uint32, copy=False)
+
+            last_bid = float(bids[-1]) if bids.size else bid_q
+            last_ask = float(asks[-1]) if asks.size else ask_q
+
+            if last_bid <= 0 or last_ask <= 0 or last_ask < last_bid:
+                last_bid, last_ask = bid_q, ask_q
 
             horizon = max(1e-6, float(times[-1] - times[0]))
             tps = float(w_n / horizon)
@@ -516,8 +576,10 @@ class MarketFeed:
             mids = (bids + asks) / 2.0
             mid_diff = np.diff(mids)
 
+            # volatility on mid changes
             volatility = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
 
+            # flips: sign changes of mid movement
             if mid_diff.size > 2:
                 s = np.sign(mid_diff)
                 s = s[s != 0]
@@ -525,22 +587,24 @@ class MarketFeed:
             else:
                 flips = 0
 
-            BUY_FLAG = int(getattr(mt5, "TICK_FLAG_BUY", 128))
-            SELL_FLAG = int(getattr(mt5, "TICK_FLAG_SELL", 64))
+            # Robust order-flow proxy (NOT using BUY/SELL flags):
+            # direction = sign(mid change), weight = max(volume, 1)
+            if mid_diff.size > 0:
+                wgt = np.maximum(vols[1:], 1.0)
+                d = np.sign(mid_diff)
+                buy_w = float(np.sum(wgt[d > 0])) if np.any(d > 0) else 0.0
+                sell_w = float(np.sum(wgt[d < 0])) if np.any(d < 0) else 0.0
+                denom = max(1e-6, buy_w + sell_w)
+                tick_delta = float((buy_w - sell_w) / denom)
+                aggr_delta = tick_delta
+                cvd_add = float(buy_w - sell_w)
+            else:
+                tick_delta = 0.0
+                aggr_delta = 0.0
+                cvd_add = 0.0
 
-            buy_mask = (flags & BUY_FLAG) != 0
-            sell_mask = (flags & SELL_FLAG) != 0
-
-            buy_vol = float(np.sum(vols[buy_mask])) if bool(buy_mask.any()) else 0.0
-            sell_vol = float(np.sum(vols[sell_mask])) if bool(sell_mask.any()) else 0.0
-            total_vol = max(1e-6, buy_vol + sell_vol)
-
-            tick_delta = float((buy_vol - sell_vol) / total_vol)
-            aggr_delta = tick_delta
-
-            # update CVD
             with self._data_lock:
-                self._cumulative_delta = cumulative_delta_prev + (buy_vol - sell_vol)
+                self._cumulative_delta = cumulative_delta_prev + cvd_add
                 cumulative_delta = float(self._cumulative_delta)
 
             imb = 0.0
@@ -550,15 +614,16 @@ class MarketFeed:
                 total_book = max(1e-6, float(np.sum(bid_vols) + np.sum(ask_vols)))
                 imb = float((np.sum(bid_vols) - np.sum(ask_vols)) / total_book)
 
+            # t-stat-like micro trend
             std = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
             if std > 0 and mid_diff.size > 0:
                 micro_trend = float(np.mean(mid_diff) / (std / np.sqrt(float(mid_diff.size))))
             else:
                 micro_trend = 0.0
 
-            # regime detection
+            # regime detection (lightweight)
             regime = "unknown"
-            if df_m1 is not None and len(df_m1) >= 60:
+            if df_m1 is not None and len(df_m1) >= 60 and all(k in df_m1.columns for k in ("close", "high", "low")):
                 c = df_m1["close"].values.astype(np.float64, copy=False)
                 h = df_m1["high"].values.astype(np.float64, copy=False)
                 l = df_m1["low"].values.astype(np.float64, copy=False)
@@ -577,7 +642,6 @@ class MarketFeed:
                     np.maximum(np.abs(h50 - prev_c), np.abs(l50 - prev_c)),
                 )[1:]
 
-                # fast EMA-style ATR (small array -> loop is fine & deterministic)
                 alpha = 2.0 / (float(atr_period) + 1.0)
                 atr = np.empty_like(tr)
                 atr[0] = tr[0]
@@ -608,21 +672,9 @@ class MarketFeed:
             if tps < float(self.sp.micro_min_tps):
                 ok = False
                 reason = "low_liquidity"
-            if tps > float(self.sp.micro_max_tps):
+            elif tps > float(self.sp.micro_max_tps):
                 ok = False
                 reason = "tps_spike"
-
-            # Spread from last bid/ask (fast); fallback to MT5 if missing
-            if last_bid > 0 and last_ask > 0:
-                mid = 0.5 * (last_bid + last_ask)
-                sp_pct = float(abs(last_ask - last_bid) / mid) if mid > 0 else 1.0
-            else:
-                sp_pct = self.spread_pct()
-
-            spread_cb_pct = float(getattr(self.cfg, "spread_cb_pct", 0.0010) or 0.0010)
-            if sp_pct > max(float(self.sp.spread_limit_pct), spread_cb_pct):
-                ok = False
-                reason = "spread_cb"
 
             if flips > int(self.sp.quote_flips_max):
                 ok = False
@@ -659,12 +711,13 @@ class MarketFeed:
                 orders = mt5.orders_get()
             py_mt5_ms = (time.time() - t0) * 1000.0
 
-            ping_ms = float(getattr(term, "ping_last", 0) or 0) / 1000.0 if term else 0.0
+            # Keep numeric as-is; no risky unit conversion assumptions.
+            ping_raw = float(getattr(term, "ping_last", 0) or 0) if term else 0.0
             queue = int(len(orders) if orders else 0)
 
             self._last_latency = LatencyStats(
                 py_mt5_ms=float(py_mt5_ms),
-                mt5_ping_ms=float(ping_ms),
+                mt5_ping_ms=float(ping_raw),
                 order_queue=queue,
             )
             return self._last_latency
@@ -685,17 +738,9 @@ class MarketFeed:
             ask_prices = np.asarray([p for p, _ in book["asks"]], dtype=np.float64)
             ask_vols = np.asarray([v for _, v in book["asks"]], dtype=np.float64)
 
-            strong_support = (
-                float(np.average(bid_prices, weights=bid_vols))
-                if float(bid_vols.sum()) > 0
-                else None
-            )
-            strong_resistance = (
-                float(np.average(ask_prices, weights=ask_vols))
-                if float(ask_vols.sum()) > 0
-                else None
-            )
-            mid = float(0.5 * (bid_prices[0] + ask_prices[0]))
+            strong_support = float(np.average(bid_prices, weights=bid_vols)) if float(bid_vols.sum()) > 0 else None
+            strong_resistance = float(np.average(ask_prices, weights=ask_vols)) if float(ask_vols.sum()) > 0 else None
+            mid = float(0.5 * (bid_prices[0] + ask_prices[0])) if bid_prices.size and ask_prices.size else None
 
             all_prices = np.concatenate((bid_prices, ask_prices))
             all_vols = np.concatenate((bid_vols, ask_vols))

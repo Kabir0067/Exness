@@ -412,7 +412,10 @@ def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
         if h.ok:
             return
         time.sleep(0.20)
-    raise RuntimeError(f"mt5_health_failed:{last}")
+    hint = ""
+    if last == "algo_trading_disabled_in_terminal":
+        hint = " Enable Algo Trading in MT5: Tools → Options → Expert Advisors → Allow Algo Trading (or press AutoTrading button on toolbar)."
+    raise RuntimeError(f"mt5_health_failed:{last}{hint}")
 
 
 # =============================================================================

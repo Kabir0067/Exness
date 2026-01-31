@@ -1,7 +1,8 @@
-# utils.py
+# Bot/bot_utils.py
 from __future__ import annotations
 
-import logging 
+import html
+import logging
 import socket
 import time
 import traceback
@@ -18,22 +19,15 @@ import urllib3
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectTimeout, ReadTimeout, RequestException
 from telebot import apihelper
-from telebot import types
 from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot import types
 
 from config_xau import get_config_from_env
-from ExnessAPI.functions import (
-    market_is_open,
-    open_buy_order_btc,
-    open_sell_order_btc,
-    open_sell_order_xau,
-    open_buy_order_xau,
-    close_all_position_by_profit,
-)
+from ExnessAPI.functions import market_is_open
 from Bot.portfolio_engine import engine
-from mt5_client import ensure_mt5, MT5_LOCK
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
+from mt5_client import ensure_mt5, MT5_LOCK
 
 # =============================================================================
 # Logging (production-grade: rotate + no dup handlers)
@@ -83,6 +77,8 @@ SL_USD_MIN = 1
 SL_USD_MAX = 10
 SL_CALLBACK_PREFIX = "sl_usd:"
 
+AI_CALLBACK_PREFIX = "ai:"
+
 # Helpers menu: TP/SL + open orders with count 2,4,6,8,10,12,14,16
 HELPER_CALLBACK_PREFIX = "hlp:"
 HELPER_ORDER_COUNTS = (2, 4, 6, 8, 10, 12, 14, 16)
@@ -101,9 +97,23 @@ apihelper.READ_TIMEOUT = int(getattr(cfg, "telegram_read_timeout", 60) or 60)
 apihelper.CONNECT_TIMEOUT = int(getattr(cfg, "telegram_connect_timeout", 60) or 60)
 
 # =============================================================================
+# Git / README Button (inline URL button)
+# =============================================================================
+GIT_README_URL = "https://github.com/Kabir0067/Exness/blob/main/README.md"
+GIT_README_TEXT = "🔗 System information"
+
+
+def build_git_readme_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(text=GIT_README_TEXT, url=GIT_README_URL))
+    return kb
+
+
+# =============================================================================
 # Reliability: single retry/backoff layer (no double wrapping)
 # =============================================================================
 TG_LOCK = Lock()
+
 
 @dataclass(frozen=True)
 class Backoff:
@@ -114,6 +124,7 @@ class Backoff:
     def delay(self, attempt: int) -> float:
         return min(self.max_delay, self.base * (self.factor ** max(0, attempt - 1)))
 
+
 _NETWORK_EXC = (
     ReadTimeout,
     ConnectTimeout,
@@ -123,6 +134,7 @@ _NETWORK_EXC = (
     socket.gaierror,
     OSError,
 )
+
 
 def _should_retry(exc: Exception) -> bool:
     if isinstance(exc, _NETWORK_EXC):
@@ -143,6 +155,7 @@ def _should_retry(exc: Exception) -> bool:
 
     return False
 
+
 def tg_call(
     fn: Callable[..., Any],
     *args: Any,
@@ -158,6 +171,20 @@ def tg_call(
         except Exception as exc:
             should_retry = _should_retry(exc) and attempt < max_retries
             if not should_retry:
+                # Fallback: if HTML parsing failed, retry plain text
+                try:
+                    if isinstance(exc, ApiTelegramException):
+                        desc = str(getattr(exc, "description", "")).lower()
+                        code = int(getattr(exc, "error_code", 0) or 0)
+                        if code == 400 and ("parse entities" in desc or "start tag" in desc):
+                            pm = kwargs.get("parse_mode")
+                            if pm and str(pm).lower() == "html":
+                                log.warning("TG HTML parse error, retrying plain text... | err=%s", exc)
+                                kwargs["parse_mode"] = None
+                                continue
+                except Exception:
+                    pass
+
                 suppress_log = False
                 if on_permanent_failure:
                     try:
@@ -179,7 +206,6 @@ def tg_call(
                 return None
 
             d = backoff.delay(attempt)
-            # log.warning disabled by ERROR level, kept for optional future
             if attempt == 1 or attempt % 3 == 0:
                 log.warning(
                     "TG retry fn=%s attempt=%d/%d err=%s sleep=%.1fs",
@@ -191,6 +217,7 @@ def tg_call(
                 )
             time.sleep(d)
     return None
+
 
 # =============================================================================
 # Bounded TTL cache (no leaks; supports caching None + pop)
@@ -239,33 +266,38 @@ class TTLCache:
         _, val = item
         return val
 
+
 # Cache of chats that blocked the bot to avoid repeated 403 spam.
 _blocked_chat_cache = TTLCache(maxsize=512, ttl_sec=12 * 3600)
 
 # Typing throttle (prevents chat_action storms)
 _typing_cache = TTLCache(maxsize=2048, ttl_sec=1.2)
 
+
 def _format_datetime(dt: Optional[datetime] = None, show_date: bool = False, show_time: bool = True) -> str:
     """Форматирование даты и времени в красивом HTML формате."""
     if dt is None:
         dt = datetime.now()
-    
-    parts = []
+
+    parts: list[str] = []
     if show_date:
         parts.append(f"<b>{dt.strftime('%Y-%m-%d')}</b>")
     if show_time:
         parts.append(f"<code>{dt.strftime('%H:%M:%S')}</code>")
-    
+
     return " ".join(parts) if parts else ""
+
 
 def _format_time_only() -> str:
     """Только время в красивом формате."""
     return f"<code>{datetime.now().strftime('%H:%M:%S')}</code>"
 
+
 def _format_date_time() -> str:
     """Дата и время в красивом формате."""
     now = datetime.now()
     return f"<b>{now.strftime('%Y-%m-%d')}</b> <code>{now.strftime('%H:%M:%S')}</code>"
+
 
 def _extract_chat_id_from_call(
     fn_name: str,
@@ -290,6 +322,7 @@ def _extract_chat_id_from_call(
                 return candidate
 
     return None
+
 
 def _handle_permanent_telegram_failure(
     fn_name: str,
@@ -316,21 +349,25 @@ def _handle_permanent_telegram_failure(
             return True
     return False
 
+
 # Global reference to bot instance (set from bot.py)
 _bot_ref: Optional[Any] = None
 
 # Global reference to original send_chat_action (set from bot.py)
 _orig_send_chat_action_ref: Optional[Callable[..., Any]] = None
 
+
 def set_bot_instance(bot_instance: Any) -> None:
     """Set the bot instance from bot.py"""
     global _bot_ref
     _bot_ref = bot_instance
 
+
 def set_orig_send_chat_action(func: Callable[..., Any]) -> None:
     """Set the original send_chat_action function from bot.py"""
     global _orig_send_chat_action_ref
     _orig_send_chat_action_ref = func
+
 
 def _maybe_send_typing(chat_id: Optional[Any]) -> None:
     # Global policy: every outgoing message triggers typing, but throttled.
@@ -346,7 +383,6 @@ def _maybe_send_typing(chat_id: Optional[Any]) -> None:
     if _orig_send_chat_action_ref is not None:
         send_func = _orig_send_chat_action_ref
     else:
-        # Fallback: try to get from apihelper, but this should not happen if bot.py is initialized correctly
         try:
             send_func = getattr(apihelper, "send_chat_action", None)
             if send_func is None:
@@ -355,17 +391,24 @@ def _maybe_send_typing(chat_id: Optional[Any]) -> None:
         except Exception:
             log.warning("_maybe_send_typing: failed to get send_chat_action, skipping typing")
             return
-    
+
     tg_call(
         send_func,
         chat_id,
         action="typing",
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("send_chat_action", exc, (chat_id,), {"action": "typing"}),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "send_chat_action",
+            exc,
+            (chat_id,),
+            {"action": "typing"},
+        ),
     )
+
 
 def _rk_remove() -> types.ReplyKeyboardRemove:
     # Only policy: remove reply keyboard only via ReplyKeyboardRemove
     return types.ReplyKeyboardRemove()
+
 
 def _fmt_price(val: float) -> str:
     try:
@@ -373,12 +416,14 @@ def _fmt_price(val: float) -> str:
     except Exception:
         return str(val)
 
+
 def _send_clean(chat_id: int, text: str, *, parse_mode: str = "HTML") -> None:
     # One-shot message that guarantees reply keyboard is removed.
     if _bot_ref is None:
         log.error("_send_clean: bot instance not set")
         return
     _bot_ref.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=_rk_remove())
+
 
 def _notify_order_opened(intent: Any, result: Any) -> None:
     try:
@@ -399,12 +444,11 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
 
         sltp = f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0 and tp > 0) else "-"
         direction_emoji = "🟢" if str(intent.signal).lower() == "buy" else "🔴"
-        currency = "USD"
         time_str = _format_time_only()
-        
+
         msg = (
-            f"{direction_emoji} <b>{intent.signal.upper()}</b> | <b>{intent.asset}</b>\n"
-            f"📌 {intent.symbol} | #{intent.order_id} | Lot: <b>{float(intent.lot):.4f}</b>\n"
+            f"{direction_emoji} <b>{html.escape(str(intent.signal)).upper()}</b> | <b>{html.escape(str(intent.asset))}</b>\n"
+            f"📌 {html.escape(str(intent.symbol))} | #{intent.order_id} | Lot: <b>{float(intent.lot):.4f}</b>\n"
             f"🏷 <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | 🛡 {sltp}\n"
             f"🧠 <b>{conf_pct:.1f}%</b> | {time_str}"
         )
@@ -413,6 +457,7 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
         _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
         return
+
 
 def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str = "") -> None:
     try:
@@ -429,6 +474,7 @@ def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str
         _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
     except Exception:
         return
+
 
 def _notify_engine_stopped(asset: str, reason: str = "") -> None:
     try:
@@ -447,6 +493,7 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
     except Exception:
         return
 
+
 def _notify_daily_start(asset: str, day: str) -> None:
     try:
         if not is_admin_chat(ADMIN):
@@ -463,28 +510,34 @@ def _notify_daily_start(asset: str, day: str) -> None:
     except Exception:
         return
 
+
 def is_admin_chat(chat_id: int) -> bool:
     return bool(ADMIN and int(chat_id) == int(ADMIN))
 
+
 def deny(message: types.Message) -> None:
-    """Отправляет многоязычное сообщение об отказе в доступе."""
+    """Unauthorized access message + inline README button."""
     if _bot_ref is None:
         log.error("deny: bot instance not set")
         return
+
     msg = (
-        "🔒 PRIVATE ACCESS ONLY\n"
-        "— — — — — — — — — — — — —\n"
-        "🇬🇧 This bot private. Access denied.\n"
+        "🔒 <b>PRIVATE ACCESS ONLY</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🇬🇧 This bot is private. Access denied.\n"
         "🇷🇺 Бот приватный. Доступ ограничен.\n"
-        "🇹🇯 Бот хусусӣ. Дастраси маҳдуд.\n"
-        "— — — — — — — — — — — — —\n"
+        "🇹🇯 Бот хусусӣ. Дастрасӣ маҳдуд.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
         "👤 Owner: @kabir_0067"
     )
+
     _bot_ref.send_message(
         message.chat.id,
         msg,
-        reply_markup=_rk_remove(),
+        parse_mode="HTML",
+        reply_markup=build_git_readme_keyboard(),
     )
+
 
 def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
     if not bool(getattr(cfg_obj, "enable_telemetry", False)):
@@ -512,6 +565,7 @@ def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
         log.warning("fetch_external_correlation error: %s", exc)
         _corr_cache.set(key, None)
         return None
+
 
 def build_health_ribbon(status: Any, compact: bool = True) -> str:
     try:
@@ -542,6 +596,7 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
         log.error("build_health_ribbon error: %s", exc)
         return ""
 
+
 def _format_status_message(status: Any) -> str:
     active_label = str(getattr(status, "active_asset", "NONE"))
     if active_label == "NONE" and getattr(status, "trading", False):
@@ -549,7 +604,7 @@ def _format_status_message(status: Any) -> str:
 
     active_icon = "🟢" if getattr(status, "trading", False) else "🔴"
     trading_status = "ON" if getattr(status, "trading", False) else "OFF"
-    mt5_status = "✓" if getattr(status, "connected", False) else "✗"
+    mt5_state = "✓" if getattr(status, "connected", False) else "✗"
     balance = float(getattr(status, "balance", 0.0))
     equity = float(getattr(status, "equity", 0.0))
     today_pnl = float(getattr(status, "today_pnl", 0.0))
@@ -558,10 +613,10 @@ def _format_status_message(status: Any) -> str:
     open_btc = int(getattr(status, "open_trades_btc", 0))
     sig_xau = str(getattr(status, "last_signal_xau", "Neutral"))
     sig_btc = str(getattr(status, "last_signal_btc", "Neutral"))
-    queue = int(getattr(status, "exec_queue_size", 0))
-    
+    queue_size = int(getattr(status, "exec_queue_size", 0))
+
     return (
-        f"{active_icon} <b>Система</b> | Trading: <b>{trading_status}</b> | MT5: <b>{mt5_status}</b>\n"
+        f"{active_icon} <b>Система</b> | Trading: <b>{trading_status}</b> | MT5: <b>{mt5_state}</b>\n"
         f"💰 <b>{balance:.2f}$</b> | Equity: <b>{equity:.2f}$</b>"
     ) + (
         f" | PnL: <b>{today_pnl:+.2f}$</b>\n" if today_pnl != 0 else "\n"
@@ -571,8 +626,9 @@ def _format_status_message(status: Any) -> str:
         f"🔹 XAU: <b>{open_xau}</b> | {sig_xau} | "
         f"🔸 BTC: <b>{open_btc}</b> | {sig_btc}"
     ) + (
-        f" | 📥 <b>{queue}</b>\n" if queue > 0 else "\n"
+        f" | 📥 <b>{queue_size}</b>\n" if queue_size > 0 else "\n"
     )
+
 
 def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     text = (
@@ -585,14 +641,14 @@ def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     total_open = int(summary.get("total_open", 0) or 0)
 
     if total_closed > 0:
-        net = float(summary.get('net', 0.0) or 0.0)
-        wins = int(summary.get('wins', 0) or 0)
-        losses = int(summary.get('losses', 0) or 0)
-        profit = float(summary.get('profit', 0.0) or 0.0)
-        loss = float(summary.get('loss', 0.0) or 0.0)
+        net = float(summary.get("net", 0.0) or 0.0)
+        wins = int(summary.get("wins", 0) or 0)
+        losses = int(summary.get("losses", 0) or 0)
+        profit = float(summary.get("profit", 0.0) or 0.0)
+        loss = float(summary.get("loss", 0.0) or 0.0)
         win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
         pnl_emoji = "🟢" if net >= 0 else "🔴"
-        
+
         text += (
             f"\n{pnl_emoji} <b>P&L: {net:+.2f}$</b>\n"
             f"📊 {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>\n"
@@ -602,21 +658,25 @@ def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
         text += "\n🚫 Ордерҳои басташуда: 0\n"
 
     if total_open > 0:
-        unrealized = float(summary.get('unrealized_pnl', 0.0) or 0.0)
+        unrealized = float(summary.get("unrealized_pnl", 0.0) or 0.0)
         text += f"🔓 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized:+.2f}$</b>\n"
 
-    balance = float(summary.get('balance', 0.0) or 0.0)
+    balance = float(summary.get("balance", 0.0) or 0.0)
     text += f"\n💰 <b>{balance:.2f}$</b>\n"
     return text
 
+
 def _build_tp_usd_keyboard(min_usd: int = TP_USD_MIN, max_usd: int = TP_USD_MAX, row_width: int = 5) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=row_width)
-    kb.add(*[
-        InlineKeyboardButton(text=f"{i}$", callback_data=f"{TP_CALLBACK_PREFIX}{i}")
-        for i in range(int(min_usd), int(max_usd) + 1)
-    ])
+    kb.add(
+        *[
+            InlineKeyboardButton(text=f"{i}$", callback_data=f"{TP_CALLBACK_PREFIX}{i}")
+            for i in range(int(min_usd), int(max_usd) + 1)
+        ]
+    )
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{TP_CALLBACK_PREFIX}cancel"))
     return kb
+
 
 def _format_tp_result(usd: float, res: dict) -> str:
     total = int(res.get("total", 0) or 0)
@@ -626,23 +686,38 @@ def _format_tp_result(usd: float, res: dict) -> str:
     errors = res.get("errors") or []
 
     status_emoji = "✅" if ok else "⚠️"
-    lines = [
-        f"{status_emoji} <b>TP: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"
-    ]
+    lines = [f"{status_emoji} <b>TP: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"]
     if skipped > 0:
         lines.append(f"⏭️ Skip: <b>{skipped}</b>")
     if errors:
-        preview = " | ".join(e[:30] for e in errors[:3])
+        preview = " | ".join(html.escape(str(e))[:30] for e in errors[:3])
         lines.append(f"⚠️ <code>{preview}</code>")
     return "\n".join(lines)
 
+
 def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX, row_width: int = 5) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=row_width)
-    kb.add(*[
-        InlineKeyboardButton(text=f"{i}$", callback_data=f"{SL_CALLBACK_PREFIX}{i}")
-        for i in range(int(min_usd), int(max_usd) + 1)
-    ])
+    kb.add(
+        *[
+            InlineKeyboardButton(text=f"{i}$", callback_data=f"{SL_CALLBACK_PREFIX}{i}")
+            for i in range(int(min_usd), int(max_usd) + 1)
+        ]
+    )
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
+    return kb
+
+
+def build_ai_keyboard() -> InlineKeyboardMarkup:
+    """AI меню: XAU/BTC + Intraday."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton(text="🥇 Xau Ai", callback_data=f"{AI_CALLBACK_PREFIX}xau_scalp"),
+        InlineKeyboardButton(text="₿ Btc Ai", callback_data=f"{AI_CALLBACK_PREFIX}btc_scalp"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="📈 Xau Intraday", callback_data=f"{AI_CALLBACK_PREFIX}xau_intraday"),
+        InlineKeyboardButton(text="📉 Btc Intraday", callback_data=f"{AI_CALLBACK_PREFIX}btc_intraday"),
+    )
     return kb
 
 
@@ -667,12 +742,15 @@ def build_helpers_keyboard() -> InlineKeyboardMarkup:
 def build_helper_order_count_keyboard(action: str) -> InlineKeyboardMarkup:
     """Тугмаҳои рақами 2,4,6,8,10,12,14,16 барои ордеркушои (монанд ба TP/SL)."""
     kb = InlineKeyboardMarkup(row_width=4)
-    kb.add(*[
-        InlineKeyboardButton(text=str(c), callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:{c}")
-        for c in HELPER_ORDER_COUNTS
-    ])
+    kb.add(
+        *[
+            InlineKeyboardButton(text=str(c), callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:{c}")
+            for c in HELPER_ORDER_COUNTS
+        ]
+    )
     kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel"))
     return kb
+
 
 def format_close_by_profit_result(res: Dict[str, Any]) -> str:
     """Формати натиҷаи «бастани фақат фоидадор» барои пайғоми бот."""
@@ -682,7 +760,7 @@ def format_close_by_profit_result(res: Dict[str, Any]) -> str:
     status_emoji = "✅" if ok else "⚠️"
     lines = [f"{status_emoji} <b>Бастани фоидадор:</b> <b>{closed}</b>"]
     if errors:
-        preview = " | ".join(str(e)[:25] for e in errors[:2])
+        preview = " | ".join(html.escape(str(e))[:25] for e in errors[:2])
         lines.append(f"⚠️ <code>{preview}</code>")
     return "\n".join(lines)
 
@@ -695,36 +773,35 @@ def _format_sl_result(usd: float, res: dict) -> str:
     errors = res.get("errors") or []
 
     status_emoji = "✅" if ok else "⚠️"
-    lines = [
-        f"{status_emoji} <b>SL: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"
-    ]
+    lines = [f"{status_emoji} <b>SL: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"]
     if skipped > 0:
         lines.append(f"⏭️ Skip: <b>{skipped}</b>")
     if errors:
-        preview = " | ".join(e[:30] for e in errors[:3])
+        preview = " | ".join(html.escape(str(e))[:30] for e in errors[:3])
         lines.append(f"⚠️ <code>{preview}</code>")
     return "\n".join(lines)
 
+
 _summary_cache = TTLCache(maxsize=4, ttl_sec=3.0)
-
 _corr_cache = TTLCache(maxsize=8, ttl_sec=float(getattr(cfg, "correlation_refresh_sec", 60) or 60))
-
 _orders_kb_cache = TTLCache(maxsize=256, ttl_sec=120.0)
+
 
 def format_order(order_data: Dict[str, Any]) -> str:
     direction_emoji = "🟢" if order_data.get("type") == "BUY" else "🔴"
     direction_text = "BUY" if order_data.get("type") == "BUY" else "SELL"
-    ticket = order_data.get('ticket', '-')
-    symbol = order_data.get('symbol', '-')
-    volume = float(order_data.get('volume', 0.0) or 0.0)
-    price = float(order_data.get('price', 0.0) or 0.0)
+    ticket = order_data.get("ticket", "-")
+    symbol = order_data.get("symbol", "-")
+    volume = float(order_data.get("volume", 0.0) or 0.0)
+    price = float(order_data.get("price", 0.0) or 0.0)
     profit = float(order_data.get("profit", 0.0) or 0.0)
     profit_emoji = "🟢" if profit >= 0 else "🔴"
-    
+
     return (
-        f"{direction_emoji} <b>{direction_text}</b> | <b>{symbol}</b> | #{ticket}\n"
+        f"{direction_emoji} <b>{direction_text}</b> | <b>{html.escape(str(symbol))}</b> | #{ticket}\n"
         f"📦 <b>{volume:.2f}</b> | 🏷 <b>{price:.5f}</b> | {profit_emoji} <b>{profit:+.2f}$</b>"
     )
+
 
 def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     key = (index, total, ticket)
@@ -749,6 +826,7 @@ def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     _orders_kb_cache.set(key, kb)
     return kb
 
+
 def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
     """Компактный профессиональный формат отчета."""
     try:
@@ -761,26 +839,29 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
             date_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
             date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        period_map = {"Имрӯза": "📊 РӮЗОНА", "Ҳафтаина": "📊 ҲАФТАИНА", "Моҳона": "📊 МОҲОНА", "Пурра (Аз ибтидо)": "📊 ПУРРА"}
+        period_map = {
+            "Имрӯза": "📊 РӮЗОНА",
+            "Ҳафтаина": "📊 ҲАФТАИНА",
+            "Моҳона": "📊 МОҲОНА",
+            "Пурра (Аз ибтидо)": "📊 ПУРРА",
+        }
         title = period_map.get(period_name, f"📊 {period_name.upper()}")
-        
+
         text = f"<b>{title}</b>\n"
 
         if date_from and date_to:
-            # Форматируем даты красиво
             try:
                 if period_name == "Пурра (Аз ибтидо)":
-                    # Для полного отчета показываем только даты
-                    df = date_from.split()[0] if ' ' in date_from else date_from
-                    dt = date_to.split()[0] if ' ' in date_to else date_to
+                    df = date_from.split()[0] if " " in date_from else date_from
+                    dt = date_to.split()[0] if " " in date_to else date_to
                     text += f"<b>{df}</b> → <b>{dt}</b>\n"
                 else:
-                    # Для других периодов показываем дату и время
-                    df = date_from.split()[0] if ' ' in date_from else date_from
-                    dt_time = date_to.split()[1] if ' ' in date_to else ""
-                    dt_date = date_to.split()[0] if ' ' in date_to else date_to
+                    df = date_from.split()[0] if " " in date_from else date_from
+                    dt_time = date_to.split()[1] if " " in date_to else ""
+                    dt_date = date_to.split()[0] if " " in date_to else date_to
                     if dt_time:
-                        text += f"<b>{df}</b> <code>{date_from.split()[1] if ' ' in date_from else ''}</code> → <b>{dt_date}</b> <code>{dt_time}</code>\n"
+                        df_time = date_from.split()[1] if " " in date_from else ""
+                        text += f"<b>{df}</b> <code>{df_time}</code> → <b>{dt_date}</b> <code>{dt_time}</code>\n"
                     else:
                         text += f"<b>{df}</b> → <b>{dt_date}</b>\n"
             except Exception:
@@ -801,7 +882,7 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
             pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
             win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
             profit_factor = profit / loss if loss > 0 else (profit if profit > 0 else 0.0)
-            
+
             text += (
                 f"\n{pnl_emoji} <b>P&L: {net_pnl:+.2f}$</b>\n"
                 f"📊 {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>"
@@ -818,6 +899,7 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
         return text
     except Exception as exc:
         return f"⚠️ <code>{exc}</code>"
+
 
 def check_full_program() -> tuple[bool, str]:
     issues: list[str] = []
@@ -841,14 +923,11 @@ def check_full_program() -> tuple[bool, str]:
     else:
         # XAU: игнорируем ошибки в выходные дни (суббота/воскресенье)
         if not xau_pipe.last_market_ok:
-            # Если рынок XAU закрыт (выходные) - это нормально, не считаем ошибкой
             if market_is_open("XAU"):
-                # Рынок должен быть открыт, но данные плохие - это ошибка
                 reason = str(xau_pipe.last_market_reason or "")
                 issues.append(f"XAU Market Data Error: {reason}")
-            # Если market_is_open("XAU") == False (выходные) - не добавляем ошибку
-        
-        # BTC: всегда должен работать (24/7)
+
+        # BTC: always expected (24/7)
         if not btc_pipe.last_market_ok:
             issues.append(f"BTC Market Data Error: {btc_pipe.last_market_reason}")
 
@@ -876,8 +955,3 @@ def check_full_program() -> tuple[bool, str]:
 
     ok_note = "✅ <b>Санҷиш анҷом ёфт</b>\nҲамаи модулҳо (XAU + BTC) дуруст фаъоланд."
     return True, ok_note + ("\n" + telemetry if telemetry else "")
-
-
-
-
-
