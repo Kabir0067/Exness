@@ -1103,10 +1103,16 @@ class RiskManager:
     def _fallback_atr_sl_tp(self, side: str, entry: float, adapt: Dict[str, Any]) -> Tuple[float, float]:
         try:
             atr = float(adapt.get("atr", 0.0) or 0.0)
-            if atr <= 0 and hasattr(self.cfg, "fallback_atr_abs"):
-                atr = float(getattr(self.cfg, "fallback_atr_abs"))
+            
+            # SAFE FALLBACK: If ATR is missing/0, use 0.5% default distance
+            if atr <= 1e-9:
+                if hasattr(self.cfg, "fallback_atr_abs") and float(getattr(self.cfg, "fallback_atr_abs") or 0.0) > 0:
+                     atr = float(getattr(self.cfg, "fallback_atr_abs"))
+                else:
+                    atr = entry * 0.005  # 0.5% fallback
 
-            if atr <= 0:
+            if atr <= 1e-9:
+                # Should not happen unless entry is 0
                 return entry, entry
 
             regime = str(adapt.get("regime", "trend") or "trend")

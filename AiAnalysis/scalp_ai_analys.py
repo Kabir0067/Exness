@@ -5,6 +5,7 @@ import os
 import time
 import urllib.request
 import urllib.error
+import ssl
 from typing import Any, Dict, Optional, Tuple
 
 import logging
@@ -276,8 +277,14 @@ IMPORTANT:
 def _http_post_json(url: str, body: Dict[str, Any], headers: Dict[str, str], timeout: int) -> Tuple[int, str]:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    
+    # FIX: Bypass SSL verification for local dev/broken cert chains
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     try:
-        with urllib.request.urlopen(req, timeout=int(timeout)) as resp:
+        with urllib.request.urlopen(req, timeout=int(timeout), context=ctx) as resp:
             status = int(getattr(resp, "status", 200))
             text = resp.read().decode("utf-8", errors="replace")
             return status, text

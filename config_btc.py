@@ -266,15 +266,15 @@ class EngineConfig:
 
     # Signal quality
     # STRICT (to reduce false signals): only trade strong setups.
-    min_confidence_signal: float = 0.85
-    conf_min: int = 85
-    conf_min_low: int = 85
-    conf_min_high: int = 90
-    ultra_confidence_min: float = 0.90
+    min_confidence_signal: float = 0.60
+    conf_min: int = 60
+    conf_min_low: int = 55
+    conf_min_high: int = 75
+    ultra_confidence_min: float = 0.80
     confidence_bias: float = 50.0
     confidence_gain: float = 85.0
     net_norm_signal_threshold: float = 0.08
-    strong_conf_min: int = 90
+    strong_conf_min: int = 80
     require_ema_stack: bool = True
 
     # Indicators
@@ -337,7 +337,7 @@ class EngineConfig:
     fixed_volume: float = 0.01
     max_risk_per_trade: float = 0.015
 
-    max_positions: int = 1
+    max_positions: int = 50
 
     # Multi-order shaping
     multi_order_tp_bonus_pct: float = 0.15

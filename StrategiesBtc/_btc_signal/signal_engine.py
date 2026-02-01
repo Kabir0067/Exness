@@ -1035,7 +1035,9 @@ class SignalEngine:
 
             atr = _atr(h, l, c, 14)
             atr_val = float(safe_last(atr, 1.0) or 1.0)
-            if atr_val <= 0:
+            
+            # FAIL-OPEN: If ATR is invalid, don't block. Let RiskManager handle sizing/stops.
+            if atr_val <= 1e-9:
                 return True
 
             sign = 1.0 if _side_norm(side) == "Buy" else -1.0
@@ -1048,7 +1050,8 @@ class SignalEngine:
             end_i = max(start_i + 1, len(c) - h_bars - 1)
             
             if end_i <= start_i or (end_i - start_i) < 5:
-                return True  # Fail-open for scalping
+                # FAIL-OPEN: Not enough samples to judge
+                return True
 
             for i in range(start_i, end_i):
                 if (i + h_bars) >= len(c):
@@ -1058,20 +1061,20 @@ class SignalEngine:
                     wins += 1
                 total += 1
 
-            if total < 5:  # Reduced from 10 for BTC scalping
+            if total < 5:  # Reduced from 10
                 return True
 
             hitrate = wins / total
-            edge_needed = (tc_bps / 10000.0) * 2.0  # Reduced from 3.0
-            threshold = 0.45 + edge_needed  # Reduced from 0.50
+            edge_needed = (tc_bps / 10000.0) * 2.0
+            threshold = 0.45 + edge_needed
             
             # === OPTIMIZED FOR BTC SCALPING ===
-            # Much wider margin (15%) for BTC volatility
-            if hitrate >= (threshold - 0.15):
+            # Even wider margin (20%) for BTC
+            if hitrate >= (threshold - 0.20):
                 return True
             
-            # If hitrate is above 35%, allow signal (BTC can be choppy)
-            if hitrate >= 0.35:
+            # Absolute floor: if > 30% hitrate in choppy BTC, allow it
+            if hitrate >= 0.30:
                 return True
             
             result = bool(hitrate >= threshold)
