@@ -705,10 +705,9 @@ def ai_callback_handler(call: telebot.types.CallbackQuery) -> None:
 
 def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
     try:
-        bot.edit_message_text(
-            "🔄 <b>AI XAU Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
+        loading = bot.send_message(
             chat_id,
-            message_id,
+            "🔄 <b>AI XAU Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
             parse_mode="HTML",
         )
         payload = get_ai_payload_xau_intraday()
@@ -716,25 +715,25 @@ def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
             bot.edit_message_text(
                 "⚠️ <b>XAU Intraday — Маълумот дастнорас</b>",
                 chat_id,
-                message_id,
+                loading.message_id,
                 parse_mode="HTML",
             )
             return
         result = analyse_intraday("XAU", payload)
         text = _format_ai_signal("XAU", result)
         kb = build_helpers_keyboard()
-        bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
+        bot.delete_message(chat_id, loading.message_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception as exc:
         log.error("XAU Intraday AI handler error: %s | tb=%s", exc, traceback.format_exc())
-        bot.edit_message_text(f"⚠️ Хатогии Intraday XAU: <code>{exc}</code>", chat_id, message_id, parse_mode="HTML")
+        bot.send_message(chat_id, f"⚠️ Хатогии Intraday XAU: <code>{exc}</code>", parse_mode="HTML")
 
 
 def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
     try:
-        bot.edit_message_text(
-            "🔄 <b>AI BTC Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
+        loading = bot.send_message(
             chat_id,
-            message_id,
+            "🔄 <b>AI BTC Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
             parse_mode="HTML",
         )
         payload = get_ai_payload_btc_intraday()
@@ -742,17 +741,18 @@ def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
             bot.edit_message_text(
                 "⚠️ <b>BTC Intraday — Маълумот дастнорас</b>",
                 chat_id,
-                message_id,
+                loading.message_id,
                 parse_mode="HTML",
             )
             return
         result = analyse_intraday("BTC", payload)
         text = _format_ai_signal("BTC", result)
         kb = build_helpers_keyboard()
-        bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
+        bot.delete_message(chat_id, loading.message_id)
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     except Exception as exc:
         log.error("BTC Intraday AI handler error: %s | tb=%s", exc, traceback.format_exc())
-        bot.edit_message_text(f"⚠️ Хатогии Intraday BTC: <code>{exc}</code>", chat_id, message_id, parse_mode="HTML")
+        bot.send_message(chat_id, f"⚠️ Хатогии Intraday BTC: <code>{exc}</code>", parse_mode="HTML")
 
 
 # =============================================================================

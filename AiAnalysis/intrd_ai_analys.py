@@ -35,9 +35,9 @@ if not log.handlers:
 # =============================================================================
 # Intraday runtime knobs (separate env names)
 # =============================================================================
-AI_INTRA_TIMEOUT_SEC = 12
+AI_INTRA_TIMEOUT_SEC = 20
 AI_INTRA_MAX_RETRIES = 1
-AI_INTRA_MIN_CONF = 0.82
+AI_INTRA_MIN_CONF = 0.60
 
 AI_INTRA_BUDGET_SEC = 8.0
 AI_INTRA_CACHE_TTL_SEC = 3600  # H1 => cache up to 1h (safe)
