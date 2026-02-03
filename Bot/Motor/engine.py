@@ -66,6 +66,10 @@ class MultiAssetTradingEngine:
         # IMPORTANT: map order_id -> risk_manager (robust RM routing)
         self._order_rm_by_id: Dict[str, Any] = {}
 
+        # Log suppression for high-frequency skips
+        self._last_log_id: Dict[str, str] = {}
+
+
         # Loop tuning
         self._poll_fast = float(os.getenv("PORTFOLIO_POLL_FAST_SEC", "0.25") or "0.25")
         self._poll_slow = float(os.getenv("PORTFOLIO_POLL_SLOW_SEC", "0.75") or "0.75")
@@ -120,6 +124,17 @@ class MultiAssetTradingEngine:
         self._last_phase_by_asset: Dict[str, str] = {"XAU": "?", "BTC": "?"}
         self._hard_stop_notified: Dict[str, bool] = {"XAU": False, "BTC": False}
         self._last_daily_date_by_asset: Dict[str, str] = {"XAU": "", "BTC": ""}
+
+        # ============================================================
+        # CRITICAL FIX #3: Post-Trade Cooldown System
+        # Prevents rapid re-entry after a trade closes
+        # ============================================================
+        self._last_trade_close_ts: Dict[str, float] = {"XAU": 0.0, "BTC": 0.0}
+        self._trade_cooldown_sec: float = float(os.getenv("TRADE_COOLDOWN_SEC", "300.0") or "300.0")  # 5 minutes default
+        self._cooldown_blocked_count: Dict[str, int] = {"XAU": 0, "BTC": 0}
+
+        # Position tracking for detecting trade closures
+        self._last_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
 
         self._refresh_signal_cooldowns()
 
@@ -538,25 +553,95 @@ class MultiAssetTradingEngine:
         except Exception:
             pass
 
-        # Phase kill
+        # ============================================================
+        # PHASE C SHADOW MODE: Block execution but send alert
+        # Shows what trade WOULD have happened for transparency
+        # ============================================================
         phase = self._get_phase(risk)
         if phase == "C":
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=phase_c_kill", cand.asset)
+            log_health.warning(
+                "PHASE_C_SHADOW | asset=%s signal=%s conf=%.2f lot=%.4f sl=%.2f tp=%.2f | BLOCKED - Shadow Mode Active",
+                cand.asset,
+                cand.signal,
+                cand.confidence,
+                cand.lot,
+                cand.sl,
+                cand.tp,
+            )
+            
+            # Send Telegram notification (Shadow Mode alert)
+            if self._signal_notifier:
+                try:
+                    # Get current price for the alert
+                    with MT5_LOCK:
+                        tick = mt5.symbol_info_tick(cand.symbol)
+                    current_price = float(tick.ask if cand.signal == "Buy" else tick.bid) if tick else 0.0
+                    
+                    # Build shadow mode alert payload
+                    shadow_alert = {
+                        "type": "PHASE_C_SHADOW",
+                        "asset": cand.asset,
+                        "symbol": cand.symbol,
+                        "signal": cand.signal,
+                        "confidence": cand.confidence,
+                        "lot": cand.lot,
+                        "sl": cand.sl,
+                        "tp": cand.tp,
+                        "price": current_price,
+                        "blocked": True,
+                        "reason": "Phase C - Daily Risk Limit Reached",
+                        "message": f"⚠️ [PHASE C - SHADOW TRADE] Verified {cand.signal} Signal on {cand.symbol}.\n"
+                                   f"Price: {current_price:.2f} | Confidence: {cand.confidence:.0f}%\n"
+                                   f"(Trade blocked by Risk Limit)\n"
+                                   f"Would-be Lot: {cand.lot:.2f} | SL: {cand.sl:.2f} | TP: {cand.tp:.2f}",
+                    }
+                    self._signal_notifier(cand.asset, shadow_alert)
+                except Exception as e:
+                    log_health.error("PHASE_C_SHADOW notification error: %s", e)
+            
+            return False, None
+
+        # ============================================================
+        # FIX #3: Post-Trade Cooldown Check
+        # Prevents rapid re-entry after a trade closes
+        # ============================================================
+        last_close_ts = self._last_trade_close_ts.get(cand.asset, 0.0)
+        time_since_close = now - last_close_ts
+        if time_since_close < self._trade_cooldown_sec and last_close_ts > 0:
+            self._cooldown_blocked_count[cand.asset] = self._cooldown_blocked_count.get(cand.asset, 0) + 1
+            # Log periodically to avoid spam
+            if self._cooldown_blocked_count[cand.asset] % 10 == 1:
+                log_health.info(
+                    "ENQUEUE_SKIP | asset=%s reason=trade_cooldown remaining=%.0fs total_blocked=%d",
+                    cand.asset,
+                    self._trade_cooldown_sec - time_since_close,
+                    self._cooldown_blocked_count[cand.asset],
+                )
             return False, None
 
         # 1 signal_id => 1 order (edge trigger)
         last_id, last_sig = self._edge_last_trade.get(cand.asset, ("", "Neutral"))
         if cand.signal in ("Buy", "Sell") and last_id == str(cand.signal_id) and last_sig == str(cand.signal):
-            log_health.info(
-                "ENQUEUE_SKIP | asset=%s reason=edge_same_signal_id signal=%s signal_id=%s",
-                cand.asset,
-                cand.signal,
-                cand.signal_id,
-            )
+            # Throttled logging for edge duplicates
+            last_log = self._last_log_id.get(cand.asset)
+            if last_log != str(cand.signal_id):
+                log_health.info(
+                    "ENQUEUE_SKIP | asset=%s reason=edge_same_signal_id signal=%s signal_id=%s",
+                    cand.asset,
+                    cand.signal,
+                    cand.signal_id,
+                )
+                self._last_log_id[cand.asset] = str(cand.signal_id)
             return False, None
 
+        # SILENT DUPLICATE CHECK: Avoid log spam for the same signal ID
+        # Only log if we haven't seen this specific signal ID skip recently
         if self._is_duplicate(cand.asset, cand.signal_id, now, max_orders=int(order_count), order_index=int(order_index)):
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
+            # Check if we already logged this skip for this signal_id
+            last_log = self._last_log_id.get(cand.asset)
+            if last_log != str(cand.signal_id):
+                log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
+                self._last_log_id[cand.asset] = str(cand.signal_id)
             return False, None
 
         # Tick + digits
@@ -1026,6 +1111,35 @@ class MultiAssetTradingEngine:
                 open_btc = self._btc.open_positions()
                 self._active_asset = self._select_active_asset(open_xau, open_btc)
 
+                # ============================================================
+                # FIX #3: Detect Position Closures -> Trigger Cooldown
+                # ============================================================
+                now_ts = time.time()
+                prev_xau = self._last_open_positions.get("XAU", 0)
+                prev_btc = self._last_open_positions.get("BTC", 0)
+
+                # XAU position closed
+                if prev_xau > 0 and open_xau == 0:
+                    self._last_trade_close_ts["XAU"] = now_ts
+                    self._cooldown_blocked_count["XAU"] = 0  # Reset counter
+                    log_health.info(
+                        "TRADE_CLOSED | asset=XAU cooldown_started=%.0fs",
+                        self._trade_cooldown_sec,
+                    )
+
+                # BTC position closed
+                if prev_btc > 0 and open_btc == 0:
+                    self._last_trade_close_ts["BTC"] = now_ts
+                    self._cooldown_blocked_count["BTC"] = 0  # Reset counter
+                    log_health.info(
+                        "TRADE_CLOSED | asset=BTC cooldown_started=%.0fs",
+                        self._trade_cooldown_sec,
+                    )
+
+                # Update position tracking
+                self._last_open_positions["XAU"] = open_xau
+                self._last_open_positions["BTC"] = open_btc
+
                 self._heartbeat(open_xau, open_btc)
 
                 # SAFETY: serial mode disabled (concurrent XAU + BTC trading)
@@ -1132,21 +1246,35 @@ class MultiAssetTradingEngine:
                                 ",".join(selected.reasons) if selected.reasons else "-",
                             )
                         else:
-                            log_health.info(
-                                "ORDER_SKIP | asset=%s symbol=%s signal=%s conf=%.4f blocked=%s batch=%s/%s reasons=%s",
-                                selected.asset,
-                                selected.symbol,
-                                selected.signal,
-                                selected.confidence,
-                                selected.blocked,
-                                int(idx) + 1,
-                                int(order_count),
-                                ",".join(selected.reasons) if selected.reasons else "-",
-                            )
+                            # Suppress ORDER_SKIP log for duplicates to prevent spam
+                            # We only care about skips that are NOT duplicates (e.g. risk blocks, bad price)
+                            # Duplicates are already handled silently or with single log in _enqueue_order
+                            if not self._is_duplicate(selected.asset, selected.signal_id, time.time(), max_orders=int(order_count), order_index=int(idx)):
+                                log_health.info(
+                                    "ORDER_SKIP | asset=%s symbol=%s signal=%s conf=%.4f blocked=%s batch=%s/%s reasons=%s",
+                                    selected.asset,
+                                    selected.symbol,
+                                    selected.signal,
+                                    selected.confidence,
+                                    selected.blocked,
+                                    int(idx) + 1,
+                                    int(order_count),
+                                    ",".join(selected.reasons) if selected.reasons else "-",
+                                )
 
                 consecutive_errors = 0
 
-                # Adaptive sleep
+                # Adaptive sleep - SKIP SLEEP if TICK data is stale (>5s) to catch up
+                # NOTE: Use TICK age, not BAR age. M1 bars are always 0-60s old by design.
+                tick_age_x = float(self._xau.last_tick_age_sec) if self._xau else 0.0
+                tick_age_b = float(self._btc.last_tick_age_sec) if self._btc else 0.0
+                max_tick_age = max(tick_age_x, tick_age_b)
+                
+                if max_tick_age > 5.0:
+                    # Tick data is stale - skip sleep to process faster
+                    time.sleep(0.02)  # Tiny sleep to prevent CPU spin
+                    continue
+                    
                 dt = time.time() - t0
                 poll = self._poll_fast
                 if self._order_q.qsize() >= max(3, self._max_queue // 2):

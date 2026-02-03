@@ -149,7 +149,9 @@ def _throttled_health_log(cfg: MT5ClientConfig, reason: str) -> None:
     global _last_health_log_ts_mono
     now = _mono()
     if now - _last_health_log_ts_mono >= float(cfg.health_log_throttle_sec):
-        logger.error("Fast path health failed: %s", reason)
+        # SENIOR FIX: Downgrade to WARNING. The system auto-heals immediately after this.
+        # ERROR should be reserved for unrecoverable failures or final exhausted retries.
+        logger.warning("Fast path health failed (attempting auto-heal): %s", reason)
         _last_health_log_ts_mono = now
 
 
@@ -562,10 +564,22 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
             if h.ok:
                 return mt5
             _throttled_health_log(cfg, h.reason)
-            try:
-                mt5.shutdown()
-            except Exception:
-                pass
+            
+            # Robustness: If terminal_info is None, the IPC link is likely dead or the terminal is hung.
+            # Instead of polite shutdown, force a kill to ensure a clean slate.
+            if h.reason == "terminal_info_none" and _is_windows() and cfg.taskkill_on_ipc_timeout:
+                logger.warning("Detecting zombie terminal (terminal_info_none). Forcing taskkill before restart.")
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+                _taskkill_terminal_windows()
+            else:
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+            
             _initialized = False
 
     last_exc: Optional[Exception] = None

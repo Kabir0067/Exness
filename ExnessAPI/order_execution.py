@@ -568,10 +568,13 @@ class OrderExecutor:
             if r is not None and last_rc in (rc_done, rc_done_partial, rc_no_changes):
                 return True
 
-            # if invalid stops -> re-sanitize from fresh tick and retry
+            # if invalid stops -> re-sanitize from fresh tick and retry with WIDER margin
             if last_rc in (rc_invalid_stops, rc_trade_context_busy):
+                # SENIOR FIX: Expand safety margin on each retry (x2, x3...)
+                expand_mult = float(i) * 2.0
                 sl2, tp2, ctx = self._sanitize_sltp_by_market_constraints(
-                    symbol=symbol, side=side, desired_sl=planned_sl, desired_tp=planned_tp, meta=meta
+                    symbol=symbol, side=side, desired_sl=planned_sl, desired_tp=planned_tp, meta=meta,
+                    expand_dist_mult=expand_mult
                 )
                 req["sl"] = float(sl2) if sl2 > 0 else 0.0
                 req["tp"] = float(tp2) if tp2 > 0 else 0.0
@@ -624,6 +627,7 @@ class OrderExecutor:
         desired_sl: float,
         desired_tp: float,
         meta: _SymbolMeta,
+        expand_dist_mult: float = 1.0,  # multiplier for safety distance (retries)
     ) -> tuple[float, float, dict[str, Any]]:
         """
         Sanitizes SL/TP against:
@@ -651,9 +655,11 @@ class OrderExecutor:
 
         # Minimum distance = max(stops_level, freeze_level) * point + safety margin
         min_level = max(int(meta.stops_level), int(meta.freeze_level))
-        min_dist = float(min_level) * point
-        safety = 2.0 * point  # small safety
-        dist = min_dist + safety
+        
+        # SENIOR FIX: Increase default safety from 2.0 to 5.0 points to satisfy strict brokers/volatility
+        # And multiply by expand_dist_mult if we are retrying
+        base_safety = 5.0 * point
+        min_dist_abs = (float(min_level) * point) + (base_safety * float(expand_dist_mult))
 
         sl = float(desired_sl) if float(desired_sl) > 0 else 0.0
         tp = float(desired_tp) if float(desired_tp) > 0 else 0.0
@@ -661,10 +667,13 @@ class OrderExecutor:
         if side == "Buy":
             # For BUY: SL must be <= bid - dist, TP must be >= bid + dist
             if sl > 0.0:
-                sl = min(sl, bid - dist)
+                # Force SL to be at least min_dist away
+                sl = min(sl, bid - min_dist_abs)
             if tp > 0.0:
-                tp = max(tp, bid + dist)
-            # direction sanity
+                # Force TP to be at least min_dist away
+                tp = max(tp, bid + min_dist_abs)
+            
+            # direction sanity (SL below price, TP above price)
             if sl > 0.0 and not (sl < bid):
                 sl = 0.0
             if tp > 0.0 and not (tp > bid):
@@ -672,15 +681,19 @@ class OrderExecutor:
         else:
             # SELL: SL >= ask + dist, TP <= ask - dist
             if sl > 0.0:
-                sl = max(sl, ask + dist)
+                # Force SL to be at least min_dist away
+                sl = max(sl, ask + min_dist_abs)
             if tp > 0.0:
-                tp = min(tp, ask - dist)
+                # Force TP to be at least min_dist away
+                tp = min(tp, ask - min_dist_abs)
+                
+            # direction sanity
             if sl > 0.0 and not (sl > ask):
                 sl = 0.0
             if tp > 0.0 and not (tp < ask):
                 tp = 0.0
 
-        # rounding
+        # Strict rounding to tick size (using point as proxy if v_step is vol)
         if sl > 0.0:
             sl = round(float(sl), digits)
         if tp > 0.0:
@@ -694,7 +707,8 @@ class OrderExecutor:
                 "point": point,
                 "stops_level": int(meta.stops_level),
                 "freeze_level": int(meta.freeze_level),
-                "dist": dist,
+                "dist_required": min_dist_abs,
+                "expand_mult": expand_dist_mult,
             }
         )
         return float(sl), float(tp), ctx

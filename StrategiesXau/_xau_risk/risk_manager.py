@@ -566,6 +566,34 @@ class RiskManager:
                 daily_realized = float((bal - self.daily_start_balance) / self.daily_start_balance)
                 daily_equity = float((eq - self.daily_start_balance) / self.daily_start_balance)
 
+            # =================================================================
+            # TIERED DAILY DRAWDOWN LOGIC (Scientific Risk Management)
+            # -3% -> Phase B (Defensive Mode: reduce size by 50%)
+            # -5% -> Phase C (HARD STOP: kill all trading)
+            # =================================================================
+            PHASE_B_DRAWDOWN_TRIGGER = -0.03  # -3% triggers defensive mode
+            HARD_STOP_DRAWDOWN_TRIGGER = -0.05  # -5% triggers hard stop
+
+            # Trigger 1: -3% Loss -> Phase B (Defensive Mode)
+            if daily_equity <= PHASE_B_DRAWDOWN_TRIGGER and self.current_phase == "A":
+                prev = str(self.current_phase)
+                self._set_phase("B", "drawdown_defensive_3pct")
+                log_risk.warning(
+                    "PHASE_B_ACTIVATED | daily_loss=%.2f%% EXCEEDS 3%% | phase=%s->B | DEFENSIVE MODE: 50%% reduced sizing",
+                    abs(daily_equity) * 100,
+                    prev,
+                )
+
+            # Trigger 2: -5% Loss -> HARD STOP (Kill Switch)
+            if daily_equity <= HARD_STOP_DRAWDOWN_TRIGGER and self.current_phase != "C":
+                prev = str(self.current_phase)
+                self._enter_hard_stop("emergency_5pct_hard_stop")
+                log_risk.error(
+                    "HARD_STOP_ACTIVATED | daily_loss=%.2f%% EXCEEDS 5%% LIMIT | phase=%s->C | KILLING ALL TRADING FOR TODAY",
+                    abs(daily_equity) * 100,
+                    prev,
+                )
+
             # Log periodically (every ~1 min) or on significant change could be nice, but keep it clean for now.
             # 5. Phase Logic
             # A -> B (Target Reached)
@@ -969,10 +997,22 @@ class RiskManager:
             if float(eq) <= 0:
                 return self._fallback_volume()
 
-            risk_money = float(eq) * float(self.cfg.max_risk_per_trade)
+            # ================================================================
+            # SCIENTIFIC RISK SIZING (For XAUUSD/BTCUSD Volatility)
+            # - Normal (Phase A): Up to 2.5% risk per trade
+            # - Defensive (Phase B): 50% reduction -> 1.25% max
+            # ================================================================
+            MAX_RISK_PERCENT = 0.025  # 2.5% max risk per trade (room to breathe)
+            config_risk = float(self.cfg.max_risk_per_trade)
+            effective_risk_pct = min(config_risk, MAX_RISK_PERCENT)
+            
+            risk_money = float(eq) * effective_risk_pct
 
+            # Phase B Defensive Mode: 50% size reduction
             if self.current_phase == "B":
-                risk_money *= float(getattr(self.cfg, "phase_b_risk_mult", 1.0) or 1.0)
+                PHASE_B_REDUCTION = 0.50  # 50% reduction in Phase B
+                risk_money *= PHASE_B_REDUCTION
+                log_risk.debug("PHASE_B_SIZING | risk reduced by 50%% | effective_risk=%.4f", risk_money)
             if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
                 risk_money *= float(getattr(self.cfg, "dd_risk_mult", 1.0) or 1.0)
 

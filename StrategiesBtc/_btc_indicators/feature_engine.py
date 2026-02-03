@@ -90,6 +90,19 @@ class Classic_FeatureEngine:
         self._cache_ts: float = 0.0
         self._cache_min_interval_ms: float = float(getattr(cfg, "indicator_cache_min_interval_ms", 0.0) or 0.0)
 
+        # ============== INSTITUTIONAL ALPHA PARAMETERS ==============
+        # Linear Regression Trend Analysis
+        self._linreg_period = int(getattr(cfg, "linreg_period", 20) or 20)
+        self._htf_slope_block_threshold = float(getattr(cfg, "htf_slope_block_threshold", 0.2) or 0.2)
+        
+        # Volatility Regime Detection
+        self._vol_explosive_threshold = float(getattr(cfg, "volatility_explosive_threshold", 1.8) or 1.8)  # Higher for BTC
+        self._vol_dead_threshold = float(getattr(cfg, "volatility_dead_threshold", 0.6) or 0.6)
+        self._vol_atr_period = int(getattr(cfg, "vol_atr_period", 50) or 50)
+        
+        # Forecast Continuation
+        self._forecast_vol_mult = float(getattr(cfg, "forecast_vol_mult", 1.5) or 1.5)
+
     # ------------------------------------------------------------------
     # small finite helper (kept internal; no API change)
     # ------------------------------------------------------------------
@@ -888,3 +901,200 @@ class Classic_FeatureEngine:
             return out
         except Exception:
             return out
+
+    # ==================== INSTITUTIONAL ALPHA FUNCTIONS ====================
+
+    def linreg_trend_slope(self, closes: np.ndarray, period: Optional[int] = None) -> float:
+        """
+        Calculate Linear Regression Slope normalized to [-1, +1].
+        Used for Fractal Market Analysis - detecting H1/M15 trend direction.
+        
+        Returns:
+            float: Normalized slope (-1 = strong bearish, +1 = strong bullish, 0 = flat)
+        """
+        try:
+            period = period or self._linreg_period
+            if len(closes) < period:
+                return 0.0
+            
+            y = closes[-period:].astype(np.float64)
+            if not np.all(np.isfinite(y)):
+                return 0.0
+            
+            x = np.arange(period, dtype=np.float64)
+            
+            # Linear regression: y = mx + b
+            x_mean = np.mean(x)
+            y_mean = np.mean(y)
+            
+            numerator = np.sum((x - x_mean) * (y - y_mean))
+            denominator = np.sum((x - x_mean) ** 2)
+            
+            if abs(denominator) < 1e-12:
+                return 0.0
+            
+            slope = numerator / denominator
+            
+            # Normalize by price level (slope per bar as % of price)
+            norm_factor = y_mean * 0.0005  # Adjusted for BTC price levels
+            if abs(norm_factor) < 1e-12:
+                return 0.0
+            
+            normalized_slope = slope / norm_factor
+            return float(np.clip(normalized_slope, -1.0, 1.0))
+            
+        except Exception as exc:
+            logger.error("linreg_trend_slope error: %s | tb=%s", exc, traceback.format_exc())
+            return 0.0
+
+    def volatility_regime(self, atr_series: np.ndarray, period: Optional[int] = None) -> Tuple[str, float]:
+        """
+        Detect volatility regime based on ATR ratio.
+        
+        Returns:
+            Tuple[str, float]: (regime, atr_ratio)
+            - regime: "explosive" (high vol), "normal", "dead" (low vol/consolidation)
+            - atr_ratio: Current ATR / SMA(ATR, period)
+        """
+        try:
+            period = period or self._vol_atr_period
+            if len(atr_series) < period:
+                return "normal", 1.0
+            
+            atr_current = float(atr_series[-1])
+            atr_ma = float(np.mean(atr_series[-period:]))
+            
+            if not _finite(atr_current) or not _finite(atr_ma) or atr_ma <= 0:
+                return "normal", 1.0
+            
+            ratio = atr_current / atr_ma
+            
+            if ratio >= self._vol_explosive_threshold:
+                return "explosive", float(ratio)
+            elif ratio <= self._vol_dead_threshold:
+                return "dead", float(ratio)
+            else:
+                return "normal", float(ratio)
+                
+        except Exception as exc:
+            logger.error("volatility_regime error: %s | tb=%s", exc, traceback.format_exc())
+            return "normal", 1.0
+
+    def forecast_continuation(self, df: pd.DataFrame, vol_series: np.ndarray) -> str:
+        """
+        Predict next candle continuation based on price breakout + volume confirmation.
+        
+        Logic:
+        - If close > previous high AND volume > 1.5x average -> "bull_continuation"
+        - If close < previous low AND volume > 1.5x average -> "bear_continuation"
+        - Otherwise -> "none"
+        
+        Returns:
+            str: "bull_continuation", "bear_continuation", or "none"
+        """
+        try:
+            if len(df) < 3 or len(vol_series) < 20:
+                return "none"
+            
+            close_now = float(df["close"].iloc[-1])
+            high_prev = float(df["high"].iloc[-2])
+            low_prev = float(df["low"].iloc[-2])
+            vol_now = float(vol_series[-1])
+            vol_avg = float(np.mean(vol_series[-20:]))
+            
+            if not all(_finite(x) for x in [close_now, high_prev, low_prev, vol_now, vol_avg]):
+                return "none"
+            
+            vol_mult = self._forecast_vol_mult
+            vol_confirmed = vol_now > (vol_avg * vol_mult)
+            
+            if close_now > high_prev and vol_confirmed:
+                return "bull_continuation"
+            elif close_now < low_prev and vol_confirmed:
+                return "bear_continuation"
+            else:
+                return "none"
+                
+        except Exception as exc:
+            logger.error("forecast_continuation error: %s | tb=%s", exc, traceback.format_exc())
+            return "none"
+
+    def htf_trend_gate(self, h1_closes: Optional[np.ndarray], m15_closes: Optional[np.ndarray]) -> Tuple[bool, bool, float, float]:
+        """
+        Higher Timeframe Trend Gate - Block signals against the macro trend.
+        
+        Returns:
+            Tuple[bool, bool, float, float]: 
+            - buy_allowed: True if H1 not strongly bearish
+            - sell_allowed: True if H1 not strongly bullish
+            - h1_slope: H1 linear regression slope
+            - m15_slope: M15 linear regression slope
+        """
+        try:
+            h1_slope = 0.0
+            m15_slope = 0.0
+            
+            if h1_closes is not None and len(h1_closes) >= self._linreg_period:
+                h1_slope = self.linreg_trend_slope(h1_closes)
+            
+            if m15_closes is not None and len(m15_closes) >= self._linreg_period:
+                m15_slope = self.linreg_trend_slope(m15_closes)
+            
+            threshold = self._htf_slope_block_threshold
+            
+            # Block Buy if H1 is strongly bearish
+            buy_allowed = h1_slope >= -threshold
+            # Block Sell if H1 is strongly bullish  
+            sell_allowed = h1_slope <= threshold
+            
+            return buy_allowed, sell_allowed, float(h1_slope), float(m15_slope)
+            
+        except Exception as exc:
+            logger.error("htf_trend_gate error: %s | tb=%s", exc, traceback.format_exc())
+            return True, True, 0.0, 0.0
+
+    def god_tier_signal(
+        self,
+        order_block: str,
+        rsi: float,
+        divergence: str,
+        h1_slope: float,
+        fvg_bull: bool,
+        fvg_bear: bool,
+    ) -> Tuple[bool, str]:
+        """
+        Detect "God Tier" setups - rare high-probability entries.
+        
+        Conditions for God Tier BUY:
+        - H1 Order Block touched (bull_ob)
+        - RSI < 35 (oversold zone)
+        - Bullish divergence OR FVG bull
+        - H1 not strongly bearish
+        
+        Returns:
+            Tuple[bool, str]: (is_god_tier, direction "buy"/"sell"/"none")
+        """
+        try:
+            # God Tier BUY
+            if (
+                order_block == "bull_ob"
+                and rsi < 35.0
+                and (divergence == "bullish" or fvg_bull)
+                and h1_slope >= -0.15
+            ):
+                return True, "buy"
+            
+            # God Tier SELL
+            if (
+                order_block == "bear_ob"
+                and rsi > 65.0
+                and (divergence == "bearish" or fvg_bear)
+                and h1_slope <= 0.15
+            ):
+                return True, "sell"
+            
+            return False, "none"
+            
+        except Exception as exc:
+            logger.error("god_tier_signal error: %s | tb=%s", exc, traceback.format_exc())
+            return False, "none"

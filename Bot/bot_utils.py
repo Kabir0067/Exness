@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from queue import Queue, Full
 from threading import Lock
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -67,6 +68,27 @@ if not log.handlers:
 # =============================================================================
 cfg = get_config_from_env()
 ADMIN = int(getattr(cfg, "admin_id", 0) or 0)
+
+# =============================================================================
+# Non-blocking notification queue (fire-and-forget for engine notifications)
+# =============================================================================
+_NOTIFY_QUEUE: "Queue[Tuple[int, str]]" = Queue(maxsize=200)
+
+
+def notify_async(chat_id: int, message: str) -> None:
+    """
+    Fire-and-forget Telegram message. NEVER blocks the calling thread.
+    Used by engine notifiers to avoid blocking trading loop during Telegram outages.
+    """
+    try:
+        _NOTIFY_QUEUE.put_nowait((int(chat_id), str(message)))
+    except Full:
+        pass  # Drop if queue full - never block engine
+
+
+def get_notify_queue() -> "Queue[Tuple[int, str]]":
+    """Access the notification queue from main.py worker thread."""
+    return _NOTIFY_QUEUE
 PAGE_SIZE = 1
 
 TP_USD_MIN = 1
@@ -156,6 +178,19 @@ def _should_retry(exc: Exception) -> bool:
     return False
 
 
+def _is_callback_query_expired(exc: Exception) -> bool:
+    """Check if error is a benign 'callback query expired' (user clicked button >30s ago)."""
+    if isinstance(exc, ApiTelegramException):
+        try:
+            code = int(getattr(exc, "error_code", 0) or 0)
+            desc = str(getattr(exc, "description", "") or "").lower()
+            # Telegram returns 400 "query is too old" when callback expires
+            return code == 400 and ("query is too old" in desc or "query id is invalid" in desc)
+        except Exception:
+            pass
+    return False
+
+
 def tg_call(
     fn: Callable[..., Any],
     *args: Any,
@@ -169,6 +204,10 @@ def tg_call(
             with TG_LOCK:
                 return fn(*args, **kwargs)
         except Exception as exc:
+            # Silently ignore benign callback query timeout errors
+            if _is_callback_query_expired(exc):
+                return None  # Silent fail - this is expected when user clicks old buttons
+            
             should_retry = _should_retry(exc) and attempt < max_retries
             if not should_retry:
                 # Fallback: if HTML parsing failed, retry plain text
@@ -452,9 +491,8 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
             f"🏷 <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | 🛡 {sltp}\n"
             f"🧠 <b>{conf_pct:.1f}%</b> | {time_str}"
         )
-        if _bot_ref is None:
-            return
-        _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
+        # Non-blocking: push to queue, don't wait for Telegram
+        notify_async(ADMIN, msg)
     except Exception:
         return
 
@@ -469,9 +507,8 @@ def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str
             f"🔄 <b>{asset}</b>: <b>{old_phase}</b> → <b>{new_phase}</b>{reason_line}\n"
             f"{time_str}"
         )
-        if _bot_ref is None:
-            return
-        _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
+        # Non-blocking: push to queue, don't wait for Telegram
+        notify_async(ADMIN, msg)
     except Exception:
         return
 
@@ -487,9 +524,8 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
             f"✅ Барои оғоз: /buttons → «🚀 Оғози Тиҷорат»\n"
             f"{time_str}"
         )
-        if _bot_ref is None:
-            return
-        _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
+        # Non-blocking: push to queue, don't wait for Telegram
+        notify_async(ADMIN, msg)
     except Exception:
         return
 
@@ -504,9 +540,8 @@ def _notify_daily_start(asset: str, day: str) -> None:
             f"✅ Лимитҳо ва омор аз нав ҳисоб шуданд\n"
             f"{time_str}"
         )
-        if _bot_ref is None:
-            return
-        _bot_ref.send_message(ADMIN, msg, parse_mode="HTML")
+        # Non-blocking: push to queue, don't wait for Telegram
+        notify_async(ADMIN, msg)
     except Exception:
         return
 

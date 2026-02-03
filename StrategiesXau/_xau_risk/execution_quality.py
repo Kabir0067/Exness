@@ -6,8 +6,10 @@ from typing import Deque, Optional, Dict, List, Any
 import numpy as np
 
 from .utils import _side_norm
+from dataclasses import dataclass
 
 
+@dataclass
 class ExecSample:
     ts: float
     side: str

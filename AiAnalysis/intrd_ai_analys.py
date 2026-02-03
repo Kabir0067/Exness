@@ -608,13 +608,19 @@ def analyse_intraday(asset: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
         res["stop_loss"] = None
         res["take_profit"] = None
 
-    # Hard gate (PATCH: clear levels when gated)
+    # --- Hard gate: if confidence below threshold => AI_NO_DECISION ---
+    # The AI must only speak when it is 100% sure. If uncertain, stay silent.
     if conf < AI_INTRA_MIN_CONF:
+        log.warning(
+            "⛔ AI_NO_DECISION | asset=%s conf=%.2f < min=%.2f | Signal Skipped: AI Inference returned NO ANSWER (Low Confidence)",
+            asset, conf, AI_INTRA_MIN_CONF
+        )
         res["signal"] = "HOLD"
+        res["status"] = "AI_NO_DECISION"  # Explicit status for downstream consumers
         res["action_short"] = "Интизор"
         res["stop_loss"] = None
         res["take_profit"] = None
-        res["reason"] = f"{res.get('reason','—')} | gated: conf<{AI_INTRA_MIN_CONF}"
+        res["reason"] = f"⛔ AI_NO_DECISION: conf={conf:.2f} < min={AI_INTRA_MIN_CONF} | {res.get('reason','—')}"
 
     if ts_bar_h1 > 0:
         _CACHE[cache_key] = (time.time(), dict(res))

@@ -14,6 +14,11 @@ from .logging_setup import log_err, log_health
 from .models import AssetCandidate
 from .utils import parse_bar_key, tf_seconds
 
+# =============================================================================
+# CRITICAL: Stale Data Guard - Reject signals when data is too old
+# =============================================================================
+STALE_DATA_THRESHOLD_SEC = 2.0  # STRICT: Reject signals if data is older than 2 seconds
+
 
 def _to_epoch_seconds(x: Any) -> Optional[float]:
     """Robust conversion for pandas/mt5 datetime representations to epoch seconds."""
@@ -81,6 +86,10 @@ class _AssetPipeline:
         # default tightened for scalping; can be overridden from cfg
         self._min_bar_age_sec = float(getattr(cfg, "market_min_bar_age_sec", 30.0) or 30.0)
 
+        # Tick-based freshness (real-time data age)
+        self.last_tick_age_sec = 0.0  # Age from most recent tick, not bar
+        self._last_tick_ts = 0.0  # Timestamp of last tick update
+
         self._last_market_ok_ts = 0.0
         self._market_validate_every = float(getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0)
         self._last_reconcile_ts = 0.0
@@ -93,6 +102,16 @@ class _AssetPipeline:
         self._baseline_last_dt: Optional[datetime] = None
 
         self._reconcile_interval = float(getattr(cfg, "reconcile_interval_sec", 15.0) or 15.0)
+
+        # Stale data guard metrics
+        self._stale_data_rejections = 0
+        self._stale_data_log_interval = 10  # Log every N rejections
+
+        # Signal caching to reduce CPU load
+        self._last_computed_close = 0.0
+        self._last_computed_ts = 0.0
+        self._cache_ttl_sec = 0.3  # Only recompute if price changed or 300ms elapsed
+        self._cached_candidate: Optional[AssetCandidate] = None
 
     def _baseline_gate(self, bar_key: str) -> Tuple[bool, str]:
         """Return (ok, reason). If ok=False => block trade for baseline sync."""
@@ -251,6 +270,23 @@ class _AssetPipeline:
                 self.last_market_ts = "-"
 
             self.last_market_tf = str(getattr(self.cfg.symbol_params, "tf_primary", None) or "-")
+
+            # ==============================================================
+            # TICK FRESHNESS CHECK (Real-time data age, not bar age)
+            # M1 bars only update at minute boundaries, but ticks are live
+            # ==============================================================
+            try:
+                symbol = getattr(self.cfg.symbol_params, "resolved", None) or getattr(self.cfg.symbol_params, "base", "")
+                with MT5_LOCK:
+                    tick = mt5.symbol_info_tick(symbol)
+                if tick is not None:
+                    tick_time = getattr(tick, "time", 0)
+                    if tick_time > 0:
+                        self._last_tick_ts = float(tick_time)
+                        self.last_tick_age_sec = max(0.0, now - float(tick_time))
+            except Exception:
+                pass  # Keep existing tick age if fetch fails
+
             self.last_market_ok = True
             self.last_market_reason = "ok"
             return True
@@ -300,6 +336,55 @@ class _AssetPipeline:
 
     def compute_candidate(self) -> Optional[AssetCandidate]:
         try:
+            now = time.time()
+
+            # =================================================================
+            # CRITICAL FIX: STALE DATA GUARD (Uses TICK freshness, not bar age)
+            # M1 bars only update at minute boundaries (always appear 0-60s old)
+            # Ticks are real-time, so tick age is the true data freshness
+            # =================================================================
+            # Use tick age for freshness check (5-second threshold for ticks)
+            TICK_STALE_THRESHOLD_SEC = 5.0  # Ticks should arrive every few seconds
+            data_age = self.last_tick_age_sec if self._last_tick_ts > 0 else self.last_bar_age_sec
+            
+            if data_age > TICK_STALE_THRESHOLD_SEC:
+                self._stale_data_rejections += 1
+                # Log periodically to avoid log spam
+                if self._stale_data_rejections % self._stale_data_log_interval == 1:
+                    log_health.warning(
+                        "STALE_DATA_REJECT | asset=%s tick_age=%.1fs bar_age=%.1fs threshold=%.1fs total_rejections=%d",
+                        self.asset,
+                        self.last_tick_age_sec,
+                        self.last_bar_age_sec,
+                        TICK_STALE_THRESHOLD_SEC,
+                        self._stale_data_rejections,
+                    )
+                return AssetCandidate(
+                    asset=self.asset,
+                    symbol=self.symbol,
+                    signal="Neutral",
+                    confidence=0.0,
+                    lot=0.0,
+                    sl=0.0,
+                    tp=0.0,
+                    latency_ms=0.0,
+                    blocked=True,
+                    reasons=("stale_data",),
+                    signal_id=f"{self.asset}_STALE_{int(now)}",
+                    raw_result=None,
+                )
+
+            # =================================================================
+            # OPTIMIZATION: Signal Caching
+            # Don't recompute if price hasn't changed and cache is fresh
+            # =================================================================
+            price_unchanged = abs(self.last_market_close - self._last_computed_close) < 0.01
+            cache_fresh = (now - self._last_computed_ts) < self._cache_ttl_sec
+
+            if price_unchanged and cache_fresh and self._cached_candidate is not None:
+                # Return cached candidate but update timestamp
+                return self._cached_candidate
+
             # execute=True SAFE (no side effects) -> calculates lot/sl/tp
             res = self.signal.compute(execute=True)
 
@@ -359,7 +444,7 @@ class _AssetPipeline:
                 blocked = True
                 reasons = reasons + (baseline_reason,)
 
-            return AssetCandidate(
+            candidate = AssetCandidate(
                 asset=self.asset,
                 symbol=self.symbol,
                 signal=signal,
@@ -373,6 +458,13 @@ class _AssetPipeline:
                 signal_id=signal_id,
                 raw_result=res,
             )
+
+            # Store in cache for optimization
+            self._last_computed_close = self.last_market_close
+            self._last_computed_ts = now
+            self._cached_candidate = candidate
+
+            return candidate
         except Exception as exc:
             log_err.error("%s compute_candidate error: %s | tb=%s", self.asset, exc, traceback.format_exc())
             return None

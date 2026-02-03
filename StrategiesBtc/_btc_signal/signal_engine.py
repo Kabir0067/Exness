@@ -803,77 +803,209 @@ class SignalEngine:
         spread_pct: float,
         tick_stats: TickStats,
     ) -> Tuple[float, int]:
+        """
+        INSTITUTIONAL 100-POINT SCORING SYSTEM (BTC)
+        
+        Components:
+        - Trend Score (30 pts): H1 slope alignment + EMA stack + ADX strength
+        - Momentum Score (20 pts): RSI zone + MACD crossover + histogram direction
+        - Volatility Score (20 pts): ATR regime + spread OK + volume confirmation
+        - Pattern Score (30 pts): Order Block + FVG + Sweep + Divergence
+        
+        Total: 100 points max
+        Execution Rule: Only trade if total_score >= 85
+        """
         try:
-            _ = (book,)
-
-            # weights (cached base * adaptive multipliers)
-            w_base = self._get_base_weights()
-            w_mul = adapt.get("w_mul") or {}
-            mul = np.array(
-                [
-                    float(w_mul.get("trend", 1.0)),
-                    float(w_mul.get("momentum", 1.0)),
-                    float(w_mul.get("meanrev", 1.0)),
-                    float(w_mul.get("structure", 1.0)),
-                    float(w_mul.get("volume", 1.0)),
-                ],
-                dtype=np.float64,
-            )
-            weights = w_base * mul
-            s = float(np.sum(weights))
-            if s <= 0:
-                weights = w_base
-            else:
-                weights = weights / s
-
-            regime = str(adapt.get("regime", "trend") or "trend")
-
-            # scores (keep structure)
-            scores = np.zeros(5, dtype=np.float64)
-            s_trend = self._trend_score(indp, indc, indl, regime)
-            s_mom = self._momentum_score(indp, indc)
-            s_mrev = self._meanrev_score(indp, regime)
-            s_struc = self._structure_score(indp)
+            _ = book  # Reserved for future orderbook analysis
             
-            # NaN Protection / Check
-            if not np.isfinite(s_trend): s_trend = 0.0
-            if not np.isfinite(s_mom): s_mom = 0.0
-            if not np.isfinite(s_mrev): s_mrev = 0.0
-            if not np.isfinite(s_struc): s_struc = 0.0
-
-            scores[0] = float(s_trend)
-            scores[1] = float(s_mom)
-            scores[2] = float(s_mrev)
-            scores[3] = float(s_struc)
-
-            z_vol = float(indp.get("z_vol", indp.get("z_volume", 0.0)) or 0.0)
-            if not np.isfinite(z_vol): z_vol = 0.0
-            scores[4] = float(np.tanh(z_vol / 3.0))
-
-            net_norm = float(np.dot(scores, weights))
-            if not np.isfinite(net_norm): net_norm = 0.0
-            net_abs = abs(net_norm)
-
-            # FIXED confidence
-            base_conf = self._conf_from_strength(net_abs, float(spread_pct), tick_stats)
-            if not np.isfinite(base_conf): base_conf = 0.0
+            total_score = 0.0
+            score_breakdown: Dict[str, float] = {}
             
-            conf = int(_clamp(base_conf, 10.0, 96.0))
-
-            # strength caps (consistent)
-            conf = self._cap_conf_by_strength(conf, net_abs)
-
-            # Diagnostic Log for 0.0 confidence or suspicious drops
-            if conf <= 0 or net_abs <= 0.01:
-                log.warning(
-                    "ZERO_CONF_DEBUG | conf=%s net=%.4f | scores=[%.2f, %.2f, %.2f, %.2f, %.2f] | w=[%.2f, %.2f, %.2f, %.2f, %.2f] | ind_trend=%s ind_rsi=%s z_vol=%s",
-                    conf, net_norm,
-                    scores[0], scores[1], scores[2], scores[3], scores[4],
-                    weights[0], weights[1], weights[2], weights[3], weights[4],
-                    indp.get("trend"), indp.get("rsi"), z_vol
+            # ==================== TREND SCORE (30 pts max) ====================
+            trend_score = 0.0
+            
+            # 1. ADX Strength (0-10 pts)
+            adx_p = float(indp.get("adx", 0.0) or 0.0)
+            if adx_p >= 30.0:
+                trend_score += 10.0
+            elif adx_p >= 25.0:
+                trend_score += 8.0
+            elif adx_p >= 20.0:
+                trend_score += 5.0
+            elif adx_p >= 15.0:
+                trend_score += 3.0
+            
+            # 2. EMA Stack Alignment (0-10 pts)
+            close_p = float(indp.get("close", 0.0) or 0.0)
+            ema9 = float(indp.get("ema9", indp.get("ema_short", close_p)) or close_p)
+            ema21 = float(indp.get("ema21", indp.get("ema_mid", close_p)) or close_p)
+            ema50 = float(indp.get("ema50", indp.get("ema_long", close_p)) or close_p)
+            
+            if close_p > ema9 > ema21 > ema50:  # Perfect bullish stack
+                trend_score += 10.0
+            elif close_p < ema9 < ema21 < ema50:  # Perfect bearish stack
+                trend_score += 10.0
+            elif close_p > ema21 > ema50:  # Partial bullish
+                trend_score += 6.0
+            elif close_p < ema21 < ema50:  # Partial bearish
+                trend_score += 6.0
+            elif close_p > ema50:  # Weak bullish
+                trend_score += 3.0
+            elif close_p < ema50:  # Weak bearish
+                trend_score += 3.0
+            
+            # 3. HTF Trend Alignment (0-10 pts)
+            trend_l = str(indl.get("trend", "") or "").lower()
+            trend_c = str(indc.get("trend", "") or "").lower()
+            
+            if ("strong_up" in trend_l or "strong_down" in trend_l):
+                trend_score += 10.0
+            elif ("up" in trend_l or "down" in trend_l):
+                trend_score += 6.0
+            elif ("up" in trend_c or "down" in trend_c):
+                trend_score += 4.0
+            
+            trend_score = min(30.0, trend_score)
+            score_breakdown["trend"] = trend_score
+            total_score += trend_score
+            
+            # ==================== MOMENTUM SCORE (20 pts max) ====================
+            momentum_score = 0.0
+            
+            # 1. RSI Zone (0-8 pts)
+            rsi_p = float(indp.get("rsi", 50.0) or 50.0)
+            if rsi_p > 60.0 or rsi_p < 40.0:  # Clear directional RSI
+                momentum_score += 8.0
+            elif rsi_p > 55.0 or rsi_p < 45.0:  # Moderate directional
+                momentum_score += 5.0
+            elif rsi_p > 52.0 or rsi_p < 48.0:  # Slight bias
+                momentum_score += 2.0
+            
+            # 2. MACD Crossover (0-8 pts)
+            macd = float(indp.get("macd", 0.0) or 0.0)
+            macd_sig = float(indp.get("macd_signal", indp.get("macd_sig", 0.0)) or 0.0)
+            macd_hist = float(indp.get("macd_hist", 0.0) or 0.0)
+            
+            if macd > macd_sig and macd_hist > 0:  # Bullish crossover confirmed
+                momentum_score += 8.0
+            elif macd < macd_sig and macd_hist < 0:  # Bearish crossover confirmed
+                momentum_score += 8.0
+            elif abs(macd - macd_sig) < abs(macd) * 0.1:  # Near crossover
+                momentum_score += 4.0
+            
+            # 3. MACD Histogram Momentum (0-4 pts)
+            if abs(macd_hist) > abs(macd) * 0.3:  # Strong histogram
+                momentum_score += 4.0
+            elif abs(macd_hist) > abs(macd) * 0.15:  # Moderate histogram
+                momentum_score += 2.0
+            
+            momentum_score = min(20.0, momentum_score)
+            score_breakdown["momentum"] = momentum_score
+            total_score += momentum_score
+            
+            # ==================== VOLATILITY SCORE (20 pts max) ====================
+            volatility_score = 0.0
+            
+            # 1. Volume Confirmation (0-8 pts)
+            z_vol = float(indp.get("z_volume", indp.get("z_vol", 0.0)) or 0.0)
+            if z_vol >= 2.0:  # High volume
+                volatility_score += 8.0
+            elif z_vol >= 1.0:  # Above average
+                volatility_score += 6.0
+            elif z_vol >= 0.0:  # Normal
+                volatility_score += 4.0
+            elif z_vol >= -0.5:  # Slightly low
+                volatility_score += 2.0
+            
+            # 2. Spread OK (0-6 pts) - BTC has tighter spread requirements
+            spread_limit = float(getattr(self.sp, "spread_limit_pct", 0.0005) or 0.0005)
+            if spread_pct <= spread_limit * 0.5:  # Excellent spread
+                volatility_score += 6.0
+            elif spread_pct <= spread_limit * 0.8:  # Good spread
+                volatility_score += 4.0
+            elif spread_pct <= spread_limit:  # Acceptable spread
+                volatility_score += 2.0
+            
+            # 3. ATR Regime (0-6 pts)
+            atr_pct = float(indp.get("atr_pct", 0.001) or 0.001)
+            atr_lo = float(getattr(self.cfg, "atr_pct_lo", 0.0008) or 0.0008)
+            atr_hi = float(getattr(self.cfg, "atr_pct_hi", 0.005) or 0.005)
+            
+            if atr_lo <= atr_pct <= atr_hi:  # Goldilocks zone
+                volatility_score += 6.0
+            elif atr_pct > atr_hi * 0.8:  # Slightly high but OK
+                volatility_score += 4.0
+            elif atr_pct < atr_lo * 1.5:  # Low but tradeable
+                volatility_score += 2.0
+            
+            volatility_score = min(20.0, volatility_score)
+            score_breakdown["volatility"] = volatility_score
+            total_score += volatility_score
+            
+            # ==================== PATTERN SCORE (30 pts max) ====================
+            pattern_score = 0.0
+            
+            # 1. Order Block Touch (0-10 pts)
+            ob = str(indp.get("order_block", "") or "")
+            if ob in ("bull_ob", "bear_ob"):
+                pattern_score += 10.0
+            
+            # 2. Fair Value Gap (0-8 pts)
+            fvg_bull = bool(indp.get("fvg_bull", False))
+            fvg_bear = bool(indp.get("fvg_bear", False))
+            if fvg_bull or fvg_bear:
+                pattern_score += 8.0
+            
+            # 3. Liquidity Sweep (0-8 pts)
+            sweep = str(indp.get("liquidity_sweep", "") or "")
+            if sweep in ("bull", "bear"):
+                pattern_score += 8.0
+            
+            # 4. Divergence (0-4 pts)
+            rsi_div = str(indp.get("rsi_div", "none") or "none")
+            macd_div = str(indp.get("macd_div", "none") or "none")
+            if rsi_div in ("bullish", "bearish") or macd_div in ("bullish", "bearish"):
+                pattern_score += 4.0
+            
+            pattern_score = min(30.0, pattern_score)
+            score_breakdown["pattern"] = pattern_score
+            total_score += pattern_score
+            
+            # ==================== FINAL CALCULATIONS ====================
+            total_score = min(100.0, total_score)
+            
+            # Convert to net_norm (-1 to +1) for compatibility
+            direction = 0.0
+            if rsi_p > 50 and macd_hist > 0 and close_p > ema21:
+                direction = 1.0  # Bullish
+            elif rsi_p < 50 and macd_hist < 0 and close_p < ema21:
+                direction = -1.0  # Bearish
+            elif rsi_p > 55 or macd_hist > 0:
+                direction = 0.5
+            elif rsi_p < 45 or macd_hist < 0:
+                direction = -0.5
+            
+            net_norm = direction * (total_score / 100.0)
+            
+            # Confidence = score directly (0-100 scale)
+            conf = int(min(96, total_score))
+            
+            # Apply tick volatility penalty
+            tick_vol = float(getattr(tick_stats, "volatility", 0.0) or 0.0)
+            if tick_vol > 60.0:
+                conf = max(0, conf - 15)
+            elif tick_vol > 40.0:
+                conf = max(0, conf - 8)
+            
+            # Log for debugging
+            if conf >= 80:
+                log.info(
+                    "SCORE_100 | total=%d | trend=%.0f mom=%.0f vol=%.0f pattern=%.0f | net=%.3f",
+                    int(total_score), trend_score, momentum_score, volatility_score, pattern_score, net_norm
                 )
 
-            return float(net_norm), int(conf)
+            return net_norm, conf
+            
         except Exception as exc:
             log.error("_ensemble_score crash: %s | tb=%s", exc, traceback.format_exc())
             return 0.0, 0

@@ -446,6 +446,56 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
 
 
 # ==========================
+# Engine Notify Worker (non-blocking queue consumer)
+# ==========================
+def run_engine_notify_worker(stop_event: Event) -> None:
+    """
+    Consumes engine notification queue without blocking trading loop.
+    Messages from engine notifiers are delivered asynchronously.
+    """
+    from Bot.bot_utils import get_notify_queue
+    
+    q = get_notify_queue()
+    backoff = Backoff(base=1.0, factor=2.0, max_delay=30.0)
+    log_rl = RateLimiter(30.0)
+    pending = None
+    attempt = 0
+    
+    while not stop_event.is_set():
+        try:
+            if pending is None:
+                pending = q.get(timeout=0.5)
+                attempt = 0
+        except Empty:
+            continue
+            
+        if pending is None:
+            continue
+            
+        chat_id, msg = pending
+        attempt += 1
+        
+        try:
+            bot.send_message(chat_id, msg, parse_mode="HTML")
+            pending = None  # Success - clear pending
+        except NETWORK_EXC as exc:
+            if log_rl.allow("notify_net"):
+                log.warning("Engine notify network error: %s", exc)
+            delay = backoff.delay(attempt)
+            sleep_interruptible(stop_event, delay)
+        except Exception as exc:
+            log.error("Engine notify error: %s", exc)
+            pending = None  # Drop on non-network errors
+    
+    # Best-effort drain on shutdown
+    try:
+        while True:
+            q.get_nowait()
+    except Exception:
+        pass
+
+
+# ==========================
 # Main
 # ==========================
 def main(argv: Optional[list[str]] = None) -> int:
@@ -461,6 +511,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     log_monitor = LogMonitor(shutdown.stop_event)
     log_monitor.start()
+
+    # Engine notification worker (fire-and-forget queue consumer)
+    notify_worker_thread = Thread(
+        target=run_engine_notify_worker,
+        args=(shutdown.stop_event,),
+        name="engine.notify_worker",
+        daemon=True,
+    )
+    notify_worker_thread.start()
 
     notifier.notify("✅ System boot")
 
