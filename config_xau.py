@@ -382,6 +382,10 @@ class EngineConfig:
     market_max_bar_age_mult: float = 2.0
     market_validate_interval_sec: float = 1.0
 
+    # Data freshness guards (stale data rejection)
+    tick_stale_threshold_sec: float = 15.0  # Reject signals if tick data older than this
+    volume_filter_mult: float = 0.4  # Current vol must be > vol_filter_mult * 20-period MA
+
     # NOTE: duplicated fields below are kept (NO-STRUCTURE-CHANGE); defaults aligned to the final values.
     meta_barrier_R: float = 0.50
     meta_h_bars: int = 6

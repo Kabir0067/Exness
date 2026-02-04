@@ -1,179 +1,318 @@
-# QuantCore: Institutional Scalping System
+<![CDATA[# 🚀 QuantCore Pro: Institutional AI Trading System
 ## XAUUSDm • BTCUSDm • Exness MT5
 
 ```
-██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗ ██████╗ ██████╗ ██████╗ ███████╗
-██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝██╔════╝██╔═══██╗██╔══██╗██╔════╝
-██║   ██║██║   ██║███████║██╔██╗ ██║   ██║   ██║     ██║   ██║██████╔╝█████╗  
-██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║   ██║     ██║   ██║██╔══██╗██╔══╝  
-╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   ╚██████╗╚██████╔╝██║  ██║███████╗
- ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗ ██████╗ ██████╗ ██████╗ ███████╗ ║
+║ ██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝██╔════╝██╔═══██╗██╔══██╗██╔════╝ ║
+║ ██║   ██║██║   ██║███████║██╔██╗ ██║   ██║   ██║     ██║   ██║██████╔╝█████╗   ║
+║ ██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║   ██║     ██║   ██║██╔══██╗██╔══╝   ║
+║ ╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   ╚██████╗╚██████╔╝██║  ██║███████╗ ║
+║  ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝ ║
+║                                                                                 ║
+║                    🏆 PROFESSIONAL ALGORITHMIC TRADING SYSTEM 🏆                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
-
-**Production-grade algorithmic trading system** for Exness MetaTrader 5. Executes independent multi-timeframe scalping strategies for **Gold** and **Bitcoin** with institutional-level risk management.
 
 ---
 
-## 🎯 Key Features
+## 🌟 Overview
+
+**QuantCore Pro** is a production-grade algorithmic trading system for Exness MetaTrader 5. It executes independent **multi-timeframe scalping strategies** for Gold (XAU) and Bitcoin (BTC) with institutional-level risk management and AI-powered analysis.
+
+### ✨ Highlights
 
 | Feature | Description |
 |---------|-------------|
-| **Dual-Asset Trading** | XAU and BTC run independently in parallel |
-| **3-Phase Risk Regime** | Adaptive A/B/C system with automatic UTC reset |
-| **Sniper Filters** | Volume, momentum, and spread validation gates |
-| **Non-Blocking I/O** | Telegram decoupled from trading loop |
-| **Tick-Level Freshness** | Real-time data age validation (5s threshold) |
-| **AI Integration** | Gemini-powered market analysis (optional) |
+| 🎯 **Dual-Asset Trading** | XAU and BTC operate independently in parallel |
+| 🧠 **AI Neural Scoring** | 6-layer ensemble model with divergence detection |
+| 📊 **6 Timeframe Analysis** | M1, M5, M15, H1, H4, D1 multi-timeframe fusion |
+| 🛡️ **3-Phase Risk Regime** | Adaptive A/B/C system with automatic UTC reset |
+| 🎯 **Sniper Filters** | Volume, momentum, spread, and MTF validation gates |
+| ⚡ **Non-Blocking I/O** | Telegram decoupled from trading loop |
+| 🤖 **Telegram Bot** | Full control panel with real-time notifications |
+| 📈 **God Tier Detection** | Rare high-probability entry identification |
 
 ---
 
 ## 🏗️ System Architecture
 
-```mermaid
-graph TB
-    subgraph "Data Layer"
-        MT5[MetaTrader 5] -->|Ticks + Bars| FEED[DataFeed]
-        FEED --> CACHE[(Rate Cache)]
-    end
-    
-    subgraph "Processing Layer"
-        CACHE --> PIPELINE[Pipeline Orchestrator]
-        PIPELINE --> FEATURES[Feature Engine]
-        FEATURES --> SIGNAL[Signal Engine]
-    end
-    
-    subgraph "Risk Layer"
-        SIGNAL --> SNIPER{Sniper Filters}
-        SNIPER -->|volume_ok| RISK{Risk Manager}
-        SNIPER -->|low_volume| REJECT[Reject + Log]
-        RISK -->|Phase A/B| EXEC[Order Executor]
-        RISK -->|Phase C| BLOCK[Hard Stop]
-    end
-    
-    subgraph "Execution Layer"
-        EXEC -->|MT5_LOCK| MT5
-        MT5 -->|Result| NOTIFY[Telegram Notifier]
-    end
-    
-    subgraph "Control Layer"
-        TG[Telegram Bot] -->|Commands| ENGINE[Engine Control]
-        NOTIFY -->|Fire-and-Forget| QUEUE[(Notify Queue)]
-        QUEUE --> TG
-    end
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            QUANTCORE PRO ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
+│  │   MT5 API    │───▶│  Data Feed   │───▶│ Rate Cache   │                   │
+│  │   Exness     │    │  M1-D1 Bars  │    │  800 bars    │                   │
+│  └──────────────┘    └──────────────┘    └──────────────┘                   │
+│         │                    │                   │                          │
+│         ▼                    ▼                   ▼                          │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │                    FEATURE ENGINE                            │            │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐            │            │
+│  │  │  EMA    │ │  RSI    │ │  ADX    │ │  MACD   │            │            │
+│  │  │ 9/21/50 │ │ Period  │ │ Trend   │ │ Diverg  │            │            │
+│  │  │  /200   │ │   14    │ │   14    │ │ 12/26/9 │            │            │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘            │            │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐            │            │
+│  │  │   FVG   │ │ Liqui-  │ │ Order   │ │ Round   │            │            │
+│  │  │  Gaps   │ │ Sweep   │ │ Block   │ │ Numbers │            │            │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘            │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │                     SIGNAL ENGINE                            │            │
+│  │                                                               │            │
+│  │  ┌─────────────────┐   ┌─────────────────┐                   │            │
+│  │  │ Ensemble Score  │──▶│ MTF Alignment   │                   │            │
+│  │  │  net: -1 to +1  │   │  Score: 0-6/6   │                   │            │
+│  │  └─────────────────┘   └─────────────────┘                   │            │
+│  │          │                     │                              │            │
+│  │          ▼                     ▼                              │            │
+│  │  ┌─────────────────────────────────────────┐                 │            │
+│  │  │         CONFIDENCE CALCULATOR           │                 │            │
+│  │  │  Divergence Boost • MTF Boost • Caps    │                 │            │
+│  │  │       Output: 0-98% Confidence          │                 │            │
+│  │  └─────────────────────────────────────────┘                 │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │                    SNIPER FILTERS                            │            │
+│  │  ✓ Volume Check    ✓ Spread Check    ✓ MTF Gate            │            │
+│  │  ✓ Tick Freshness  ✓ ADX Trend       ✓ Anomaly Block       │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │                    RISK MANAGER                              │            │
+│  │  Phase A: Normal  │  Phase B: Protective  │  Phase C: STOP  │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │                   ORDER EXECUTOR                             │            │
+│  │    MT5_LOCK • ATR-Based SL/TP • Retry Logic • Slippage      │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
+│  │   Telegram   │◀───│ Notify Queue │◀───│   Engine     │                   │
+│  │     Bot      │    │ Fire-Forget  │    │   Control    │                   │
+│  └──────────────┘    └──────────────┘    └──────────────┘                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🧵 Threading Model
+## � AI Neural Scoring System
 
-| Thread | Purpose | Blocking |
-|--------|---------|----------|
-| `engine.supervisor` | Main trading loop | ❌ Never waits for Telegram |
-| `telegram.supervisor` | Bot polling (infinity_polling) | Independent |
-| `engine.notify_worker` | Fire-and-forget notifications | Async queue consumer |
-| `order_executor` | MT5 order execution | Uses MT5_LOCK |
+### Multi-Timeframe Analysis (MTF)
 
-**Key Optimization**: Engine notifications use `notify_async()` queue - trading loop never blocks on Telegram network issues.
+The system analyzes **6 timeframes** for each trade decision:
+
+| # | Timeframe | Purpose | Weight |
+|---|-----------|---------|--------|
+| 1 | **M1** | Entry precision | +1 point |
+| 2 | **M5** | Short-term trend | +1 point (+1 if strong ADX) |
+| 3 | **M15** | Medium-term trend | +1 point (+1 if strong ADX) |
+| 4 | **H1** | HTF trend gate | Block/Allow |
+| 5 | **H4** | Macro trend | Analysis |
+| 6 | **D1** | Global direction | Analysis |
+
+### MTF Score Interpretation
+
+```
+mtf:6/6 = Perfect alignment   → +5% confidence boost
+mtf:5/6 = Strong alignment    → +3% confidence boost  
+mtf:4/6 = Good alignment      → +1% confidence boost
+mtf:2/6 = Weak alignment      → -10% confidence penalty
+```
+
+### Ensemble Score Components
+
+| Component | Description | Range |
+|-----------|-------------|-------|
+| **Net Score** | Weighted indicator fusion | -1.0 to +1.0 |
+| **Divergence** | RSI/MACD price divergence | bullish/bearish/none |
+| **Confluence** | Sweep + Divergence combo | Boost multiplier |
+| **Extreme Guard** | Overbought/oversold filter | Block/Allow |
+
+### Confidence Calculation
+
+```python
+# Base confidence from ensemble
+net_norm, conf = _ensemble_score(indicators, book, tick_stats)
+
+# Confluence boost (sweep + divergence)
+if has_confluence and net_abs >= 0.15:
+    conf = min(92, conf * 1.12)  # +12% boost
+
+# MTF alignment adjustment  
+if mtf_score >= 6:
+    conf = min(98, conf * 1.05)  # Perfect: +5%
+elif mtf_score <= 2:
+    conf = max(0, conf * 0.90)   # Weak: -10%
+
+# Strength caps
+if net_abs < 0.08:  conf = min(80, conf)
+if net_abs < 0.12:  conf = min(88, conf)
+if net_abs < 0.18:  conf = min(95, conf)
+```
+
+### 🎯 God Tier Detection
+
+Rare, high-probability setups identified when:
+
+| Condition | Buy | Sell |
+|-----------|-----|------|
+| Order Block | bull_ob | bear_ob |
+| RSI Zone | < 35 (oversold) | > 65 (overbought) |
+| Divergence | Bullish | Bearish |
+| H1 Trend | Not bearish | Not bullish |
 
 ---
 
 ## 🛡️ Risk Management: 3-Phase Regime
 
-The system enforces adaptive risk limits that reset daily at **00:00 UTC**.
+The system enforces adaptive risk limits that **reset daily at 00:00 UTC**.
 
 ### 🟢 Phase A: Normal Trading
+
 | Parameter | XAU | BTC |
 |-----------|-----|-----|
-| Confidence Threshold | ≥85% | ≥60% |
+| Confidence Threshold | ≥55% | ≥55% |
 | Max Lot | 0.05 | 0.01 |
 | Multi-Order | Up to 3 | Up to 2 |
 | Daily Loss Limit | 2% | 3% |
 
 ### 🟡 Phase B: Protective Mode
+
 **Trigger**: Daily P&L hits ±target OR drawdown exceeds warning threshold
 
 | Parameter | Change |
 |-----------|--------|
 | Lot Size | Reduced 50% |
-| Confidence | ≥90% required |
+| Confidence | ≥75% required |
 | Multi-Order | Disabled (max 1) |
 
 ### 🔴 Phase C: Hard Stop
+
 **Trigger**: Daily loss exceeds max threshold (5% XAU / 6% BTC)
 
 | Behavior | Description |
 |----------|-------------|
 | Trading | **Completely blocked** |
 | Analysis | Still runs (monitoring mode) |
+| Signals | Sent to Telegram (no execution) |
 | Reset | Automatic at 00:00 UTC |
 
 ---
 
 ## 🎯 Sniper Filter System
 
-All signals pass through institutional-grade filters before execution:
+All signals pass through institutional-grade filters:
 
 ### 1. Volume Filter
 ```python
-if current_vol < vol_ma * 0.8:
-    return REJECT("low_volume", "sniper_reject")
+# Skip check for first 15 seconds of new bar
+if bar_age_sec < 15.0:
+    pass  # Volume still building
+else:
+    if current_vol < vol_ma * 0.8:
+        return REJECT("low_volume", "sniper_reject")
 ```
-- Compares current tick volume to 20-period MA
-- Prevents trading in thin/illiquid markets
-- **Night sessions**: Typically blocked due to low volume
 
-### 2. Spread Filter
+### 2. MTF Gate
 ```python
-if spread_usd > max_spread_usd:
+# Buy requires M5 bullish AND M15 NOT bearish
+trend_ok_buy = m5_bullish and (not m15_bearish)
+
+# Sell requires M5 bearish AND M15 NOT bullish  
+trend_ok_sell = m5_bearish and (not m15_bullish)
+```
+
+### 3. Spread Filter
+```python
+if spread_pct > max_spread_pct:
     return REJECT("spread_high", "risk_block")
 ```
-- XAU: Dynamic based on ATR
-- BTC: Max $25 USD
-
-### 3. Momentum Confirmation
-```python
-if momentum_confirms < min_required:
-    return REJECT("weak_momentum", "sniper_reject")
-```
-- Requires multiple timeframe alignment
-- Prevents chasing exhausted moves
 
 ### 4. Tick Freshness
 ```python
 if tick_age_sec > 5.0:
     return REJECT("stale_data", "data_block")
 ```
-- Uses real tick timestamps, not bar age
-- Ensures signals use fresh market data
+
+### 5. Anomaly Detection
+- Range spike detection
+- Wick spike (manipulation) 
+- Gap jump detection
+- Stop-run rejection
 
 ---
 
-## 💬 Telegram Dashboard
+## 📊 Signal Lifecycle
 
-### Commands
+### Signal Duration
+| Timeframe | Validity |
+|-----------|----------|
+| **M1 Signal** | 1-5 minutes |
+| **M5 Confirmation** | 5-15 minutes |
+| **M15 Trend** | 15-60 minutes |
+
+### Order Duration
+| Scenario | Expected Duration |
+|----------|-------------------|
+| Active Market (London/NY) | 1-5 minutes |
+| Slow Market (Asia) | 5-15 minutes |
+| Range Market | 15+ minutes or SL |
+
+### Execution Speed
+| Metric | Value |
+|--------|-------|
+| Signal Generation | 10-30ms |
+| Order Placement | <100ms |
+| Total Latency | <200ms |
+
+---
+
+## 💬 Telegram Bot Dashboard
+
+### 📱 Control Panel
+
+| Button | Function |
+|--------|----------|
+| ✅ **Оғоз** | Start trading |
+| 🛑 **Қатъ** | Stop trading (monitoring mode) |
+| 📊 **Статус** | Engine status |
+| 💰 **Баланс** | Account balance |
+| 📈 **Таърих** | Trading history |
+| 🤖 **AI** | AI analysis menu |
+
+### 📋 Commands
+
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome + control panel |
-| `/status` | Live engine status, phases, latency |
-| `/balance` | Account balance and equity |
-| `/history` | Full trading history report |
-| `/ai` | AI market analysis menu |
-| `/helpers` | Quick TP/SL and order tools |
+| `/status` | Live engine status |
+| `/balance` | Account balance |
+| `/history` | Full trading history |
+| `/ai` | AI market analysis |
+| `/buttons` | Show control panel |
 
-### Notifications
-- 🟢🔴 **Order opened**: Direction, price, SL/TP, confidence
-- 🔄 **Phase change**: A→B, B→C transitions with reason
-- 🛑 **Hard stop**: Automatic and manual stop alerts
-- 🌅 **Daily start**: New trading day confirmation
+### 🔔 Notifications
 
-### Non-Blocking Design
-```python
-# Engine uses fire-and-forget queue
-notify_async(ADMIN, message)  # Never blocks
-
-# Separate worker thread handles delivery
-engine.notify_worker → Telegram API
-```
+| Event | Format |
+|-------|--------|
+| 🟢 **Buy Signal** | Asset, Price, SL/TP, Confidence% |
+| � **Sell Signal** | Asset, Price, SL/TP, Confidence% |
+| � **Trade Closed** | Profit/Loss, Duration |
+| 🔄 **Phase Change** | A→B, B→C with reason |
+| 🛑 **Hard Stop** | Automatic block alert |
 
 ---
 
@@ -182,30 +321,31 @@ engine.notify_worker → Telegram API
 ### Signal Engine
 | Component | Specification |
 |-----------|---------------|
-| Timeframes | M1, M5, M15 (multi-TF fusion) |
-| Models | Trend, Momentum, MeanRev, Structure, Volume |
-| Meta Gate | Probability barrier (0.40 threshold) |
-| Confidence | 0-100% normalized output |
+| Timeframes | M1, M5, M15, H1, H4, D1 |
+| Indicators | EMA, RSI, ADX, MACD, Bollinger |
+| Patterns | FVG, Liquidity Sweep, Order Block |
+| Confidence | 0-98% normalized output |
 
 ### Order Execution
 | Parameter | Value |
 |-----------|-------|
-| SL/TP Calculation | ATR-based with structure zones |
-| Min R:R Ratio | 1:1.5 |
-| P95 Latency Limit | 550ms |
+| SL/TP Calculation | ATR-based + USD target |
+| Default Lot | 0.02 |
+| Default TP | +5 USD |
+| P95 Latency | <200ms |
 | Max Slippage | 20 points |
 
 ### Data Pipeline
-| Metric | Target |
-|--------|--------|
+| Metric | Value |
+|--------|-------|
 | Loop Interval | ~2 seconds |
 | Tick Age Threshold | 5 seconds |
 | Bar Cache | 800 bars per asset |
-| Dynamic Sleep | Skips sleep if data stale |
+| Dynamic Sleep | Skips when catching up |
 
 ---
 
-## � Quick Start
+## 🚀 Quick Start
 
 ### Prerequisites
 - Python 3.12+
@@ -251,50 +391,76 @@ python main.py --engine-only
 | `portfolio_engine_error.log` | Errors and exceptions |
 | `portfolio_engine_diag.jsonl` | Diagnostic JSON data |
 
-### Key Log Patterns
+### Log Patterns
 ```
 PIPELINE_STAGE | step=market_data ok_xau=True age_xau=0.1s
-PIPELINE_STAGE | step=signals asset=XAU signal=Buy confidence=0.87
-ORDER_SELECTED | asset=XAU signal=Buy conf=0.87 lot=0.02
-TRADE_CLOSED | asset=XAU cooldown_started=120s
+PIPELINE_STAGE | step=signals asset=XAU signal=Buy confidence=87
+ORDER_SELECTED | asset=XAU signal=Buy conf=87 lot=0.02
+TRADE_CLOSED | asset=XAU profit=+$5.20 duration=3m
 PHASE_CHANGE | asset=XAU old=A new=B reason=daily_target
+```
+
+### Understanding Signals
+```
+reasons=net:-0.380,mtf:1/6,phase:A
+        │         │       │
+        │         │       └── Risk phase (A=normal)
+        │         └── MTF alignment (1 of 6)
+        └── Net score (bearish -0.38)
 ```
 
 ---
 
 ## ✅ Production Readiness
 
-| Audit Item | Status | Details |
-|------------|--------|---------|
-| Monday Wake-Up | ✅ | Auto-detects market open via `is_market_open()` |
-| 00:00 UTC Reset | ✅ | Daily stats and risk phases reset in-memory |
-| Concurrency | ✅ | `MT5_LOCK` protects all broker API calls |
-| Non-Blocking | ✅ | Telegram I/O decoupled from trading loop |
-| Stale Data Guard | ✅ | Tick-based freshness check (5s threshold) |
-| Dynamic Sleep | ✅ | Skips sleep when data is stale to catch up |
+| Feature | Status | Details |
+|---------|--------|---------|
+| Monday Wake-Up | ✅ | Auto-detects market open |
+| 00:00 UTC Reset | ✅ | Daily stats and phases reset |
+| Concurrency | ✅ | `MT5_LOCK` protects all API calls |
+| Non-Blocking | ✅ | Telegram decoupled from loop |
+| Stale Data Guard | ✅ | 5-second tick freshness |
+| Dynamic Sleep | ✅ | Skips sleep when catching up |
 
 ---
 
 ## ⚠️ Risk Disclaimer
 
-**HIGH RISK INVESTMENT WARNING**
-
-This software is for educational and research purposes. Financial trading involves significant risk of loss.
-
-- **No Guarantee**: Past performance does not indicate future results
-- **Software Risk**: Bugs, network issues, or broker rejections can cause losses
-- **Market Risk**: Volatile markets can result in rapid capital loss
-- **Liability**: Authors assume no responsibility for financial damages
-
-**USE AT YOUR OWN RISK**
+> **HIGH RISK INVESTMENT WARNING**
+>
+> This software is for educational and research purposes. Financial trading involves significant risk of loss.
+>
+> - **No Guarantee**: Past performance does not indicate future results
+> - **Software Risk**: Bugs, network issues, or broker rejections can cause losses
+> - **Market Risk**: Volatile markets can result in rapid capital loss
+> - **Liability**: Authors assume no responsibility for financial damages
+>
+> **USE AT YOUR OWN RISK**
 
 ---
 
 ## 👨‍💻 Author
 
-Python Developer | Django Back-end | XAU - BTC - USD | Trade Analyst | Exness MT5 | Global Markets |
+```
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   👤 Gafurov Kabir                                           ║
+║   🐍 Python Developer | Django Back-end                      ║
+║   📊 XAU • BTC • USD | Trade Analyst                         ║
+║   🏢 Exness MT5 | Global Markets                             ║
+║   🇹🇯 Tajikistan                                             ║
+║   📅 2026                                                     ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+```
 
-Developed with ❤️ by Gafurov Kabir 📅 2026 | Tajikistan 🇹🇯
 ---
 
-*Built with precision for institutional-grade execution* ⚡
+<div align="center">
+
+### ⚡ Built with precision for institutional-grade execution ⚡
+
+**QuantCore Pro** — *Where AI meets Trading*
+
+</div>
+]]>

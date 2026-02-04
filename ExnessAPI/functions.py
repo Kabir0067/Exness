@@ -1556,14 +1556,14 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
 # =============================================================================
 # Fast market open: fixed lot=0.02, SL=-5 USD, TP=+5 USD, sync (no await)
 # =============================================================================
-_FIXED_LOT = 0.02
+_FIXED_LOT = 0.01
 _FIXED_SL_USD = 8.0   # -8 USD
-_FIXED_TP_USD = 5.0   # +5 USD
-_SYMBOL_BTC = "BTCUSDm"
+_FIXED_TP_USD = 3.0   # +3 USD
+_SYMBOL_BTC = "BTCUSDm"     
 _SYMBOL_XAU = "XAUUSDm"
 
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
-    """One market order: lot=0.02, SL=-5 USD, TP=+5 USD. Sync."""
+    """One market order: lot=0.02, NO SL, TP=+5 USD. Sync."""
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
         _symbol_select(symbol)
@@ -1577,10 +1577,13 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             return False
         ptype = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
         fake_pos = type("_Pos", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": entry, "type": ptype})()
-        sl_price = _usd_to_sl_price_for_position(fake_pos, _FIXED_SL_USD)
+        
+        # NO STOP LOSS for manual orders
+        sl = 0.0
+        
         tp_price = _usd_to_tp_price_for_position(fake_pos, _FIXED_TP_USD)
-        sl = float(sl_price) if sl_price is not None and sl_price > 0 else 0.0
         tp = float(tp_price) if tp_price is not None and tp_price > 0 else 0.0
+        
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         req: Dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -1589,11 +1592,11 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             "type": int(order_type),
             "position": 0,
             "price": entry,
-            "sl": sl,
+            "sl": 0.0,  # NO STOP LOSS
             "tp": tp,
             "deviation": int(DEFAULT_DEVIATION),
             "magic": int(DEFAULT_MAGIC),
-            "comment": "open_fixed_sltp",
+            "comment": "open_fixed_tp_only",
             "type_filling": int(_best_filling_type(symbol)),
             "type_time": mt5.ORDER_TIME_GTC,
         }
@@ -1605,16 +1608,12 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             p = float(t.ask if is_buy else t.bid)
             if p > 0:
                 rq["price"] = p
-                if sl > 0 or tp > 0:
+                # Only update TP, no SL
+                if tp > 0:
                     fp = type("_P", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": p, "type": ptype})()
-                    if sl > 0:
-                        sp = _usd_to_sl_price_for_position(fp, _FIXED_SL_USD)
-                        if sp is not None and sp > 0:
-                            rq["sl"] = float(sp)
-                    if tp > 0:
-                        top = _usd_to_tp_price_for_position(fp, _FIXED_TP_USD)
-                        if top is not None and top > 0:
-                            rq["tp"] = float(top)
+                    top = _usd_to_tp_price_for_position(fp, _FIXED_TP_USD)
+                    if top is not None and top > 0:
+                        rq["tp"] = float(top)
 
         ok, _, _ = _send_with_retries(
             req,

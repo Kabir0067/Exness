@@ -184,25 +184,28 @@ class SignalEngine:
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
             # ==============================================================
-            # SNIPER LOGIC #1: Volume Validation
+            # SNIPER LOGIC #1: Volume Validation (Smart)
             # Reject signals in low-volume conditions (choppy markets)
-            # tick_volume must be above 20-period moving average
+            # BUT: Skip check during first 15 seconds of bar (volume is naturally low)
             # ==============================================================
             try:
                 if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
-                    vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
-                    current_vol = float(dfp["tick_volume"].iloc[-1])
-                    vol_multiplier = float(getattr(self.cfg, "volume_filter_mult", 0.8) or 0.8)
-                    if current_vol < vol_ma * vol_multiplier:
-                        return self._neutral(
-                            sym,
-                            [f"low_volume:{current_vol:.0f}<{vol_ma * vol_multiplier:.0f}", "sniper_reject"],
-                            t0,
-                            spread_pct=spread_pct,
-                            bar_key=bar_key,
-                            regime=_as_regime(adapt.get("regime")),
-                            trade_blocked=True,
-                        )
+                    # Only apply volume filter after bar has had time to accumulate volume
+                    bar_age_ok = last_age >= 15.0  # Wait 15s for volume to build
+                    if bar_age_ok:
+                        vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
+                        current_vol = float(dfp["tick_volume"].iloc[-1])
+                        vol_multiplier = float(getattr(self.cfg, "volume_filter_mult", 0.4) or 0.4)
+                        if current_vol < vol_ma * vol_multiplier:
+                            return self._neutral(
+                                sym,
+                                [f"low_volume:{current_vol:.0f}<{vol_ma * vol_multiplier:.0f}", "sniper_reject"],
+                                t0,
+                                spread_pct=spread_pct,
+                                bar_key=bar_key,
+                                regime=_as_regime(adapt.get("regime")),
+                                trade_blocked=True,
+                            )
             except Exception:
                 pass  # Continue if volume check fails
 

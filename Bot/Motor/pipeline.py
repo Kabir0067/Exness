@@ -343,8 +343,8 @@ class _AssetPipeline:
             # M1 bars only update at minute boundaries (always appear 0-60s old)
             # Ticks are real-time, so tick age is the true data freshness
             # =================================================================
-            # Use tick age for freshness check (5-second threshold for ticks)
-            TICK_STALE_THRESHOLD_SEC = 5.0  # Ticks should arrive every few seconds
+            # Use tick age for freshness check (reads from config, default 15s)
+            TICK_STALE_THRESHOLD_SEC = float(getattr(self.cfg, "tick_stale_threshold_sec", 15.0) or 15.0)
             data_age = self.last_tick_age_sec if self._last_tick_ts > 0 else self.last_bar_age_sec
             
             if data_age > TICK_STALE_THRESHOLD_SEC:
