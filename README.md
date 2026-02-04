@@ -1,4 +1,4 @@
-<![CDATA[# 🚀 QuantCore Pro: Institutional AI Trading System
+# 🚀 QuantCore Pro: Institutional AI Trading System
 ## XAUUSDm • BTCUSDm • Exness MT5
 
 ```
@@ -463,4 +463,3 @@ reasons=net:-0.380,mtf:1/6,phase:A
 **QuantCore Pro** — *Where AI meets Trading*
 
 </div>
-]]>
