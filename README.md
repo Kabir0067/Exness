@@ -1,59 +1,85 @@
 <div align="center">
 
-# 🚀 QuantCore Pro
+<!-- ANIMATED HEADER -->
+<img src="https://capsule-render.vercel.app/api?type=venom&color=0:00d4ff,50:7c3aed,100:ff0080&height=200&section=header&text=QuantCore%20Pro&fontSize=80&fontColor=ffffff&animation=twinkling&fontAlignY=35&desc=Institutional%20AI%20Trading%20System&descSize=25&descAlignY=55" width="100%" />
 
-### **Institutional AI Trading System**
+<!-- ANIMATED TYPING -->
+<img src="https://readme-typing-svg.demolab.com?font=Orbitron&weight=900&size=28&duration=3000&pause=1000&color=00D4FF&center=true&vCenter=true&multiline=true&width=800&height=100&lines=🤖+AI-Powered+Gold+%26+Bitcoin+Trading;⚡+Sub-200ms+Execution+Speed;💎+Institutional-Grade+Risk+Management" alt="Typing SVG" />
 
-[![Python](https://img.shields.io/badge/Python-3.12+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![MetaTrader5](https://img.shields.io/badge/MetaTrader-5-0078D4?style=for-the-badge&logo=metatrader&logoColor=white)](https://www.metatrader5.com)
-[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://telegram.org)
-[![License](https://img.shields.io/badge/License-Private-red?style=for-the-badge)](LICENSE)
+<br/>
 
-**XAUUSDm** • **BTCUSDm** • **Exness MT5**
+<!-- ANIMATED BADGES -->
+<a href="#"><img src="https://img.shields.io/badge/💰_GOLD-XAUUSDm-FFD700?style=for-the-badge&labelColor=000000" /></a>
+<a href="#"><img src="https://img.shields.io/badge/₿_BITCOIN-BTCUSDm-F7931A?style=for-the-badge&labelColor=000000" /></a>
+<a href="#"><img src="https://img.shields.io/badge/🏦_BROKER-Exness_MT5-00D4FF?style=for-the-badge&labelColor=000000" /></a>
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=00D9FF&center=true&vCenter=true&width=600&lines=🏆+Professional+Algorithmic+Trading;🧠+AI-Powered+Signal+Generation;📊+Multi-Timeframe+Analysis;⚡+Institutional-Grade+Execution" alt="Typing SVG" />
+<br/><br/>
 
----
+<!-- TECH STACK BADGES -->
+<img src="https://img.shields.io/badge/Python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white" />
+<img src="https://img.shields.io/badge/MetaTrader-5-0078D4?style=flat-square&logo=metatrader&logoColor=white" />
+<img src="https://img.shields.io/badge/Telegram-Bot_API-26A5E4?style=flat-square&logo=telegram&logoColor=white" />
+<img src="https://img.shields.io/badge/AI-Neural_Engine-FF6B6B?style=flat-square&logo=tensorflow&logoColor=white" />
+<img src="https://img.shields.io/badge/Status-Production-00FF88?style=flat-square" />
 
-### 🎯 Quick Stats
+<br/><br/>
 
-| 📈 Assets | ⏱️ Timeframes | 🎯 Confidence | ⚡ Latency |
-|:---------:|:-------------:|:-------------:|:----------:|
-| **2** | **6** | **0-98%** | **<200ms** |
-| XAU + BTC | M1→D1 | Neural Score | P95 |
+<!-- STATS CARDS -->
+<table>
+<tr>
+<td align="center">
+<img src="https://img.shields.io/badge/📈_Assets-2-00D4FF?style=for-the-badge&labelColor=1a1a2e" /><br/>
+<sub><b>XAU + BTC</b></sub>
+</td>
+<td align="center">
+<img src="https://img.shields.io/badge/⏱️_Timeframes-6-7C3AED?style=for-the-badge&labelColor=1a1a2e" /><br/>
+<sub><b>M1 → D1</b></sub>
+</td>
+<td align="center">
+<img src="https://img.shields.io/badge/🎯_Confidence-0--98%25-FF0080?style=for-the-badge&labelColor=1a1a2e" /><br/>
+<sub><b>Neural Score</b></sub>
+</td>
+<td align="center">
+<img src="https://img.shields.io/badge/⚡_Latency-<200ms-00FF88?style=for-the-badge&labelColor=1a1a2e" /><br/>
+<sub><b>P95</b></sub>
+</td>
+</tr>
+</table>
 
 </div>
 
 ---
 
-## 🌟 Overview
+<div align="center">
 
-**QuantCore Pro** is a production-grade algorithmic trading system for Exness MetaTrader 5. It executes independent **multi-timeframe scalping strategies** for Gold (XAU) and Bitcoin (BTC) with institutional-level risk management and AI-powered analysis.
+## ⚡ CORE FEATURES
+
+</div>
 
 <table>
 <tr>
 <td width="50%">
 
-### ✨ Core Features
+### 🎯 Trading Engine
 
 | Feature | Description |
-|:--------|:------------|
-| 🎯 **Dual-Asset** | XAU & BTC parallel trading |
-| 🧠 **AI Scoring** | 6-layer ensemble model |
-| 📊 **MTF Analysis** | M1, M5, M15, H1, H4, D1 |
-| 🛡️ **Risk Regime** | Adaptive A/B/C phases |
+|:-------:|:------------|
+| 🤖 | **Dual-Asset Trading** — XAU & BTC parallel |
+| 🧠 | **AI Neural Scoring** — 6-layer ensemble |
+| 📊 | **MTF Analysis** — M1, M5, M15, H1, H4, D1 |
+| 🎯 | **God Tier Detection** — Rare high-prob setups |
 
 </td>
 <td width="50%">
 
-### ⚡ Performance
+### 🛡️ Risk & Control
 
 | Feature | Description |
-|:--------|:------------|
-| 🎯 **Sniper Filters** | Volume, spread gates |
-| ⚡ **Non-Blocking** | Decoupled Telegram |
-| 🤖 **Bot Control** | Real-time dashboard |
-| 📈 **God Tier** | High-prob detection |
+|:-------:|:------------|
+| 🛡️ | **3-Phase Regime** — A/B/C auto-reset |
+| 🎯 | **Sniper Filters** — Volume, spread gates |
+| ⚡ | **Non-Blocking I/O** — Decoupled Telegram |
+| 📱 | **Bot Dashboard** — Full control panel |
 
 </td>
 </tr>
@@ -61,262 +87,404 @@
 
 ---
 
-## 🏗️ System Architecture
+<div align="center">
+
+## 🏗️ SYSTEM ARCHITECTURE
+
+</div>
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#00d4ff', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#7c3aed', 'lineColor': '#ff0080', 'secondaryColor': '#1a1a2e', 'tertiaryColor': '#0f0f23'}}}%%
+
 flowchart TB
-    subgraph INPUT["📥 DATA LAYER"]
-        MT5["🔌 MT5 API<br/>Exness"]
-        FEED["📊 Data Feed<br/>M1-D1 Bars"]
-        CACHE["💾 Rate Cache<br/>800 bars"]
+    subgraph INPUT["<b>📥 DATA LAYER</b>"]
+        MT5["🔌 <b>MT5 API</b><br/>Exness Real"]
+        FEED["📊 <b>Data Feed</b><br/>M1-D1 OHLCV"]
+        CACHE["💾 <b>Rate Cache</b><br/>800 bars/asset"]
     end
 
-    subgraph FEATURE["⚙️ FEATURE ENGINE"]
+    subgraph FEATURE["<b>⚙️ FEATURE ENGINE</b>"]
         direction LR
         EMA["📈 EMA<br/>9/21/50/200"]
         RSI["📊 RSI<br/>Period 14"]
         ADX["📉 ADX<br/>Trend 14"]
         MACD["🔄 MACD<br/>12/26/9"]
+        BB["📏 Bollinger<br/>20, 2σ"]
     end
 
-    subgraph PATTERN["🔍 PATTERN DETECTION"]
+    subgraph PATTERN["<b>🔍 SMART MONEY CONCEPTS</b>"]
         direction LR
-        FVG["🕳️ FVG<br/>Gaps"]
+        FVG["🕳️ FVG<br/>Imbalance"]
         SWEEP["💧 Liquidity<br/>Sweep"]
         OB["📦 Order<br/>Block"]
         RN["🎯 Round<br/>Numbers"]
     end
 
-    subgraph SIGNAL["🧠 SIGNAL ENGINE"]
-        ENS["🎲 Ensemble Score<br/>net: -1 to +1"]
-        MTF["📊 MTF Alignment<br/>Score: 0-6/6"]
-        CONF["🎯 Confidence Calculator<br/>Output: 0-98%"]
+    subgraph SIGNAL["<b>🧠 AI SIGNAL ENGINE</b>"]
+        ENS["🎲 <b>Ensemble Score</b><br/>net: -1.0 to +1.0"]
+        MTF["📊 <b>MTF Alignment</b><br/>Score: 0-6/6"]
+        CONF["🎯 <b>Confidence</b><br/>Output: 0-98%"]
+        GOD["👑 <b>God Tier</b><br/>Rare Setups"]
     end
 
-    subgraph FILTER["🎯 SNIPER FILTERS"]
+    subgraph FILTER["<b>🎯 SNIPER FILTER CHAIN</b>"]
         direction LR
-        VOL["✓ Volume"]
-        SPR["✓ Spread"]
-        TICK["✓ Tick Fresh"]
-        ANOM["✓ Anomaly"]
+        F1["✅ Volume"]
+        F2["✅ Spread"]
+        F3["✅ MTF Gate"]
+        F4["✅ Tick Fresh"]
+        F5["✅ Anomaly"]
     end
 
-    subgraph RISK["🛡️ RISK MANAGER"]
+    subgraph RISK["<b>🛡️ RISK MANAGER</b>"]
         direction LR
-        PA["🟢 Phase A<br/>Normal"]
-        PB["🟡 Phase B<br/>Protective"]
-        PC["🔴 Phase C<br/>STOP"]
+        PA["🟢 Phase A<br/><i>Normal</i>"]
+        PB["🟡 Phase B<br/><i>Protective</i>"]
+        PC["🔴 Phase C<br/><i>BLOCKED</i>"]
     end
 
-    subgraph EXEC["⚡ EXECUTION"]
-        ORD["📝 Order Executor<br/>MT5_LOCK • ATR SL/TP"]
-        TG["📱 Telegram Bot<br/>Notifications"]
+    subgraph EXEC["<b>⚡ ORDER EXECUTION</b>"]
+        ORD["📝 <b>Executor</b><br/>MT5_LOCK • ATR SL/TP"]
+        TG["📱 <b>Telegram</b><br/>Fire & Forget"]
     end
 
-    MT5 --> FEED --> CACHE
-    CACHE --> FEATURE
-    EMA & RSI & ADX & MACD --> PATTERN
-    FVG & SWEEP & OB & RN --> SIGNAL
-    ENS --> MTF --> CONF
-    CONF --> FILTER
-    VOL & SPR & TICK & ANOM --> RISK
-    PA & PB & PC --> EXEC
-    ORD <--> TG
+    MT5 ==> FEED ==> CACHE
+    CACHE ==> FEATURE
+    EMA & RSI & ADX & MACD & BB ==> PATTERN
+    FVG & SWEEP & OB & RN ==> SIGNAL
+    ENS ==> MTF ==> CONF
+    CONF --> GOD
+    CONF ==> FILTER
+    F1 & F2 & F3 & F4 & F5 ==> RISK
+    PA & PB & PC ==> EXEC
+    ORD <-.-> TG
 
-    style INPUT fill:#1a1a2e,stroke:#00d9ff,stroke-width:2px
-    style FEATURE fill:#16213e,stroke:#00ff88,stroke-width:2px
-    style PATTERN fill:#0f3460,stroke:#ff6b6b,stroke-width:2px
-    style SIGNAL fill:#1a1a2e,stroke:#ffd93d,stroke-width:2px
-    style FILTER fill:#16213e,stroke:#6bcb77,stroke-width:2px
-    style RISK fill:#0f3460,stroke:#ff8c00,stroke-width:2px
-    style EXEC fill:#1a1a2e,stroke:#4ecdc4,stroke-width:2px
+    style INPUT fill:#0a192f,stroke:#00d4ff,stroke-width:3px,color:#ffffff
+    style FEATURE fill:#112240,stroke:#7c3aed,stroke-width:3px,color:#ffffff
+    style PATTERN fill:#1a1a40,stroke:#ff0080,stroke-width:3px,color:#ffffff
+    style SIGNAL fill:#0a192f,stroke:#ffd700,stroke-width:3px,color:#ffffff
+    style FILTER fill:#112240,stroke:#00ff88,stroke-width:3px,color:#ffffff
+    style RISK fill:#1a1a40,stroke:#ff6b35,stroke-width:3px,color:#ffffff
+    style EXEC fill:#0a192f,stroke:#00d4ff,stroke-width:3px,color:#ffffff
 ```
 
 ---
 
-## 🧠 AI Neural Scoring System
+<div align="center">
 
-### Multi-Timeframe Analysis (MTF)
+## 🧠 AI NEURAL SCORING
+
+</div>
+
+### 📊 Multi-Timeframe Fusion
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#00d4ff'}}}%%
+
 graph LR
-    subgraph TIMEFRAMES["📊 6 TIMEFRAME FUSION"]
-        M1["⚡ M1<br/>Entry Precision<br/>+1 point"]
-        M5["📈 M5<br/>Short-term<br/>+1-2 points"]
-        M15["📊 M15<br/>Medium-term<br/>+1-2 points"]
-        H1["🕐 H1<br/>HTF Gate<br/>Block/Allow"]
-        H4["🕓 H4<br/>Macro Trend<br/>Analysis"]
-        D1["📅 D1<br/>Global Direction<br/>Analysis"]
+    subgraph MTF["<b>🔮 6-TIMEFRAME ANALYSIS</b>"]
+        M1["⚡ <b>M1</b><br/>Entry<br/>+1 pt"]
+        M5["📈 <b>M5</b><br/>Short<br/>+1-2 pt"]
+        M15["📊 <b>M15</b><br/>Medium<br/>+1-2 pt"]
+        H1["🕐 <b>H1</b><br/>HTF Gate<br/>Block/Allow"]
+        H4["🕓 <b>H4</b><br/>Macro<br/>Analysis"]
+        D1["📅 <b>D1</b><br/>Global<br/>Direction"]
     end
 
     M1 --> M5 --> M15 --> H1 --> H4 --> D1
+    D1 --> SCORE["🎯 <b>MTF SCORE</b><br/>0-6/6"]
 
-    style M1 fill:#00d9ff,stroke:#fff,stroke-width:2px
-    style M5 fill:#00ff88,stroke:#fff,stroke-width:2px
-    style M15 fill:#ffd93d,stroke:#fff,stroke-width:2px
-    style H1 fill:#ff6b6b,stroke:#fff,stroke-width:2px
-    style H4 fill:#ff8c00,stroke:#fff,stroke-width:2px
-    style D1 fill:#9b59b6,stroke:#fff,stroke-width:2px
+    style M1 fill:#00d4ff,stroke:#fff,stroke-width:2px,color:#000
+    style M5 fill:#7c3aed,stroke:#fff,stroke-width:2px,color:#fff
+    style M15 fill:#ff0080,stroke:#fff,stroke-width:2px,color:#fff
+    style H1 fill:#ff6b35,stroke:#fff,stroke-width:2px,color:#fff
+    style H4 fill:#ffd700,stroke:#fff,stroke-width:2px,color:#000
+    style D1 fill:#00ff88,stroke:#fff,stroke-width:2px,color:#000
+    style SCORE fill:#1a1a2e,stroke:#00d4ff,stroke-width:3px,color:#00d4ff
 ```
 
-### MTF Score Interpretation
+<div align="center">
 
-| Score | Alignment | Confidence Effect |
-|:-----:|:----------|:------------------|
-| **6/6** | 🟢 Perfect | +5% boost |
-| **5/6** | 🟢 Strong | +3% boost |
-| **4/6** | 🟡 Good | +1% boost |
-| **2/6** | 🔴 Weak | -10% penalty |
+### 🎯 MTF Score Impact
 
-### Ensemble Score Components
+| Score | Status | Effect | Visual |
+|:-----:|:------:|:-------|:------:|
+| **6/6** | 🟢 Perfect | **+5%** confidence boost | ████████████ |
+| **5/6** | 🟢 Strong | **+3%** confidence boost | ██████████░░ |
+| **4/6** | 🟡 Good | **+1%** confidence boost | ████████░░░░ |
+| **3/6** | 🟡 Neutral | No change | ██████░░░░░░ |
+| **2/6** | 🔴 Weak | **-10%** confidence penalty | ████░░░░░░░░ |
 
-| Component | Description | Range |
-|:----------|:------------|:------|
-| **Net Score** | Weighted indicator fusion | `-1.0` to `+1.0` |
-| **Divergence** | RSI/MACD price divergence | `bullish/bearish/none` |
-| **Confluence** | Sweep + Divergence combo | Boost multiplier |
-| **Extreme Guard** | Overbought/oversold filter | `Block/Allow` |
+</div>
 
-### Confidence Calculation
+### 🎲 Ensemble Components
+
+<table>
+<tr>
+<td width="25%" align="center">
+
+🎯 **Net Score**
+
+`-1.0` ↔ `+1.0`
+
+Weighted fusion
+
+</td>
+<td width="25%" align="center">
+
+📈 **Divergence**
+
+`bull` / `bear` / `none`
+
+RSI/MACD vs Price
+
+</td>
+<td width="25%" align="center">
+
+🔥 **Confluence**
+
+`Sweep + Divergence`
+
+Boost multiplier
+
+</td>
+<td width="25%" align="center">
+
+🛡️ **Extreme Guard**
+
+`Block` / `Allow`
+
+OB/OS filter
+
+</td>
+</tr>
+</table>
+
+### 💻 Confidence Algorithm
 
 ```python
-# Base confidence from ensemble
+# 🧠 Base confidence from ensemble
 net_norm, conf = _ensemble_score(indicators, book, tick_stats)
 
-# Confluence boost (sweep + divergence)
+# 🔥 Confluence boost (sweep + divergence)
 if has_confluence and net_abs >= 0.15:
     conf = min(92, conf * 1.12)  # +12% boost
 
-# MTF alignment adjustment  
+# 📊 MTF alignment adjustment  
 if mtf_score >= 6:
     conf = min(98, conf * 1.05)  # Perfect: +5%
 elif mtf_score <= 2:
     conf = max(0, conf * 0.90)   # Weak: -10%
 
-# Strength caps
-if net_abs < 0.08:  conf = min(80, conf)
-if net_abs < 0.12:  conf = min(88, conf)
-if net_abs < 0.18:  conf = min(95, conf)
+# 🎯 Strength caps
+if net_abs < 0.08:  conf = min(80, conf)  # Weak signal
+if net_abs < 0.12:  conf = min(88, conf)  # Moderate
+if net_abs < 0.18:  conf = min(95, conf)  # Strong
 ```
-
-### 🎯 God Tier Detection
-
-> **Rare, high-probability setups identified when all conditions align:**
-
-| Condition | 🟢 Buy | 🔴 Sell |
-|:----------|:-------|:--------|
-| Order Block | `bull_ob` | `bear_ob` |
-| RSI Zone | `< 35` (oversold) | `> 65` (overbought) |
-| Divergence | Bullish | Bearish |
-| H1 Trend | Not bearish | Not bullish |
 
 ---
 
-## 🛡️ Risk Management: 3-Phase Regime
+<div align="center">
 
-> The system enforces adaptive risk limits that **reset daily at 00:00 UTC**.
+## 👑 GOD TIER DETECTION
+
+**Rare, High-Probability Setups**
+
+</div>
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
+
+flowchart LR
+    subgraph CONDITIONS["<b>⚡ ALL CONDITIONS MUST ALIGN</b>"]
+        OB["📦 Order Block<br/><code>bull_ob / bear_ob</code>"]
+        RSI["📊 RSI Zone<br/><code><35 / >65</code>"]
+        DIV["📈 Divergence<br/><code>bullish / bearish</code>"]
+        H1["🕐 H1 Trend<br/><code>aligned</code>"]
+    end
+
+    OB --> GOD
+    RSI --> GOD
+    DIV --> GOD
+    H1 --> GOD
+
+    GOD["👑 <b>GOD TIER</b><br/>🎯 Maximum Confidence"]
+
+    style OB fill:#7c3aed,stroke:#fff,stroke-width:2px
+    style RSI fill:#00d4ff,stroke:#fff,stroke-width:2px
+    style DIV fill:#ff0080,stroke:#fff,stroke-width:2px
+    style H1 fill:#ffd700,stroke:#fff,stroke-width:2px
+    style GOD fill:#ffd700,stroke:#ff0080,stroke-width:4px,color:#000
+```
+
+<table align="center">
+<tr>
+<th>Condition</th>
+<th>🟢 BUY Signal</th>
+<th>🔴 SELL Signal</th>
+</tr>
+<tr>
+<td><b>📦 Order Block</b></td>
+<td><code>bull_ob</code></td>
+<td><code>bear_ob</code></td>
+</tr>
+<tr>
+<td><b>📊 RSI Zone</b></td>
+<td><code>< 35</code> (oversold)</td>
+<td><code>> 65</code> (overbought)</td>
+</tr>
+<tr>
+<td><b>📈 Divergence</b></td>
+<td>Bullish</td>
+<td>Bearish</td>
+</tr>
+<tr>
+<td><b>🕐 H1 Trend</b></td>
+<td>Not bearish</td>
+<td>Not bullish</td>
+</tr>
+</table>
+
+---
+
+<div align="center">
+
+## 🛡️ RISK MANAGEMENT
+
+**3-Phase Adaptive Regime — Auto-Reset at 00:00 UTC**
+
+</div>
+
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#00ff88'}}}%%
+
 stateDiagram-v2
-    [*] --> PhaseA: Daily Reset 00:00 UTC
+    [*] --> A: 🕛 00:00 UTC Reset
 
-    PhaseA --> PhaseB: Daily P&L hits target OR\nDrawdown warning
-    PhaseB --> PhaseC: Daily loss exceeds\nmax threshold
-    PhaseC --> PhaseA: 00:00 UTC Auto-Reset
+    A --> B: ⚠️ P&L target hit OR\nDrawdown warning
+    B --> C: 🚨 Max loss exceeded
+    C --> A: 🕛 00:00 UTC Auto-Reset
 
-    state PhaseA {
-        [*] --> Normal
-        Normal: 🟢 NORMAL TRADING
-        Normal: ✓ Full lot size
-        Normal: ✓ Multi-order enabled
-        Normal: ✓ Confidence ≥55%
+    state A {
+        [*] --> NormalOps
+        NormalOps: 🟢 <b>PHASE A: NORMAL</b>
+        NormalOps: ━━━━━━━━━━━━━━━━━━━━
+        NormalOps: ✅ Full lot size
+        NormalOps: ✅ Multi-order enabled
+        NormalOps: ✅ Confidence ≥55%
+        NormalOps: ✅ All strategies active
     }
 
-    state PhaseB {
-        [*] --> Protective
-        Protective: 🟡 PROTECTIVE MODE
-        Protective: ⚠️ Lot size -50%
-        Protective: ⚠️ Single order only
-        Protective: ⚠️ Confidence ≥75%
+    state B {
+        [*] --> ProtectiveOps
+        ProtectiveOps: 🟡 <b>PHASE B: PROTECTIVE</b>
+        ProtectiveOps: ━━━━━━━━━━━━━━━━━━━━
+        ProtectiveOps: ⚠️ Lot size HALVED
+        ProtectiveOps: ⚠️ Single order only
+        ProtectiveOps: ⚠️ Confidence ≥75%
+        ProtectiveOps: ⚠️ Conservative mode
     }
 
-    state PhaseC {
-        [*] --> HardStop
-        HardStop: 🔴 HARD STOP
-        HardStop: ❌ Trading BLOCKED
-        HardStop: 📊 Analysis continues
-        HardStop: 📱 Signals to Telegram
+    state C {
+        [*] --> StopOps
+        StopOps: 🔴 <b>PHASE C: HARD STOP</b>
+        StopOps: ━━━━━━━━━━━━━━━━━━━━
+        StopOps: ❌ Trading BLOCKED
+        StopOps: 📊 Analysis continues
+        StopOps: 📱 Signals to Telegram
+        StopOps: ⏰ Wait for UTC reset
     }
 ```
 
-### 🟢 Phase A: Normal Trading
+<table align="center">
+<tr>
+<td align="center" width="33%">
+
+### 🟢 Phase A
 
 | Parameter | XAU | BTC |
 |:----------|:---:|:---:|
-| Confidence Threshold | `≥55%` | `≥55%` |
+| Confidence | `≥55%` | `≥55%` |
 | Max Lot | `0.05` | `0.01` |
-| Multi-Order | Up to 3 | Up to 2 |
-| Daily Loss Limit | `2%` | `3%` |
+| Multi-Order | 3 | 2 |
+| Loss Limit | `2%` | `3%` |
 
-### 🟡 Phase B: Protective Mode
+</td>
+<td align="center" width="33%">
+
+### 🟡 Phase B
 
 | Parameter | Change |
-|:----------|:-------|
-| Lot Size | Reduced `50%` |
-| Confidence | `≥75%` required |
-| Multi-Order | Disabled (max 1) |
+|:----------|:------:|
+| Lot Size | `-50%` |
+| Confidence | `≥75%` |
+| Multi-Order | `1 max` |
+| Mode | `Conservative` |
 
-### 🔴 Phase C: Hard Stop
+</td>
+<td align="center" width="33%">
 
-| Behavior | Description |
-|:---------|:------------|
-| Trading | **Completely blocked** |
-| Analysis | Still runs (monitoring) |
-| Signals | Sent to Telegram (no execution) |
-| Reset | Automatic at `00:00 UTC` |
+### 🔴 Phase C
+
+| Behavior | Status |
+|:---------|:------:|
+| Trading | `BLOCKED` |
+| Analysis | `Running` |
+| Signals | `Telegram` |
+| Reset | `00:00 UTC` |
+
+</td>
+</tr>
+</table>
 
 ---
 
-## 🎯 Sniper Filter System
+<div align="center">
 
-> All signals pass through **institutional-grade filters**:
+## 🎯 SNIPER FILTER CHAIN
+
+**5-Layer Institutional-Grade Validation**
+
+</div>
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
+
 flowchart LR
-    subgraph FILTERS["🎯 5-LAYER FILTER CHAIN"]
-        direction TB
-        F1["📊 Volume Filter<br/>≥80% of MA"]
-        F2["📈 MTF Gate<br/>Trend alignment"]
-        F3["💰 Spread Filter<br/>Max spread check"]
-        F4["⏱️ Tick Freshness<br/><5 seconds"]
-        F5["🚨 Anomaly Detection<br/>Manipulation guard"]
+    SIG["📥 <b>RAW SIGNAL</b>"]
+    
+    subgraph CHAIN["<b>🎯 5-LAYER FILTER CHAIN</b>"]
+        F1["📊 <b>VOLUME</b><br/>≥80% of MA<br/><i>Skip first 15s</i>"]
+        F2["📈 <b>MTF GATE</b><br/>Trend alignment<br/><i>M5+M15 check</i>"]
+        F3["💰 <b>SPREAD</b><br/>Max spread<br/><i>% threshold</i>"]
+        F4["⏱️ <b>TICK</b><br/>Freshness<br/><i><5 seconds</i>"]
+        F5["🚨 <b>ANOMALY</b><br/>Manipulation<br/><i>Spike guard</i>"]
     end
 
-    SIG["📥 Raw<br/>Signal"] --> F1
-    F1 --> |PASS| F2
-    F2 --> |PASS| F3
-    F3 --> |PASS| F4
-    F4 --> |PASS| F5
-    F5 --> |PASS| EXE["✅ Execute<br/>Order"]
+    SIG ==> F1 ==> F2 ==> F3 ==> F4 ==> F5 ==> EXE["✅ <b>EXECUTE</b>"]
 
-    F1 --> |REJECT| REJ["❌ Rejected"]
-    F2 --> |REJECT| REJ
-    F3 --> |REJECT| REJ
-    F4 --> |REJECT| REJ
-    F5 --> |REJECT| REJ
+    F1 -.-> |REJECT| REJ["❌"]
+    F2 -.-> |REJECT| REJ
+    F3 -.-> |REJECT| REJ
+    F4 -.-> |REJECT| REJ
+    F5 -.-> |REJECT| REJ
 
-    style FILTERS fill:#1a1a2e,stroke:#00d9ff,stroke-width:2px
-    style SIG fill:#ffd93d,stroke:#fff,stroke-width:2px
-    style EXE fill:#00ff88,stroke:#fff,stroke-width:2px
-    style REJ fill:#ff6b6b,stroke:#fff,stroke-width:2px
+    style SIG fill:#7c3aed,stroke:#fff,stroke-width:2px
+    style CHAIN fill:#0a192f,stroke:#00d4ff,stroke-width:3px
+    style F1 fill:#112240,stroke:#00d4ff,stroke-width:2px
+    style F2 fill:#112240,stroke:#7c3aed,stroke-width:2px
+    style F3 fill:#112240,stroke:#ff0080,stroke-width:2px
+    style F4 fill:#112240,stroke:#ffd700,stroke-width:2px
+    style F5 fill:#112240,stroke:#ff6b35,stroke-width:2px
+    style EXE fill:#00ff88,stroke:#fff,stroke-width:3px,color:#000
+    style REJ fill:#ff0000,stroke:#fff,stroke-width:2px
 ```
 
 <details>
-<summary><b>📋 Filter Code Details</b></summary>
+<summary><b>📋 Click to View Filter Code</b></summary>
 
-### 1. Volume Filter
+### 1️⃣ Volume Filter
 ```python
-# Skip check for first 15 seconds of new bar
 if bar_age_sec < 15.0:
     pass  # Volume still building
 else:
@@ -324,136 +492,129 @@ else:
         return REJECT("low_volume", "sniper_reject")
 ```
 
-### 2. MTF Gate
+### 2️⃣ MTF Gate
 ```python
-# Buy requires M5 bullish AND M15 NOT bearish
 trend_ok_buy = m5_bullish and (not m15_bearish)
-
-# Sell requires M5 bearish AND M15 NOT bullish  
 trend_ok_sell = m5_bearish and (not m15_bullish)
 ```
 
-### 3. Spread Filter
+### 3️⃣ Spread Filter
 ```python
 if spread_pct > max_spread_pct:
     return REJECT("spread_high", "risk_block")
 ```
 
-### 4. Tick Freshness
+### 4️⃣ Tick Freshness
 ```python
 if tick_age_sec > 5.0:
     return REJECT("stale_data", "data_block")
 ```
 
-### 5. Anomaly Detection
-- Range spike detection
-- Wick spike (manipulation)
-- Gap jump detection
-- Stop-run rejection
+### 5️⃣ Anomaly Detection
+- 📊 Range spike detection
+- 🕯️ Wick spike (manipulation)
+- 📈 Gap jump detection  
+- 🛑 Stop-run rejection
 
 </details>
 
 ---
 
-## 📊 Signal Lifecycle
-
-```mermaid
-timeline
-    title Signal → Order → Close
-
-    section Signal Generation
-        M1 Signal : 1-5 min validity
-        M5 Confirmation : 5-15 min validity
-        M15 Trend : 15-60 min validity
-
-    section Order Execution
-        London/NY Session : 1-5 min duration
-        Asian Session : 5-15 min duration
-        Range Market : 15+ min or SL
-
-    section Performance
-        Signal Gen : 10-30ms
-        Order Place : <100ms
-        Total Latency : <200ms
-```
-
----
-
-## 💬 Telegram Bot Dashboard
-
 <div align="center">
+
+## 💬 TELEGRAM BOT
+
+**Full Control Dashboard**
+
+</div>
+
+<table align="center">
+<tr>
+<td width="50%">
 
 ### 📱 Control Panel
 
 | Button | Function |
 |:------:|:---------|
 | ✅ **Оғоз** | Start trading |
-| 🛑 **Қатъ** | Stop trading (monitoring mode) |
+| 🛑 **Қатъ** | Stop (monitoring) |
 | 📊 **Статус** | Engine status |
 | 💰 **Баланс** | Account balance |
-| 📈 **Таърих** | Trading history |
-| 🤖 **AI** | AI analysis menu |
+| 📈 **Таърих** | Trade history |
+| 🤖 **AI** | AI analysis |
 
-</div>
+</td>
+<td width="50%">
 
 ### 📋 Commands
 
 | Command | Description |
 |:--------|:------------|
-| `/start` | Welcome + control panel |
-| `/status` | Live engine status |
-| `/balance` | Account balance |
-| `/history` | Full trading history |
-| `/ai` | AI market analysis |
-| `/buttons` | Show control panel |
+| `/start` | Welcome panel |
+| `/status` | Live status |
+| `/balance` | Balance info |
+| `/history` | Trade history |
+| `/ai` | AI analysis |
+| `/buttons` | Show panel |
 
-### 🔔 Notifications
+</td>
+</tr>
+</table>
+
+### 🔔 Real-Time Notifications
 
 | Event | Format |
 |:------|:-------|
-| 🟢 **Buy Signal** | Asset, Price, SL/TP, Confidence% |
-| 🔴 **Sell Signal** | Asset, Price, SL/TP, Confidence% |
-| 💰 **Trade Closed** | Profit/Loss, Duration |
-| 🔄 **Phase Change** | A→B, B→C with reason |
-| 🛑 **Hard Stop** | Automatic block alert |
+| 🟢 **Buy Signal** | Asset • Price • SL/TP • Confidence% |
+| 🔴 **Sell Signal** | Asset • Price • SL/TP • Confidence% |
+| 💰 **Trade Closed** | P&L • Duration • Result |
+| 🔄 **Phase Change** | A→B→C • Reason |
+| 🛑 **Hard Stop** | Auto-block alert |
 
 ---
 
-## ⚙️ Technical Specifications
+<div align="center">
+
+## ⚙️ TECHNICAL SPECS
+
+</div>
 
 <table>
 <tr>
-<td width="33%">
+<td width="33%" align="center">
 
 ### 📡 Signal Engine
-| Component | Spec |
-|:----------|:-----|
-| Timeframes | M1→D1 |
-| Indicators | EMA, RSI, ADX, MACD |
-| Patterns | FVG, Sweep, OB |
-| Confidence | 0-98% |
+
+| Component | Value |
+|:----------|:------|
+| Timeframes | `M1→D1` |
+| Indicators | `EMA RSI ADX MACD BB` |
+| Patterns | `FVG Sweep OB` |
+| Confidence | `0-98%` |
 
 </td>
-<td width="33%">
+<td width="33%" align="center">
 
 ### ⚡ Execution
+
 | Parameter | Value |
 |:----------|:------|
-| SL/TP | ATR-based |
-| Default Lot | 0.02 |
-| Default TP | +$5 |
-| Max Slippage | 20 pts |
+| SL/TP | `ATR-based` |
+| Default Lot | `0.02` |
+| Default TP | `+$5 USD` |
+| Slippage | `20 pts max` |
 
 </td>
-<td width="33%">
+<td width="33%" align="center">
 
-### 📊 Pipeline
+### 📊 Performance
+
 | Metric | Value |
 |:-------|:------|
-| Loop Interval | ~2s |
-| Tick Threshold | 5s |
-| Bar Cache | 800 |
-| P95 Latency | <200ms |
+| Loop | `~2 sec` |
+| Tick Age | `<5 sec` |
+| Bar Cache | `800/asset` |
+| P95 | `<200ms` |
 
 </td>
 </tr>
@@ -461,17 +622,22 @@ timeline
 
 ---
 
-## 🚀 Quick Start
+<div align="center">
 
-### Prerequisites
+## 🚀 QUICK START
+
+</div>
+
+### 📋 Prerequisites
 
 ```
-✓ Python 3.12+
-✓ MetaTrader 5 (Exness Terminal)
-✓ Windows OS (MT5 requirement)
+✅ Python 3.12+
+✅ MetaTrader 5 (Exness Terminal)
+✅ Windows OS
+✅ Telegram Bot Token
 ```
 
-### Installation
+### 📦 Installation
 
 ```bash
 git clone <repo>
@@ -479,7 +645,7 @@ cd Exness
 pip install -r requirements.txt
 ```
 
-### Configuration (.env)
+### ⚙️ Configuration (.env)
 
 ```ini
 EXNESS_LOGIN=12345678
@@ -489,103 +655,126 @@ BOT_TOKEN=123456:ABC-DEF...
 ADMIN_ID=987654321
 ```
 
-### Run
+### ▶️ Run
 
 ```bash
-# Full mode (with Telegram)
-python main.py
-
-# Headless mode (VPS)
-python main.py --headless
-
-# Engine only (no Telegram)
-python main.py --engine-only
+python main.py              # Full mode
+python main.py --headless   # VPS mode
+python main.py --engine-only # No Telegram
 ```
-
----
-
-## 📊 Monitoring & Logs
-
-### Log Files
-
-| File | Content |
-|:-----|:--------|
-| `portfolio_engine_health.log` | Pipeline stages, signals, orders |
-| `portfolio_engine_error.log` | Errors and exceptions |
-| `portfolio_engine_diag.jsonl` | Diagnostic JSON data |
-
-### Log Patterns
-
-```log
-PIPELINE_STAGE | step=market_data ok_xau=True age_xau=0.1s
-PIPELINE_STAGE | step=signals asset=XAU signal=Buy confidence=87
-ORDER_SELECTED | asset=XAU signal=Buy conf=87 lot=0.02
-TRADE_CLOSED | asset=XAU profit=+$5.20 duration=3m
-PHASE_CHANGE | asset=XAU old=A new=B reason=daily_target
-```
-
-### Understanding Signals
-
-```
-reasons=net:-0.380,mtf:1/6,phase:A
-        │         │       │
-        │         │       └── Risk phase (A=normal)
-        │         └── MTF alignment (1 of 6)
-        └── Net score (bearish -0.38)
-```
-
----
-
-## ✅ Production Readiness
-
-| Feature | Status | Details |
-|:--------|:------:|:--------|
-| Monday Wake-Up | ✅ | Auto-detects market open |
-| 00:00 UTC Reset | ✅ | Daily stats & phases reset |
-| Concurrency | ✅ | `MT5_LOCK` protects all API |
-| Non-Blocking | ✅ | Telegram decoupled |
-| Stale Data Guard | ✅ | 5-second tick freshness |
-| Dynamic Sleep | ✅ | Skips when catching up |
-
----
-
-## ⚠️ Risk Disclaimer
-
-> [!CAUTION]
-> **HIGH RISK INVESTMENT WARNING**
->
-> This software is for educational and research purposes. Financial trading involves significant risk of loss.
->
-> - **No Guarantee**: Past performance does not indicate future results
-> - **Software Risk**: Bugs, network issues, or broker rejections can cause losses
-> - **Market Risk**: Volatile markets can result in rapid capital loss
-> - **Liability**: Authors assume no responsibility for financial damages
->
-> **USE AT YOUR OWN RISK**
 
 ---
 
 <div align="center">
 
-## 👨‍💻 Author
+## 📊 MONITORING
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=500&size=18&pause=1000&color=00D9FF&center=true&vCenter=true&width=400&lines=Gafurov+Kabir;Python+Developer+%7C+Django+Backend;XAU+•+BTC+•+USD+%7C+Trade+Analyst" alt="Author" />
+</div>
 
-| | |
-|:---:|:---|
-| 👤 | **Gafurov Kabir** |
-| 🐍 | Python Developer \| Django Back-end |
-| 📊 | XAU • BTC • USD \| Trade Analyst |
-| 🏢 | Exness MT5 \| Global Markets |
-| 🇹🇯 | Tajikistan |
-| 📅 | 2026 |
+### 📁 Log Files
+
+| File | Content |
+|:-----|:--------|
+| `portfolio_engine_health.log` | Pipeline • Signals • Orders |
+| `portfolio_engine_error.log` | Errors • Exceptions |
+| `portfolio_engine_diag.jsonl` | Diagnostic JSON |
+
+### 📋 Log Format
+
+```log
+PIPELINE_STAGE | step=market_data ok_xau=True age_xau=0.1s
+PIPELINE_STAGE | step=signals asset=XAU signal=Buy confidence=87
+ORDER_SELECTED | asset=XAU signal=Buy conf=87 lot=0.02
+TRADE_CLOSED   | asset=XAU profit=+$5.20 duration=3m
+PHASE_CHANGE   | asset=XAU old=A new=B reason=daily_target
+```
+
+---
+
+<div align="center">
+
+## ✅ PRODUCTION READY
+
+</div>
+
+| Feature | Status | Details |
+|:--------|:------:|:--------|
+| 🌅 Monday Wake-Up | ✅ | Auto-detects market open |
+| 🕛 00:00 UTC Reset | ✅ | Daily stats & phases reset |
+| 🔒 Concurrency | ✅ | `MT5_LOCK` thread-safe |
+| ⚡ Non-Blocking | ✅ | Telegram decoupled |
+| 📊 Stale Guard | ✅ | 5-second freshness |
+| 💤 Dynamic Sleep | ✅ | Skips when catching up |
+
+---
+
+<div align="center">
+
+## ⚠️ RISK DISCLAIMER
+
+</div>
+
+> [!CAUTION]
+> ### ⚠️ HIGH RISK INVESTMENT WARNING
+>
+> This software is for **educational and research purposes only**.
+>
+> | Risk Type | Description |
+> |:----------|:------------|
+> | 📉 **No Guarantee** | Past performance ≠ future results |
+> | 💻 **Software Risk** | Bugs, network issues can cause losses |
+> | 📈 **Market Risk** | Volatile markets = rapid capital loss |
+> | ⚖️ **Liability** | Authors assume NO responsibility |
+>
+> ### **USE AT YOUR OWN RISK**
+
+---
+
+<div align="center">
+
+## 👨‍💻 AUTHOR
+
+<img src="https://readme-typing-svg.demolab.com?font=Orbitron&weight=700&size=24&duration=3000&pause=1000&color=00D4FF&center=true&vCenter=true&width=500&lines=Gafurov+Kabir;Python+Developer+%7C+Django+Backend;Gold+•+Bitcoin+•+USD+Analyst" alt="Author" />
+
+<br/>
+
+<table>
+<tr>
+<td align="center"><b>👤</b></td>
+<td><b>Gafurov Kabir</b></td>
+</tr>
+<tr>
+<td align="center"><b>🐍</b></td>
+<td>Python Developer | Django Backend</td>
+</tr>
+<tr>
+<td align="center"><b>📊</b></td>
+<td>XAU • BTC • USD | Trade Analyst</td>
+</tr>
+<tr>
+<td align="center"><b>🏢</b></td>
+<td>Exness MT5 | Global Markets</td>
+</tr>
+<tr>
+<td align="center"><b>🇹🇯</b></td>
+<td>Tajikistan</td>
+</tr>
+<tr>
+<td align="center"><b>📅</b></td>
+<td>2026</td>
+</tr>
+</table>
+
+<br/>
 
 ---
 
 ### ⚡ Built with precision for institutional-grade execution ⚡
 
-**QuantCore Pro** — *Where AI meets Trading*
+<img src="https://readme-typing-svg.demolab.com?font=Orbitron&weight=900&size=30&duration=2000&pause=500&color=FFD700&center=true&vCenter=true&width=600&lines=QuantCore+Pro;Where+AI+Meets+Trading+💎" alt="Footer" />
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=100&section=footer" width="100%" />
+<br/>
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00d4ff,50:7c3aed,100:ff0080&height=120&section=footer" width="100%" />
 
 </div>
