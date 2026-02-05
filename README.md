@@ -264,6 +264,47 @@ stateDiagram-v2
 
 <div align="center">
 
+## 🛡️ ADAPTIVE LOT & KILL ENGINE
+
+**The Mathematical "Black Box" Revealed**
+
+</div>
+
+### 1. 🧮 Adaptive Lot Sizing (The Formula)
+
+Unlike retail bots that use static lots, the engine dynamically recalculates position size **on every tick** using a multivariate equation verified in `risk_manager.py`:
+
+```math
+Lot = (Equity * Risk% * Confidence * PhaseFactor) / 1_Lot_Risk_Value
+```
+
+| Variable | Source | Description |
+|:---|:---:|:---|
+| **Equity** | `_account_snapshot()` | Uses **Floating Equity**, not Balance. If you are in drawdown, risk automatically shrinks. |
+| **Confidence** | `AI_Score (0.0-1.0)` | A 0.85 confidence score = 85% sizing. A 0.95 score = 95% sizing. |
+| **PhaseFactor** | `Regime Logic` | **Phase A (1.0)** &rarr; **Phase B (0.5)** &rarr; **Phase C (0.0)**. |
+
+<br/>
+
+### 2. 🔌 Auto-Kill Protocols (The Safety)
+
+The system is hard-coded with **non-negotiable** survival triggers that override all AI signals.
+
+#### 🚨 A. The "Hard Stop" (Phase C Lock)
+*   **Trigger**: Daily Drawdown > **5.0%** (Equity-based).
+*   **Action**: Immediate `Phase C` Transition.
+*   **Result**: All trading disabled until **00:00 UTC**. No manual override possible.
+
+#### 📉 B. Performance Kill Switch
+*   **Monitor**: Sliding window of last **5-10 trades**.
+*   **Trigger**: Expectancy drops below **-0.5R** or Winrate < **30%**.
+*   **Action**: Strategy status shifts to `KILLED` or `COOLING`.
+*   **Logic**: *"Stop digging if the shovel is broken."*
+
+---
+
+<div align="center">
+
 ## 🎯 SNIPER FILTER CHAIN
 
 **5-Layer Institutional Validation**

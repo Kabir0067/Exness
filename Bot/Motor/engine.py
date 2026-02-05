@@ -12,7 +12,7 @@ from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 import MetaTrader5 as mt5
 
-from ExnessAPI.functions import close_all_position
+from ExnessAPI.functions import close_all_position, market_is_open
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 # -------------------- XAU stack --------------------
@@ -107,7 +107,7 @@ class MultiAssetTradingEngine:
 
         self._xau: Optional[_AssetPipeline] = None
         self._btc: Optional[_AssetPipeline] = None
-
+        
         self._last_cand_xau: Optional[AssetCandidate] = None
         self._last_cand_btc: Optional[AssetCandidate] = None
 
@@ -1264,12 +1264,30 @@ class MultiAssetTradingEngine:
 
                 consecutive_errors = 0
 
-                # Adaptive sleep - SKIP SLEEP if TICK data is stale (>5s) to catch up
+                # ============================================================
+                # CRITICAL FIX: STALE DATA AUTO-RECOVERY
+                # ============================================================
                 # NOTE: Use TICK age, not BAR age. M1 bars are always 0-60s old by design.
                 tick_age_x = float(self._xau.last_tick_age_sec) if self._xau else 0.0
                 tick_age_b = float(self._btc.last_tick_age_sec) if self._btc else 0.0
+
+                # 1. Force Recovery if data is dead (>60s)
+                # Check XAU (only if market open)
+                if tick_age_x > 60.0 and market_is_open("XAU"):
+                    log_health.warning("STALE_DATA_CRITICAL | asset=XAU tick_age=%.1fs > 60s -> FORCE RECOVERY", tick_age_x)
+                    if self._recover_all():
+                        consecutive_errors = 0
+                    continue
+
+                # Check BTC (always 24/7)
+                if tick_age_b > 60.0:
+                    log_health.warning("STALE_DATA_CRITICAL | asset=BTC tick_age=%.1fs > 60s -> FORCE RECOVERY", tick_age_b)
+                    if self._recover_all():
+                        consecutive_errors = 0
+                    continue
+
+                # 2. Adaptive sleep - SKIP SLEEP if TICK data is slightly stale (>5s) to catch up
                 max_tick_age = max(tick_age_x, tick_age_b)
-                
                 if max_tick_age > 5.0:
                     # Tick data is stale - skip sleep to process faster
                     time.sleep(0.02)  # Tiny sleep to prevent CPU spin
