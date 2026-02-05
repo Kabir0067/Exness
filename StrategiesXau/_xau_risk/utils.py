@@ -124,3 +124,67 @@ def _atr_fallback(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: 
     for i in range(1, len(tr)):
         out[i] = alpha * tr[i] + (1.0 - alpha) * out[i - 1]
     return out
+
+
+def clamp01(x: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def tp_multiplier_from_conf(confidence: float, min_mult: float = 1.5, max_mult: float = 3.0) -> float:
+    c = clamp01(confidence)
+    lo = float(min_mult)
+    hi = float(max_mult)
+    if hi < lo:
+        hi = lo
+    return float(lo + (hi - lo) * c)
+
+
+def atr_take_profit(
+    entry: float,
+    atr: float,
+    side: str,
+    confidence: float,
+    min_mult: float = 1.5,
+    max_mult: float = 3.0,
+) -> float:
+    mult = tp_multiplier_from_conf(confidence, min_mult=min_mult, max_mult=max_mult)
+    s = str(side or "").strip().lower()
+    sign = 1.0 if s in ("buy", "long", "b", "1", "order_type_buy", "op_buy") else -1.0
+    return float(entry + sign * float(atr) * mult)
+
+
+def adaptive_risk_money(
+    equity: float,
+    base_risk_pct: float,
+    confidence: float,
+    phase: str,
+    drawdown: float,
+    *,
+    phase_factors: dict | None = None,
+    dd_cut: float = 0.10,
+    dd_mult: float = 0.5,
+) -> float:
+    if not math.isfinite(float(equity)) or equity <= 0.0:
+        return 0.0
+    br = float(base_risk_pct)
+    if not math.isfinite(br) or br <= 0.0:
+        return 0.0
+    c = clamp01(confidence)
+    pf = phase_factors or {"A": 1.2, "B": 0.8, "C": 0.5}
+    ph = str(phase or "A").upper()
+    phase_mult = float(pf.get(ph, 1.0))
+    dd = float(drawdown)
+    if not math.isfinite(dd):
+        dd = 0.0
+    dd_factor = float(dd_mult) if dd > float(dd_cut) else 1.0
+    return float(equity * br * c * phase_mult * dd_factor)

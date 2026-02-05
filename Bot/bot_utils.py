@@ -721,7 +721,7 @@ def _format_tp_result(usd: float, res: dict) -> str:
     errors = res.get("errors") or []
 
     status_emoji = "✅" if ok else "⚠️"
-    lines = [f"{status_emoji} <b>TP: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"]
+    lines = [f"{status_emoji} <b>TP (min): {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"]
     if skipped > 0:
         lines.append(f"⏭️ Skip: <b>{skipped}</b>")
     if errors:

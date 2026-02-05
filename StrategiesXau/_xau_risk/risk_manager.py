@@ -21,6 +21,7 @@ from config_xau import EngineConfig, SymbolParams, GOLD_MARKET_END_MINUTES, GOLD
 from DataFeed.xau_market_feed import MicroZones, TickStats
 from mt5_client import MT5_LOCK, ensure_mt5
 
+
 from .execution_quality import ExecSample, ExecutionQualityMonitor
 from .logging_ import _FILE_LOCK, LOG_DIR, log_risk, RiskLogger
 from .broker_adapter import BrokerAdapter
@@ -38,9 +39,11 @@ from .utils import (
     _is_finite,
     _side_norm,
     _utcnow,
-    gold_lot_and_takeprofit,
     percentile_rank,
+    adaptive_risk_money,
+    atr_take_profit,
 )
+
 
 class RiskManager:
     """
@@ -368,16 +371,11 @@ class RiskManager:
 
     def _fallback_volume(self) -> float:
         """
-        Safe fallback volume when dynamic sizing cannot be computed.
+        No static lot fallback for adaptive sizing.
         """
-        fv = getattr(self.cfg, "fixed_volume", None)
-        if fv is None:
-            return 0.0
-        try:
-            return self.broker.normalize_volume_floor(float(fv))
-        except Exception:
-            return 0.0
+        return 0.0
 
+    # ------------------- quote/execution hooks -------------------
     # ------------------- quote/execution hooks -------------------
     def on_quote(self, bid: float, ask: float) -> None:
         try:
@@ -531,6 +529,69 @@ class RiskManager:
     def _get_equity(self) -> float:
         _, eq = self._account_snapshot()
         return float(eq)
+
+    # ------------------- kill switch (strategy governance) -------------------
+    def _recent_closed_trade_profits(self, limit: int) -> List[float]:
+        try:
+            if not self._ensure_ready():
+                return []
+            days = int(self._kill_history_days)
+            end = self._utc_now()
+            start = end - timedelta(days=days)
+            with MT5_LOCK:
+                deals = mt5.history_deals_get(start, end) or ()
+            entry_out = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+            magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+            out: List[Tuple[int, float]] = []
+            for d in deals:
+                if str(getattr(d, "symbol", "")) != self.symbol:
+                    continue
+                if int(getattr(d, "magic", 0) or 0) != magic:
+                    continue
+                if int(getattr(d, "entry", -1) or -1) != entry_out:
+                    continue
+                t_msc = int(getattr(d, "time_msc", 0) or 0)
+                profit = float(getattr(d, "profit", 0.0) or 0.0)
+                out.append((t_msc, profit))
+            out.sort(key=lambda x: x[0])
+            profits = [p for _, p in out]
+            return profits[-max(0, int(limit)):]
+        except Exception as exc:
+            log_risk.error("kill_switch history error: %s | tb=%s", exc, traceback.format_exc())
+            return []
+
+    def _refresh_kill_switch(self) -> None:
+        now = time.time()
+        if (now - float(self._kill_last_check_ts)) < float(self._kill_check_interval_sec):
+            return
+        self._kill_last_check_ts = now
+
+        profits = self._recent_closed_trade_profits(int(self._kill_min_trades))
+        prev = self._kill_state.status
+        self._kill_state.update(
+            profits,
+            now,
+            min_trades=int(self._kill_min_trades),
+            kill_expectancy=float(self._kill_expectancy_threshold),
+            kill_winrate=float(self._kill_winrate_threshold),
+            cooling_expectancy=float(self._cooling_expectancy_threshold),
+            cooling_sec=float(self._cooling_duration_sec),
+        )
+
+        if self._kill_state.status != prev:
+            log_risk.warning(
+                "KILL_SWITCH | status=%s->%s | exp=%.3f winrate=%.1f%% trades=%s",
+                prev,
+                self._kill_state.status,
+                float(self._kill_state.last_expectancy),
+                float(self._kill_state.last_winrate) * 100.0,
+                int(self._kill_state.last_trades),
+            )
+
+    def strategy_status(self) -> str:
+        self._refresh_kill_switch()
+        return str(self._kill_state.status)
+
 
     # ------------------- state evaluation (Phase A/B/C) -------------------
     def evaluate_account_state(self) -> None:
@@ -812,6 +873,14 @@ class RiskManager:
             self.evaluate_account_state()
             phase = str(self.current_phase or "A")
 
+            self._refresh_kill_switch()
+            if self._kill_state.status == "KILLED":
+                reasons.append("kill_switch_killed")
+                return RiskDecision(False, reasons)
+            if self._kill_state.status == "COOLING" and time.time() < float(self._kill_state.cooling_until_ts):
+                reasons.append("kill_switch_cooling")
+                return RiskDecision(False, reasons)
+
             if self.requires_hard_stop():
                 reasons.append(f"risk:{self.hard_stop_reason() or 'hard_stop'}")
                 return RiskDecision(False, reasons)
@@ -882,6 +951,14 @@ class RiskManager:
         try:
             _ = tz
             self.evaluate_account_state()
+
+            self._refresh_kill_switch()
+            if self._kill_state.status == "KILLED":
+                reasons.append("kill_switch_killed")
+                return False, reasons
+            if self._kill_state.status == "COOLING" and time.time() < float(self._kill_state.cooling_until_ts):
+                reasons.append("kill_switch_cooling")
+                return False, reasons
 
             reasons: List[str] = []
 
@@ -962,10 +1039,8 @@ class RiskManager:
         confidence: float,
     ) -> float:
         """
-        Broker-true risk sizing.
-
-        Safety contract:
-          - Any invalid inputs or calc failures -> return 0.0 (skip trade) or fixed_volume fallback if configured.
+        Adaptive lot sizing:
+          Lot = (Equity * BaseRisk% * Confidence * PhaseFactor * DrawdownFactor) / Risk_1lot
         """
         try:
             self.evaluate_account_state()
@@ -985,40 +1060,39 @@ class RiskManager:
                 return 0.0
 
             if not self._symbol_meta():
-                return self._fallback_volume()
+                return 0.0
 
             min_rr = getattr(self.cfg, "min_rr", None)
             if min_rr is not None:
                 rr_ratio = self._rr(ep, sl, tp)
-                if rr_ratio < float(min_rr):
+                rr_min = max(float(min_rr), 1.5)
+                if rr_ratio < rr_min:
                     return 0.0
 
             _, eq = self._account_snapshot()
             if float(eq) <= 0:
-                return self._fallback_volume()
+                return 0.0
 
-            # ================================================================
-            # SCIENTIFIC RISK SIZING (For XAUUSD/BTCUSD Volatility)
-            # - Normal (Phase A): Up to 2.5% risk per trade
-            # - Defensive (Phase B): 50% reduction -> 1.25% max
-            # ================================================================
-            MAX_RISK_PERCENT = 0.025  # 2.5% max risk per trade (room to breathe)
-            config_risk = float(self.cfg.max_risk_per_trade)
-            effective_risk_pct = min(config_risk, MAX_RISK_PERCENT)
-            
-            risk_money = float(eq) * effective_risk_pct
+            conf = conf / 100.0 if conf > 1.5 else conf
+            conf = max(0.0, min(1.0, conf))
 
-            # Phase B Defensive Mode: 50% size reduction
-            if self.current_phase == "B":
-                PHASE_B_REDUCTION = 0.50  # 50% reduction in Phase B
-                risk_money *= PHASE_B_REDUCTION
-                log_risk.debug("PHASE_B_SIZING | risk reduced by 50%% | effective_risk=%.4f", risk_money)
-            if self._current_drawdown > float(self.cfg.max_drawdown) * 0.5:
-                risk_money *= float(getattr(self.cfg, "dd_risk_mult", 1.0) or 1.0)
+            risk_money = adaptive_risk_money(
+                float(eq),
+                float(self.cfg.max_risk_per_trade),
+                conf,
+                str(self.current_phase or "A"),
+                float(self._current_drawdown),
+                phase_factors={"A": 1.2, "B": 0.8, "C": 0.5},
+                dd_cut=0.10,
+                dd_mult=0.5,
+            )
+
+            if risk_money <= 0:
+                return 0.0
 
             risk_1lot = abs(self._order_calc_profit_money(side_n, 1.0, ep, sl))
             if risk_1lot <= 0:
-                return self._fallback_volume()
+                return 0.0
 
             raw_lot = float(risk_money) / float(risk_1lot)
 
@@ -1031,24 +1105,22 @@ class RiskManager:
                         raw_lot = min(raw_lot, float(margin_cap) / float(margin_1lot))
 
             lot = self._normalize_volume_floor(raw_lot)
-            
-            # --- STRICT MAX LOT ENFORCEMENT ---
+
             HARD_MAX_LOT = 0.20
             cfg_max_lot = float(getattr(self.cfg, "max_lot", 0.20) or 0.20)
             effective_max_lot = min(HARD_MAX_LOT, cfg_max_lot)
-            
+
             if lot > effective_max_lot:
                 lot = effective_max_lot
-            
+
             lot = self._normalize_volume_floor(float(lot))
-            # ----------------------------------
-            
             return float(lot) if lot > 0 and _is_finite(lot) else 0.0
 
         except Exception as exc:
             log_risk.error("calculate_position_size error: %s | tb=%s", exc, traceback.format_exc())
-            return self._fallback_volume()
+            return 0.0
 
+    # ------------------- SL/TP planners
     # ------------------- SL/TP planners -------------------
     def _micro_zone_sl_tp(
         self,
@@ -1110,6 +1182,40 @@ class RiskManager:
             log_risk.error("_fallback_atr_sl_tp error: %s | tb=%s", exc, traceback.format_exc())
             return entry, entry
 
+    def _calculate_structure_sl(self, side: str, entry: float, df: Optional[pd.DataFrame]) -> Tuple[float, str]:
+        """
+        Finds the recent Swing Low (Buy) or Swing High (Sell) to use as a structural Stop Loss.
+        Logic: Look back 20 candles.
+        """
+        try:
+            if df is None or df.empty or len(df) < 20:
+                return entry, "no_structure"
+
+            # Lookback period for swing
+            lookback = 20
+            # Use High/Low from the last N candles
+            recent_data = df.tail(lookback)
+
+            if side == "Buy":
+                # For Buy, SL is below the lowest low
+                swing_low = float(recent_data["low"].min())
+                if swing_low > 0 and swing_low < entry:
+                    return swing_low, "swing_low"
+                else:
+                    return entry, "invalid_swing_low"
+
+            else: # Sell
+                # For Sell, SL is above the highest high
+                swing_high = float(recent_data["high"].max())
+                if swing_high > 0 and swing_high > entry:
+                    return swing_high, "swing_high"
+                else:
+                    return entry, "invalid_swing_high"
+        
+        except Exception as exc:
+            log_risk.error("_calculate_structure_sl error: %s", exc)
+            return entry, "structure_error"
+
     def plan_order(
         self,
         side: str,
@@ -1125,6 +1231,7 @@ class RiskManager:
         max_positions: int = 0,
         unrealized_pl: float = 0.0,
         allow_when_blocked: bool = False,
+        df: Optional[pd.DataFrame] = None,
     ) -> PlanOrderResult:
         try:
             _ = (ind, ticks)
@@ -1154,24 +1261,76 @@ class RiskManager:
             if not _is_finite(entry_price) or entry_price <= 0:
                 return PlanOrderResult(ok=False, reason="invalid_price")
 
-            # 1) ATR injection
+            # =================================================================
+            # NEW "SENIOR" SL LOGIC: Volatility-Adjusted + Structure
+            # =================================================================
+            
+            # 1. Get ATR
             atr = 0.0
             try:
                 atr = float((adapt or {}).get("atr", 0.0) or ind.get("atr", 0.0) or 0.0)
             except Exception:
                 atr = 0.0
+            
+            if atr <= 1e-9:
+                atr = entry_price * 0.003 # 0.3% fallback if ATR missing
 
-            adapt2 = dict(adapt or {})
-            adapt2["atr"] = float(atr)
+            # 2. Calculate ATR-Based SL (Gold: 1.5x - 2.0x ATR)
+            sl_mult_atr = 2.0
+            atr_sl_dist = atr * sl_mult_atr
+            
+            if side_n == "Buy":
+                atr_sl_price = entry_price - atr_sl_dist
+            else:
+                atr_sl_price = entry_price + atr_sl_dist
 
-            # 2) Base ATR plan
-            sl, tp = self._fallback_atr_sl_tp(side_n, entry_price, adapt2)
+            # 3. Structure SL
+            struct_sl_price, struct_reason = self._calculate_structure_sl(side_n, entry_price, df)
+            
+            # 4. Final SL (Wider)
+            final_sl = atr_sl_price
+            sl_source = "ATR_2.0x"
+            if side_n == "Buy":
+                if struct_reason == "swing_low" and struct_sl_price < atr_sl_price:
+                    final_sl = struct_sl_price
+                    sl_source = "Structure_Low"
+                else:
+                    final_sl = min(atr_sl_price, struct_sl_price)
+                    if final_sl == struct_sl_price:
+                        sl_source = "Structure_Low"
+            else:
+                if struct_reason == "swing_high" and struct_sl_price > atr_sl_price:
+                    final_sl = struct_sl_price
+                    sl_source = "Structure_High"
+                else:
+                    final_sl = max(atr_sl_price, struct_sl_price)
+                    if final_sl == struct_sl_price:
+                        sl_source = "Structure_High"
 
-            # 3) If ATR missing, fallback to micro-zone (last resort)
-            if (not _is_finite(sl, tp)) or sl == entry_price or tp == entry_price:
-                sl, tp = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
+            # 5. Safety Check (0.2%)
+            min_dist_pct = 0.002
+            min_safety_dist = entry_price * min_dist_pct
+            if abs(entry_price - final_sl) < min_safety_dist:
+                log_risk.info(f"SL too close to entry (Distance < {min_safety_dist:.5f}). Force-Widening.")
+                if side_n == "Buy":
+                    final_sl = entry_price - min_safety_dist
+                else:
+                    final_sl = entry_price + min_safety_dist
+                sl_source += "_ForceWiden"
 
-            # 4) Cost-floor from broker constraints + exec monitor
+            sl = self.broker.normalize_price(final_sl)
+
+            log_risk.info(
+                f"SL_CALC | Symbol: {self.symbol} | Side: {side_n} | ATR: {atr:.5f} | "
+                f"ATR_SL: {atr_sl_price:.5f} | Struct_SL: {struct_sl_price:.5f} ({struct_reason}) | "
+                f"Final_SL: {sl:.5f} ({sl_source}) | Dist: {abs(entry_price - sl):.5f}"
+            )
+
+            tp_min_mult = float(getattr(self.cfg, "tp_conf_min_mult", 1.5) or 1.5)
+            tp_max_mult = float(getattr(self.cfg, "tp_conf_max_mult", 3.0) or 3.0)
+            tp = atr_take_profit(entry_price, atr, side_n, float(confidence), min_mult=tp_min_mult, max_mult=tp_max_mult)
+
+            # 3) Cost-floor from broker constraints + exec monitor
             min_dist = self._min_stop_distance()
             min_sl_pct = float(getattr(self.cfg, "min_sl_pct", 0.00045) or 0.00045)
             min_tp_pct = float(getattr(self.cfg, "min_tp_pct", 0.00055) or 0.00055)
@@ -1216,7 +1375,7 @@ class RiskManager:
             if not _is_finite(sl, tp):
                 return PlanOrderResult(ok=False, reason="sl_tp_calc_failed_nonfinite")
 
-            # 5) Enforce floors
+            # 4) Enforce floors
             if side_n == "Buy":
                 if abs(entry_price - float(sl)) < min_sl:
                     sl = self._normalize_price(entry_price - min_sl)
@@ -1228,7 +1387,7 @@ class RiskManager:
                 if abs(float(tp) - entry_price) < min_tp:
                     tp = self._normalize_price(entry_price - min_tp)
 
-            # 6) Micro-zones only EXTEND
+            # 5) Micro-zones only EXTEND
             if zones is not None:
                 slz, tpz = self._micro_zone_sl_tp(side_n, entry_price, zones, float(tick_volatility))
                 if _is_finite(slz, tpz) and slz != entry_price and tpz != entry_price:
@@ -1242,6 +1401,36 @@ class RiskManager:
             if not _is_finite(sl, tp) or sl == entry_price or tp == entry_price:
                 return PlanOrderResult(ok=False, reason="sl_tp_calc_failed_no_dist")
 
+            # 6) RR >= 1.5
+            rr_cfg = float(getattr(self.cfg, "min_rr", 1.0) or 1.0)
+            rr_min = max(rr_cfg, 1.5)
+            dist_sl = abs(entry_price - float(sl))
+            if dist_sl > 0:
+                dist_tp = abs(float(tp) - entry_price)
+                if dist_tp < dist_sl * rr_min:
+                    tp = (
+                        self._normalize_price(entry_price + dist_sl * rr_min)
+                        if side_n == "Buy"
+                        else self._normalize_price(entry_price - dist_sl * rr_min)
+                    )
+
+            rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
+            if rr_cap > 0:
+                rr_cap = max(rr_cap, rr_min)
+                dist_tp = abs(tp - entry_price)
+                if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
+                    tp = (
+                        self._normalize_price(entry_price + dist_sl * rr_cap)
+                        if side_n == "Buy"
+                        else self._normalize_price(entry_price - dist_sl * rr_cap)
+                    )
+                    if abs(tp - entry_price) < min_tp:
+                        tp = (
+                            self._normalize_price(entry_price + min_tp)
+                            if side_n == "Buy"
+                            else self._normalize_price(entry_price - min_tp)
+                        )
+
             sl, tp = self._apply_broker_constraints(side_n, entry_price, float(sl), float(tp))
 
             if side_n == "Buy" and not (sl < entry_price < tp):
@@ -1249,67 +1438,9 @@ class RiskManager:
             if side_n == "Sell" and not (tp < entry_price < sl):
                 return PlanOrderResult(ok=False, reason="invalid_sl_tp_sell")
 
-            # ---- lot/TP (your deterministic ladder + USD-TP conversion) ----
-            self.evaluate_account_state()
-            if (not allow_when_blocked) and (
-                self.current_phase == "C" and not bool(getattr(self.cfg, "ignore_daily_stop_for_trading", False))
-            ):
-                log_risk.error(
-                    "plan_order BLOCKED (lot/TP calc) | phase=C | reason=%s",
-                    self._phase_reason_last or "phase_c",
-                )
-                return PlanOrderResult(ok=False, reason=f"phase_c:{self._phase_reason_last}")
-
-            use_usd_tp = False
-            balance = float(self._get_balance())
-            base_lot, tp_usd = gold_lot_and_takeprofit(balance) if balance > 0 else (0.0, 0.0)
-            base_lot = self._normalize_volume_floor(float(base_lot or 0.0))
-
-            if base_lot > 0 and float(tp_usd or 0.0) > 0.0:
-                tp_price = self._tp_usd_to_price(entry_price, side_n, base_lot, float(tp_usd))
-                if tp_price is not None:
-                    tp = float(tp_price)
-                    sl, tp = self._apply_broker_constraints(side_n, entry_price, float(sl), float(tp))
-                    if (side_n == "Buy" and tp > entry_price) or (side_n == "Sell" and tp < entry_price):
-                        use_usd_tp = True
-
-            if use_usd_tp:
-                lot = float(base_lot)
-            else:
-                min_rr = getattr(self.cfg, "min_rr", None)
-                if min_rr is not None:
-                    rr = self._rr(entry_price, sl, tp)
-                    rr_min = float(min_rr)
-                    if rr < rr_min:
-                        dist = abs(entry_price - sl)
-                        tp = (
-                            self._normalize_price(entry_price + dist * rr_min)
-                            if side_n == "Buy"
-                            else self._normalize_price(entry_price - dist * rr_min)
-                        )
-                        sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
-
-                rr_cap = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
-                if rr_cap > 0:
-                    dist_sl = abs(entry_price - sl)
-                    dist_tp = abs(tp - entry_price)
-                    if dist_sl > 0 and dist_tp > dist_sl * rr_cap:
-                        tp = (
-                            self._normalize_price(entry_price + dist_sl * rr_cap)
-                            if side_n == "Buy"
-                            else self._normalize_price(entry_price - dist_sl * rr_cap)
-                        )
-                        if abs(tp - entry_price) < min_tp:
-                            tp = (
-                                self._normalize_price(entry_price + min_tp)
-                                if side_n == "Buy"
-                                else self._normalize_price(entry_price - min_tp)
-                            )
-                        sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
-
-                lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
-                if lot <= 0 or not _is_finite(lot):
-                    return PlanOrderResult(ok=False, reason="invalid_lot_size")
+            lot = self.calculate_position_size(side_n, entry_price, sl, tp, float(confidence))
+            if lot <= 0 or not _is_finite(lot):
+                return PlanOrderResult(ok=False, reason="invalid_lot_size")
 
             # --- STRICT MAX LOT ENFORCEMENT ---
             HARD_MAX_LOT = 0.20
@@ -1329,17 +1460,16 @@ class RiskManager:
                 and float(unrealized_pl) >= 0.0
                 and float(confidence) >= float(self.cfg.ultra_confidence_min)
             ):
-                if not use_usd_tp:
-                    scale_factor = max(0.3, 1.0 - (int(open_positions) / max(1, int(max_positions))))
-                    lot = self._normalize_volume_floor(lot * scale_factor)
+                scale_factor = max(0.3, 1.0 - (int(open_positions) / max(1, int(max_positions))))
+                lot = self._normalize_volume_floor(lot * scale_factor)
 
-                    tp_bonus = 1.0 + float(getattr(self.cfg, "multi_order_tp_bonus_pct", 0.12) or 0.12)
-                    tp = (
-                        self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
-                        if side_n == "Buy"
-                        else self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
-                    )
-                    sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
+                tp_bonus = 1.0 + float(getattr(self.cfg, "multi_order_tp_bonus_pct", 0.12) or 0.12)
+                tp = (
+                    self._normalize_price(entry_price + abs(tp - entry_price) * tp_bonus)
+                    if side_n == "Buy"
+                    else self._normalize_price(entry_price - abs(tp - entry_price) * tp_bonus)
+                )
+                sl, tp = self._apply_broker_constraints(side_n, entry_price, sl, tp)
 
             # Final check
             if not _is_finite(sl, tp, lot):
@@ -1358,6 +1488,7 @@ class RiskManager:
             log_risk.error("plan_order exception: %s", exc, exc_info=True)
             return PlanOrderResult(ok=False, reason=f"exception:{type(exc).__name__}")
 
+    # ------------------- trade recording -------------------
     # ------------------- trade recording -------------------
     def record_trade(self, *args, **kwargs) -> None:
         try:
@@ -1816,6 +1947,13 @@ class RiskManager:
                 "ewma_lat": float(self.execmon.ewma_lat or 0.0),
                 "ewma_spread": float(self.execmon.ewma_spread or 0.0),
             },
+            "kill_switch": {
+                "status": str(self._kill_state.status),
+                "cooling_until_ts": float(self._kill_state.cooling_until_ts),
+                "last_expectancy": float(self._kill_state.last_expectancy),
+                "last_winrate": float(self._kill_state.last_winrate),
+                "last_trades": int(self._kill_state.last_trades),
+            },
         }
 
         with _FILE_LOCK:
@@ -1829,6 +1967,14 @@ class RiskManager:
         with _FILE_LOCK:
             raw = p.read_text(encoding="utf-8")
         st = json.loads(raw)
+
+        ks = st.get("kill_switch") or {}
+        self._kill_state.status = str(ks.get("status", self._kill_state.status) or self._kill_state.status)
+        self._kill_state.cooling_until_ts = float(ks.get("cooling_until_ts", self._kill_state.cooling_until_ts) or 0.0)
+        self._kill_state.last_expectancy = float(ks.get("last_expectancy", self._kill_state.last_expectancy) or 0.0)
+        self._kill_state.last_winrate = float(ks.get("last_winrate", self._kill_state.last_winrate) or 0.0)
+        self._kill_state.last_trades = int(ks.get("last_trades", self._kill_state.last_trades) or 0)
+        self._kill_last_status = self._kill_state.status
 
         saved_date = str(st.get("daily_date", "")).strip()
         if saved_date and saved_date != str(self._utc_date()):

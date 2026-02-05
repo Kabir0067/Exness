@@ -742,6 +742,7 @@ class SignalEngine:
                 book=book,
                 bar_key=bar_key,
                 reasons=reasons,
+                dfp=dfp,  # Pass dataframe for structure analysis
             )
 
         except Exception as exc:
@@ -1476,6 +1477,7 @@ class SignalEngine:
         book: Dict[str, Any],
         bar_key: str,
         reasons: List[str],
+        dfp: Optional[pd.DataFrame] = None,
     ) -> SignalResult:
         comp_ms = (time.perf_counter() - t0) * 1000.0
         sid = self._signal_id(sym, str(self.sp.tf_primary), bar_key, signal)
@@ -1522,6 +1524,7 @@ class SignalEngine:
                     max_positions=int(getattr(self.cfg, "max_positions", 3) or 3),
                     unrealized_pl=float(unreal_pl),
                     allow_when_blocked=bool(phase_c_block),
+                    df=dfp,
                 )
 
                 if not plan.ok:

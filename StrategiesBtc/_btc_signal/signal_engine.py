@@ -475,6 +475,7 @@ class SignalEngine:
                 book=book,
                 bar_key=bar_key,
                 reasons=reasons,
+                dfp=dfp,  # Pass dataframe for structure analysis
             )
 
         except Exception as exc:
@@ -630,14 +631,10 @@ class SignalEngine:
         else:
             conf_min = min(96, base_conf_min + 15)
 
-        # Check if fixed_volume is set - if so, prefer fixed volume over dynamic sizing
+        # Adaptive sizing only (no static lot fallbacks)
         fixed_vol = float(getattr(self.cfg, "fixed_volume", 0.0) or 0.0)
-        use_dynamic = True  # Default to dynamic sizing
-        if fixed_vol > 0:
-            # If fixed_volume is set, we'll use it as fallback, but still try dynamic first
-            # This allows dynamic sizing to work when it can, but falls back to fixed_volume
-            use_dynamic = True  # Still try dynamic, but will fallback to fixed_vol if it fails
-        
+        use_dynamic = True
+
         return {
             "conf_min": int(conf_min),
             "sl_mult": float(getattr(self.cfg, "sl_atr_mult_trend", 1.35) or 1.35),
@@ -646,7 +643,7 @@ class SignalEngine:
             "w_mul": {"trend": 1.0, "momentum": 1.0, "meanrev": 1.0, "structure": 1.0, "volume": 1.0},
             "regime": "trend",
             "phase": phase,
-            "use_dynamic_sizing": bool(use_dynamic),
+            "use_dynamic_sizing": True,
             "fixed_volume": float(fixed_vol),
         }
 
@@ -1272,6 +1269,7 @@ class SignalEngine:
         book: Dict[str, Any],
         bar_key: str,
         reasons: List[str],
+        dfp: Optional[pd.DataFrame] = None,
     ) -> SignalResult:
         comp_ms = (time.perf_counter() - t0) * 1000.0
         sid = self._signal_id(sym, str(self.sp.tf_primary), bar_key, signal)
@@ -1305,6 +1303,7 @@ class SignalEngine:
                             max_positions=int(getattr(self.cfg, "max_positions", 3) or 3),
                             unrealized_pl=float(unreal_pl),
                             allow_when_blocked=True,
+                            df=dfp,
                         )
 
                         block_reasons = list(trade_dec.reasons or [])
@@ -1353,6 +1352,7 @@ class SignalEngine:
                     max_positions=int(getattr(self.cfg, "max_positions", 3) or 3),
                     unrealized_pl=float(unreal_pl),
                     allow_when_blocked=False,
+                    df=dfp,
                 )
 
                 if entry_val is None or sl_val is None or tp_val is None or lot_val is None:

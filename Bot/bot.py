@@ -290,7 +290,7 @@ def tek_profit_put(message: telebot.types.Message) -> None:
     kb = _build_tp_usd_keyboard()
     bot.send_message(
         message.chat.id,
-        "🎛 <b>Take Profit (USD)</b>\nБарои <b>ҳамаи позицияҳои кушода</b> интихоб кунед:",
+        "🎛 <b>Take Profit (ATR-based, USD floor)</b>\nБарои <b>ҳамаи позицияҳои кушода</b> интихоб кунед:",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -366,7 +366,7 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
         kb = _build_tp_usd_keyboard()
         bot.send_message(
             call.message.chat.id,
-            "📈 <b>Take Profit (USD)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед:",
+            "📈 <b>Take Profit (ATR-based, USD floor)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед:",
             reply_markup=kb,
             parse_mode="HTML",
         )

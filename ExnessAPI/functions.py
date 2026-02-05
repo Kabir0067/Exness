@@ -26,6 +26,7 @@ from datetime import datetime
 import MetaTrader5 as mt5
 
 from mt5_client import MT5_LOCK, ensure_mt5
+
 from log_config import get_log_path
 
 # =============================================================================
@@ -57,6 +58,47 @@ _TICK_CACHE_TTL_SEC = 0.20
 # Logging (ERROR-only, rotating)
 # =============================================================================
 _ORDERS_LOG_PATH = get_log_path("functions.log")
+
+def clamp01(x: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def adaptive_risk_money(
+    equity: float,
+    base_risk_pct: float,
+    confidence: float,
+    phase: str,
+    drawdown: float,
+    *,
+    phase_factors: dict | None = None,
+    dd_cut: float = 0.10,
+    dd_mult: float = 0.5,
+) -> float:
+    if not math.isfinite(float(equity)) or equity <= 0.0:
+        return 0.0
+    br = float(base_risk_pct)
+    if not math.isfinite(br) or br <= 0.0:
+        return 0.0
+    c = clamp01(confidence)
+    pf = phase_factors or {"A": 1.2, "B": 0.8, "C": 0.5}
+    ph = str(phase or "A").upper()
+    phase_mult = float(pf.get(ph, 1.0))
+    dd = float(drawdown)
+    if not math.isfinite(dd):
+        dd = 0.0
+    dd_factor = float(dd_mult) if dd > float(dd_cut) else 1.0
+    return float(equity * br * c * phase_mult * dd_factor)
+
 
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
     logger.setLevel(level)  
@@ -834,42 +876,223 @@ def close_all_position_by_profit(
 # =============================================================================
 # USD -> TP/SL price conversion helpers
 # =============================================================================
+# =============================================================================
+# ATR-based TP helpers (volatility-adjusted)
+# =============================================================================
+_ATR_TF = mt5.TIMEFRAME_M1
+_ATR_PERIOD = 14
+_ATR_BARS = 200
+
+_TP_CONF_MIN_MULT = 1.5
+_TP_CONF_MAX_MULT = 3.0
+_TP_MIN_RR = 1.5
+
+_MANUAL_CONFIDENCE = 0.60
+_MANUAL_SL_ATR_MULT = 1.0
+_MANUAL_BASE_RISK_PCT = 0.01
+
+
+def _clamp01(x: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _tp_mult_from_conf(confidence: float) -> float:
+    c = _clamp01(confidence)
+    lo = float(_TP_CONF_MIN_MULT)
+    hi = float(_TP_CONF_MAX_MULT)
+    if hi < lo:
+        hi = lo
+    return float(lo + (hi - lo) * c)
+
+
+def _atr_wilder(highs: list[float], lows: list[float], closes: list[float], period: int) -> float:
+    n = min(len(highs), len(lows), len(closes))
+    if n <= int(period):
+        return 0.0
+    trs: list[float] = []
+    prev_close = float(closes[0])
+    for i in range(1, n):
+        hi = float(highs[i])
+        lo = float(lows[i])
+        tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        trs.append(tr)
+        prev_close = float(closes[i])
+    if len(trs) < int(period):
+        return 0.0
+    atr = sum(trs[: int(period)]) / float(period)
+    for tr in trs[int(period):]:
+        atr = (atr * (float(period) - 1.0) + tr) / float(period)
+    return float(atr)
+
+
+def _get_atr_value(symbol: str) -> float:
+    try:
+        ensure_mt5()
+        _symbol_select(symbol)
+        with MT5_LOCK:
+            rates = mt5.copy_rates_from_pos(symbol, _ATR_TF, 0, int(_ATR_BARS))
+        if rates is None or len(rates) < (_ATR_PERIOD + 2):
+            return 0.0
+        highs = [float(r["high"]) for r in rates]
+        lows = [float(r["low"]) for r in rates]
+        closes = [float(r["close"]) for r in rates]
+        return float(_atr_wilder(highs, lows, closes, int(_ATR_PERIOD)))
+    except Exception as exc:
+        log_orders.error("_get_atr_value error: %s | last_error=%s", exc, _safe_last_error())
+        return 0.0
+
+
+def _expected_profit(symbol: str, side: str, volume: float, entry: float, price2: float) -> float:
+    try:
+        order_type = mt5.ORDER_TYPE_BUY if str(side).lower() == "buy" else mt5.ORDER_TYPE_SELL
+        with MT5_LOCK:
+            val = mt5.order_calc_profit(order_type, symbol, float(volume), float(entry), float(price2))
+        return float(val) if val is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def _normalize_volume_floor(symbol: str, vol: float) -> float:
+    info = _symbol_info_cached(symbol)
+    if info is None:
+        return float(vol)
+    vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+    vmax = float(getattr(info, "volume_max", 100.0) or 100.0)
+    step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    v = max(vmin, min(float(vol), vmax))
+    n = math.floor((v - vmin) / max(step, 1e-9))
+    v_aligned = vmin + (n * step)
+    v_aligned = max(vmin, min(v_aligned, vmax))
+    return float(round(v_aligned, 8))
+
+
+def _account_equity_drawdown() -> tuple[float, float]:
+    try:
+        with MT5_LOCK:
+            acc = mt5.account_info()
+        if not acc:
+            return 0.0, 0.0
+        bal = float(getattr(acc, "balance", 0.0) or 0.0)
+        eq = float(getattr(acc, "equity", 0.0) or 0.0)
+        dd = 0.0
+        if bal > 0 and eq > 0:
+            dd = max(0.0, (bal - eq) / bal)
+        return float(eq or bal), float(dd)
+    except Exception:
+        return 0.0, 0.0
+
+
+def _adaptive_lot_for_entry(symbol: str, side: str, entry: float, sl: float, confidence: float) -> float:
+    try:
+        eq, dd = _account_equity_drawdown()
+        risk_money = adaptive_risk_money(
+            eq,
+            float(_MANUAL_BASE_RISK_PCT),
+            float(confidence),
+            "A",
+            float(dd),
+            phase_factors={"A": 1.2, "B": 0.8, "C": 0.5},
+            dd_cut=0.10,
+            dd_mult=0.5,
+        )
+        if risk_money <= 0:
+            return 0.0
+        risk_1lot = abs(_expected_profit(symbol, side, 1.0, float(entry), float(sl)))
+        if risk_1lot <= 0:
+            return 0.0
+        raw = float(risk_money) / float(risk_1lot)
+        return _normalize_volume_floor(symbol, raw)
+    except Exception:
+        return 0.0
+
+
+def _atr_tp_from_entry(
+    symbol: str,
+    side: str,
+    entry: float,
+    volume: float,
+    *,
+    confidence: float,
+    atr: float | None = None,
+    min_profit_usd: float = 0.0,
+    sl_price: float | None = None,
+) -> Optional[float]:
+    try:
+        atr_val = float(atr) if atr is not None else 0.0
+        if atr_val <= 0.0:
+            atr_val = _get_atr_value(symbol)
+        if atr_val <= 0.0:
+            return None
+
+        s = str(side).lower()
+        sign = 1.0 if s == "buy" else -1.0
+
+        mult = _tp_mult_from_conf(confidence)
+        min_mult = float(_TP_MIN_RR) * float(_MANUAL_SL_ATR_MULT)
+        if mult < min_mult:
+            mult = min_mult
+
+        tp = float(entry) + sign * atr_val * mult
+
+        if float(min_profit_usd) > 0.0:
+            profit_per_atr = abs(_expected_profit(symbol, side, float(volume), float(entry), float(entry) + sign * atr_val))
+            if profit_per_atr > 0.0:
+                mult_needed = float(min_profit_usd) / float(profit_per_atr)
+                if mult_needed > mult:
+                    mult = mult_needed
+                    tp = float(entry) + sign * atr_val * mult
+
+        if sl_price is not None and float(sl_price) > 0.0:
+            dist_sl = abs(float(entry) - float(sl_price))
+            if dist_sl > 0 and abs(tp - float(entry)) < dist_sl * float(_TP_MIN_RR):
+                tp = float(entry) + sign * dist_sl * float(_TP_MIN_RR)
+
+        return float(tp)
+    except Exception:
+        return None
+
+
 def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float]:
+    """
+    Deprecated USD-based TP conversion.
+    Now uses ATR-based TP with the USD value acting as a MINIMUM profit floor.
+    """
     try:
         symbol = str(getattr(pos, "symbol", ""))
         vol = float(getattr(pos, "volume", 0.0) or 0.0)
         open_price = float(getattr(pos, "price_open", 0.0) or 0.0)
         ptype = int(getattr(pos, "type", 0) or 0)
+        sl_price = float(getattr(pos, "sl", 0.0) or 0.0)
 
-        if not symbol or vol <= 0.0 or usd_profit <= 0.0 or open_price <= 0.0:
+        if not symbol or vol <= 0.0 or open_price <= 0.0:
             return None
 
-        info = _symbol_info_cached(symbol)
-        if info is None:
-            return None
-
-        tick_value = float(
-            (getattr(info, "trade_tick_value", 0.0) or 0.0)
-            or (getattr(info, "trade_tick_value_profit", 0.0) or 0.0)
+        side = "Buy" if ptype == mt5.POSITION_TYPE_BUY else "Sell"
+        tp = _atr_tp_from_entry(
+            symbol,
+            side,
+            open_price,
+            vol,
+            confidence=float(_MANUAL_CONFIDENCE),
+            atr=None,
+            min_profit_usd=float(usd_profit or 0.0),
+            sl_price=sl_price if sl_price > 0 else None,
         )
-        tick_size = float(
-            (getattr(info, "trade_tick_size", 0.0) or 0.0)
-            or (getattr(info, "trade_tick_size_profit", 0.0) or 0.0)
-        )
-        digits = int(getattr(info, "digits", 5) or 5)
-
-        if tick_value <= 0.0 or tick_size <= 0.0:
+        if tp is None or float(tp) <= 0.0:
             return None
 
-        ticks_needed = float(usd_profit) / (tick_value * vol)
-        if not math.isfinite(ticks_needed) or ticks_needed <= 0:
-            return None
-
-        price_delta = ticks_needed * tick_size
-        tp = open_price + price_delta if ptype == mt5.POSITION_TYPE_BUY else open_price - price_delta
-
-        tp = round(float(tp), digits)
-        return tp if tp > 0 else None
+        tp = _enforce_stop_distance_for_tp(symbol, ptype, float(tp))
+        return float(tp) if tp > 0 else None
 
     except Exception as exc:
         log_orders.error("_usd_to_tp_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
@@ -1554,16 +1777,13 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Fast market open: fixed lot=0.02, SL=-5 USD, TP=+5 USD, sync (no await)
+# Fast market open: adaptive lot + ATR-based SL/TP, sync (no await)
 # =============================================================================
-_FIXED_LOT = 0.01
-_FIXED_SL_USD = 8.0   # -8 USD
-_FIXED_TP_USD = 3.0   # +3 USD
 _SYMBOL_BTC = "BTCUSDm"     
 _SYMBOL_XAU = "XAUUSDm"
 
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
-    """One market order: lot=0.02, NO SL, TP=+5 USD. Sync."""
+    """One market order: adaptive lot, ATR-based SL/TP. Sync."""
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
         _symbol_select(symbol)
@@ -1576,30 +1796,54 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         if entry <= 0:
             return False
         ptype = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
-        fake_pos = type("_Pos", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": entry, "type": ptype})()
-        
-        # NO STOP LOSS for manual orders
-        sl = 0.0
-        
-        tp_price = _usd_to_tp_price_for_position(fake_pos, _FIXED_TP_USD)
-        tp = float(tp_price) if tp_price is not None and tp_price > 0 else 0.0
-        
+        side_n = "Buy" if is_buy else "Sell"
+
+        atr = _get_atr_value(symbol)
+        if atr <= 0:
+            atr = entry * (0.005 if "BTC" in symbol.upper() else 0.003)
+
+        sl = entry - atr * float(_MANUAL_SL_ATR_MULT) if is_buy else entry + atr * float(_MANUAL_SL_ATR_MULT)
+        sl = _enforce_stop_distance_for_sl(symbol, ptype, float(sl))
+
+        lot = _adaptive_lot_for_entry(symbol, side_n, float(entry), float(sl), float(_MANUAL_CONFIDENCE))
+        if lot <= 0:
+            log_orders.error("_place_market_order_fixed_sltp: lot calc failed symbol=%s", symbol)
+            return False
+
+        tp = _atr_tp_from_entry(
+            symbol,
+            side_n,
+            float(entry),
+            float(lot),
+            confidence=float(_MANUAL_CONFIDENCE),
+            atr=float(atr),
+            min_profit_usd=0.0,
+            sl_price=float(sl),
+        )
+        if tp is None or float(tp) <= 0:
+            return False
+
+        tp = _enforce_stop_distance_for_tp(symbol, ptype, float(tp))
+
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         req: Dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": float(_FIXED_LOT),
+            "volume": float(lot),
             "type": int(order_type),
             "position": 0,
             "price": entry,
-            "sl": 0.0,  # NO STOP LOSS
-            "tp": tp,
+            "sl": float(sl),
+            "tp": float(tp),
             "deviation": int(DEFAULT_DEVIATION),
             "magic": int(DEFAULT_MAGIC),
-            "comment": "open_fixed_tp_only",
+            "comment": "open_atr_sltp",
             "type_filling": int(_best_filling_type(symbol)),
             "type_time": mt5.ORDER_TIME_GTC,
         }
+
+        tp_mult = _tp_mult_from_conf(float(_MANUAL_CONFIDENCE))
+        tp_mult = max(tp_mult, float(_TP_MIN_RR) * float(_MANUAL_SL_ATR_MULT))
 
         def _refresh(rq: Dict[str, Any], attempt: int) -> None:
             t = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
@@ -1608,12 +1852,13 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             p = float(t.ask if is_buy else t.bid)
             if p > 0:
                 rq["price"] = p
-                # Only update TP, no SL
-                if tp > 0:
-                    fp = type("_P", (), {"symbol": symbol, "volume": _FIXED_LOT, "price_open": p, "type": ptype})()
-                    top = _usd_to_tp_price_for_position(fp, _FIXED_TP_USD)
-                    if top is not None and top > 0:
-                        rq["tp"] = float(top)
+                sl2 = p - float(atr) * float(_MANUAL_SL_ATR_MULT) if is_buy else p + float(atr) * float(_MANUAL_SL_ATR_MULT)
+                sl2 = _enforce_stop_distance_for_sl(symbol, ptype, float(sl2))
+                tp2 = p + (float(atr) * tp_mult if is_buy else -float(atr) * tp_mult)
+                tp2 = _enforce_stop_distance_for_tp(symbol, ptype, float(tp2))
+                if tp2 > 0:
+                    rq["sl"] = float(sl2)
+                    rq["tp"] = float(tp2)
 
         ok, _, _ = _send_with_retries(
             req,
@@ -1628,9 +1873,8 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         log_orders.error("_place_market_order_fixed_sltp error: symbol=%s side=%s %s", symbol, side, exc)
         return False
 
-
 def open_buy_order_btc(count: int) -> int:
-    """Open `count` market BUY on BTCUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    """Open `count` market BUY on BTCUSDm. Adaptive lot + ATR SL/TP, sync."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Buy"):
@@ -1639,7 +1883,7 @@ def open_buy_order_btc(count: int) -> int:
 
 
 def open_buy_order_xau(count: int) -> int:
-    """Open `count` market BUY on XAUUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    """Open `count` market BUY on XAUUSDm. Adaptive lot + ATR SL/TP, sync."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Buy"):
@@ -1648,7 +1892,7 @@ def open_buy_order_xau(count: int) -> int:
 
 
 def open_sell_order_btc(count: int) -> int:
-    """Open `count` market SELL on BTCUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    """Open `count` market SELL on BTCUSDm. Adaptive lot + ATR SL/TP, sync."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Sell"):
@@ -1657,7 +1901,7 @@ def open_sell_order_btc(count: int) -> int:
 
 
 def open_sell_order_xau(count: int) -> int:
-    """Open `count` market SELL on XAUUSDm. Lot=0.02, SL=-5 USD, TP=+5 USD, sync."""
+    """Open `count` market SELL on XAUUSDm. Adaptive lot + ATR SL/TP, sync."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Sell"):
