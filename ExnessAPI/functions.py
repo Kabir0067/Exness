@@ -1782,96 +1782,62 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
 _SYMBOL_BTC = "BTCUSDm"     
 _SYMBOL_XAU = "XAUUSDm"
 
+
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
-    """One market order: adaptive lot, ATR-based SL/TP. Sync."""
+    """DEFAULT SIMPLE ORDER: lot=0.02, TP=2 USD, SL=0"""
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
         _symbol_select(symbol)
-        tick = _tick_cached(symbol)
-        if not tick:
-            log_orders.error("_place_market_order_fixed_sltp: tick missing symbol=%s", symbol)
+
+        tick = mt5.symbol_info_tick(symbol)
+        info = mt5.symbol_info(symbol)
+        if not tick or not info:
             return False
-        is_buy = str(side).lower() == "buy"
+
+        is_buy = side.lower() == "buy"
         entry = float(tick.ask if is_buy else tick.bid)
         if entry <= 0:
             return False
-        ptype = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
-        side_n = "Buy" if is_buy else "Sell"
 
-        atr = _get_atr_value(symbol)
-        if atr <= 0:
-            atr = entry * (0.005 if "BTC" in symbol.upper() else 0.003)
+        lot = 0.01
+        profit_usd = 2.0
+        sl = 0.0  # ❌ NO STOP LOSS
 
-        sl = entry - atr * float(_MANUAL_SL_ATR_MULT) if is_buy else entry + atr * float(_MANUAL_SL_ATR_MULT)
-        sl = _enforce_stop_distance_for_sl(symbol, ptype, float(sl))
+        tick_size = info.trade_tick_size
+        tick_value = info.trade_tick_value
 
-        lot = _adaptive_lot_for_entry(symbol, side_n, float(entry), float(sl), float(_MANUAL_CONFIDENCE))
-        if lot <= 0:
-            log_orders.error("_place_market_order_fixed_sltp: lot calc failed symbol=%s", symbol)
+        if tick_size <= 0 or tick_value <= 0:
             return False
 
-        tp = _atr_tp_from_entry(
-            symbol,
-            side_n,
-            float(entry),
-            float(lot),
-            confidence=float(_MANUAL_CONFIDENCE),
-            atr=float(atr),
-            min_profit_usd=0.0,
-            sl_price=float(sl),
-        )
-        if tp is None or float(tp) <= 0:
-            return False
+        price_delta = (profit_usd * tick_size) / (tick_value * lot)
 
-        tp = _enforce_stop_distance_for_tp(symbol, ptype, float(tp))
+        tp = entry + price_delta if is_buy else entry - price_delta
+        tp = round(tp, info.digits)
 
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-        req: Dict[str, Any] = {
+
+        request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": float(lot),
-            "type": int(order_type),
-            "position": 0,
+            "volume": lot,
+            "type": order_type,
             "price": entry,
-            "sl": float(sl),
-            "tp": float(tp),
-            "deviation": int(DEFAULT_DEVIATION),
-            "magic": int(DEFAULT_MAGIC),
-            "comment": "open_atr_sltp",
-            "type_filling": int(_best_filling_type(symbol)),
+            "sl": sl,
+            "tp": tp,
+            "deviation": DEFAULT_DEVIATION,
+            "magic": DEFAULT_MAGIC,
+            "comment": "fixed_lot_tp2_sl0",
+            "type_filling": _best_filling_type(symbol),
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
-        tp_mult = _tp_mult_from_conf(float(_MANUAL_CONFIDENCE))
-        tp_mult = max(tp_mult, float(_TP_MIN_RR) * float(_MANUAL_SL_ATR_MULT))
+        result = mt5.order_send(request)
+        return result and result.retcode == mt5.TRADE_RETCODE_DONE
 
-        def _refresh(rq: Dict[str, Any], attempt: int) -> None:
-            t = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
-            if not t:
-                return
-            p = float(t.ask if is_buy else t.bid)
-            if p > 0:
-                rq["price"] = p
-                sl2 = p - float(atr) * float(_MANUAL_SL_ATR_MULT) if is_buy else p + float(atr) * float(_MANUAL_SL_ATR_MULT)
-                sl2 = _enforce_stop_distance_for_sl(symbol, ptype, float(sl2))
-                tp2 = p + (float(atr) * tp_mult if is_buy else -float(atr) * tp_mult)
-                tp2 = _enforce_stop_distance_for_tp(symbol, ptype, float(tp2))
-                if tp2 > 0:
-                    rq["sl"] = float(sl2)
-                    rq["tp"] = float(tp2)
-
-        ok, _, _ = _send_with_retries(
-            req,
-            retries=max(1, DEFAULT_RETRIES),
-            success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
-            sleep_base=_CLOSE_RETRY_BASE_SEC,
-            sleep_cap=_CLOSE_RETRY_CAP_SEC,
-            refresh_before_send=_refresh,
-        )
-        return bool(ok)
-    except Exception as exc:
-        log_orders.error("_place_market_order_fixed_sltp error: symbol=%s side=%s %s", symbol, side, exc)
+    except Exception as e:
+        log_orders.error("fixed simple order error %s %s", symbol, e)
         return False
+
 
 def open_buy_order_btc(count: int) -> int:
     """Open `count` market BUY on BTCUSDm. Adaptive lot + ATR SL/TP, sync."""
