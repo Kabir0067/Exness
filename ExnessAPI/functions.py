@@ -1815,6 +1815,7 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         tp = round(tp, info.digits)
 
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+        print(" رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ - (Кабир 🤲🏼)")
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -1830,6 +1831,9 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             "type_filling": _best_filling_type(symbol),
             "type_time": mt5.ORDER_TIME_GTC,
         }
+
+        print(f"\n[MANUAL EXECUTION] {symbol} {side}")
+        log_orders.info(f"MANUAL_EXEC_START | {symbol} | {side} | Verse Printed")
 
         result = mt5.order_send(request)
         return result and result.retcode == mt5.TRADE_RETCODE_DONE
