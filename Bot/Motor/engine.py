@@ -8,6 +8,7 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime
+from dataclasses import replace
 from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 import MetaTrader5 as mt5
@@ -489,8 +490,7 @@ class MultiAssetTradingEngine:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         return f"PORD_{asset}_{ts}_{self._order_counter}_{os.getpid()}"
 
-    @staticmethod
-    def _candidate_is_tradeable(c: AssetCandidate) -> bool:
+    def _candidate_is_tradeable(self, c: AssetCandidate) -> bool:
         if c.signal not in ("Buy", "Sell"):
             return False
         if c.blocked:
@@ -499,9 +499,15 @@ class MultiAssetTradingEngine:
             return False
         if c.sl <= 0.0 or c.tp <= 0.0:
             return False
-        # STRICT: only trade if confidence >= 0.85 (85%+)
-        if float(c.confidence) < 0.85:
+        
+        # DYNAMIC CONFIDENCE CHECK (Config-based)
+        # Use config specific to the asset
+        cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
+        min_conf = float(getattr(cfg, "min_confidence_signal", 0.80) or 0.80)
+        
+        if float(c.confidence) < min_conf:
             return False
+            
         return True
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
@@ -1205,6 +1211,16 @@ class MultiAssetTradingEngine:
                     if not self._candidate_is_tradeable(selected):
                         # Detect if it was a high-confidence signal that was blocked (Hard Stop)
                         # We notify here because _candidate_is_tradeable returned False.
+                        
+                        # ENHANCEMENT: Explicitly add "low_confidence" reason if that was the cause
+                        cfg = self._xau_cfg if selected.asset == "XAU" else self._btc_cfg
+                        min_conf = float(getattr(cfg, "min_confidence_signal", 0.80) or 0.80)
+                        
+                        if float(selected.confidence) < min_conf:
+                             # Create a modified copy with the new reason for notification
+                             new_reasons = tuple(selected.reasons) + (f"low_confidence:{selected.confidence:.2f}<{min_conf:.2f}",)
+                             selected = replace(selected, reasons=new_reasons)
+
                         if (getattr(selected, "blocked", False) or getattr(selected, "reasons", None)) and hasattr(self, "_skip_notifier") and self._skip_notifier:
                              # Check duplicate to prevent spamming the same blocked signal
                              if not self._is_duplicate(selected.asset, selected.signal_id, time.time(), max_orders=1, order_index=999):

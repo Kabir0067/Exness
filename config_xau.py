@@ -687,7 +687,7 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
     # Keep your original behavior; only clean assignments.
-    cfg.min_confidence_signal = 0.85
+    cfg.min_confidence_signal = 0.80
     cfg.ultra_confidence_min = 0.90
     cfg.max_risk_per_trade = 0.02
     cfg.tp_atr_mult_trend = 2.7
