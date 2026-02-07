@@ -191,6 +191,18 @@ def _is_callback_query_expired(exc: Exception) -> bool:
     return False
 
 
+def _is_message_not_modified(exc: Exception) -> bool:
+    """Check if error is 'message is not modified' (content is same)."""
+    if isinstance(exc, ApiTelegramException):
+        try:
+            code = int(getattr(exc, "error_code", 0) or 0)
+            desc = str(getattr(exc, "description", "") or "").lower()
+            return code == 400 and "message is not modified" in desc
+        except Exception:
+            pass
+    return False
+
+
 def tg_call(
     fn: Callable[..., Any],
     *args: Any,
@@ -207,6 +219,10 @@ def tg_call(
             # Silently ignore benign callback query timeout errors
             if _is_callback_query_expired(exc):
                 return None  # Silent fail - this is expected when user clicks old buttons
+
+            # Silently ignore "message is not modified"
+            if _is_message_not_modified(exc):
+                return None
             
             should_retry = _should_retry(exc) and attempt < max_retries
             if not should_retry:
