@@ -38,8 +38,46 @@ from .utils import (
     _utcnow,
     percentile_rank,
     adaptive_risk_money,
+    percentile_rank,
+    adaptive_risk_money,
     atr_take_profit,
 )
+
+
+@dataclass
+class KillSwitchState:
+    status: str = "ACTIVE"
+    cooling_until_ts: float = 0.0
+    last_expectancy: float = 0.0
+    last_winrate: float = 0.0
+    last_trades: int = 0
+
+    def update(self, profits: List[float], now: float, min_trades: int, kill_expectancy: float, kill_winrate: float, cooling_expectancy: float, cooling_sec: float) -> None:
+        self.last_trades = len(profits)
+        if self.last_trades < min_trades:
+            return  # Not enough data, keep status
+
+        wins = sum(1 for p in profits if p > 0)
+        # Avoid numpy dependency here if possible, or use it if imported
+        avg_win = float(np.mean([p for p in profits if p > 0])) if wins > 0 else 0.0
+        losses = [abs(p) for p in profits if p <= 0]
+        avg_loss = float(np.mean(losses)) if losses else 0.0
+        
+        self.last_winrate = wins / self.last_trades if self.last_trades > 0 else 0.0
+        self.last_expectancy = (self.last_winrate * avg_win) - ((1.0 - self.last_winrate) * avg_loss)
+
+        # Logic
+        if self.last_expectancy < kill_expectancy:
+            self.status = "KILLED"
+        elif self.last_expectancy < cooling_expectancy:
+             if self.status != "COOLING":
+                 self.status = "COOLING"
+                 self.cooling_until_ts = now + cooling_sec
+        else:
+            if self.status == "COOLING" and now < self.cooling_until_ts:
+                pass 
+            else:
+                self.status = "ACTIVE"
 
 
 @dataclass
@@ -134,7 +172,22 @@ class RiskManager:
         self._survival_last_flush_ts: float = 0.0
         self._survival_last_update_emit: Dict[str, float] = {}
         self._survival_max_size: int = int(getattr(self.cfg, "signal_survival_max_entries", 1000) or 1000)
+        self._survival_max_size: int = int(getattr(self.cfg, "signal_survival_max_entries", 1000) or 1000)
         self._init_signal_survival()
+
+        # --- FIX: Kill Switch Initialization (Critical) ---
+        self._kill_last_check_ts: float = 0.0
+        self._kill_check_interval_sec: float = 60.0
+        self._kill_state = KillSwitchState()
+        
+        # Configurable thresholds (or defaults)
+        self._kill_history_days = float(getattr(self.cfg, "kill_switch_lookback_days", 1) or 1)
+        self._kill_min_trades = int(getattr(self.cfg, "kill_switch_min_trades", 5) or 5)
+        self._kill_expectancy_threshold = float(getattr(self.cfg, "kill_switch_expectancy", -50.0) or -50.0) # Very loose default
+        self._kill_winrate_threshold = float(getattr(self.cfg, "kill_switch_min_winrate", 0.05) or 0.05)
+        self._cooling_expectancy_threshold = float(getattr(self.cfg, "kill_switch_cooling_expectancy", -20.0) or -20.0)
+        self._cooling_duration_sec = float(getattr(self.cfg, "kill_switch_cooling_sec", 1800.0) or 1800.0)
+        # --------------------------------------------------
 
         # Execution hist (fast RAM + periodic flush, with memory limits)
         self._slip_bins = [-float("inf"), -50, -30, -20, -10, -5, 0, 5, 10, 20, 30, 50, float("inf")]
@@ -720,32 +773,33 @@ class RiskManager:
                         prev_b, self.current_phase, daily_realized, target,
                     )
 
-            # LOSS -> Phase B/C
-            # Сначала проверяем loss_c (более критичный) - если превышен, сразу в C
-            if loss_c > 0 and daily_equity <= -loss_c:
-                prev_c = str(self.current_phase)
-                # C is REAL now (trade-block). Hard stop only if extreme below max_loss and limits enabled.
-                self._set_phase("C", "daily_loss_c")
-                self._enter_soft_stop("daily_loss_c")
-                if prev_c != "C":
-                    log_risk.error(
-                        "PHASE_CHANGE | %s->%s | reason=daily_loss_c daily_return=%.4f loss_c=%.4f",
-                        prev_c, self.current_phase, daily_equity, loss_c,
-                    )
-            # Если loss_c не превышен, но превышен loss_b - переходим в B
-            elif loss_b > 0 and daily_realized <= -loss_b:
-                prev_b = str(self.current_phase)
-                self._set_phase("B", "daily_loss_b")
-                if prev_b != self.current_phase:
-                    log_risk.error(
-                        "PHASE_CHANGE | %s->%s | reason=daily_loss_b daily_return=%.4f loss_b=%.4f",
-                        prev_b, self.current_phase, daily_realized, loss_b,
-                    )
+            # =================================================================
+            # TIERED DAILY DRAWDOWN LOGIC (Aggressive "Money Maker" Mode)
+            # Old: -3% -> B, -5% -> C (Too conservative)
+            # New: -15% -> B, -40% -> C (Aggressive)
+            # =================================================================
+            PHASE_B_DRAWDOWN_TRIGGER = -0.15  # -15% triggers defensive mode
+            HARD_STOP_DRAWDOWN_TRIGGER = -0.40  # -40% triggers hard stop
 
-            # HARD STOP (absolute)
-            if bool(getattr(self.cfg, "enforce_daily_limits", False)):
-                if daily_equity <= -max_loss:
-                    self._enter_hard_stop("max_daily_loss")
+            # Trigger 1: -15% Loss -> Phase B (Defensive Mode)
+            if daily_equity <= PHASE_B_DRAWDOWN_TRIGGER and self.current_phase == "A":
+                prev = str(self.current_phase)
+                self._set_phase("B", "drawdown_defensive_15pct")
+                log_risk.warning(
+                    "PHASE_B_ACTIVATED | daily_loss=%.2f%% EXCEEDS 15%% | phase=%s->B | DEFENSIVE MODE",
+                    abs(daily_equity) * 100,
+                    prev,
+                )
+
+            # Trigger 2: -40% Loss -> HARD STOP (Kill Switch)
+            if daily_equity <= HARD_STOP_DRAWDOWN_TRIGGER and self.current_phase != "C":
+                prev = str(self.current_phase)
+                self._enter_hard_stop("emergency_40pct_hard_stop")
+                log_risk.error(
+                    "HARD_STOP_ACTIVATED | daily_loss=%.2f%% EXCEEDS 40%% LIMIT | phase=%s->C",
+                    abs(daily_equity) * 100,
+                    prev,
+                )
 
             # PROFIT PROTECT: after hitting target/peak, if equity falls from peak too much -> stop trading
             if protect_peak_dd > 0:
@@ -1254,6 +1308,73 @@ class RiskManager:
             log_risk.error("_calculate_structure_sl error: %s", exc)
             return entry, "structure_error"
 
+    # ------------------- trailing stop / breakeven -------------------
+    def check_trailing_stop(
+        self,
+        current_price: float,
+        entry_price: float,
+        sl_price: float,
+        tp_price: float,
+        side: str,
+        atr: float
+    ) -> Optional[float]:
+        """
+        Logic:
+        1. Breakeven: If Profit >= 40% of MaxProfit -> Move SL to Entry.
+        2. Trailing: After BE, trail by 1.5 * ATR.
+        """
+        try:
+            side_n = _side_norm(side)
+            dist_total = abs(tp_price - entry_price)
+            if dist_total <= 1e-9:
+                return None
+                
+            current_dist = 0.0
+            if side_n == "Buy":
+                current_dist = current_price - entry_price
+            else:
+                current_dist = entry_price - current_price
+                
+            # 1. Breakeven Check (40% to TP)
+            progress = current_dist / dist_total
+            new_sl = None
+            
+            # Breakeven Level
+            if progress >= 0.40:
+                # Target SL = Entry (plus small buffer maybe? strict Entry for now)
+                be_price = entry_price
+                
+                # Check if we can improve current SL
+                if side_n == "Buy":
+                    if sl_price < be_price:
+                        new_sl = be_price
+                else:
+                    if sl_price > be_price:
+                        new_sl = be_price
+                        
+            # 2. Trailing Stop (1.5x ATR) if we are in profit
+            # Only trail if we are profitable (e.g. past BE or significantly up)
+            if progress > 0.40: 
+                trail_dist = atr * 1.5
+                if side_n == "Buy":
+                    trail_target = current_price - trail_dist
+                    # Only move UP
+                    current_sl_to_use = new_sl if new_sl is not None else sl_price
+                    if trail_target > current_sl_to_use:
+                        new_sl = trail_target
+                else:
+                    trail_target = current_price + trail_dist
+                    # Only move DOWN
+                    current_sl_to_use = new_sl if new_sl is not None else sl_price
+                    if trail_target < current_sl_to_use:
+                        new_sl = trail_target
+                        
+            return new_sl
+            
+        except Exception as exc:
+            log_risk.error("check_trailing_stop error: %s", exc)
+            return None
+
     def plan_order(
         self,
         side: str,
@@ -1320,9 +1441,28 @@ class RiskManager:
                 atr = 0.0
             
             if atr <= 1e-9:
-                atr = max(abs(entry_price - float(sl)), entry_price * 0.005) # 0.5% fallback for BTC
+                atr = max(abs(entry_price - float(sl or 0)), entry_price * 0.005) # 0.5% fallback for BTC
 
-            # 2. Calculate ATR-Based SL (BTC: 2.0x - 2.5x ATR)
+            # =================================================================
+            # SNIPER MODE: KILL ZONE FILTER
+            # =================================================================
+            # Reject if market is dead (low volatility)
+            # BTC needs larger threshold than Gold due to scale
+            min_vol_threshold = entry_price * 0.00025  # 0.025% move required for BTC
+            if tick_volatility < min_vol_threshold and atr < (entry_price * 0.001):
+                log_risk.info(f"SNIPER_REJECT | {side_n} | Low Volatility: TickVol={tick_volatility:.2f} ATR={atr:.2f}")
+                return None, None, None, None, "kill_zone_low_volatility"
+
+            # Reject if we are in "Noise" (price too close to recent structure loops)
+            # (Simplified: We rely on Spread/ATR ratio)
+            spread = self.broker.current_spread_points() * float(self.broker.point_value())
+            if spread > 0 and (atr / spread) < 2.0:
+                 log_risk.info(f"SNIPER_REJECT | {side_n} | High Spread/Noise Ratio: ATR/Spread = {atr/spread:.2f}")
+                 return None, None, None, None, "kill_zone_high_noise"
+            # =================================================================
+
+            # 2. Calculate ATR-Based SL (Base 2.5x for Volatility Survival)
+            # CRITICAL OPTIMIZATION: Wide Base SL to survive noise
             sl_mult_atr = 2.5
             atr_sl_dist = atr * sl_mult_atr
             
@@ -1334,31 +1474,37 @@ class RiskManager:
             # 3. Structure SL
             struct_sl_price, struct_reason = self._calculate_structure_sl(side_n, entry_price, df)
             
-            # 4. Final SL (Wider)
+            # 4. Final SL (Structure Priority + Buffer)
+            # The user wants SL behind Swings + Buffer.
+            sl_buffer = atr * 0.5  # 0.5 ATR buffer behind the swing
             final_sl = atr_sl_price
             sl_source = "ATR_2.5x"
-            if side_n == "Buy":
-                if struct_reason == "swing_low" and struct_sl_price < atr_sl_price:
-                    final_sl = struct_sl_price
-                    sl_source = "Structure_Low"
-                else:
-                    final_sl = min(atr_sl_price, struct_sl_price)
-                    if final_sl == struct_sl_price:
-                        sl_source = "Structure_Low"
-            else:
-                if struct_reason == "swing_high" and struct_sl_price > atr_sl_price:
-                    final_sl = struct_sl_price
-                    sl_source = "Structure_High"
-                else:
-                    final_sl = max(atr_sl_price, struct_sl_price)
-                    if final_sl == struct_sl_price:
-                        sl_source = "Structure_High"
 
-            # 5. Safety Check (0.2%)
+            if side_n == "Buy":
+                if struct_reason == "swing_low" and struct_sl_price < entry_price:
+                    # Use structure low -> subtract buffer
+                    final_sl = struct_sl_price - sl_buffer
+                    sl_source = "Structure_Low_Buffered"
+                else:
+                    # No structure? Use Wide ATR (Sniper patience: maybe reject? For now use wide ATR)
+                    final_sl = entry_price - (atr * 2.5)
+                    sl_source = "ATR_Fallback_Wide"
+            else:
+                if struct_reason == "swing_high" and struct_sl_price > entry_price:
+                    # Use structure high -> add buffer
+                    final_sl = struct_sl_price + sl_buffer
+                    sl_source = "Structure_High_Buffered"
+                else:
+                    final_sl = entry_price + (atr * 2.5)
+                    sl_source = "ATR_Fallback_Wide"
+
+            # 5. Safety Check (Min Distance)
             min_dist_pct = 0.002
             min_safety_dist = entry_price * min_dist_pct
-            if abs(entry_price - final_sl) < min_safety_dist:
-                log_risk.info(f"SL too close (Distance < {min_safety_dist:.5f}). Force-Widening.")
+            real_dist = abs(entry_price - final_sl)
+            
+            if real_dist < min_safety_dist:
+                log_risk.info(f"SNIPER_ADJUST | SL too close ({real_dist:.2f}). Widening to {min_safety_dist:.2f}")
                 if side_n == "Buy":
                     final_sl = entry_price - min_safety_dist
                 else:
@@ -1368,9 +1514,8 @@ class RiskManager:
             sl = self.broker.normalize_price(final_sl)
 
             log_risk.info(
-                f"SL_CALC | Symbol: {self.symbol} | Side: {side_n} | ATR: {atr:.5f} | "
-                f"ATR_SL: {atr_sl_price:.5f} | Struct_SL: {struct_sl_price:.5f} ({struct_reason}) | "
-                f"Final_SL: {sl:.5f} ({sl_source}) | Dist: {abs(entry_price - sl):.5f}"
+                f"SNIPER_SL | Symbol: {self.symbol} | Side: {side_n} | Source: {sl_source} | "
+                f"Entry: {entry_price:.2f} | SL: {sl:.2f} | Dist: {abs(entry_price - sl):.2f}"
             )
 
             # --- Restore Broker Min Limits (deleted in previous step) ---
@@ -1389,19 +1534,21 @@ class RiskManager:
                 if abs(entry_price - float(sl)) < min_sl:
                     sl = self.broker.normalize_price(entry_price + min_sl)
 
-            # --- ATR-based TP (confidence-scaled) ---
-            atr = 0.0
-            try:
-                atr = float((adapt or {}).get("atr", 0.0) or ind.get("atr", 0.0) or 0.0)
-            except Exception:
-                atr = 0.0
-            if atr <= 1e-9:
-                # Fallback to SL distance or 0.5% of price (BTC-safe)
-                atr = max(abs(entry_price - float(sl)), entry_price * 0.005)
-
-            tp_min_mult = float(getattr(self.cfg, "tp_conf_min_mult", 1.5) or 1.5)
-            tp_max_mult = float(getattr(self.cfg, "tp_conf_max_mult", 3.0) or 3.0)
-            tp = atr_take_profit(entry_price, atr, side_n, float(confidence), min_mult=tp_min_mult, max_mult=tp_max_mult)
+            # CRITICAL OPTIMIZATION: Dynamic TP (Scalp vs Swing)
+            # Conf < 85 -> Scalp Mode (1.5x Risk)
+            # Conf >= 85 -> Swing Mode (2.5x Risk)
+            dist_sl_p = abs(entry_price - atr_sl_price)
+            if float(confidence) >= 85:
+                 # Swing Mode
+                 tp_dist = dist_sl_p * 2.5
+            else:
+                 # Scalp Mode
+                 tp_dist = dist_sl_p * 1.5
+             
+            if side_n == "Buy":
+                 tp = entry_price + tp_dist
+            else:
+                 tp = entry_price - tp_dist
 
             # Enforce minimum TP distance
             if side_n == "Buy":
@@ -1424,9 +1571,9 @@ class RiskManager:
                 log_risk.info("plan_order blocked: bad_sell_limits tp=%s entry=%s sl=%s", tp, entry_price, sl)
                 return None, None, None, None, f"bad_sell_limits:tp={tp},en={entry_price},sl={sl}"
 
-            # Enforce RR >= 1.5
-            rr_cfg = float(getattr(self.cfg, "min_rr", 1.0) or 1.0)
-            rr_min = max(rr_cfg, 1.5)
+            # Enforce SNIPER RR >= 2.0
+            rr_cfg = float(getattr(self.cfg, "min_rr", 2.0) or 2.0)
+            rr_min = max(rr_cfg, 2.0) # FORCE 2.0
             dist_sl = abs(entry_price - float(sl))
             if dist_sl > 0:
                 dist_tp = abs(float(tp) - entry_price)

@@ -81,6 +81,7 @@ class ExecutionWorker(threading.Thread):
                 enqueue_time=float(intent.enqueue_time),
                 magic=int(getattr(intent.cfg, "magic", 777001) or 777001),
                 comment=str(getattr(intent.cfg, "comment", "portfolio") or "portfolio"),
+                cfg=intent.cfg,  # Pass Config for Dry Run
             )
             ex = self._build_executor()
             hooks = self._get_telemetry_hooks(intent)

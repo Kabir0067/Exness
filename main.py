@@ -18,7 +18,7 @@ import urllib3
 
 TG_HEALTH_NOTIFY = False
 
-from Bot.bot import bot, ADMIN, bot_commands
+from Bot.bot import bot, ADMIN, bot_commands, send_signal_notification
 from Bot.portfolio_engine import engine
 from log_config import LOG_DIR as LOG_ROOT, get_log_path, log_dir_stats
 
@@ -84,6 +84,36 @@ def sleep_interruptible(stop_event: Event, seconds: float) -> None:
         if left <= 0:
             return
         stop_event.wait(timeout=min(0.5, left))
+
+
+
+class SingletonInstance:
+    """
+    Ensure only one instance of the bot runs by binding a TCP socket.
+    If the port is already in use, we assume another instance is running and exit.
+    """
+    def __init__(self, port: int = 12345):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._port = int(port)
+        self._lock_success = False
+
+    def __enter__(self):
+        try:
+            # Bind to localhost on the specific port
+            self._socket.bind(("127.0.0.1", self._port))
+            self._lock_success = True
+            return self
+        except socket.error:
+            # Port is already in use
+            self._lock_success = False
+            raise RuntimeError(f"Another instance is already running on port {self._port}")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._lock_success:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True)
@@ -499,12 +529,33 @@ def run_engine_notify_worker(stop_event: Event) -> None:
 # Main
 # ==========================
 def main(argv: Optional[list[str]] = None) -> int:
+    try:
+        # Use a context manager to hold the socket lock for the duration of main()
+        with SingletonInstance(port=12345):
+            return _main_inner(argv)
+    except RuntimeError as e:
+        print(f"FATAL: {e}")
+        return 1
+    except Exception as e:
+        print(f"FATAL: Singleton check failed: {e}")
+        return 1
+
+
+def _main_inner(argv: Optional[list[str]] = None) -> int:
     shutdown = GracefulShutdown()
 
     parser = argparse.ArgumentParser(description="XAUUSDm Scalping System (Exness MT5) - Production Runner")
     parser.add_argument("--headless", action="store_true", help="Оғоз бе Telegram (ҳолати VPS)")
     parser.add_argument("--engine-only", action="store_true", help="Фақат мотор, бе бот")
     args = parser.parse_args(argv)
+
+    # ==========================
+    # WIRING: Signal Flow
+    # ==========================
+    # Explicitly connect Engine -> Bot
+    # This ensures signals generated in engine.py reach Bot/bot.py -> Telegram
+    engine.set_signal_notifier(send_signal_notification)
+    log.info("SIGNAL_NOTIFIER_WIRED | Engine -> Bot connected")
 
     notifier = Notifier(shutdown.stop_event, queue_max=200)
     notifier.start()
@@ -520,8 +571,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         daemon=True,
     )
     notify_worker_thread.start()
-
-    notifier.notify("✅ System boot")
 
     engine_thread = Thread(
         target=run_engine_supervisor,

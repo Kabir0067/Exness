@@ -153,6 +153,9 @@ class MultiAssetTradingEngine:
     def set_signal_notifier(self, cb: Optional[Callable[[str, Any], None]]) -> None:
         self._signal_notifier = cb
 
+    def set_skip_notifier(self, cb: Optional[Callable[[AssetCandidate], None]]) -> None:
+        self._skip_notifier = cb
+
     # -------------------- MT5 init/health --------------------
     def _init_mt5(self) -> bool:
         try:
@@ -1197,7 +1200,20 @@ class MultiAssetTradingEngine:
 
                     # 2. EXECUTION LOGIC (Strict)
                     # Hard-filter: Must be strictly tradeable (not blocked, good prices, etc)
+                    # 2. EXECUTION LOGIC (Strict)
+                    # Hard-filter: Must be strictly tradeable (not blocked, good prices, etc)
                     if not self._candidate_is_tradeable(selected):
+                        # Detect if it was a high-confidence signal that was blocked (Hard Stop)
+                        # We notify here because _candidate_is_tradeable returned False.
+                        if (getattr(selected, "blocked", False) or getattr(selected, "reasons", None)) and hasattr(self, "_skip_notifier") and self._skip_notifier:
+                             # Check duplicate to prevent spamming the same blocked signal
+                             if not self._is_duplicate(selected.asset, selected.signal_id, time.time(), max_orders=1, order_index=999):
+                                 try:
+                                     self._skip_notifier(selected)
+                                     # Mark seen to update cooldown
+                                     self._mark_seen(selected.asset, selected.signal_id, time.time())
+                                 except Exception:
+                                     pass
                         continue
 
                     # Double-check Manual Stop for execution only
@@ -1261,6 +1277,12 @@ class MultiAssetTradingEngine:
                                     int(order_count),
                                     ",".join(selected.reasons) if selected.reasons else "-",
                                 )
+                                # Notify user about skipped signal (Hard Stop / Filtered) if configured
+                                if hasattr(self, "_skip_notifier") and self._skip_notifier:
+                                    try:
+                                        self._skip_notifier(selected)
+                                    except Exception:
+                                        pass
 
                 consecutive_errors = 0
 

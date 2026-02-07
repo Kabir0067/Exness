@@ -266,6 +266,7 @@ class EngineConfig:
     enforce_drawdown_limits: bool = False
     ignore_external_positions: bool = True
     magic: int = 777001
+    dry_run: bool = False  # SIMULATION MODE: If True, logic runs but NO orders sent.
 
     min_confidence_signal: float = 0.85
     conf_min: int = 85
@@ -676,6 +677,7 @@ def get_config_from_env() -> EngineConfig:
         server=_env_required("EXNESS_SERVER"),
         telegram_token=_env_required("BOT_TOKEN"),
         admin_id=_env_int("ADMIN_ID"),
+        dry_run=_env_bool("DRY_RUN", False),
     )
     cfg.validate()
     return cfg

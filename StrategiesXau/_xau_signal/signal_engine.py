@@ -188,26 +188,11 @@ class SignalEngine:
             # Reject signals in low-volume conditions (choppy markets)
             # BUT: Skip check during first 15 seconds of bar (volume is naturally low)
             # ==============================================================
-            try:
-                if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
-                    # Only apply volume filter after bar has had time to accumulate volume
-                    bar_age_ok = last_age >= 15.0  # Wait 15s for volume to build
-                    if bar_age_ok:
-                        vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
-                        current_vol = float(dfp["tick_volume"].iloc[-1])
-                        vol_multiplier = float(getattr(self.cfg, "volume_filter_mult", 0.4) or 0.4)
-                        if current_vol < vol_ma * vol_multiplier:
-                            return self._neutral(
-                                sym,
-                                [f"low_volume:{current_vol:.0f}<{vol_ma * vol_multiplier:.0f}", "sniper_reject"],
-                                t0,
-                                spread_pct=spread_pct,
-                                bar_key=bar_key,
-                                regime=_as_regime(adapt.get("regime")),
-                                trade_blocked=True,
-                            )
-            except Exception:
-                pass  # Continue if volume check fails
+            # ==============================================================
+            # SNIPER LOGIC #1: Volume Validation (Moved to after Confidence)
+            # ==============================================================
+            # (Volume check removed from here to allow confidence-based filtering)
+            pass
 
             # HTF alignment (FIXED: symmetric, no "sell always ok")
             close_p = float(indp.get("close", 0.0) or 0.0)
@@ -324,6 +309,42 @@ class SignalEngine:
 
             net_norm, conf = self._ensemble_score(indp, indc, indl, book, adapt, spread_pct, tick_stats)
             net_abs = abs(net_norm)
+
+            # ==============================================================
+            # SNIPER LOGIC #1: Volume Validation (Strict & Tiered)
+            # Re-inserted here to use 'conf'
+            # ==============================================================
+            try:
+                if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
+                    bar_age_ok = last_age >= 5.0
+                    if bar_age_ok:
+                        vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
+                        current_vol = float(dfp["tick_volume"].iloc[-1])
+                        
+                        # Tiered Logic:
+                        # Conf < 80: Strict (0.8x)
+                        # Conf >= 85: Relaxed (0.3x)
+                        # Else: Standard (0.6x)
+                        if conf >= 85:
+                            vol_mult = 0.3
+                        elif conf < 80:
+                            vol_mult = 0.8
+                        else:
+                            vol_mult = 0.6
+                        
+                        if current_vol < vol_ma * vol_mult:
+                            return self._neutral(
+                                sym,
+                                [f"low_volume_sniper:{current_vol:.0f}<{vol_ma * vol_mult:.0f}", f"vol_mult:{vol_mult}"],
+                                t0,
+                                spread_pct=spread_pct,
+                                bar_key=bar_key,
+                                regime=_as_regime(adapt.get("regime")),
+                                trade_blocked=True,
+                            )
+            except Exception:
+                pass
+
 
             # Confluence layer
             ext = self._extreme_flag(dfp, indp)
@@ -595,7 +616,13 @@ class SignalEngine:
             if signal in ("Buy", "Sell") and hasattr(self.risk, "can_emit_signal"):
                 try:
                     allowed, gate_reasons = self.risk.can_emit_signal(int(conf), getattr(self.feed, "tz", None))
+
                     if not bool(allowed):
+                        # Log MISSED OPPORTUNITY
+                        log.warning(
+                            "MISSED OPPORTUNITY | %s | Signal: %s | Conf: %d | Reasons: %s",
+                            sym, signal, int(conf), gate_reasons
+                        )
                         return self._neutral(
                             sym,
                             ["emit_gate"] + list(gate_reasons or []),
@@ -722,12 +749,22 @@ class SignalEngine:
             # Dynamic confidence caps (strength-based)
             if net_abs < 0.10:
                 conf = min(conf, 82)
-            elif net_abs < 0.15:
-                conf = min(conf, 88)
-            elif net_abs < 0.20:
-                conf = min(conf, 93)
             else:
                 conf = min(conf, 96)
+
+            # ==============================================================
+            # SNIPER LOGIC #2: Dynamic ATR Stop Loss ("Toqatfarso")
+            # Widen SL for strong signals to survive noise
+            # ==============================================================
+            if conf >= 85:
+                # Widen SL by 20%
+                old_sl = float(adapt.get("sl_mult", 1.35))
+                adapt["sl_mult"] = old_sl * 1.2 
+                # Ensure TP is at least 2x SL (RR >= 1:2)
+                # But don't shrink TP if it's already huge; just ensure min RR
+                min_tp = adapt["sl_mult"] * 2.0
+                if float(adapt.get("tp_mult", 0.0)) < min_tp:
+                    adapt["tp_mult"] = min_tp
 
             return self._finalize(
                 sym=sym,

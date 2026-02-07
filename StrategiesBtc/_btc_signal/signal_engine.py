@@ -327,6 +327,41 @@ class SignalEngine:
             net_norm, conf = self._ensemble_score(
                 indp, indc, indl, book, adapt, spread_pct, tick_stats
             )
+            net_abs = abs(net_norm)
+
+            # ==============================================================
+            # SNIPER LOGIC #1: Volume Validation (Strict & Tiered)
+            # ==============================================================
+            try:
+                if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
+                    bar_age_ok = last_age >= 5.0
+                    if bar_age_ok:
+                        vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
+                        current_vol = float(dfp["tick_volume"].iloc[-1])
+                        
+                        # Tiered Logic:
+                        # Conf < 80: Strict (0.8x)
+                        # Conf >= 85: Relaxed (0.3x)
+                        # Else: Standard (0.6x)
+                        if conf >= 85:
+                            vol_mult = 0.3
+                        elif conf < 80:
+                            vol_mult = 0.8
+                        else:
+                            vol_mult = 0.6
+                        
+                        if current_vol < vol_ma * vol_mult:
+                            return self._neutral(
+                                sym,
+                                [f"low_volume_sniper:{current_vol:.0f}<{vol_ma * vol_mult:.0f}", f"vol_mult:{vol_mult}"],
+                                t0,
+                                spread_pct=spread_pct,
+                                bar_key=bar_key,
+                                regime=str(adapt.get("regime")),
+                                trade_blocked=True,
+                            )
+            except Exception:
+                pass
 
             # 9) Pattern detection
             sweep = self._liquidity_sweep(dfp, indp)
@@ -450,6 +485,38 @@ class SignalEngine:
 
             # Single consistent cap (avoid double conflicting caps)
             conf = self._cap_conf_by_strength(int(conf), abs(net_norm))
+
+            # Risk-level emission gate (Missed Opportunity Logging)
+            if signal in ("Buy", "Sell") and hasattr(self.risk, "can_emit_signal"):
+                try:
+                    allowed, gate_reasons = self.risk.can_emit_signal(int(conf), getattr(self.feed, "tz", None))
+                    if not bool(allowed):
+                        log.warning(
+                            "MISSED OPPORTUNITY | %s | Signal: %s | Conf: %d | Reasons: %s",
+                            sym, signal, int(conf), gate_reasons
+                        )
+                        return self._neutral(
+                            sym,
+                            ["emit_gate"] + list(gate_reasons or []),
+                            t0,
+                            spread_pct=spread_pct,
+                            bar_key=bar_key,
+                            regime=str(adapt.get("regime")),
+                            trade_blocked=True,
+                        )
+                except Exception:
+                    pass
+
+            # ==============================================================
+            # SNIPER LOGIC #2: Dynamic ATR Stop Loss ("Toqatfarso")
+            # Widen SL for strong signals to survive noise
+            # ==============================================================
+            if conf >= 85:
+                old_sl = float(adapt.get("sl_mult", 1.35))
+                adapt["sl_mult"] = old_sl * 1.2 
+                min_tp = adapt["sl_mult"] * 2.0
+                if float(adapt.get("tp_mult", 0.0)) < min_tp:
+                    adapt["tp_mult"] = min_tp
 
             # 14) Finalize (plan only)
             reasons: List[str] = list(guard_reasons)

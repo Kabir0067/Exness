@@ -491,7 +491,90 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
             f"🏷 <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | 🛡 {sltp}\n"
             f"🧠 <b>{conf_pct:.1f}%</b> | {time_str}"
         )
-        # Non-blocking: push to queue, don't wait for Telegram
+        notify_async(ADMIN, msg)
+    except Exception:
+        return
+
+
+def _notify_order_skipped(candidate: Any) -> None:
+    try:
+        # Only notify highly confident signals that are blocked
+        if not is_admin_chat(ADMIN):
+            return
+        
+        # Only notify if explicitly blocked or has reasons
+        if not getattr(candidate, "blocked", False) and not getattr(candidate, "reasons", None):
+            return
+
+        conf = float(getattr(candidate, "confidence", 0.0) or 0.0)
+        # Filter weak signals to avoid spam - only notify Strong signals that got blocked
+        if conf < 0.80:
+            return
+
+        sltp = f"{_fmt_price(float(getattr(candidate, 'sl', 0)))} / {_fmt_price(float(getattr(candidate, 'tp', 0)))}"
+        lot = float(getattr(candidate, "lot", 0.0))
+        
+        reasons_list = getattr(candidate, "reasons", []) or []
+        reasons_str = ", ".join(reasons_list) if reasons_list else "Hard Stop / Filter"
+
+        direction_emoji = "🟢" if str(candidate.signal).lower() == "buy" else "🔴"
+        time_str = _format_time_only()
+
+        # User requested actionable message even if blocked
+        msg = (
+            f"⚠️ <b>SIGNAL (BLOCKED)</b> | {direction_emoji} <b>{html.escape(str(candidate.signal)).upper()}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💎 <b>{html.escape(str(candidate.asset))}</b> | {html.escape(str(candidate.symbol))}\n"
+            f"📦 Lot: <b>{lot:.2f}</b> | Conf: <b>{conf:.2f}</b>\n"
+            f"🛡 SL/TP: <b>{sltp}</b>\n"
+            f"🚫 Қатъ шуд: <b>{html.escape(reasons_str)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Агар хоҳед, дастӣ савдо кунед.</i>\n"
+            f"{time_str}"
+        )
+        # Non-blocking: push to queue
+        notify_async(ADMIN, msg)
+    except Exception:
+        return
+
+
+def _notify_signal(asset: str, result: Any) -> None:
+    try:
+        # User simulation / manual mode notification
+        if not is_admin_chat(ADMIN):
+            return
+
+        sig = str(getattr(result, "signal", "Neutral"))
+        if sig == "Neutral":
+            return
+
+        conf = float(getattr(result, "confidence", 0.0) or 0.0)
+        # Scale if > 1
+        if conf > 1.05:
+            conf = conf / 100.0
+        conf = max(0.0, min(1.0, conf))
+
+        # Basic filter (optional, engine usually filters this)
+        if conf < 0.50:
+            return
+            
+        direction_emoji = "🟢" if sig.lower() == "buy" else "🔴"
+        time_str = _format_time_only()
+        
+        # Prepare reasons
+        reasons_list = getattr(result, "reasons", []) or []
+        reasons_str = ", ".join(reasons_list[:3]) if reasons_list else "-"
+
+        msg = (
+            f"📡 <b>SIGNAL DETECTED</b> | {direction_emoji} <b>{html.escape(sig).upper()}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💎 <b>{html.escape(str(asset))}</b>\n"
+            f"🧠 Confidence: <b>{conf*100:.1f}%</b>\n"
+            f"🔍 Reasons: {html.escape(reasons_str)}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Execution pending...</i>\n"
+            f"{time_str}"
+        )
         notify_async(ADMIN, msg)
     except Exception:
         return

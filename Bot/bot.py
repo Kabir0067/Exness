@@ -73,7 +73,9 @@ from .bot_utils import (
     _notify_daily_start,
     _notify_engine_stopped,
     _notify_order_opened,
+    _notify_order_skipped,
     _notify_phase_change,
+    _notify_signal,
     _rk_remove,
     _send_clean,
     build_ai_keyboard,
@@ -186,6 +188,7 @@ bot.send_chat_action = _safe_send_chat_action
 bot.set_my_commands = _safe_set_my_commands
 
 engine.set_order_notifier(_notify_order_opened)
+engine.set_skip_notifier(_notify_order_skipped)
 engine.set_phase_notifier(_notify_phase_change)
 engine.set_engine_stop_notifier(_notify_engine_stopped)
 engine.set_daily_start_notifier(_notify_daily_start)
@@ -1204,36 +1207,11 @@ def message_dispatcher(message: telebot.types.Message) -> None:
     bot.send_message(message.chat.id, "❓ Амали номаълум. /buttons → меню.", parse_mode="HTML")
 
 
-def _on_signal_detected(asset: str, result: Dict[str, Any]) -> None:
-    """Callback from engine when a signal is detected during Manual Stop (Monitoring Mode)."""
-    try:
-        if not isinstance(result, dict):
-            signal = getattr(result, "signal", "Neutral")
-            confidence = float(getattr(result, "confidence", 0.0) or 0.0)
-            if confidence > 1:
-                confidence = confidence / 100.0
-            reasons = list(getattr(result, "reasons", []) or [])
-            result = {
-                "signal": signal,
-                "confidence": float(confidence),
-                "entry": getattr(result, "entry", None),
-                "stop_loss": getattr(result, "sl", None),
-                "take_profit": getattr(result, "tp", None),
-                "reason": "; ".join(str(r) for r in reasons if r) or "",
-            }
 
-        text = _format_ai_signal(asset, result)
+def send_signal_notification(asset: str, result: Dict[str, Any]) -> None:
+    """
+    Callback for engine to notify Telegram about a new signal.
+    Wired in main.py via engine.set_signal_notifier().
+    """
+    _notify_signal(asset, result)
 
-        header = "⚠️ <b>СИГНАЛ (МОНИТОРИНГ)</b> ⚠️\n<i>(Савдо иҷро нашуд - Режими Stop)</i>\n\n"
-        full_text = header + text
-
-        chat_id = getattr(cfg, "telegram_chat_id", None)
-        if chat_id:
-            bot.send_message(chat_id, full_text, parse_mode="HTML")
-            bot.send_message(chat_id, "🛠 <b>Ёрдамчии савдо</b>", parse_mode="HTML", reply_markup=build_helpers_keyboard())
-    except Exception as exc:
-        log.error("Signal notification failed: %s", exc)
-
-
-# Register the callback
-engine.set_signal_notifier(_on_signal_detected)

@@ -69,7 +69,9 @@ class OrderRequest:
     enqueue_time: float
     deviation: int = 50
     magic: int = 987654
+    magic: int = 987654
     comment: str = "scalp"
+    cfg: Any = None  # Added for Dry Run access
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,39 @@ class OrderExecutor:
                 sl_s, tp_s = self._sanitize_stops(side, req_price, planned_sl, planned_tp)
 
                 sent_ts = time.time()
+
+                # --- SPIRITUAL SIGNATURE ---
+                verse = "رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ - (Кабир 🤲🏼)"
+                print(f"\n{verse}")
+                log_err.info(f"DIGITAL_INTENTION | {verse} | symbol={request.symbol} side={side}")
+                # ---------------------------
+
+                # --- DRY RUN CHECK ---
+                if request.cfg and getattr(request.cfg, "dry_run", False):
+                    print(f"\n[DRY RUN] Order BLOCKED by Simulation Mode.")
+                    print(f"          Symbol: {request.symbol}")
+                    print(f"          Side:   {side}")
+                    print(f"          Vol:    {vol}")
+                    print(f"          Price:  {req_price}")
+                    print(f"          SL:     {sl_s}")
+                    print(f"          TP:     {tp_s}")
+                    log_err.info(f"DRY_RUN_EXECUTION | {request.symbol} | {side} | {vol} | {req_price}")
+                    
+                    # Return Mock Result
+                    return OrderResult(
+                        order_id=request.order_id,
+                        signal_id=request.signal_id,
+                        ok=True,
+                        reason="dry_run_success",
+                        sent_ts=sent_ts,
+                        fill_ts=time.time(),
+                        req_price=req_price,
+                        exec_price=req_price,
+                        volume=vol,
+                        slippage=0.0,
+                        retcode=10009 # DONE
+                    )
+                # ---------------------
 
                 result = self._send_deal(
                     symbol=request.symbol,
