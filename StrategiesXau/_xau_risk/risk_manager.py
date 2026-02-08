@@ -1468,21 +1468,42 @@ class RiskManager:
                 f"Entry: {entry_price:.2f} | SL: {sl:.2f} | Dist: {abs(entry_price-sl):.2f}"
             )
 
-            # CRITICAL OPTIMIZATION: Dynamic TP (Scalp vs Swing)
-            # Conf < 85 -> Scalp Mode (1.5x Risk)
-            # Conf >= 85 -> Swing Mode (2.5x Risk)
-            dist_sl_p = abs(entry_price - atr_sl_price)
-            if float(confidence) >= 85:
-                # Swing Mode
-                tp_dist = dist_sl_p * 2.5
-            else:
-                # Scalp Mode
-                tp_dist = dist_sl_p * 1.5
+            # CRITICAL OPTIMIZATION: Volatility-Adjusted Micro-Scalping TP
+            # Formula: TP = Entry +/- (ATR(5) * Scalping_Multiplier [0.8 - 1.2])
             
+            # 1. Determine Scalping Multiplier based on Confidence
+            # High Confidence (>85) -> 1.2x ATR
+            # Normal Confidence -> 1.0x ATR
+            scalp_mult = 1.0
+            if float(confidence) >= 85:
+                scalp_mult = 1.2
+            elif float(confidence) < 50: # Very weak signal (should be blocked anyway)
+                scalp_mult = 0.8
+                
+            # Allow config override
+            if hasattr(self.cfg, "scalping_tp_multiplier"):
+                try:
+                    scalp_mult = float(self.cfg.scalping_tp_multiplier)
+                except:
+                    pass
+
+            tp_dist = atr * scalp_mult
+            
+            # 2. Enforce Minimum Profit Floor (Spread + Commission Buffer)
+            # Estimate commission/swap buffer as ~5-10% of spread or fixed points
+            # sp_pts comes from snapshot or current
+            current_sp_val = self._current_spread_points() * float(self._point)
+            profit_floor = current_sp_val * 1.5 # Spread + 50% buffer
+            
+            if tp_dist < profit_floor:
+                log_risk.info(f"SCALP_ADJUST | TP distance ({tp_dist:.2f}) < ProfitFloor ({profit_floor:.2f}). Widening.")
+                tp_dist = profit_floor
+
             if side_n == "Buy":
                 tp = entry_price + tp_dist
             else:
                 tp = entry_price - tp_dist
+
 
             # 3) Cost-floor from broker constraints + exec monitor
             min_dist = self._min_stop_distance()

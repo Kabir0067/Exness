@@ -704,6 +704,7 @@ def get_config_from_env() -> EngineConfig:
         server=_env_required("EXNESS_SERVER"),
         telegram_token=_env_required("BOT_TOKEN"),
         admin_id=_env_int("ADMIN_ID"),
+        mt5_path=os.getenv("MT5_PATH"),
     )
 
     cfg.validate()

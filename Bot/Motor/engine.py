@@ -83,9 +83,15 @@ class MultiAssetTradingEngine:
         self._last_analysis_paused_state = False
         self._last_analysis_state_log_ts = 0.0
 
+        self._edge_last_trade: dict[str, tuple[str, str]] = {}
+        self._edge_last_notified: dict[str, tuple[str, str]] = {}
+        self._last_skip_log_ts: dict[str, float] = {}  # Anti-spam throttle for blocked notifications
+        
+        # Order Tracking
+        self._seen_index: dict[tuple[str, str], tuple[float, int]] = {}
+
         # Idempotency window
         self._seen: Deque[Tuple[str, str, float]] = deque()
-        self._seen_index: Dict[Tuple[str, str], Tuple[float, int]] = {}
         self._signal_cooldown_sec_by_asset: Dict[str, float] = {"XAU": 60.0, "BTC": 60.0}
 
         # Recovery
@@ -138,6 +144,28 @@ class MultiAssetTradingEngine:
         self._last_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
 
         self._refresh_signal_cooldowns()
+
+    # -------------------- HARD KILL-SWITCH (CRITICAL) --------------------
+    def _check_hard_stop_file(self) -> None:
+        """
+        CRITICAL: Checks for physical 'STOP.lock' file presence.
+        If found, IMMEDIATELY triggers manual_stop and wipes queues.
+        """
+        if os.path.exists("STOP.lock"):
+            if not self._manual_stop:
+                log_health.critical("HARD_KILL_SWITCH | STOP.lock DETECTED | ABORTING ALL TRADES")
+                self._manual_stop = True
+                
+                # Immediate Queue Wipe
+                self._drain_queue(self._order_q)
+                self._drain_queue(self._result_q)
+                
+                # Optional: Send emergency notification
+                if self._engine_stop_notifier:
+                    try:
+                        self._engine_stop_notifier("ALL", "STOP.lock File Detected")
+                    except Exception:
+                        pass
 
     def set_order_notifier(self, cb: Optional[Callable[[OrderIntent, ExecutionResult], None]]) -> None:
         self._order_notifier = cb
@@ -500,12 +528,21 @@ class MultiAssetTradingEngine:
         if c.sl <= 0.0 or c.tp <= 0.0:
             return False
         
-        # DYNAMIC CONFIDENCE CHECK (Config-based)
+        # DYNAMIC CONFIDENCE CHECK (Config-based + Hard Floor)
         # Use config specific to the asset
         cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
-        min_conf = float(getattr(cfg, "min_confidence_signal", 0.80) or 0.80)
         
-        if float(c.confidence) < min_conf:
+        # User Requirement: Strict threshold: if confidence < 0.75: return No_Trade
+        HARD_MIN_CONF = 0.75
+        conf_val = float(c.confidence)
+        
+        # Config might be higher (e.g. 0.80), but NEVER lower than 0.75
+        cfg_min = float(getattr(cfg, "min_confidence_signal", 0.75) or 0.75)
+        effective_min = max(HARD_MIN_CONF, cfg_min)
+        
+        if conf_val < effective_min:
+            # We don't log here to avoid spamming low-conf signals, 
+            # but we explicitly reject them.
             return False
             
         return True
@@ -665,6 +702,29 @@ class MultiAssetTradingEngine:
         if price <= 0:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=bad_price", cand.asset)
             return False, None
+
+        # ============================================================
+        # FIX #4: SLIPPAGE PROTECTION (Pre-Trade)
+        # ============================================================
+        # 1. Spread Check
+        current_spread_points = float(tick.ask - tick.bid) / float(info.point) if info.point else 99999.0
+        max_spread_pts = float(getattr(cfg, "max_spread_points", 0) or 0)
+        
+        # Default safety defaults if config missing
+        if max_spread_pts <= 0:
+            max_spread_pts = 650.0 if cand.asset == "BTC" else 35.0  # ~3.5 pips XAU, ~$6.5 BTC
+            
+        if current_spread_points > max_spread_pts:
+             log_health.info(
+                 "ENQUEUE_SKIP | asset=%s reason=spread_too_high spread=%s > max=%s", 
+                 cand.asset, int(current_spread_points), int(max_spread_pts)
+             )
+             return False, None
+
+        # 2. Volatility/Slip Estimation (Basic)
+        # If market is moving too fast (tick.last != bid/ask midpoint by large margin), maybe unsafe?
+        # For now, spread check is the most reliable "pre-trade" slippage guard.
+
 
         digits = int(getattr(info, "digits", 0) or 0) if info else 0
         sl_val = float(cand.sl)
@@ -1026,6 +1086,16 @@ class MultiAssetTradingEngine:
                         time.sleep(0.6)
                     continue
 
+                # CRITICAL: Hard Stop File Check (Every Iteration)
+                self._check_hard_stop_file()
+
+                # Don't trade if manual stop active
+                if self._manual_stop:
+                     # If we just entered manual stop, we already drained queues in _check_hard_stop_file
+                     # Just ensure we loop quickly but don't execute
+                     time.sleep(0.5)
+                     continue
+
                 # Hard stop notifications (do not trade when requires_hard_stop True)
                 try:
                     for asset, pipe in (("XAU", self._xau), ("BTC", self._btc)):
@@ -1224,12 +1294,17 @@ class MultiAssetTradingEngine:
                         if (getattr(selected, "blocked", False) or getattr(selected, "reasons", None)) and hasattr(self, "_skip_notifier") and self._skip_notifier:
                              # Check duplicate to prevent spamming the same blocked signal
                              if not self._is_duplicate(selected.asset, selected.signal_id, time.time(), max_orders=1, order_index=999):
-                                 try:
-                                     self._skip_notifier(selected)
-                                     # Mark seen to update cooldown
-                                     self._mark_seen(selected.asset, selected.signal_id, time.time())
-                                 except Exception:
-                                     pass
+                                 # ROBUST FIX: Mark seen FIRST to prevent infinite retry loops if notifier fails
+                                 self._mark_seen(selected.asset, selected.signal_id, time.time())
+                                 
+                                 # ADDITIONAL THROTTLE: Prevent spam if signal ID flutters
+                                 last_skip = self._last_skip_log_ts.get(selected.asset, 0.0)
+                                 if (time.time() - last_skip) > 5.0:
+                                     try:
+                                         self._skip_notifier(selected)
+                                         self._last_skip_log_ts[selected.asset] = time.time()
+                                     except Exception:
+                                         pass
                         continue
 
                     # Double-check Manual Stop for execution only

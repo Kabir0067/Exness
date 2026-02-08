@@ -1534,17 +1534,32 @@ class RiskManager:
                 if abs(entry_price - float(sl)) < min_sl:
                     sl = self.broker.normalize_price(entry_price + min_sl)
 
-            # CRITICAL OPTIMIZATION: Dynamic TP (Scalp vs Swing)
-            # Conf < 85 -> Scalp Mode (1.5x Risk)
-            # Conf >= 85 -> Swing Mode (2.5x Risk)
-            dist_sl_p = abs(entry_price - atr_sl_price)
+            # CRITICAL OPTIMIZATION: Volatility-Adjusted Micro-Scalping TP
+            # Formula: TP = Entry +/- (ATR(5) * Scalping_Multiplier [0.8 - 1.2])
+
+            scalp_mult = 1.0 # Default for normal confidence
             if float(confidence) >= 85:
-                 # Swing Mode
-                 tp_dist = dist_sl_p * 2.5
-            else:
-                 # Scalp Mode
-                 tp_dist = dist_sl_p * 1.5
-             
+                scalp_mult = 1.2 # High confidence
+            elif float(confidence) < 50:
+                scalp_mult = 0.8
+            
+            # Allow config override
+            if hasattr(self.cfg, "scalping_tp_multiplier"):
+                try:
+                    scalp_mult = float(self.cfg.scalping_tp_multiplier)
+                except:
+                    pass
+
+            tp_dist = atr * scalp_mult
+
+            # 2. Enforce Minimum Profit Floor (Spread + Commission Buffer)
+            current_sp_val = self.broker.current_spread_points() * float(self.broker.point_value())
+            profit_floor = current_sp_val * 1.5 # Spread + 50% buffer
+
+            if tp_dist < profit_floor:
+                log_risk.info(f"SCALP_ADJUST | TP distance ({tp_dist:.2f}) < ProfitFloor ({profit_floor:.2f}). Widening.")
+                tp_dist = profit_floor
+
             if side_n == "Buy":
                  tp = entry_price + tp_dist
             else:

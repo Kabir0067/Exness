@@ -465,7 +465,7 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
     if not ok2:
         e2 = _last_error()
         if _is_auth_failed(e1) or _is_auth_failed(e2):
-            raise MT5AuthError(f"authorization_failed: init_with_creds={e1} init_no_creds={e2}")
+            raise MT5AuthError(f"authorization_failed: login={cfg.creds.login} server={cfg.creds.server} path={mt5_path} | init_with_creds={e1} init_no_creds={e2}")
         raise RuntimeError(f"mt5.initialize failed: {e2} | first_try={e1}")
 
     with MT5_LOCK:
@@ -483,7 +483,7 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
             except Exception:
                 pass
         if _is_auth_failed(e1) or _is_auth_failed(e3):
-            raise MT5AuthError(f"authorization_failed: init_with_creds={e1} login={e3}")
+            raise MT5AuthError(f"authorization_failed: login={cfg.creds.login} server={cfg.creds.server} path={mt5_path} | init_with_creds={e1} login={e3}")
         raise RuntimeError(f"mt5.login failed: {e3} | first_try={e1}")
 
 
