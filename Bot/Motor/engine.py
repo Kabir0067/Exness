@@ -1293,18 +1293,17 @@ class MultiAssetTradingEngine:
 
                         if (getattr(selected, "blocked", False) or getattr(selected, "reasons", None)) and hasattr(self, "_skip_notifier") and self._skip_notifier:
                              # Check duplicate to prevent spamming the same blocked signal
+                             # STABLE ID FIX: Now that signal_id is stable (bar-based), this check will correctly suppress
+                             # repeated notifications for the SAME signal during the same bar.
                              if not self._is_duplicate(selected.asset, selected.signal_id, time.time(), max_orders=1, order_index=999):
                                  # ROBUST FIX: Mark seen FIRST to prevent infinite retry loops if notifier fails
                                  self._mark_seen(selected.asset, selected.signal_id, time.time())
                                  
-                                 # ADDITIONAL THROTTLE: Prevent spam if signal ID flutters
-                                 last_skip = self._last_skip_log_ts.get(selected.asset, 0.0)
-                                 if (time.time() - last_skip) > 5.0:
-                                     try:
-                                         self._skip_notifier(selected)
-                                         self._last_skip_log_ts[selected.asset] = time.time()
-                                     except Exception:
-                                         pass
+                                 try:
+                                     self._skip_notifier(selected)
+                                     self._last_skip_log_ts[selected.asset] = time.time()
+                                 except Exception:
+                                     pass
                         continue
 
                     # Double-check Manual Stop for execution only

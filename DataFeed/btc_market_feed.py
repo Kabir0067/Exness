@@ -785,34 +785,75 @@ class MarketFeed:
                     )
                 )
                 min_ticks = int(min(220, max(12, min_ticks)))  # hard cap to avoid permanent block
-
-                if len(self._tick_deque) < min_ticks:
-                    return TickStats(ok=False, reason=f"low_ticks_buf:{len(self._tick_deque)}/{min_ticks}")
-                arr = np.asarray(self._tick_deque, dtype=np.float64)
-
-            if arr.ndim != 2 or arr.shape[1] < 6 or arr.shape[0] < 2:
+            if arr.ndim != 2 or arr.shape[1] < 6:
                 return TickStats(ok=False, reason="bad_tick_shape")
 
             # Window end based on LAST tick time (prevents clock-skew false windows)
             end_ms = float(arr[-1, 0])
             start_ms = end_ms - win_ms
             w = arr[arr[:, 0] >= start_ms]
+            w_n = int(w.shape[0])
 
-            if w.shape[0] < min_ticks:
-                return TickStats(ok=False, reason=f"low_ticks:{int(w.shape[0])}/{min_ticks}")
+            # MOVED: Calculate stats even if low ticks, to provide volatility data to Risk Manager
+            times = w[:, 0] / 1000.0 if w_n > 0 else np.array([])
+            bids = w[:, 1] if w_n > 0 else np.array([])
+            asks = w[:, 2] if w_n > 0 else np.array([])
+            vols = w[:, 3] if w_n > 0 else np.array([])
+            flags = w[:, 5].astype(np.uint32, copy=False) if w_n > 0 else np.array([])
+
+            last_bid = float(bids[-1]) if bids.size else bid
+            last_ask = float(asks[-1]) if asks.size else ask
+
+            horizon = max(1e-6, float(times[-1] - times[0])) if times.size > 1 else 1.0
+            tps = float(w_n / horizon)
+
+            mids = (bids + asks) / 2.0 if bids.size else np.array([])
+            mid_diff = np.diff(mids) if mids.size > 1 else np.array([])
+
+            # volatility on mid changes
+            volatility = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
+
+            # flips: sign changes of mid movement
+            if mid_diff.size > 2:
+                s = np.sign(mid_diff)
+                s = s[s != 0]
+                flips = int(np.sum(s[:-1] != s[1:])) if s.size > 2 else 0
+            else:
+                flips = 0
+
+            # Robust order-flow proxy
+            if mid_diff.size > 0:
+                wgt = np.maximum(vols[1:], 1.0)
+                d = np.sign(mid_diff)
+                buy_w = float(np.sum(wgt[d > 0])) if np.any(d > 0) else 0.0
+                sell_w = float(np.sum(wgt[d < 0])) if np.any(d < 0) else 0.0
+                denom = max(1e-6, buy_w + sell_w)
+                tick_delta = float((buy_w - sell_w) / denom)
+                aggr_delta = tick_delta
+                cvd_add = float(buy_w - sell_w)
+            else:
+                tick_delta = 0.0
+                aggr_delta = 0.0
+                cvd_add = 0.0
+
+            # NOW check min_ticks (after calculating volatility)
+            if w_n < min_ticks:
+                return TickStats(
+                    ok=False,
+                    reason=f"low_ticks:{w_n}/{min_ticks}",
+                    bid=last_bid,
+                    ask=last_ask,
+                    volatility=volatility, # Pass calculated volatility
+                    tps=tps,
+                    flips=flips,
+                    tick_delta=tick_delta
+                )
 
             # Stale tick window protection
             tick_age_ms = (time.time() * 1000.0) - end_ms
             if tick_age_ms > max(2500.0, win_ms * 2.0):
                 return TickStats(ok=False, reason="stale_ticks")
 
-            bids = w[:, 1]
-            asks = w[:, 2]
-            vols = w[:, 3]
-            flags = w[:, 5].astype(np.uint32, copy=False)
-
-            last_bid = float(bids[-1]) if bids.size else bid
-            last_ask = float(asks[-1]) if asks.size else ask
             if last_bid <= 0.0 or last_ask <= 0.0:
                 last_bid, last_ask = bid, ask
 

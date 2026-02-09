@@ -584,7 +584,9 @@ class SignalEngine:
 
             if isinstance(t, (pd.Timestamp, np.datetime64)):
                 tt = pd.to_datetime(t)
-                return tt.isoformat()
+                # STABILIZATION FIX: round to nearest second
+                tt = tt.replace(microsecond=0)
+                return tt.strftime("%Y-%m-%dT%H:%M:%S")
             return str(t)
         except Exception:
             return "bar_err"

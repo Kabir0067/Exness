@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 from config_xau import EngineConfig, SymbolParams
 from DataFeed.xau_market_feed import MarketFeed, TickStats
@@ -795,6 +796,7 @@ class SignalEngine:
             if df is None or df.empty:
                 return "no_bar"
 
+            # STABILIZATION FIX: timestamp must be stable for the entire bar duration
             if "time" in df.columns:
                 t = df["time"].iloc[-1]
             elif "datetime" in df.columns:
@@ -804,10 +806,20 @@ class SignalEngine:
             else:
                 t = df.index[-1]
 
-            if isinstance(t, (pd.Timestamp, np.datetime64)):
-                ts = pd.to_datetime(t)
-                return ts.isoformat()
-            return str(t)
+            # Ensure we have a pandas Timestamp
+            if not isinstance(t, (pd.Timestamp, datetime)):
+                try:
+                    t = pd.to_datetime(t)
+                except Exception:
+                    return str(t)
+
+            # Round to nearest second (strip micros) to prevent high-res timestamp jitter
+            # Ideally this should be floor to timeframe, but strip micros is a good baseline fix
+            if hasattr(t, "replace"):
+                t = t.replace(microsecond=0)
+            
+            # Use strict format: YYYY-MM-DDTHH:MM:SS
+            return t.strftime("%Y-%m-%dT%H:%M:%S")
         except Exception:
             return "bar_err"
 

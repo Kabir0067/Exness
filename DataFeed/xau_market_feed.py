@@ -556,25 +556,24 @@ class MarketFeed:
 
             w = arr[arr[:, 0] >= (now_ms - win_ms)]
             w_n = int(w.shape[0])
-            if w_n < min_ticks:
-                return TickStats(ok=False, reason=f"low_ticks:{w_n}/{min_ticks}", bid=bid_q, ask=ask_q)
-
-            times = w[:, 0] / 1000.0
-            bids = w[:, 1]
-            asks = w[:, 2]
-            vols = w[:, 3]
-
+            # MOVED: Calculate stats even if low ticks, to provide volatility data to Risk Manager
+            
+            times = w[:, 0] / 1000.0 if w_n > 0 else np.array([])
+            bids = w[:, 1] if w_n > 0 else np.array([])
+            asks = w[:, 2] if w_n > 0 else np.array([])
+            vols = w[:, 3] if w_n > 0 else np.array([])
+            
             last_bid = float(bids[-1]) if bids.size else bid_q
             last_ask = float(asks[-1]) if asks.size else ask_q
 
             if last_bid <= 0 or last_ask <= 0 or last_ask < last_bid:
                 last_bid, last_ask = bid_q, ask_q
 
-            horizon = max(1e-6, float(times[-1] - times[0]))
+            horizon = max(1e-6, float(times[-1] - times[0])) if times.size > 1 else 1.0
             tps = float(w_n / horizon)
 
-            mids = (bids + asks) / 2.0
-            mid_diff = np.diff(mids)
+            mids = (bids + asks) / 2.0 if bids.size else np.array([])
+            mid_diff = np.diff(mids) if mids.size > 1 else np.array([])
 
             # volatility on mid changes
             volatility = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
@@ -587,8 +586,7 @@ class MarketFeed:
             else:
                 flips = 0
 
-            # Robust order-flow proxy (NOT using BUY/SELL flags):
-            # direction = sign(mid change), weight = max(volume, 1)
+            # Robust order-flow proxy
             if mid_diff.size > 0:
                 wgt = np.maximum(vols[1:], 1.0)
                 d = np.sign(mid_diff)
@@ -606,6 +604,20 @@ class MarketFeed:
             with self._data_lock:
                 self._cumulative_delta = cumulative_delta_prev + cvd_add
                 cumulative_delta = float(self._cumulative_delta)
+
+            # NOW check min_ticks (after calculating volatility)
+            if w_n < min_ticks:
+                return TickStats(
+                    ok=False, 
+                    reason=f"low_ticks:{w_n}/{min_ticks}", 
+                    bid=last_bid, 
+                    ask=last_ask,
+                    volatility=volatility, # Pass calculated volatility
+                    tps=tps,
+                    flips=flips,
+                    tick_delta=tick_delta,
+                    cumulative_delta=cumulative_delta
+                )
 
             imb = 0.0
             if book and book.get("bids") and book.get("asks"):
