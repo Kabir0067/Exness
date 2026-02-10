@@ -394,7 +394,7 @@ class EngineConfig:
     exec_window: int = 300
     exec_max_p95_latency_ms: float = 550.0
     exec_max_p95_slippage_points: float = 20.0
-    exec_max_spread_points: float = 2000.0
+    exec_max_spread_points: float = 3000.0
     exec_max_ewma_slippage_points: float = 15.0
     exec_breaker_sec: float = 120.0
 

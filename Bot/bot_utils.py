@@ -328,6 +328,9 @@ _blocked_chat_cache = TTLCache(maxsize=512, ttl_sec=12 * 3600)
 # Typing throttle (prevents chat_action storms)
 _typing_cache = TTLCache(maxsize=2048, ttl_sec=1.2)
 
+# Prevent notification spam for blocked signals
+_notify_skip_cache = TTLCache(maxsize=500, ttl_sec=300)
+
 
 def _format_datetime(dt: Optional[datetime] = None, show_date: bool = False, show_time: bool = True) -> str:
     """Форматирование даты и времени в красивом HTML формате."""
@@ -514,9 +517,15 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
 
 def _notify_order_skipped(candidate: Any) -> None:
     try:
-        # Only notify highly confident signals that are blocked
         if not is_admin_chat(ADMIN):
             return
+        
+        # Debounce spam
+        if candidate and hasattr(candidate, "signal_id"):
+             sid = str(candidate.signal_id)
+             if _notify_skip_cache.get(sid):
+                 return
+             _notify_skip_cache.set(sid, True)
         
         # Only notify if explicitly blocked or has reasons
         if not getattr(candidate, "blocked", False) and not getattr(candidate, "reasons", None):

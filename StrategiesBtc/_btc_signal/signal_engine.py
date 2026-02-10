@@ -271,7 +271,8 @@ class SignalEngine:
                 mid_price = float((bid + ask) / 2.0)
                 sp_pct = float(getattr(self.sp, "spread_limit_pct", 0.0007) or 0.0007)
                 # allow ~1.8x configured pct, clamp to sane USD range
-                max_spread_usd = max(20.0, min(250.0, mid_price * sp_pct * 1.8))
+                # HOTFIX: Allow up to 3000 points (approx 30 USD) for BTC
+                max_spread_usd = 3000.0 if "BTC" in sym else max(20.0, min(250.0, mid_price * sp_pct * 1.8))
                 
                 if spread_usd > max_spread_usd:
                     return self._neutral(
@@ -331,29 +332,18 @@ class SignalEngine:
 
             # ==============================================================
             # SNIPER LOGIC #1: Volume Validation (Strict & Tiered)
+            # HOTFIX: Lower threshold to 15 (aggressive entry)
             # ==============================================================
             try:
                 if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
                     bar_age_ok = last_age >= 5.0
                     if bar_age_ok:
-                        vol_ma = float(dfp["tick_volume"].iloc[-20:].mean())
-                        current_vol = float(dfp["tick_volume"].iloc[-1])
-                        
-                        # Tiered Logic:
-                        # Conf < 80: Strict (0.8x)
-                        # Conf >= 85: Relaxed (0.3x)
-                        # Else: Standard (0.6x)
-                        if conf >= 85:
-                            vol_mult = 0.3
-                        elif conf < 80:
-                            vol_mult = 0.8
-                        else:
-                            vol_mult = 0.6
-                        
-                        if current_vol < vol_ma * vol_mult:
-                            return self._neutral(
+                        now_vol = float(dfp["tick_volume"].iloc[-1])
+                        # HOTFIX: Priority on Speed. Use hard floor of 15.
+                        if now_vol < 15.0:
+                             return self._neutral(
                                 sym,
-                                [f"low_volume_sniper:{current_vol:.0f}<{vol_ma * vol_mult:.0f}", f"vol_mult:{vol_mult}"],
+                                [f"low_volume_sniper:{now_vol:.0f}<15"],
                                 t0,
                                 spread_pct=spread_pct,
                                 bar_key=bar_key,
