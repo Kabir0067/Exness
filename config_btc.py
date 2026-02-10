@@ -440,8 +440,10 @@ class EngineConfig:
     signal_stability_eps: float = 0.012
 
     # Market freshness (portfolio pipeline)
-    market_min_bar_age_sec: float = 120.0
+    market_min_bar_age_sec: float = 60.0
     market_max_bar_age_mult: float = 2.0
+    stale_tick_guard_sec: float = 60.0  # RELAXED: Allow up to 60s lag before rejecting tick
+    max_latency_ms: float = 5000.0
     market_validate_interval_sec: float = 1.0
 
     # Meta/conformal gates (looser for scalping)

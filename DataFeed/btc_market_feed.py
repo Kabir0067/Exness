@@ -193,28 +193,33 @@ class MarketFeed:
             if self._tick_size > 0.0 and (now - self._last_sym_info_ts) < 60.0:
                 return float(self._tick_size)
 
-        if not self._ensure_symbol_ready():
-            with self._data_lock:
-                return float(self._tick_size or 0.0)
-
+        # Force aggressive refresh if zero
         tick_size = 0.0
         point = 0.0
-        try:
-            with MT5_LOCK:
-                info = mt5.symbol_info(self.symbol)
-            if info:
-                tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
-                point = float(getattr(info, "point", 0.0) or 0.0)
-        except Exception:
-            tick_size = 0.0
-            point = 0.0
+        
+        # Try up to 3 times to get symbol info
+        for _ in range(3):
+            try:
+                ensure_mt5()
+                with MT5_LOCK:
+                    info = mt5.symbol_info(self.symbol)
+                if info:
+                    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+                    point = float(getattr(info, "point", 0.0) or 0.0)
+                    if tick_size > 0:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.05)
 
+        # Fallback to sensible defaults for BTC if MT5 fails
         if tick_size <= 0.0:
-            tick_size = point
+            tick_size = 0.01  # Minimum BTC tick size
+            point = 0.01
 
         with self._data_lock:
-            self._tick_size = float(max(0.0, tick_size))
-            self._point = float(max(0.0, point))
+            self._tick_size = float(max(0.01, tick_size))
+            self._point = float(max(0.01, point))
             self._last_sym_info_ts = now
             return float(self._tick_size)
 
