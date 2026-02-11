@@ -775,7 +775,7 @@ class MarketFeed:
                 )
 
             # Full microstructure path
-            self._sync_ticks(self.symbol, n_ticks=2000)
+            arr = self._sync_ticks(self.symbol, n_ticks=2000)
             book = self.fetch_book(levels=20)
 
             micro_win_sec = float(max(1, int(self.sp.micro_window_sec)))
@@ -790,7 +790,8 @@ class MarketFeed:
                     )
                 )
                 min_ticks = int(min(220, max(12, min_ticks)))  # hard cap to avoid permanent block
-            if arr.ndim != 2 or arr.shape[1] < 6:
+            
+            if arr is None or arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 6:
                 return TickStats(ok=False, reason="bad_tick_shape")
 
             # Window end based on LAST tick time (prevents clock-skew false windows)

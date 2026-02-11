@@ -145,7 +145,7 @@ class Classic_FeatureEngine:
             if not isinstance(df_dict, dict) or not df_dict:
                 logger.error("compute_indicators: df_dict invalid/empty")
                 return None
-            if not isinstance(shift, int) or shift < 1:
+            if not isinstance(shift, int) or shift < 0:
                 logger.error("compute_indicators: invalid shift=%s", shift)
                 return None
             if "M1" not in df_dict or not isinstance(df_dict.get("M1"), pd.DataFrame) or df_dict["M1"].empty:
@@ -273,10 +273,15 @@ class Classic_FeatureEngine:
     def _compute_tf(self, *, tf: str, df: pd.DataFrame, shift: int) -> Tuple[Optional[Dict[str, Any]], float, AnomalyResult]:
         try:
             sh = int(shift)
-            if sh <= 0:
-                sh = 1
+            if sh < 0:
+                sh = 0  # Allow 0 for real-time (Sniper Mode)
 
-            dfp = df.iloc[:-sh]
+            # Fix slicing: if sh=0, take the whole dataframe. if sh>0, slice off the end.
+            if sh == 0:
+                dfp = df
+            else:
+                dfp = df.iloc[:-sh]
+            
             required = self._min_bars(tf)
             if len(dfp) < required:
                 return None, 0.0, AnomalyResult(0.0, [], False, "OK")

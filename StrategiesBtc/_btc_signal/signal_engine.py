@@ -50,7 +50,7 @@ class SignalEngine:
         self._current_drawdown = 0.0
         self._last_meta_gate_log_ts = 0.0  # For throttled diagnostic logging
 
-        self._debounce_ms = float(getattr(self.cfg, "decision_debounce_ms", 1000.0) or 1000.0)
+        self._debounce_ms = float(getattr(self.cfg, "decision_debounce_ms", 200.0) or 200.0)
         self._stable_eps = float(getattr(self.cfg, "signal_stability_eps", 0.03) or 0.03)
 
         # ensemble weights defaults (safe)
@@ -300,7 +300,9 @@ class SignalEngine:
                 if isinstance(df_m1, pd.DataFrame) and not df_m1.empty:
                     tf_data["M1"] = df_m1
 
-            indicators = self.features.compute_indicators(tf_data)
+            # SNIPER MODE: Use shift=0 (Real-Time Forming Candle)
+            # This eliminates the 1-bar lag. Be careful of repainting, but allows instant entries.
+            indicators = self.features.compute_indicators(tf_data, shift=0)
             if not indicators:
                 return self._neutral(
                     sym,
@@ -339,11 +341,11 @@ class SignalEngine:
                     bar_age_ok = last_age >= 5.0
                     if bar_age_ok:
                         now_vol = float(dfp["tick_volume"].iloc[-1])
-                        # HOTFIX: Priority on Speed. Use hard floor of 15.
-                        if now_vol < 15.0:
+                        # HOTFIX: Priority on Speed. Use hard floor of 5.
+                        if now_vol < 5.0:
                              return self._neutral(
                                 sym,
-                                [f"low_volume_sniper:{now_vol:.0f}<15"],
+                                [f"low_volume_sniper:{now_vol:.0f}<5"],
                                 t0,
                                 spread_pct=spread_pct,
                                 bar_key=bar_key,
@@ -378,10 +380,17 @@ class SignalEngine:
             
             # Allow BREAKOUT trades when ADX is high (strong trend developing)
             adx_p = float(indp.get("adx", 0.0) or 0.0)
-            if adx_p > 25.0:  # Strong trend (lowered from 30)
-                if net_norm > 0.10:  # Bullish breakout (lowered from 0.12)
+            
+            # SNIPER OPTIMIZATION: Faster reaction for crypto
+            # 1. Lower ADX threshold for breakout detection (was 25, now 18)
+            # 2. Allow "Sniper" entry if net_norm is very strong (momentum), even if price is slightly lagging EMA
+            
+            is_sniper_momentum = abs(net_norm) > 0.15  # Strong momentum
+            
+            if adx_p > 18.0 or is_sniper_momentum:
+                if net_norm > 0.08:  # Bullish breakout/momentum
                     trend_ok_buy = True
-                elif net_norm < -0.10:  # Bearish breakout (lowered from -0.12)
+                elif net_norm < -0.08:  # Bearish breakout/momentum
                     trend_ok_sell = True
 
             net_norm_abs = abs(net_norm)
@@ -394,7 +403,7 @@ class SignalEngine:
 
             if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
                 if net_norm > net_thr:
-                    if trend_ok_buy:
+                    if trend_ok_buy:    
                         signal = "Buy"
                 elif net_norm < -net_thr:
                     if trend_ok_sell:
@@ -403,13 +412,45 @@ class SignalEngine:
             # 10.1) Confirmation gate (prevents weak/false signals in chop)
             if signal in ("Buy", "Sell"):
                 adx_p = float(indp.get("adx", 0.0) or 0.0)
-                has_confluence = bool(sweep) or (div != "none") or bool(indp.get("fvg_bull", False)) or bool(indp.get("fvg_bear", False))
+                
+                # Side-aware confluence check
+                # A BUY signal needs BULLISH confluence (not bearish)
+                is_buy = (signal == "Buy")
+                
+                sweep_ok = (sweep == "bull") if is_buy else (sweep == "bear")
+                div_ok = (div == "bullish") if is_buy else (div == "bearish")
+                fvg_ok = bool(indp.get("fvg_bull", False)) if is_buy else bool(indp.get("fvg_bear", False))
+                
+                # Penalty for contradicton
+                sweep_bad = (sweep == "bear") if is_buy else (sweep == "bull")
+                div_bad = (div == "bearish") if is_buy else (div == "bullish")
+                
+                if sweep_bad or div_bad:
+                    # Downgrade confidence significantly if trying to trade against structure
+                    conf = max(0, int(conf) - 30)
+                    # If contradiction is strong, kill the signal or force Neutral
+                    if conf < conf_min:
+                        signal = "Neutral"
+
+                has_confluence = sweep_ok or div_ok or fvg_ok
 
                 # If not enough market structure confirmation, require stronger strength
                 if (not has_confluence) and adx_p < 18.0 and abs(net_norm) < 0.15:
                     return self._neutral(
                         sym,
                         ["no_confluence"],
+                        t0,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        regime=str(adapt.get("regime")),
+                        trade_blocked=True,
+                    )
+                
+                # Retest signal validity after penalties
+                if signal == "Neutral":
+                     return self._neutral(
+                        sym,
+                        [f"contradiction_block:sweep={sweep},div={div}"],
                         t0,
                         spread_pct=spread_pct,
                         bar_key=bar_key,

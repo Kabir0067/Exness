@@ -105,7 +105,8 @@ class _AssetPipeline:
 
         # Stale data guard metrics
         self._stale_data_rejections = 0
-        self._stale_data_log_interval = 10  # Log every N rejections
+        self._last_stale_log_ts = 0.0
+        self._stale_log_interval_sec = 5.0  # Log every 5 seconds max (throttled)
 
         # Signal caching to reduce CPU load
         self._last_computed_close = 0.0
@@ -343,16 +344,19 @@ class _AssetPipeline:
             # M1 bars only update at minute boundaries (always appear 0-60s old)
             # Ticks are real-time, so tick age is the true data freshness
             # =================================================================
-            # Use tick age for freshness check (reads from config, default 15s)
-            TICK_STALE_THRESHOLD_SEC = float(getattr(self.cfg, "tick_stale_threshold_sec", 15.0) or 15.0)
+            # Use tick age for freshness check (reads from config, default 60s)
+            TICK_STALE_THRESHOLD_SEC = float(getattr(self.cfg, "tick_stale_threshold_sec", 60.0) or 60.0)
             data_age = self.last_tick_age_sec if self._last_tick_ts > 0 else self.last_bar_age_sec
             
             if data_age > TICK_STALE_THRESHOLD_SEC:
                 self._stale_data_rejections += 1
-                # Log periodically to avoid log spam
-                if self._stale_data_rejections % self._stale_data_log_interval == 1:
+                
+                # Log periodically to avoid log spam (Time-based now)
+                now_log = time.time()
+                if (now_log - self._last_stale_log_ts) > self._stale_log_interval_sec:
+                    self._last_stale_log_ts = now_log
                     log_health.warning(
-                        "STALE_DATA_REJECT | asset=%s tick_age=%.1fs bar_age=%.1fs threshold=%.1fs total_rejections=%d",
+                        "STALE_DATA_REJECT | asset=%s tick_age=%.1fs bar_age=%.1fs threshold=%.1fs total_rejections=%d (spam_throttled)",
                         self.asset,
                         self.last_tick_age_sec,
                         self.last_bar_age_sec,

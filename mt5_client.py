@@ -62,9 +62,9 @@ class MT5ClientConfig:
 
     single_instance_lock: bool = True
     taskkill_on_ipc_timeout: bool = True
-    timeout_ms: int = 90_000
-    start_wait_sec: float = 3.0
-    ready_timeout_sec: float = 30.0
+    timeout_ms: int = 300_000
+    start_wait_sec: float = 5.0
+    ready_timeout_sec: float = 120.0
     max_retries: int = 6
     retry_backoff_base_sec: float = 1.2
     backoff_cap_sec: float = 12.0
@@ -524,9 +524,10 @@ def _default_config_from_env() -> MT5ClientConfig:
         mt5_path=getattr(cfg, "mt5_path", None),
         portable=bool(getattr(cfg, "mt5_portable", False)),
         autostart=bool(getattr(cfg, "mt5_autostart", True)),
-        timeout_ms=int(getattr(cfg, "mt5_timeout_ms", 90_000) or 90_000),
+        timeout_ms=int(getattr(cfg, "mt5_timeout_ms", 300_000) or 300_000),
         require_path_on_windows=False,
         auth_fail_cooldown_sec=float(getattr(cfg, "mt5_auth_cooldown_sec", 600.0) or 600.0),
+        ready_timeout_sec=float(getattr(cfg, "mt5_ready_timeout_sec", 120.0) or 120.0),
     )
 
 
