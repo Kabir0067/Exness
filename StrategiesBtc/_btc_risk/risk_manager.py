@@ -1011,6 +1011,8 @@ class RiskManager:
             _ = tz
             self.evaluate_account_state()
 
+            reasons: List[str] = []
+
             self._refresh_kill_switch()
             if self._kill_state.status == "KILLED":
                 reasons.append("kill_switch_killed")
@@ -1018,8 +1020,6 @@ class RiskManager:
             if self._kill_state.status == "COOLING" and time.time() < float(self._kill_state.cooling_until_ts):
                 reasons.append("kill_switch_cooling")
                 return False, reasons
-
-            reasons: List[str] = []
             conf_f = float(confidence)
             if conf_f > 1.5:
                 conf_f = conf_f / 100.0
@@ -1319,58 +1319,56 @@ class RiskManager:
         atr: float
     ) -> Optional[float]:
         """
-        Logic:
-        1. Breakeven: If Profit >= 40% of MaxProfit -> Move SL to Entry.
-        2. Trailing: After BE, trail by 1.5 * ATR.
+        Dynamic trailing:
+        1) Fast breakeven lock once trade reaches early progress.
+        2) ATR trail that tightens as progress improves.
         """
         try:
             side_n = _side_norm(side)
             dist_total = abs(tp_price - entry_price)
             if dist_total <= 1e-9:
                 return None
-                
-            current_dist = 0.0
-            if side_n == "Buy":
-                current_dist = current_price - entry_price
-            else:
-                current_dist = entry_price - current_price
-                
-            # 1. Breakeven Check (40% to TP)
-            progress = current_dist / dist_total
+
+            current_dist = (current_price - entry_price) if side_n == "Buy" else (entry_price - current_price)
+            if current_dist <= 0:
+                return None
+
+            progress = current_dist / max(1e-9, dist_total)
+            atr_eff = float(atr) if float(atr) > 1e-9 else (dist_total * 0.35)
             new_sl = None
-            
-            # Breakeven Level
-            if progress >= 0.40:
-                # Target SL = Entry (plus small buffer maybe? strict Entry for now)
-                be_price = entry_price
-                
-                # Check if we can improve current SL
+
+            if progress >= 0.30:
+                be_pad = atr_eff * 0.05
+                be_price = (entry_price + be_pad) if side_n == "Buy" else (entry_price - be_pad)
                 if side_n == "Buy":
                     if sl_price < be_price:
                         new_sl = be_price
                 else:
                     if sl_price > be_price:
                         new_sl = be_price
-                        
-            # 2. Trailing Stop (1.5x ATR) if we are in profit
-            # Only trail if we are profitable (e.g. past BE or significantly up)
-            if progress > 0.40: 
-                trail_dist = atr * 1.5
+
+            if progress >= 0.45:
+                if progress >= 0.80:
+                    trail_mult = 0.90
+                elif progress >= 0.60:
+                    trail_mult = 1.10
+                else:
+                    trail_mult = 1.35
+
+                trail_dist = atr_eff * trail_mult
                 if side_n == "Buy":
                     trail_target = current_price - trail_dist
-                    # Only move UP
                     current_sl_to_use = new_sl if new_sl is not None else sl_price
                     if trail_target > current_sl_to_use:
                         new_sl = trail_target
                 else:
                     trail_target = current_price + trail_dist
-                    # Only move DOWN
                     current_sl_to_use = new_sl if new_sl is not None else sl_price
                     if trail_target < current_sl_to_use:
                         new_sl = trail_target
-                        
+
             return new_sl
-            
+
         except Exception as exc:
             log_risk.error("check_trailing_stop error: %s", exc)
             return None
@@ -1429,93 +1427,90 @@ class RiskManager:
                 log_risk.warning(f"plan_order blocked: invalid entry_price={entry_price}")
                 return None, None, None, None, f"invalid_entry_{entry_price}"
 
-            # =================================================================
-            # NEW "SENIOR" SL LOGIC: Volatility-Adjusted + Structure (BTC)
-            # =================================================================
+            # Normalize confidence: signal layer passes 0..1, local rules below use percentage.
+            conf_raw = float(confidence)
+            conf_pct = conf_raw * 100.0 if conf_raw <= 1.0 else conf_raw
+            conf_pct = float(np.clip(conf_pct, 0.0, 100.0))
 
-            # 1. Get ATR
+            # 1) ATR source (adaptive first, indicator second, safe fallback)
             atr = 0.0
             try:
                 atr = float((adapt or {}).get("atr", 0.0) or ind.get("atr", 0.0) or 0.0)
             except Exception:
                 atr = 0.0
-            
             if atr <= 1e-9:
-                atr = max(abs(entry_price - float(sl or 0)), entry_price * 0.005) # 0.5% fallback for BTC
+                atr = entry_price * 0.0035
 
-            # =================================================================
-            # SNIPER MODE: KILL ZONE FILTER
-            # =================================================================
-            # Reject if market is dead (low volatility)
-            # BTC needs larger threshold than Gold due to scale
-            min_vol_threshold = entry_price * 0.00025  # 0.025% move required for BTC
-            if tick_volatility < min_vol_threshold and atr < (entry_price * 0.001):
+            # 2) Kill-zone filters softened to avoid no-trade lockups.
+            min_vol_threshold = entry_price * 0.00020
+            if tick_volatility < min_vol_threshold and atr < (entry_price * 0.00075) and conf_pct < 70.0:
                 log_risk.info(f"SNIPER_REJECT | {side_n} | Low Volatility: TickVol={tick_volatility:.2f} ATR={atr:.2f}")
                 return None, None, None, None, "kill_zone_low_volatility"
 
-            # Reject if we are in "Noise" (price too close to recent structure loops)
-            # (Simplified: We rely on Spread/ATR ratio)
             spread = self.broker.current_spread_points() * float(self.broker.point_value())
-            if spread > 0 and (atr / spread) < 2.0:
-                 log_risk.info(f"SNIPER_REJECT | {side_n} | High Spread/Noise Ratio: ATR/Spread = {atr/spread:.2f}")
-                 return None, None, None, None, "kill_zone_high_noise"
-            # =================================================================
+            if spread > 0 and (atr / max(spread, 1e-9)) < 1.2 and conf_pct < 78.0:
+                log_risk.info(f"SNIPER_REJECT | {side_n} | High Spread/Noise Ratio: ATR/Spread = {atr/spread:.2f}")
+                return None, None, None, None, "kill_zone_high_noise"
 
-            # 2. Calculate ATR-Based SL (Base 2.5x for Volatility Survival)
-            # CRITICAL OPTIMIZATION: Wide Base SL to survive noise
-            sl_mult_atr = 2.5
+            # 3) Dynamic SL: ATR core + structure anchor with cap to prevent oversized risk.
+            base_sl_mult = float((adapt or {}).get("sl_mult", getattr(self.cfg, "sl_atr_mult_trend", 1.35)) or 1.35)
+            vol_ratio = float(tick_volatility) / max(atr, 1e-9) if float(tick_volatility) > 0 else 1.0
+            conf_sl_adj = 0.92 if conf_pct >= 88.0 else (1.10 if conf_pct < 70.0 else 1.0)
+            vol_sl_adj = 1.12 if vol_ratio > 1.4 else (0.92 if vol_ratio < 0.6 else 1.0)
+            sl_mult_atr = float(np.clip(base_sl_mult * conf_sl_adj * vol_sl_adj, 1.20, 3.00))
             atr_sl_dist = atr * sl_mult_atr
-            
-            if side_n == "Buy":
-                atr_sl_price = entry_price - atr_sl_dist
-            else:
-                atr_sl_price = entry_price + atr_sl_dist
+            atr_sl_price = (entry_price - atr_sl_dist) if side_n == "Buy" else (entry_price + atr_sl_dist)
 
-            # 3. Structure SL
             struct_sl_price, struct_reason = self._calculate_structure_sl(side_n, entry_price, df)
-            
-            # 4. Final SL (Structure Priority + Buffer)
-            # The user wants SL behind Swings + Buffer.
-            sl_buffer = atr * 0.5  # 0.5 ATR buffer behind the swing
+            sl_buffer = atr * float(getattr(self.cfg, "sniper_structure_buffer_atr", 0.25) or 0.25)
+            struct_cap = atr * float(getattr(self.cfg, "sniper_structure_cap_atr", 2.80) or 2.80)
             final_sl = atr_sl_price
-            sl_source = "ATR_2.5x"
+            sl_source = "ATR_Dynamic"
 
             if side_n == "Buy":
-                if struct_reason == "swing_low" and struct_sl_price < entry_price:
-                    # Use structure low -> subtract buffer
-                    final_sl = struct_sl_price - sl_buffer
+                struct_candidate = float(struct_sl_price - sl_buffer)
+                struct_dist = float(entry_price - struct_candidate)
+                if struct_reason == "swing_low" and 0.0 < struct_dist <= struct_cap:
+                    final_sl = min(float(atr_sl_price), struct_candidate)
                     sl_source = "Structure_Low_Buffered"
-                else:
-                    # No structure? Use Wide ATR (Sniper patience: maybe reject? For now use wide ATR)
-                    final_sl = entry_price - (atr * 2.5)
-                    sl_source = "ATR_Fallback_Wide"
+                elif struct_reason == "swing_low" and struct_dist > struct_cap:
+                    final_sl = entry_price - struct_cap
+                    sl_source = "Structure_Capped"
             else:
-                if struct_reason == "swing_high" and struct_sl_price > entry_price:
-                    # Use structure high -> add buffer
-                    final_sl = struct_sl_price + sl_buffer
+                struct_candidate = float(struct_sl_price + sl_buffer)
+                struct_dist = float(struct_candidate - entry_price)
+                if struct_reason == "swing_high" and 0.0 < struct_dist <= struct_cap:
+                    final_sl = max(float(atr_sl_price), struct_candidate)
                     sl_source = "Structure_High_Buffered"
-                else:
-                    final_sl = entry_price + (atr * 2.5)
-                    sl_source = "ATR_Fallback_Wide"
+                elif struct_reason == "swing_high" and struct_dist > struct_cap:
+                    final_sl = entry_price + struct_cap
+                    sl_source = "Structure_Capped"
 
-            # 5. Safety Check (Min Distance)
-            min_dist_pct = 0.002
+            min_dist_pct = float(getattr(self.cfg, "sniper_min_sl_pct", 0.0008) or 0.0008)
+            max_dist_pct = float(getattr(self.cfg, "sniper_max_sl_pct", 0.0075) or 0.0075)
             min_safety_dist = entry_price * min_dist_pct
+            max_safety_dist = entry_price * max_dist_pct
             real_dist = abs(entry_price - final_sl)
-            
+
             if real_dist < min_safety_dist:
-                log_risk.info(f"SNIPER_ADJUST | SL too close ({real_dist:.2f}). Widening to {min_safety_dist:.2f}")
                 if side_n == "Buy":
                     final_sl = entry_price - min_safety_dist
                 else:
                     final_sl = entry_price + min_safety_dist
                 sl_source += "_ForceWiden"
+            elif real_dist > max_safety_dist:
+                if side_n == "Buy":
+                    final_sl = entry_price - max_safety_dist
+                else:
+                    final_sl = entry_price + max_safety_dist
+                sl_source += "_ForceTighten"
 
             sl = self.broker.normalize_price(final_sl)
+            dist_sl = abs(entry_price - float(sl))
 
             log_risk.info(
                 f"SNIPER_SL | Symbol: {self.symbol} | Side: {side_n} | Source: {sl_source} | "
-                f"Entry: {entry_price:.2f} | SL: {sl:.2f} | Dist: {abs(entry_price - sl):.2f}"
+                f"Entry: {entry_price:.2f} | SL: {sl:.2f} | Dist: {dist_sl:.2f}"
             )
 
             # --- Restore Broker Min Limits (deleted in previous step) ---
@@ -1534,36 +1529,37 @@ class RiskManager:
                 if abs(entry_price - float(sl)) < min_sl:
                     sl = self.broker.normalize_price(entry_price + min_sl)
 
-            # CRITICAL OPTIMIZATION: Volatility-Adjusted Micro-Scalping TP
-            # Formula: TP = Entry +/- (ATR(5) * Scalping_Multiplier [0.8 - 1.2])
+            # Dynamic TP: volatility projection + RR floor/cap (prevents unrealistic TP inflation).
+            rr_floor_cfg = float(getattr(self.cfg, "min_rr", 1.8) or 1.8)
+            rr_floor = float(np.clip(rr_floor_cfg, 1.6, 2.6))
+            if conf_pct >= 90.0:
+                rr_target = min(2.90, rr_floor + 0.35)
+            elif conf_pct >= 82.0:
+                rr_target = min(2.70, rr_floor + 0.20)
+            elif conf_pct < 70.0:
+                rr_target = max(1.60, rr_floor - 0.15)
+            else:
+                rr_target = rr_floor
 
-            scalp_mult = 1.0 # Default for normal confidence
-            if float(confidence) >= 85:
-                scalp_mult = 1.2 # High confidence
-            elif float(confidence) < 50:
-                scalp_mult = 0.8
-            
-            # Allow config override
-            if hasattr(self.cfg, "scalping_tp_multiplier"):
-                try:
-                    scalp_mult = float(self.cfg.scalping_tp_multiplier)
-                except:
-                    pass
+            tp_mult_cfg = float(getattr(self.cfg, "scalping_tp_multiplier", 1.15) or 1.15)
+            tp_mult = tp_mult_cfg * (1.10 if conf_pct >= 88.0 else (0.92 if conf_pct < 70.0 else 1.0))
+            tp_mult = float(np.clip(tp_mult, 0.80, 2.20))
+            tp_vol_dist = atr * tp_mult
 
-            tp_dist = atr * scalp_mult
-
-            # 2. Enforce Minimum Profit Floor (Spread + Commission Buffer)
             current_sp_val = self.broker.current_spread_points() * float(self.broker.point_value())
-            profit_floor = current_sp_val * 1.5 # Spread + 50% buffer
+            profit_floor = max(current_sp_val * 1.8, atr * 0.65)
+            tp_rr_dist = dist_sl * rr_target
+            tp_dist = max(tp_vol_dist, tp_rr_dist, profit_floor)
 
-            if tp_dist < profit_floor:
-                log_risk.info(f"SCALP_ADJUST | TP distance ({tp_dist:.2f}) < ProfitFloor ({profit_floor:.2f}). Widening.")
-                tp_dist = profit_floor
+            rr_cap_cfg = float(getattr(self.cfg, "tp_rr_cap", 0.0) or 0.0)
+            rr_cap_soft = rr_cap_cfg if rr_cap_cfg > 0.0 else max(rr_target + 0.80, 3.20)
+            rr_cap_soft = max(rr_cap_soft, rr_target)
+            tp_dist = min(tp_dist, dist_sl * rr_cap_soft)
 
             if side_n == "Buy":
-                 tp = entry_price + tp_dist
+                tp = entry_price + tp_dist
             else:
-                 tp = entry_price - tp_dist
+                tp = entry_price - tp_dist
 
             # Enforce minimum TP distance
             if side_n == "Buy":
@@ -1586,9 +1582,9 @@ class RiskManager:
                 log_risk.info("plan_order blocked: bad_sell_limits tp=%s entry=%s sl=%s", tp, entry_price, sl)
                 return None, None, None, None, f"bad_sell_limits:tp={tp},en={entry_price},sl={sl}"
 
-            # Enforce SNIPER RR >= 2.0
-            rr_cfg = float(getattr(self.cfg, "min_rr", 2.0) or 2.0)
-            rr_min = max(rr_cfg, 2.0) # FORCE 2.0
+            # Enforce minimum R:R (bounded to avoid unrealistic TP targets).
+            rr_cfg = float(getattr(self.cfg, "min_rr", 1.8) or 1.8)
+            rr_min = float(np.clip(rr_cfg, 1.6, 2.6))
             dist_sl = abs(entry_price - float(sl))
             if dist_sl > 0:
                 dist_tp = abs(float(tp) - entry_price)

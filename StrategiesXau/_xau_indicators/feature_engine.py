@@ -126,7 +126,8 @@ class Classic_FeatureEngine:
             if not isinstance(df_dict, dict) or not df_dict:
                 logger.error("compute_indicators: df_dict invalid/empty")
                 return None
-            if not isinstance(shift, int) or shift < 1:
+            # shift=0 is valid for real-time (forming-candle) calculations.
+            if not isinstance(shift, int) or shift < 0:
                 logger.error("compute_indicators: invalid shift=%s", shift)
                 return None
             if "M1" not in df_dict or not isinstance(df_dict.get("M1"), pd.DataFrame) or df_dict["M1"].empty:
@@ -246,7 +247,8 @@ class Classic_FeatureEngine:
     # ------------------- per-tf compute -------------------
     def _compute_tf(self, *, tf: str, df: pd.DataFrame, shift: int) -> Tuple[Optional[Dict[str, Any]], float, AnomalyResult]:
         try:
-            dfp = df.iloc[:-shift]
+            # IMPORTANT: df.iloc[:-0] returns empty, so handle shift=0 explicitly.
+            dfp = df if int(shift) == 0 else df.iloc[:-shift]
             required = self._min_bars(tf)
             if len(dfp) < required:
                 return None, 0.0, AnomalyResult(0.0, [], False, "OK")

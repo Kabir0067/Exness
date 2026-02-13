@@ -268,14 +268,14 @@ class EngineConfig:
     magic: int = 777001
     dry_run: bool = False  # SIMULATION MODE: If True, logic runs but NO orders sent.
 
-    min_confidence_signal: float = 0.85
-    conf_min: int = 85
-    conf_min_low: int = 85
-    conf_min_high: int = 90
+    min_confidence_signal: float = 0.56
+    conf_min: int = 56
+    conf_min_low: int = 52
+    conf_min_high: int = 72
     confidence_bias: float = 50.0
     confidence_gain: float = 70.0
-    net_norm_signal_threshold: float = 0.15
-    strong_conf_min: int = 90
+    net_norm_signal_threshold: float = 0.10
+    strong_conf_min: int = 80
     require_ema_stack: bool = True
 
     adx_trend_lo: float = 16.0
@@ -333,20 +333,20 @@ class EngineConfig:
     max_trades_per_hour: int = 20
     max_signals_per_day: int = 0
 
-    sl_atr_mult_trend: float = 1.15
-    tp_atr_mult_trend: float = 2.7
-    sl_atr_mult_range: float = 1.35
-    tp_atr_mult_range: float = 2.0
+    sl_atr_mult_trend: float = 1.80
+    tp_atr_mult_trend: float = 2.2
+    sl_atr_mult_range: float = 1.60
+    tp_atr_mult_range: float = 1.8
     tp_rr_cap: float = 2.0
-    min_rr: float = 1.05
+    min_rr: float = 1.2
     sltp_cost_spread_mult: float = 1.8
     sltp_cost_slip_mult: float = 1.0
     sltp_cost_move_mult: float = 0.6
     sltp_sl_floor_mult: float = 1.15
     sltp_tp_floor_mult: float = 1.6
-    be_trigger_R: float = 0.8
+    be_trigger_R: float = 0.40
     be_lock_spread_mult: float = 1.25
-    trail_atr_mult: float = 1.05
+    trail_atr_mult: float = 1.20
 
     signal_amplification: float = 1.25
     weights: Dict[str, float] = field(
@@ -688,8 +688,8 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
     # Keep your original behavior; only clean assignments.
-    cfg.min_confidence_signal = 0.80
-    cfg.ultra_confidence_min = 0.90
+    cfg.min_confidence_signal = 0.58
+    cfg.ultra_confidence_min = 0.82
     cfg.max_risk_per_trade = 0.02
     cfg.tp_atr_mult_trend = 2.7
     cfg.use_squeeze_filter = False

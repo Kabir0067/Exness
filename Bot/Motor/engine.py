@@ -132,6 +132,8 @@ class MultiAssetTradingEngine:
         self._hard_stop_notified: Dict[str, bool] = {"XAU": False, "BTC": False}
         self._last_daily_date_by_asset: Dict[str, str] = {"XAU": "", "BTC": ""}
 
+
+
         # ============================================================
         # CRITICAL FIX #3: Post-Trade Cooldown System
         # Prevents rapid re-entry after a trade closes
@@ -184,6 +186,8 @@ class MultiAssetTradingEngine:
 
     def set_skip_notifier(self, cb: Optional[Callable[[AssetCandidate], None]]) -> None:
         self._skip_notifier = cb
+
+
 
     # -------------------- MT5 init/health --------------------
     def _init_mt5(self) -> bool:
@@ -304,6 +308,7 @@ class MultiAssetTradingEngine:
         try:
             log_health.info("RECOVER_START")
 
+
             # Stop worker first (prevents executing stale intents)
             if self._exec_worker:
                 try:
@@ -333,6 +338,7 @@ class MultiAssetTradingEngine:
                 return False
 
             self._restart_exec_worker()
+
             log_health.info("RECOVER_OK")
             return True
         except Exception as exc:
@@ -518,6 +524,26 @@ class MultiAssetTradingEngine:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         return f"PORD_{asset}_{ts}_{self._order_counter}_{os.getpid()}"
 
+    def _effective_min_conf(self, c: AssetCandidate) -> float:
+        cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
+        base = float(getattr(cfg, "min_confidence_signal", 0.55) or 0.55)
+
+        env_global = float(os.getenv("PORTFOLIO_MIN_CONF", "0.50") or "0.50")
+        env_asset = float(os.getenv(f"PORTFOLIO_MIN_CONF_{str(c.asset).upper()}", str(env_global)) or str(env_global))
+        floor = max(0.35, min(0.90, env_asset))
+
+        effective_min = max(floor, base)
+        rs = tuple(str(r) for r in (c.reasons or ()))
+
+        # Early momentum signals are allowed with a lower floor to avoid late entries.
+        if any(r.startswith("early_momentum") for r in rs):
+            effective_min = max(floor, effective_min - 0.08)
+
+
+
+        return float(max(0.0, min(1.0, effective_min)))
+
+
     def _candidate_is_tradeable(self, c: AssetCandidate) -> bool:
         if c.signal not in ("Buy", "Sell"):
             return False
@@ -527,25 +553,9 @@ class MultiAssetTradingEngine:
             return False
         if c.sl <= 0.0 or c.tp <= 0.0:
             return False
-        
-        # DYNAMIC CONFIDENCE CHECK (Config-based + Hard Floor)
-        # Use config specific to the asset
-        cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
-        
-        # User Requirement: Strict threshold: if confidence < 0.75: return No_Trade
-        HARD_MIN_CONF = 0.75
+
         conf_val = float(c.confidence)
-        
-        # Config might be higher (e.g. 0.80), but NEVER lower than 0.75
-        cfg_min = float(getattr(cfg, "min_confidence_signal", 0.75) or 0.75)
-        effective_min = max(HARD_MIN_CONF, cfg_min)
-        
-        if conf_val < effective_min:
-            # We don't log here to avoid spamming low-conf signals, 
-            # but we explicitly reject them.
-            return False
-            
-        return True
+        return bool(conf_val >= self._effective_min_conf(c))
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
         active_assets = UTCScheduler.get_active_assets()
@@ -712,13 +722,18 @@ class MultiAssetTradingEngine:
         
         # Default safety defaults if config missing
         if max_spread_pts <= 0:
-            max_spread_pts = 650.0 if cand.asset == "BTC" else 35.0  # ~3.5 pips XAU, ~$6.5 BTC
+            max_spread_pts = 2500.0 if cand.asset == "BTC" else 350.0  # ~35 pips XAU (3-digit), ~$25 BTC
             
         if current_spread_points > max_spread_pts:
-             log_health.info(
-                 "ENQUEUE_SKIP | asset=%s reason=spread_too_high spread=%s > max=%s", 
-                 cand.asset, int(current_spread_points), int(max_spread_pts)
-             )
+             # Throttle this log to once per 30s per asset to prevent spam
+             _sp_key = f"_spread_skip_ts_{cand.asset}"
+             _sp_last = getattr(self, _sp_key, 0.0)
+             if (now - _sp_last) >= 30.0:
+                 setattr(self, _sp_key, now)
+                 log_health.info(
+                     "ENQUEUE_SKIP | asset=%s reason=spread_too_high spread=%s > max=%s", 
+                     cand.asset, int(current_spread_points), int(max_spread_pts)
+                 )
              return False, None
 
         # 2. Volatility/Slip Estimation (Basic)
@@ -994,6 +1009,7 @@ class MultiAssetTradingEngine:
 
         self._restart_exec_worker()
 
+
         log_health.info(
             "PORTFOLIO_ENGINE_START | dry_run=%s xau=%s btc=%s manual_stop=%s",
             self.dry_run,
@@ -1026,6 +1042,7 @@ class MultiAssetTradingEngine:
         self._drain_queue(self._order_q)
         self._drain_queue(self._result_q)
         self._order_rm_by_id.clear()
+
 
         log_health.info("PORTFOLIO_ENGINE_STOP")
         return True
@@ -1252,12 +1269,15 @@ class MultiAssetTradingEngine:
 
                 # Execute all valid signals
                 for selected in candidates:
+
+
                     # 1. NOTIFICATION LOGIC (Decoupled & Simulation Mode)
                     # Notify even if blocked (Phase C), as long as signal is high-confidence and valid type.
                     # This allows "Simulation Mode" where user sees signals but no trades occur.
+                    notify_floor = max(0.55, min(0.90, self._effective_min_conf(selected) + 0.05))
                     is_valid_sig = (
                         selected.signal in ("Buy", "Sell")
-                        and float(selected.confidence) >= 0.85
+                        and float(selected.confidence) >= float(notify_floor)
                     )
                     
                     if is_valid_sig:
@@ -1283,8 +1303,7 @@ class MultiAssetTradingEngine:
                         # We notify here because _candidate_is_tradeable returned False.
                         
                         # ENHANCEMENT: Explicitly add "low_confidence" reason if that was the cause
-                        cfg = self._xau_cfg if selected.asset == "XAU" else self._btc_cfg
-                        min_conf = float(getattr(cfg, "min_confidence_signal", 0.80) or 0.80)
+                        min_conf = self._effective_min_conf(selected)
                         
                         if float(selected.confidence) < min_conf:
                              # Create a modified copy with the new reason for notification

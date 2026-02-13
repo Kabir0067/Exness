@@ -332,28 +332,27 @@ class SignalEngine:
             )
             net_abs = abs(net_norm)
 
-            # ==============================================================
-            # SNIPER LOGIC #1: Volume Validation (Strict & Tiered)
-            # HOTFIX: Lower threshold to 15 (aggressive entry)
-            # ==============================================================
+            early_buy, early_sell, early_score = self._early_momentum_trigger(indp, dfp, net_norm)
+
+            # Dynamic relative-volume gate avoids low-volume freeze while still blocking dead chop.
+            vol_ok = True
+            now_vol = 0.0
+            vol_floor = 0.0
+            rel_vol = 1.0
             try:
-                if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
-                    bar_age_ok = last_age >= 5.0
-                    if bar_age_ok:
-                        now_vol = float(dfp["tick_volume"].iloc[-1])
-                        # HOTFIX: Priority on Speed. Use hard floor of 5.
-                        if now_vol < 5.0:
-                             return self._neutral(
-                                sym,
-                                [f"low_volume_sniper:{now_vol:.0f}<5"],
-                                t0,
-                                spread_pct=spread_pct,
-                                bar_key=bar_key,
-                                regime=str(adapt.get("regime")),
-                                trade_blocked=True,
-                            )
+                vol_ok, now_vol, vol_floor, rel_vol = self._sniper_volume_gate(dfp, last_age=last_age)
             except Exception:
-                pass
+                vol_ok = True
+            if (not vol_ok) and (not early_buy) and (not early_sell) and net_abs < 0.16:
+                return self._neutral(
+                    sym,
+                    [f"low_volume_sniper:{now_vol:.0f}<{vol_floor:.0f}", f"relv:{rel_vol:.2f}"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=str(adapt.get("regime")),
+                    trade_blocked=True,
+                )
 
             # 9) Pattern detection
             sweep = self._liquidity_sweep(dfp, indp)
@@ -401,12 +400,17 @@ class SignalEngine:
             if conf >= 90 and (not has_confluence) and net_norm_abs < 0.20:
                 conf = min(conf, 89)
 
+            early_match = (net_norm > 0 and early_buy) or (net_norm < 0 and early_sell)
+            if early_match:
+                min_net_norm_for_signal = max(0.06, min_net_norm_for_signal * 0.88)
+                conf = min(96, int(conf + min(5.0, early_score * 2.0)))
+
             if conf >= conf_min and net_norm_abs >= min_net_norm_for_signal:
                 if net_norm > net_thr:
-                    if trend_ok_buy:    
+                    if trend_ok_buy or early_buy:
                         signal = "Buy"
                 elif net_norm < -net_thr:
-                    if trend_ok_sell:
+                    if trend_ok_sell or early_sell:
                         signal = "Sell"
 
             # 10.1) Confirmation gate (prevents weak/false signals in chop)
@@ -435,7 +439,8 @@ class SignalEngine:
                 has_confluence = sweep_ok or div_ok or fvg_ok
 
                 # If not enough market structure confirmation, require stronger strength
-                if (not has_confluence) and adx_p < 18.0 and abs(net_norm) < 0.15:
+                early_side = (is_buy and early_buy) or ((not is_buy) and early_sell)
+                if (not has_confluence) and adx_p < 18.0 and abs(net_norm) < 0.15 and (not early_side):
                     return self._neutral(
                         sym,
                         ["no_confluence"],
@@ -543,9 +548,11 @@ class SignalEngine:
             # Widen SL for strong signals to survive noise
             # ==============================================================
             if conf >= 85:
+                # Widen SL by 20%
                 old_sl = float(adapt.get("sl_mult", 1.35))
                 adapt["sl_mult"] = old_sl * 1.2 
-                min_tp = adapt["sl_mult"] * 2.0
+                # Ensure TP is at least 1.5x SL (RR >= 1:1.5 — реалистик барои scalping)
+                min_tp = adapt["sl_mult"] * 1.5
                 if float(adapt.get("tp_mult", 0.0)) < min_tp:
                     adapt["tp_mult"] = min_tp
 
@@ -558,6 +565,9 @@ class SignalEngine:
             if near_rn:
                 reasons.append("near_rn")
             reasons.append(f"net:{net_norm:.3f}")
+            reasons.append(f"relv:{rel_vol:.2f}")
+            if (signal == "Buy" and early_buy) or (signal == "Sell" and early_sell):
+                reasons.append("early_momentum")
             reasons.append(f"conf:{int(conf)}")
 
             return self._finalize(
@@ -808,6 +818,87 @@ class SignalEngine:
             return True, []
         except Exception:
             return True, []
+
+    def _sniper_volume_gate(self, dfp: pd.DataFrame, *, last_age: float) -> Tuple[bool, float, float, float]:
+        """
+        Dynamic relative-volume gate.
+        Uses recent median flow instead of a fixed threshold that can freeze the bot.
+        """
+        try:
+            if dfp is None or dfp.empty or "tick_volume" not in dfp.columns:
+                return True, 0.0, 0.0, 1.0
+
+            vols = pd.to_numeric(dfp["tick_volume"].tail(32), errors="coerce").dropna()
+            if vols.empty:
+                return True, 0.0, 0.0, 1.0
+
+            now_vol = float(vols.iloc[-1])
+            if float(last_age) < 2.0:
+                return True, now_vol, 0.0, 1.0
+
+            hist = vols.iloc[:-1]
+            baseline = float(np.median(hist.to_numpy(dtype=np.float64))) if len(hist) >= 6 else float(now_vol)
+            floor_mult = float(getattr(self.cfg, "sniper_rel_volume_floor", 0.30) or 0.30)
+            min_floor = float(getattr(self.cfg, "sniper_min_tick_volume_floor", 2.0) or 2.0)
+            vol_floor = max(min_floor, baseline * floor_mult)
+            rel_vol = now_vol / max(1.0, baseline)
+            return bool(now_vol >= vol_floor), now_vol, vol_floor, rel_vol
+        except Exception:
+            return True, 0.0, 0.0, 1.0
+
+    def _early_momentum_trigger(
+        self,
+        indp: Dict[str, Any],
+        dfp: pd.DataFrame,
+        net_norm: float,
+    ) -> Tuple[bool, bool, float]:
+        """
+        Fast move-start detector to avoid entering several candles late.
+        """
+        try:
+            if dfp is None or dfp.empty or "close" not in dfp.columns or len(dfp) < 4:
+                return False, False, 0.0
+
+            closes = pd.to_numeric(dfp["close"].tail(4), errors="coerce").dropna().to_numpy(dtype=np.float64)
+            if closes.size < 4:
+                return False, False, 0.0
+
+            step_now = float(closes[-1] - closes[-2])
+            step_prev = float(closes[-2] - closes[-3])
+            accel = step_now - step_prev
+
+            atr = float(indp.get("atr", 0.0) or 0.0)
+            if atr <= 1e-9:
+                atr = max(abs(step_now), abs(step_prev), 1e-6)
+
+            impulse = step_now / max(atr, 1e-9)
+            accel_n = accel / max(atr, 1e-9)
+
+            rsi = float(indp.get("rsi", 50.0) or 50.0)
+            macd = float(indp.get("macd", 0.0) or 0.0)
+            macd_sig = float(indp.get("macd_sig", indp.get("macd_signal", 0.0)) or 0.0)
+            macd_hist = float(indp.get("macd_hist", (macd - macd_sig)) or (macd - macd_sig))
+
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.08) or 0.08)
+            buy = bool(
+                float(net_norm) >= max(0.08, net_thr * 0.90)
+                and impulse > 0.08
+                and accel_n > -0.10
+                and rsi >= 50.0
+                and macd_hist >= -1e-6
+            )
+            sell = bool(
+                float(net_norm) <= -max(0.08, net_thr * 0.90)
+                and impulse < -0.08
+                and accel_n < 0.10
+                and rsi <= 50.0
+                and macd_hist <= 1e-6
+            )
+
+            score = max(0.0, abs(impulse)) + 0.5 * max(0.0, abs(accel_n))
+            return buy, sell, float(score)
+        except Exception:
+            return False, False, 0.0
 
     # --------------------------- ensemble scoring (FIXED)
     def _get_base_weights(self) -> np.ndarray:

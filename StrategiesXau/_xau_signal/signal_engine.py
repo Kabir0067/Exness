@@ -154,7 +154,14 @@ class SignalEngine:
 
             # Indicators (MTF)
             tf_data = {self.sp.tf_primary: dfp, self.sp.tf_confirm: dfc, self.sp.tf_long: dfl}
-            indicators = self.features.compute_indicators(tf_data)
+            # Prefer shift=0 for faster entry; fallback to shift=1 if the backend declines/returns empty.
+            indicators = None
+            try:
+                indicators = self.features.compute_indicators(tf_data, shift=0)  # type: ignore[call-arg]
+            except TypeError:
+                indicators = None
+            if not indicators:
+                indicators = self.features.compute_indicators(tf_data, shift=1)
             if not indicators:
                 return self._neutral(sym, ["no_indicators"], t0, spread_pct=spread_pct, bar_key=bar_key, trade_blocked=True)
 
@@ -184,123 +191,19 @@ class SignalEngine:
 
             adapt = self._get_adaptive_params(indp, indl, atr_pct)
 
-            # ==============================================================
-            # SNIPER LOGIC #1: Volume Validation (Smart)
-            # Reject signals in low-volume conditions (choppy markets)
-            # BUT: Skip check during first 15 seconds of bar (volume is naturally low)
-            # ==============================================================
-            # ==============================================================
-            # SNIPER LOGIC #1: Volume Validation (Moved to after Confidence)
-            # ==============================================================
-            # (Volume check removed from here to allow confidence-based filtering)
-            pass
-
-            # HTF alignment (FIXED: symmetric, no "sell always ok")
+            # Pure M1 trend gate: remove MTF scoring/penalties to avoid lagging entries.
             close_p = float(indp.get("close", 0.0) or 0.0)
-            ema50_l = float(indl.get("ema50", close_p) or close_p)
-            adx_l = float(indl.get("adx", 0.0) or 0.0)
-            adx_lo_ltf = float(getattr(self.cfg, "adx_trend_lo", 18.0) or 18.0)
-
             ema_s, ema_m = self._ema_s_m(indp, close_p)
             require_stack = bool(getattr(self.cfg, "require_ema_stack", True))
-
-            trend_l = str(indl.get("trend", "") or "").lower()
-            trend_c = str(indc.get("trend", "") or "").lower()
-            bias_up = ("up" in trend_l) or ("bull" in trend_l)
-            bias_dn = ("down" in trend_l) or ("bear" in trend_l)
-
-            c_up = ("up" in trend_c) or ("bull" in trend_c)
-            c_dn = ("down" in trend_c) or ("bear" in trend_c)
-
-            # Small tolerance for scalping noise
             ema50_pad = float(getattr(self.cfg, "ema50_pad", 0.0015) or 0.0015)
 
             ema_stack_buy = bool(close_p > ema_s > ema_m)
             ema_stack_sell = bool(close_p < ema_s < ema_m)
-
-            # Core HTF gates
-            trend_ok_buy = (close_p >= ema50_l * (1.0 - ema50_pad)) and (bias_up or (adx_l >= adx_lo_ltf * 0.90)) and (c_up or not trend_c)
-            trend_ok_sell = (close_p <= ema50_l * (1.0 + ema50_pad)) and (bias_dn or (adx_l >= adx_lo_ltf * 0.90)) and (c_dn or not trend_c)
-
+            trend_ok_buy = bool(close_p >= ema_s * (1.0 - ema50_pad))
+            trend_ok_sell = bool(close_p <= ema_s * (1.0 + ema50_pad))
             if require_stack:
-                trend_ok_buy = trend_ok_buy and ema_stack_buy
-                trend_ok_sell = trend_ok_sell and ema_stack_sell
-
-            # ==============================================================
-            # SNIPER LOGIC #2: ENHANCED MTF Confirmation (10/10 Quality)    
-            # Multi-Timeframe Alignment with ADX Strength + Price Position  
-            # ==============================================================
-            ema50_c = float(indc.get("ema50", 0.0) or 0.0)
-            ema200_c = float(indc.get("ema200", indc.get("ema", 0.0)) or 0.0)
-            ema50_l_val = float(indl.get("ema50", 0.0) or 0.0)
-            ema200_l = float(indl.get("ema200", indl.get("ema", 0.0)) or 0.0)
-            
-            # ADX values for trend strength
-            adx_c = float(indc.get("adx", 0.0) or 0.0)  # M5 ADX
-            adx_l = float(indl.get("adx", 0.0) or 0.0)  # M15 ADX
-            ADX_TREND_MIN = 20.0  # Minimum ADX for valid trend
-            
-            # Price position relative to EMAs
-            close_c = float(indc.get("close", close_p) or close_p)  # M5 close
-            close_l = float(indl.get("close", close_p) or close_p)  # M15 close
-
-            # M5 trend from EMA crossover + Price position
-            m5_bullish = (ema50_c > ema200_c and close_c > ema50_c) if (ema50_c > 0 and ema200_c > 0) else True
-            m5_bearish = (ema50_c < ema200_c and close_c < ema50_c) if (ema50_c > 0 and ema200_c > 0) else True
-            m5_trend_strong = adx_c >= ADX_TREND_MIN  # M5 has valid trend
-
-            # M15 trend from EMA + Price position
-            m15_bearish = (ema50_l_val < ema200_l * 0.998 and close_l < ema50_l_val) if (ema50_l_val > 0 and ema200_l > 0) else False
-            m15_bullish = (ema50_l_val > ema200_l * 1.002 and close_l > ema50_l_val) if (ema50_l_val > 0 and ema200_l > 0) else False
-            m15_trend_strong = adx_l >= ADX_TREND_MIN  # M15 has valid trend
-
-            # MTF Alignment Score (for confidence boost)
-            mtf_score_buy = 0
-            mtf_score_sell = 0
-            
-            # M1 alignment
-            if ema_stack_buy:
-                mtf_score_buy += 1
-            if ema_stack_sell:
-                mtf_score_sell += 1
-            
-            # M5 alignment + strength
-            if m5_bullish:
-                mtf_score_buy += 1
-                if m5_trend_strong:
-                    mtf_score_buy += 1
-            if m5_bearish:
-                mtf_score_sell += 1
-                if m5_trend_strong:
-                    mtf_score_sell += 1
-            
-            # M15 alignment + strength
-            if m15_bullish:
-                mtf_score_buy += 1
-                if m15_trend_strong:
-                    mtf_score_buy += 1
-            if m15_bearish:
-                mtf_score_sell += 1
-                if m15_trend_strong:
-                    mtf_score_sell += 1
-            
-            # Perfect alignment: M1+M5+M15 all agree with strong ADX = 6 points
-            PERFECT_MTF_SCORE = 6
-
-            # Apply SNIPER MTF gate (enhanced)
-            sniper_mtf_enabled = bool(getattr(self.cfg, "sniper_mtf_filter", True))
-            if sniper_mtf_enabled:
-                # Buy requires: M5 bullish AND M15 NOT bearish
-                trend_ok_buy = trend_ok_buy and m5_bullish and (not m15_bearish)
-                # Sell requires: M5 bearish AND M15 NOT bullish
-                trend_ok_sell = trend_ok_sell and m5_bearish and (not m15_bullish)
-                
-                # STRICT MODE: Require M5 trend strength for high-quality signals
-                strict_mtf = bool(getattr(self.cfg, "sniper_strict_mtf", True))
-                if strict_mtf:
-                    if not m5_trend_strong:
-                        # Weak M5 trend - still allow but will have lower confidence later
-                        pass
+                trend_ok_buy = bool(trend_ok_buy and ema_stack_buy)
+                trend_ok_sell = bool(trend_ok_sell and ema_stack_sell)
 
             # Ensemble score
             try:
@@ -308,31 +211,31 @@ class SignalEngine:
             except Exception:
                 book = {}
 
-            net_norm, conf = self._ensemble_score(indp, indc, indl, book, adapt, spread_pct, tick_stats)
+            # Pass M1 snapshot for confirm/long slots to keep score computation M1-driven.
+            net_norm, conf = self._ensemble_score(indp, indp, indp, book, adapt, spread_pct, tick_stats)
             net_abs = abs(net_norm)
 
-            # ==============================================================
-            # SNIPER LOGIC #1: Volume Validation (Strict & Tiered)
-            # Re-inserted here to use 'conf'
-            # ==============================================================
+            early_buy, early_sell, early_score = self._early_momentum_trigger(indp, dfp, net_norm)
+
+            # Dynamic volume gate prevents freeze: low-volume bars are allowed when momentum starts early.
+            vol_ok = True
+            now_vol = 0.0
+            vol_floor = 0.0
+            rel_vol = 1.0
             try:
-                if dfp is not None and "tick_volume" in dfp.columns and len(dfp) >= 20:
-                    bar_age_ok = last_age >= 5.0
-                    if bar_age_ok:
-                        now_vol = float(dfp["tick_volume"].iloc[-1])
-                        # HOTFIX: Priority on Speed. Use hard floor of 15.
-                        if now_vol < 15.0:
-                             return self._neutral(
-                                sym,
-                                [f"low_volume_sniper:{now_vol:.0f}<15"],
-                                t0,
-                                spread_pct=spread_pct,
-                                bar_key=bar_key,
-                                regime=_as_regime(adapt.get("regime")),
-                                trade_blocked=True,
-                            )
+                vol_ok, now_vol, vol_floor, rel_vol = self._sniper_volume_gate(dfp, last_age=last_age)
             except Exception:
-                pass
+                vol_ok = True
+            if (not vol_ok) and (not early_buy) and (not early_sell) and net_abs < 0.16:
+                return self._neutral(
+                    sym,
+                    [f"low_volume_sniper:{now_vol:.0f}<{vol_floor:.0f}", f"relv:{rel_vol:.2f}"],
+                    t0,
+                    spread_pct=spread_pct,
+                    bar_key=bar_key,
+                    regime=_as_regime(adapt.get("regime")),
+                    trade_blocked=True,
+                )
 
 
             # Confluence layer
@@ -386,21 +289,6 @@ class SignalEngine:
             if conf >= 90 and (not has_confluence) and net_abs < 0.20:
                 conf = min(conf, 89)
 
-            # ==============================================================
-            # MTF ALIGNMENT CONFIDENCE BOOST (10/10 Enhancement)
-            # Reward perfect multi-timeframe alignment
-            # ==============================================================
-            mtf_score = mtf_score_buy if net_norm > 0 else mtf_score_sell
-            
-            if mtf_score >= PERFECT_MTF_SCORE:  # 6/6 = Perfect alignment
-                conf = min(98, int(conf * 1.05))  # +5% boost
-            elif mtf_score >= 5:  # Strong alignment
-                conf = min(95, int(conf * 1.03))  # +3% boost
-            elif mtf_score >= 4:  # Good alignment
-                conf = min(92, int(conf * 1.01))  # +1% boost
-            elif mtf_score <= 2:  # Weak alignment - penalize
-                conf = max(0, int(conf * 0.90))  # -10% penalty
-
             # Decide signal
             signal = "Neutral"
             blocked_by_htf = False
@@ -424,10 +312,16 @@ class SignalEngine:
                         trade_blocked=True,
                     )
 
+            # Early impulse override reduces entry lag while keeping directional filters.
+            early_match = (net_norm > 0 and early_buy) or (net_norm < 0 and early_sell)
+            if early_match:
+                min_net_norm_for_signal = max(0.06, min_net_norm_for_signal * 0.88)
+                conf = min(96, int(conf + min(5.0, early_score * 2.0)))
+
             if conf >= conf_min and net_abs >= min_net_norm_for_signal:
-                if net_norm > net_thr and trend_ok_buy:
+                if net_norm > net_thr and (trend_ok_buy or early_buy):
                     signal = "Buy"
-                elif net_norm < -net_thr and trend_ok_sell:
+                elif net_norm < -net_thr and (trend_ok_sell or early_sell):
                     signal = "Sell"
                 else:
                     blocked_by_htf = True
@@ -491,6 +385,8 @@ class SignalEngine:
 
                 # Require 2 indicators to agree (sniper precision)
                 min_momentum_confirms = int(getattr(self.cfg, "min_momentum_confirms", 2) or 2)
+                if (signal == "Buy" and early_buy) or (signal == "Sell" and early_sell):
+                    min_momentum_confirms = max(1, min_momentum_confirms - 1)
                 if momentum_confirms < min_momentum_confirms:
                     return self._neutral(
                         sym,
@@ -547,7 +443,11 @@ class SignalEngine:
                     pts += 0.25
 
                 # Minimum points required
-                pts_min = float(getattr(self.cfg, "confirm_points_min", 2.0) or 2.0)
+                pts_min_base = float(getattr(self.cfg, "confirm_points_min", 2.0) or 2.0)
+                if (signal == "Buy" and early_buy) or (signal == "Sell" and early_sell):
+                    pts_min = max(1.30, pts_min_base - 0.50)
+                else:
+                    pts_min = pts_min_base
 
                 # Ultra-strong override (rare)
                 ultra_ok = bool(conf >= 92 and net_abs >= 0.22)
@@ -732,7 +632,9 @@ class SignalEngine:
             if near_rn:
                 reasons.append("near_rn")
             reasons.append(f"net:{net_norm:.3f}")
-            reasons.append(f"mtf:{mtf_score}/6")  # MTF alignment score
+            reasons.append(f"relv:{rel_vol:.2f}")
+            if (signal == "Buy" and early_buy) or (signal == "Sell" and early_sell):
+                reasons.append("early_momentum")
             reasons.append(f"phase:{phase}")
 
             # Dynamic confidence caps (strength-based)
@@ -749,9 +651,8 @@ class SignalEngine:
                 # Widen SL by 20%
                 old_sl = float(adapt.get("sl_mult", 1.35))
                 adapt["sl_mult"] = old_sl * 1.2 
-                # Ensure TP is at least 2x SL (RR >= 1:2)
-                # But don't shrink TP if it's already huge; just ensure min RR
-                min_tp = adapt["sl_mult"] * 2.0
+                # Ensure TP is at least 1.5x SL (RR >= 1:1.5 — реалистик барои scalping)
+                min_tp = adapt["sl_mult"] * 1.5
                 if float(adapt.get("tp_mult", 0.0)) < min_tp:
                     adapt["tp_mult"] = min_tp
 
@@ -1385,6 +1286,88 @@ class SignalEngine:
             return True, []
         except Exception:
             return True, []
+
+    def _sniper_volume_gate(self, dfp: pd.DataFrame, *, last_age: float) -> Tuple[bool, float, float, float]:
+        """
+        Dynamic relative-volume gate.
+        Prevents neutral freeze by using recent median volume instead of a hard static threshold.
+        """
+        try:
+            if dfp is None or dfp.empty or "tick_volume" not in dfp.columns:
+                return True, 0.0, 0.0, 1.0
+
+            vols = pd.to_numeric(dfp["tick_volume"].tail(32), errors="coerce").dropna()
+            if vols.empty:
+                return True, 0.0, 0.0, 1.0
+
+            now_vol = float(vols.iloc[-1])
+            if float(last_age) < 2.0:
+                return True, now_vol, 0.0, 1.0
+
+            hist = vols.iloc[:-1]
+            baseline = float(np.median(hist.to_numpy(dtype=np.float64))) if len(hist) >= 6 else float(now_vol)
+            floor_mult = float(getattr(self.cfg, "sniper_rel_volume_floor", 0.35) or 0.35)
+            min_floor = float(getattr(self.cfg, "sniper_min_tick_volume_floor", 3.0) or 3.0)
+            vol_floor = max(min_floor, baseline * floor_mult)
+            rel_vol = now_vol / max(1.0, baseline)
+            return bool(now_vol >= vol_floor), now_vol, vol_floor, rel_vol
+        except Exception:
+            return True, 0.0, 0.0, 1.0
+
+    def _early_momentum_trigger(
+        self,
+        indp: Dict[str, Any],
+        dfp: pd.DataFrame,
+        net_norm: float,
+    ) -> Tuple[bool, bool, float]:
+        """
+        Fast start-of-move detector:
+        uses candle impulse + acceleration + RSI/MACD alignment to avoid 3-candle late entries.
+        """
+        try:
+            if dfp is None or dfp.empty or "close" not in dfp.columns or len(dfp) < 4:
+                return False, False, 0.0
+
+            closes = pd.to_numeric(dfp["close"].tail(4), errors="coerce").dropna().to_numpy(dtype=np.float64)
+            if closes.size < 4:
+                return False, False, 0.0
+
+            step_now = float(closes[-1] - closes[-2])
+            step_prev = float(closes[-2] - closes[-3])
+            accel = step_now - step_prev
+
+            atr = float(indp.get("atr", 0.0) or 0.0)
+            if atr <= 1e-9:
+                atr = max(abs(step_now), abs(step_prev), 1e-6)
+
+            impulse = step_now / max(atr, 1e-9)
+            accel_n = accel / max(atr, 1e-9)
+
+            rsi = float(indp.get("rsi", 50.0) or 50.0)
+            macd = float(indp.get("macd", 0.0) or 0.0)
+            macd_sig = float(indp.get("macd_sig", indp.get("macd_signal", 0.0)) or 0.0)
+            macd_hist = float(indp.get("macd_hist", (macd - macd_sig)) or (macd - macd_sig))
+
+            net_thr = float(getattr(self.cfg, "net_norm_signal_threshold", 0.10) or 0.10)
+            buy = bool(
+                float(net_norm) >= max(0.08, net_thr * 0.85)
+                and impulse > 0.10
+                and accel_n > -0.08
+                and rsi >= 50.5
+                and macd_hist >= -1e-6
+            )
+            sell = bool(
+                float(net_norm) <= -max(0.08, net_thr * 0.85)
+                and impulse < -0.10
+                and accel_n < 0.08
+                and rsi <= 49.5
+                and macd_hist <= 1e-6
+            )
+
+            score = max(0.0, abs(impulse)) + 0.5 * max(0.0, abs(accel_n))
+            return buy, sell, float(score)
+        except Exception:
+            return False, False, 0.0
 
     def _conformal_ok(self, dfp: pd.DataFrame) -> bool:
         try:

@@ -266,11 +266,11 @@ class EngineConfig:
 
     # Signal quality
     # STRICT (to reduce false signals): only trade strong setups.
-    min_confidence_signal: float = 0.60
-    conf_min: int = 60
-    conf_min_low: int = 55
-    conf_min_high: int = 75
-    ultra_confidence_min: float = 0.80
+    min_confidence_signal: float = 0.52
+    conf_min: int = 52
+    conf_min_low: int = 48
+    conf_min_high: int = 68
+    ultra_confidence_min: float = 0.76
     confidence_bias: float = 50.0
     confidence_gain: float = 85.0
     net_norm_signal_threshold: float = 0.08
@@ -351,13 +351,13 @@ class EngineConfig:
     max_signals_per_day: int = 0
 
     # SL/TP (ATR)
-    sl_atr_mult_trend: float = 1.15
-    tp_atr_mult_trend: float = 2.7
-    sl_atr_mult_range: float = 1.35
-    tp_atr_mult_range: float = 2.0
+    sl_atr_mult_trend: float = 1.80
+    tp_atr_mult_trend: float = 2.2
+    sl_atr_mult_range: float = 1.60
+    tp_atr_mult_range: float = 1.8
     tp_rr_cap: float = 2.0
 
-    min_rr: float = 1.0
+    min_rr: float = 1.2
     sltp_cost_spread_mult: float = 1.8
     sltp_cost_slip_mult: float = 1.0
     sltp_cost_move_mult: float = 0.6
@@ -375,9 +375,9 @@ class EngineConfig:
     )
 
     # Trailing / BE
-    be_trigger_R: float = 0.70
+    be_trigger_R: float = 0.40
     be_lock_spread_mult: float = 1.20
-    trail_atr_mult: float = 0.95
+    trail_atr_mult: float = 1.20
     trail_on_entry: bool = True
 
     # Execution breaker limits
@@ -717,8 +717,8 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool = True) -> None:
     if not enable:
         return
 
-    cfg.min_confidence_signal = 0.80
-    cfg.ultra_confidence_min = 0.90
+    cfg.min_confidence_signal = 0.55
+    cfg.ultra_confidence_min = 0.78
     cfg.max_risk_per_trade = 0.012
     cfg.poll_seconds_fast = 0.05
 

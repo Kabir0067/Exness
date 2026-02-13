@@ -69,7 +69,6 @@ class OrderRequest:
     enqueue_time: float
     deviation: int = 50
     magic: int = 987654
-    magic: int = 987654
     comment: str = "scalp"
     cfg: Any = None  # Added for Dry Run access
 
