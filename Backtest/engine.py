@@ -642,7 +642,7 @@ class InstitutionalBacktestEngine:
             # Test on forward period
             xy = pipeline.transform(df_test.copy())
             X = np.stack(xy["X"].values)
-            y = np.asarray(xy["y"].values)
+            y = np.asarray(xy["ret"].values) if "ret" in xy else np.asarray(xy["y"].values)
             pred = model.model.predict(X)
             
             threshold = max(float(getattr(cfg, "percent_increase", 0.0) or 0.0), 0.0001)
@@ -755,10 +755,10 @@ class InstitutionalBacktestEngine:
         # Transform WITHOUT look-ahead
         xy = pipeline.transform(df.copy())
         X = np.stack(xy["X"].values)
-        y = np.asarray(xy["y"].values)
+        y = np.asarray(xy["ret"].values) if "ret" in xy else np.asarray(xy["y"].values)
         pred = model.predict(X)
         
-        threshold = max(float(getattr(pipeline.cfg, "percent_increase", 0.0)), 0.0001)
+        threshold = max(float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 0.0001)
         rng = np.random.default_rng(self.run_cfg.monte_carlo_seed)
         
         # Institutional simulation
@@ -886,10 +886,38 @@ class InstitutionalBacktestEngine:
             "unsafe": self._unsafe,
             "source": "Backtest.engine_institutional",
         }
-        
+
         MODEL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with MODEL_STATE_PATH.open("wb") as f:
+        # Keep per-asset state for diagnostics/history.
+        asset_state_path = get_artifact_path("models", f"model_state_{self.asset}.pkl")
+        with asset_state_path.open("wb") as f:
             pickle.dump(state, f)
+
+        # Do not overwrite a previously VERIFIED global state with a failed one.
+        should_write_global = True
+        if status != "VERIFIED" and MODEL_STATE_PATH.exists():
+            try:
+                with MODEL_STATE_PATH.open("rb") as f:
+                    prev = pickle.load(f)
+                if (
+                    isinstance(prev, dict)
+                    and bool(prev.get("real_backtest", False))
+                    and str(prev.get("status", "")).upper() == "VERIFIED"
+                ):
+                    should_write_global = False
+                    log.warning(
+                        "MODEL_STATE_KEEP_PREV_VERIFIED | prev_version=%s prev_asset=%s new_asset=%s new_status=%s",
+                        str(prev.get("model_version", "unknown")),
+                        str(prev.get("asset", "unknown")),
+                        self.asset,
+                        status,
+                    )
+            except Exception:
+                should_write_global = True
+
+        if should_write_global:
+            with MODEL_STATE_PATH.open("wb") as f:
+                pickle.dump(state, f)
         
         log.info(
             "INSTITUTIONAL_MODEL_STATE | version=%s status=%s sharpe=%.3f win_rate=%.3f",

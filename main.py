@@ -114,6 +114,50 @@ def _auto_train_models() -> bool:
     return ok
 
 
+def _auto_train_models_strict() -> bool:
+    """
+    Strict auto-train:
+    - Accept success only if at least one trained asset passes quality gate
+    - Optional asset list via AUTO_TRAIN_ASSETS (default: XAU,BTC)
+    """
+    log_local = logging.getLogger("main")
+    try:
+        from Backtest.engine import run_institutional_backtest
+    except Exception as exc:
+        log_local.error("Auto-train(strict) import failed: %s", exc)
+        return False
+
+    assets_env = str(os.getenv("AUTO_TRAIN_ASSETS", "XAU,BTC") or "XAU,BTC")
+    assets = [a.strip().upper() for a in assets_env.split(",") if a.strip()]
+    if not assets:
+        assets = ["XAU", "BTC"]
+
+    any_passed = False
+    for asset in assets:
+        try:
+            metrics = run_institutional_backtest(asset)
+            if _check_backtest_passed(metrics):
+                any_passed = True
+                log_local.info(
+                    "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                    asset,
+                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                )
+                break
+            log_local.warning(
+                "Auto-train(strict) failed quality gate | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                asset,
+                float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+            )
+        except Exception as exc:
+            log_local.error("Auto-train(strict) failed | asset=%s err=%s", asset, exc)
+    return any_passed
+
+
 def _setup_exception_hooks() -> None:
     def _handle_exception(exc_type, exc, tb) -> None:
         try:
@@ -967,7 +1011,7 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
     ready, reason = _models_ready()
     if not ready:
         log.warning("MODELS_MISSING | reason=%s", reason)
-        ok = _auto_train_models()
+        ok = _auto_train_models_strict()
         if ok:
             log.info("Auto-training completed")
         else:

@@ -165,6 +165,11 @@ def compute_institutional_metrics(
         return m
     
     pnls = np.asarray(pnl_series, dtype=np.float64)
+    if pnls.size > 0:
+        pnls = pnls[np.isfinite(pnls)]
+    if pnls.size == 0:
+        m.final_capital = initial_capital
+        return m
     m.total_trades = len(pnls)
     
     # ═══ Trade Statistics ═══════════════════════════════════════
@@ -239,8 +244,12 @@ def compute_institutional_metrics(
     m.upside_deviation = float(np.std(upside, ddof=1)) if len(upside) > 1 else 0.0
     
     # ═══ Drawdown Analysis ══════════════════════════════════════
-    peak = np.maximum.accumulate(equity)
-    drawdown = (peak - equity) / peak
+    # Include initial capital in drawdown baseline to avoid 0/0 and NaN propagation.
+    equity_curve = np.concatenate(([float(initial_capital)], equity))
+    peak = np.maximum.accumulate(equity_curve)
+    safe_peak = np.where(peak > 0.0, peak, np.nan)
+    drawdown = (peak - equity_curve) / safe_peak
+    drawdown = np.nan_to_num(drawdown, nan=0.0, posinf=0.0, neginf=0.0)
     m.max_drawdown_pct = float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
     
     # Average drawdown

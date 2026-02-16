@@ -467,12 +467,14 @@ class Pipeline:
         """Create time-series windows"""
         X = df[self.cfg.training_features].to_numpy(dtype=self._dtype, copy=False)
         y = df["target"].to_numpy(dtype=self._dtype, copy=False)
+        target_ret = df["target_return"].to_numpy(dtype=self._dtype, copy=False)
         ws = self.cfg.window_size
         total = len(X) - ws + 1
         if total <= 0:
             return {
                 "X": pd.Series([], dtype=object),
                 "y": pd.Series([], dtype=self._dtype),
+                "ret": pd.Series([], dtype=self._dtype),
             }
 
         max_samples = int(self.cfg.max_window_samples or 0)
@@ -486,16 +488,18 @@ class Pipeline:
                 stride,
             )
         
-        Xw, yw, idx = [], [], []
+        Xw, yw, rw, idx = [], [], [], []
         for i in range(ws - 1, len(X), stride):
             Xw.append(X[i - ws + 1 : i + 1].ravel())
             yw.append(y[i])
+            rw.append(target_ret[i])
             idx.append(i)
         
         dates = df.index[idx]
         return {
             "X": pd.Series(list(Xw), index=dates),
-            "y": pd.Series(yw, index=dates)
+            "y": pd.Series(yw, index=dates),
+            "ret": pd.Series(rw, index=dates),
         }
     
     def split(self, Xy: Dict[str, pd.Series]) -> Dict[str, Dict[str, pd.Series]]:
@@ -512,19 +516,23 @@ class Pipeline:
         return {
             "train": {
                 "X": Xy["X"][:train_end],
-                "y": Xy["y"][:train_end]
+                "y": Xy["y"][:train_end],
+                "ret": Xy["ret"][:train_end],
             },
             "val": {
                 "X": Xy["X"][train_end:val_end],
-                "y": Xy["y"][train_end:val_end]
+                "y": Xy["y"][train_end:val_end],
+                "ret": Xy["ret"][train_end:val_end],
             },
             "test": {
                 "X": Xy["X"][val_end:test_end],
-                "y": Xy["y"][val_end:test_end]
+                "y": Xy["y"][val_end:test_end],
+                "ret": Xy["ret"][val_end:test_end],
             },
             "holdout": {
                 "X": Xy["X"][test_end:],
-                "y": Xy["y"][test_end:]
+                "y": Xy["y"][test_end:],
+                "ret": Xy["ret"][test_end:],
             }
         }
     
