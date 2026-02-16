@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict
 
 import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
+from mt5_client import mt5_status
 
 from AiAnalysis.intrd_ai_analys import analyse_intraday
 from AiAnalysis.scalp_ai_analys import analyse
@@ -93,6 +94,7 @@ from .bot_utils import (
     order_keyboard,
     set_bot_instance,
     set_orig_send_chat_action,
+    send_action,
     tg_call,
     _summary_cache,
 )
@@ -187,6 +189,28 @@ bot.answer_callback_query = _safe_answer_callback_query
 bot.send_chat_action = _safe_send_chat_action
 bot.set_my_commands = _safe_set_my_commands
 
+# -----------------------------------------------------------------------------
+# ALIVE PROTOCOL: auto-wrap every handler with typing before any logic
+# -----------------------------------------------------------------------------
+_orig_message_handler = bot.message_handler
+_orig_callback_query_handler = bot.callback_query_handler
+
+
+def _with_action_wrapper(registrar: Callable[..., Any], action: str = "typing") -> Callable[..., Any]:
+    def _decorator_factory(*dargs: Any, **dkwargs: Any) -> Callable[[Callable[..., Any]], Any]:
+        base_deco = registrar(*dargs, **dkwargs)
+
+        def _apply(fn: Callable[..., Any]) -> Any:
+            return base_deco(send_action(action)(fn))
+
+        return _apply
+
+    return _decorator_factory
+
+
+bot.message_handler = _with_action_wrapper(_orig_message_handler, "typing")
+bot.callback_query_handler = _with_action_wrapper(_orig_callback_query_handler, "typing")
+
 engine.set_order_notifier(_notify_order_opened)
 engine.set_skip_notifier(_notify_order_skipped)
 engine.set_phase_notifier(_notify_phase_change)
@@ -196,7 +220,16 @@ engine.set_daily_start_notifier(_notify_daily_start)
 
 def admin_only_message(fn):
     def wrapper(message):
-        if not is_admin_chat(message.chat.id):
+        try:
+            chat_id = int(message.chat.id)
+        except Exception:
+            chat_id = 0
+        try:
+            user_id = int(message.from_user.id) if message.from_user else 0
+        except Exception:
+            user_id = 0
+        is_admin = bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id))
+        if not is_admin:
             deny(message)
             return
         fn(message)
@@ -212,8 +245,8 @@ def admin_only_callback(fn):
         except Exception:
             bot.answer_callback_query(call.id, "❌ Дастрасӣ нест")
             return
-        # Strong guard: both chat and user must be ADMIN
-        if not (is_admin_chat(chat_id) and ADMIN and user_id == ADMIN):
+        # Allow admin in private and group chats: either chat_id or user_id matches ADMIN.
+        if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
             bot.answer_callback_query(call.id, "❌ Дастрасӣ нест")
             return
         fn(call)
@@ -534,7 +567,15 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
 # =============================================================================
 @bot.message_handler(commands=["start"])
 def start_handler(message: telebot.types.Message) -> None:
-    if not is_admin_chat(message.chat.id):
+    try:
+        chat_id = int(message.chat.id)
+    except Exception:
+        chat_id = 0
+    try:
+        user_id = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        user_id = 0
+    if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
         deny(message)
         # Notify admin about unauthorized access attempt
         try:
@@ -575,6 +616,11 @@ def history_handler(message: telebot.types.Message) -> None:
     """
     /history - ҳисоботи пурра + маълумоти аккаунт (сенёр формат)
     """
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML", reply_markup=_rk_remove())
+        return
+
     try:
         _send_clean(message.chat.id, "📥 <b>Гирифтани ҳисобот...</b>")
 
@@ -647,6 +693,11 @@ def buttons_handler(message: telebot.types.Message) -> None:
 @bot.message_handler(commands=["balance"])
 @admin_only_message
 def balance_handler(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML", reply_markup=_rk_remove())
+        return
+
     bal = get_balance()
     if bal is None:
         bot.send_message(message.chat.id, "⚠️ Хатогӣ ҳангоми гирифтани баланс.", parse_mode="HTML", reply_markup=_rk_remove())
@@ -708,6 +759,21 @@ def ai_callback_handler(call: telebot.types.CallbackQuery) -> None:
 
 def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
     try:
+        ok_mt5, _ = mt5_status()
+        if not ok_mt5:
+            payload = get_ai_payload_xau_intraday()
+            if not payload:
+                bot.send_message(chat_id, _mt5_unavailable_message(), parse_mode="HTML")
+                return
+            result = analyse_intraday("XAU", payload)
+            text = _format_ai_signal("XAU", result)
+            if bool((payload.get("meta") or {}).get("cached_fallback")):
+                age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+                text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
+            kb = build_helpers_keyboard()
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+            return
+
         loading = bot.send_message(
             chat_id,
             "🔄 <b>AI XAU Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
@@ -724,6 +790,9 @@ def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
             return
         result = analyse_intraday("XAU", payload)
         text = _format_ai_signal("XAU", result)
+        if bool((payload.get("meta") or {}).get("cached_fallback")):
+            age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+            text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
         kb = build_helpers_keyboard()
         bot.delete_message(chat_id, loading.message_id)
         bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
@@ -734,6 +803,21 @@ def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
 
 def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
     try:
+        ok_mt5, _ = mt5_status()
+        if not ok_mt5:
+            payload = get_ai_payload_btc_intraday()
+            if not payload:
+                bot.send_message(chat_id, _mt5_unavailable_message(), parse_mode="HTML")
+                return
+            result = analyse_intraday("BTC", payload)
+            text = _format_ai_signal("BTC", result)
+            if bool((payload.get("meta") or {}).get("cached_fallback")):
+                age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+                text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
+            kb = build_helpers_keyboard()
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+            return
+
         loading = bot.send_message(
             chat_id,
             "🔄 <b>AI BTC Intraday</b>\n⏳ Гирифтани маълумоти рӯзона...",
@@ -750,6 +834,9 @@ def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
             return
         result = analyse_intraday("BTC", payload)
         text = _format_ai_signal("BTC", result)
+        if bool((payload.get("meta") or {}).get("cached_fallback")):
+            age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+            text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
         kb = build_helpers_keyboard()
         bot.delete_message(chat_id, loading.message_id)
         bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
@@ -787,7 +874,20 @@ def status_handler(message: telebot.types.Message) -> None:
 # Open orders (format + keyboard)
 # =============================================================================
 def start_view_open_orders(message: telebot.types.Message) -> None:
-    if not is_admin_chat(message.chat.id):
+    try:
+        chat_id = int(message.chat.id)
+    except Exception:
+        chat_id = 0
+    try:
+        user_id = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        user_id = 0
+    if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
+        return
+
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
         return
 
     _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>")
@@ -903,6 +1003,11 @@ def cb_orders_close_view(call: telebot.types.CallbackQuery, m: re.Match[str]) ->
 # Button dispatcher (maintainable; no huge if-elif)
 # =============================================================================
 def handle_profit_day(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     try:
         report = get_full_report_day(force_refresh=True)
         text = _format_full_report(report, "Имрӯза")
@@ -912,6 +1017,11 @@ def handle_profit_day(message: telebot.types.Message) -> None:
 
 
 def handle_profit_week(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     try:
         report = get_full_report_week(force_refresh=True)
         text = _format_full_report(report, "Ҳафтаина")
@@ -937,6 +1047,11 @@ def handle_profit_week(message: telebot.types.Message) -> None:
 
 
 def handle_profit_month(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     try:
         report = get_full_report_month(force_refresh=True)
         text = _format_full_report(report, "Моҳона")
@@ -961,11 +1076,31 @@ def handle_profit_month(message: telebot.types.Message) -> None:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
 
 
+def _mt5_unavailable_message() -> str:
+    _, reason = mt5_status()
+    reason_raw = str(reason or "unknown")
+    reason_s = reason_raw
+    if reason_s.startswith("blocked_cooldown:"):
+        reason_s = reason_s.split(":", 1)[1]
+    hint = ""
+    if "algo_trading_disabled_in_terminal" in reason_s:
+        hint = (
+            "\n\nMT5: Tools -> Options -> Expert Advisors -> "
+            "Allow Algo Trading, ва тугмаи AutoTrading-ро фаъол кунед."
+        )
+    return f"⚠️ <b>MT5 дастнорас аст</b>\n<code>{html.escape(reason_s)}</code>{hint}"
+
+
 def handle_open_orders(message: telebot.types.Message) -> None:
     start_view_open_orders(message)
 
 
 def handle_close_all(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     res = close_all_position()
     closed = int(res.get("closed", 0) or 0)
     canceled = int(res.get("canceled", 0) or 0)
@@ -985,17 +1120,36 @@ def handle_close_all(message: telebot.types.Message) -> None:
 
 
 def handle_close_by_profit(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     res = close_all_position_by_profit()
     bot.send_message(message.chat.id, format_close_by_profit_result(res), parse_mode="HTML")
 
 
 def handle_positions_summary(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
     summary = get_positions_summary()
     bot.send_message(message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML")
 
 
 def handle_balance(message: telebot.types.Message) -> None:
-    balance = get_balance()
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    acc = get_account_info()
+    if not acc:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+    balance = float(acc.get("balance", 0.0) or 0.0)
     bot.send_message(message.chat.id, f"💰 <b>Баланс</b>\n{format_usdt(balance)}", parse_mode="HTML")
 
 
@@ -1007,8 +1161,31 @@ def handle_trade_start(message: telebot.types.Message) -> None:
             return
 
         engine.clear_manual_stop()
-        engine.start()
-        bot.send_message(message.chat.id, "✅ <b>Система оғоз шуд (Савдо фаъол)</b>\n\nСавдои автоматӣ давом мекунад.", parse_mode="HTML")
+        started = bool(engine.start())
+        if started:
+            bot.send_message(
+                message.chat.id,
+                "✅ <b>Система оғоз шуд (Савдо фаъол)</b>\n\nСавдои автоматӣ давом мекунад.",
+                parse_mode="HTML",
+            )
+            return
+
+        _, reason = mt5_status()
+        reason_raw = str(reason or "unknown")
+        reason_s = reason_raw
+        if reason_s.startswith("blocked_cooldown:"):
+            reason_s = reason_s.split(":", 1)[1]
+        hint = ""
+        if "algo_trading_disabled_in_terminal" in reason_s:
+            hint = (
+                "\n\nMT5: Tools -> Options -> Expert Advisors -> "
+                "Allow Algo Trading, ва тугмаи AutoTrading-ро фаъол кунед."
+            )
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ <b>Start иҷро нашуд</b>\n<code>{html.escape(reason_s)}</code>{hint}",
+            parse_mode="HTML",
+        )
     except Exception as exc:
         bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
 
@@ -1119,6 +1296,21 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
 
 def handle_xau_ai(message: telebot.types.Message) -> None:
     try:
+        ok_mt5, _ = mt5_status()
+        if not ok_mt5:
+            payload = get_ai_payload_xau()
+            if not payload:
+                bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+                return
+            result = analyse("XAU", payload)
+            text = _format_ai_signal("XAU", result)
+            if bool((payload.get("meta") or {}).get("cached_fallback")):
+                age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+                text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
+            kb = build_helpers_keyboard()
+            bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+            return
+
         loading_msg = bot.send_message(
             message.chat.id,
             "🔄 <b>AI XAU</b>\n⏳ Гирифтани маълумот аз бозор...\n⚡ Таҳлили ИИ оғоз шуд",
@@ -1135,6 +1327,9 @@ def handle_xau_ai(message: telebot.types.Message) -> None:
             return
         result = analyse("XAU", payload)
         text = _format_ai_signal("XAU", result)
+        if bool((payload.get("meta") or {}).get("cached_fallback")):
+            age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+            text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
         kb = build_helpers_keyboard()
         bot.edit_message_text(text, message.chat.id, loading_msg.message_id, parse_mode="HTML", reply_markup=kb)
     except Exception as exc:
@@ -1144,6 +1339,21 @@ def handle_xau_ai(message: telebot.types.Message) -> None:
 
 def handle_btc_ai(message: telebot.types.Message) -> None:
     try:
+        ok_mt5, _ = mt5_status()
+        if not ok_mt5:
+            payload = get_ai_payload_btc()
+            if not payload:
+                bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+                return
+            result = analyse("BTC", payload)
+            text = _format_ai_signal("BTC", result)
+            if bool((payload.get("meta") or {}).get("cached_fallback")):
+                age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+                text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
+            kb = build_helpers_keyboard()
+            bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+            return
+
         loading_msg = bot.send_message(
             message.chat.id,
             "🔄 <b>AI BTC</b>\n⏳ Гирифтани маълумот аз бозор...\n⚡ Таҳлили ИИ оғоз шуд",
@@ -1160,6 +1370,9 @@ def handle_btc_ai(message: telebot.types.Message) -> None:
             return
         result = analyse("BTC", payload)
         text = _format_ai_signal("BTC", result)
+        if bool((payload.get("meta") or {}).get("cached_fallback")):
+            age = int((payload.get("meta") or {}).get("cached_age_sec", 0) or 0)
+            text = f"WARNING: <b>CACHED DATA</b> | age={age}s\n\n{text}"
         kb = build_helpers_keyboard()
         bot.edit_message_text(text, message.chat.id, loading_msg.message_id, parse_mode="HTML", reply_markup=kb)
     except Exception as exc:
@@ -1185,7 +1398,15 @@ BUTTONS: Dict[str, Callable[[telebot.types.Message], None]] = {
 
 @bot.message_handler(func=lambda m: True)
 def message_dispatcher(message: telebot.types.Message) -> None:
-    if not is_admin_chat(message.chat.id):
+    try:
+        chat_id = int(message.chat.id)
+    except Exception:
+        chat_id = 0
+    try:
+        user_id = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        user_id = 0
+    if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
         deny(message)
         return
 
@@ -1214,4 +1435,3 @@ def send_signal_notification(asset: str, result: Dict[str, Any]) -> None:
     Wired in main.py via engine.set_signal_notifier().
     """
     _notify_signal(asset, result)
-

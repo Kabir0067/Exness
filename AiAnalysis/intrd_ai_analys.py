@@ -37,7 +37,7 @@ if not log.handlers:
 # =============================================================================
 AI_INTRA_TIMEOUT_SEC = 20
 AI_INTRA_MAX_RETRIES = 1
-AI_INTRA_MIN_CONF = 0.60
+AI_INTRA_MIN_CONF = 0.75
 
 AI_INTRA_BUDGET_SEC = 8.0
 AI_INTRA_CACHE_TTL_SEC = 3600  # H1 => cache up to 1h (safe)
@@ -577,11 +577,20 @@ def analyse_intraday(asset: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
                 res["model"] = mdl
                 break
 
-    # 3) heuristic
+    # 3) Strict ML-only fallback: never trade on local heuristics
     if res is None:
-        res = _heuristic_signal(market_data, asset)
-        res["provider"] = "heuristic"
-        res["model"] = "local"
+        res = {
+            "signal": "HOLD",
+            "confidence": 0.0,
+            "entry": float(close) if close > 0 else None,
+            "stop_loss": None,
+            "take_profit": None,
+            "reason": "ML inference unavailable",
+            "action_short": "РРЅС‚РёР·РѕСЂ",
+            "provider": "none",
+            "model": "none",
+            "status": "ML_UNAVAILABLE",
+        }
 
     # Enforce levels
     signal = str(res.get("signal") or "HOLD").upper()
@@ -610,6 +619,15 @@ def analyse_intraday(asset: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- Hard gate: if confidence below threshold => AI_NO_DECISION ---
     # The AI must only speak when it is 100% sure. If uncertain, stay silent.
+    provider = str(res.get("provider", "none") or "none").strip().lower()
+    if provider not in ("gemini", "groq"):
+        res["signal"] = "HOLD"
+        res["status"] = "AI_NO_DECISION"
+        res["action_short"] = "РРЅС‚РёР·РѕСЂ"
+        res["stop_loss"] = None
+        res["take_profit"] = None
+        res["reason"] = f"AI_NO_DECISION: non_ml_provider={provider}"
+
     if conf < AI_INTRA_MIN_CONF:
         log.warning(
             "⛔ AI_NO_DECISION | asset=%s conf=%.2f < min=%.2f | Signal Skipped: AI Inference returned NO ANSWER (Low Confidence)",

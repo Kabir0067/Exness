@@ -6,6 +6,7 @@ import logging
 import socket
 import time
 import traceback
+from functools import wraps
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,11 +25,11 @@ from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 from telebot import types
 
-from config_xau import get_config_from_env
+from core.config import get_config_from_env
 from ExnessAPI.functions import market_is_open
 from Bot.portfolio_engine import engine
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
-from mt5_client import ensure_mt5, MT5_LOCK
+from mt5_client import MT5_LOCK, mt5_status
 
 # =============================================================================
 # Logging (production-grade: rotate + no dup handlers)
@@ -429,6 +430,7 @@ def set_orig_send_chat_action(func: Callable[..., Any]) -> None:
 
 def _maybe_send_typing(chat_id: Optional[Any]) -> None:
     # Global policy: every outgoing message triggers typing, but throttled.
+    # Hard requirement: always emit typing for outgoing UX.
     if chat_id is None:
         return
     if _blocked_chat_cache.get(chat_id):
@@ -454,6 +456,7 @@ def _maybe_send_typing(chat_id: Optional[Any]) -> None:
         send_func,
         chat_id,
         action="typing",
+        max_retries=1,
         on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
             "send_chat_action",
             exc,
@@ -461,6 +464,63 @@ def _maybe_send_typing(chat_id: Optional[Any]) -> None:
             {"action": "typing"},
         ),
     )
+
+
+def _extract_chat_id_from_handler_args(*args: Any, **kwargs: Any) -> Optional[Any]:
+    if args:
+        obj = args[0]
+        try:
+            chat = getattr(obj, "chat", None)
+            if chat is not None:
+                cid = getattr(chat, "id", None)
+                if cid is not None:
+                    return cid
+        except Exception:
+            pass
+        try:
+            msg = getattr(obj, "message", None)
+            if msg is not None:
+                chat = getattr(msg, "chat", None)
+                cid = getattr(chat, "id", None) if chat is not None else None
+                if cid is not None:
+                    return cid
+        except Exception:
+            pass
+    try:
+        if "chat_id" in kwargs:
+            return kwargs.get("chat_id")
+    except Exception:
+        pass
+    return None
+
+
+def send_action(action: str = "typing") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Decorator for Telegram handlers.
+    Sends chat action before handler logic to make the bot feel alive.
+    """
+    action_name = str(action or "typing").strip().lower() or "typing"
+
+    def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(fn)
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            chat_id = _extract_chat_id_from_handler_args(*args, **kwargs)
+            if chat_id is None:
+                return fn(*args, **kwargs)
+            if action_name == "typing":
+                _maybe_send_typing(chat_id)
+            else:
+                tg_call(
+                    getattr(apihelper, "send_chat_action"),
+                    chat_id,
+                    action=action_name,
+                    max_retries=1,
+                )
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    return _decorator
 
 
 def _rk_remove() -> types.ReplyKeyboardRemove:
@@ -694,8 +754,9 @@ def fetch_external_correlation(cfg_obj: Any) -> Optional[float]:
         return cached  # may be float or None (cached None)
 
     url = f"https://api.coingecko.com/api/v3/simple/price?ids=pax-gold&vs_currencies={vs}"
+    timeout_sec = float(getattr(cfg_obj, "correlation_timeout_sec", 1.2) or 1.2)
     try:
-        resp = _session.get(url, timeout=5, headers={"User-Agent": "xau-bot/1.0"})
+        resp = _session.get(url, timeout=timeout_sec, headers={"User-Agent": "xau-bot/1.0"})
         if resp.status_code == 200:
             data = resp.json()
             price = data.get("pax-gold", {}).get(vs)
@@ -728,9 +789,11 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
         last_btc = str(getattr(status, "last_signal_btc", "Neutral"))
         segments.append(f"Sig XAU:{last_xau} BTC:{last_btc}")
 
-        corr = fetch_external_correlation(cfg)
-        if corr is not None:
-            segments.append(f"Corr GOLD {corr:+.2f}")
+        # Keep compact ribbons instant (status command path).
+        if not compact:
+            corr = fetch_external_correlation(cfg)
+            if corr is not None:
+                segments.append(f"Corr GOLD {corr:+.2f}")
 
         ribbon = " | ".join(segments)
         prefix = "\n" if compact else ""
@@ -1048,14 +1111,19 @@ def check_full_program() -> tuple[bool, str]:
     issues: list[str] = []
 
     # 1. MT5 Connectivity
-    try:
-        ensure_mt5()
-        with MT5_LOCK:
-            acc = mt5.account_info()
-        if not acc:
-            issues.append("MT5 Account Info дастрас нест.")
-    except Exception as exc:
-        issues.append(f"MT5 Connection failed: {exc}")
+    ok_mt5, last_reason = mt5_status()
+    reason_s = str(last_reason or "unknown")
+    if ok_mt5:
+        try:
+            with MT5_LOCK:
+                acc = mt5.account_info()
+            if not acc:
+                issues.append("MT5 Account Info дастрас нест.")
+        except Exception as exc:
+            issues.append(f"MT5 Connection failed: {exc}")
+    else:
+        # Fast diagnostic mode: do not trigger reconnect attempts from chat command.
+        issues.append(f"MT5 Connection failed: {reason_s}")
 
     # 2. Check Portfolio Engine Pipelines
     xau_pipe = getattr(engine, "_xau", None)

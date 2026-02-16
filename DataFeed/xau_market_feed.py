@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytz
 
-from config_xau import EngineConfig, SymbolParams, TF_MAP
+from core.config import XAUEngineConfig as EngineConfig, XAUSymbolParams as SymbolParams, TF_MAP
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 
@@ -135,7 +135,10 @@ class MarketFeed:
                 log_feed.error("Empty symbol in MarketFeed")
                 return False
 
-            ensure_mt5()
+            # In dry-run mode, never block on full MT5 auth/init path.
+            # We only do a fast probe; if terminal is unavailable we fail-fast.
+            if not bool(getattr(self.cfg, "dry_run", False)):
+                ensure_mt5()
             with MT5_LOCK:
                 info = mt5.symbol_info(self.symbol)
                 if info is None:

@@ -10,11 +10,14 @@ if str(_root) not in sys.path:
 
 import time
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import MetaTrader5 as mt5
-from mt5_client import MT5_LOCK, ensure_mt5
+from log_config import get_log_path
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 
 Timeframe = Literal["M1", "M5", "M15"]
@@ -26,8 +29,65 @@ TIMEFRAME_MAP: Dict[str, int] = {
 }
 
 log = logging.getLogger("ai.market_feed")
-log.setLevel(logging.ERROR)
+log.setLevel(logging.INFO)
 log.propagate = False
+if not log.handlers:
+    fh = RotatingFileHandler(
+        str(get_log_path("ai_market_feed.log")),
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    log.addHandler(fh)
+
+
+_PAYLOAD_CACHE_TTL_SEC = 300.0
+_NON_RETRIABLE_MARKERS = (
+    "algo_trading_disabled_in_terminal",
+    "trading_disabled_for_account",
+    "wrong_account",
+    "blocked_cooldown:",
+)
+_LAST_PAYLOAD: Dict[str, Dict[str, Any]] = {}
+_LAST_PAYLOAD_TS: Dict[str, float] = {}
+
+
+def _mt5_blocked_reason() -> Optional[str]:
+    ok_mt5, reason = mt5_status()
+    if ok_mt5:
+        return None
+    reason_s = str(reason or "unknown")
+    if any(marker in reason_s for marker in _NON_RETRIABLE_MARKERS):
+        return reason_s
+    return None
+
+
+def _cache_payload(symbol: str, payload: Dict[str, Any]) -> None:
+    _LAST_PAYLOAD[symbol] = deepcopy(payload)
+    _LAST_PAYLOAD_TS[symbol] = time.time()
+
+
+def _cached_payload(symbol: str, reason: str) -> Optional[Dict[str, Any]]:
+    payload = _LAST_PAYLOAD.get(symbol)
+    ts = float(_LAST_PAYLOAD_TS.get(symbol, 0.0) or 0.0)
+    if not payload or ts <= 0.0:
+        return None
+    age = time.time() - ts
+    if age > _PAYLOAD_CACHE_TTL_SEC:
+        return None
+    out = deepcopy(payload)
+    meta = out.setdefault("meta", {})
+    meta["cached_fallback"] = True
+    meta["cached_age_sec"] = int(max(0.0, age))
+    meta["mt5_reason"] = str(reason or "unknown")
+    try:
+        st = str(out.get("summary_text", "") or "")
+        out["summary_text"] = st + f"\nFALLBACK=CACHED | AGE_SEC={int(max(0.0, age))} | MT5={reason}"
+    except Exception:
+        pass
+    return out
 
 
 @dataclass(frozen=True)
@@ -377,26 +437,56 @@ def _payload_from_packs(
 
 
 def get_ai_payload_xau() -> Optional[Dict[str, Any]]:
+    blocked_reason = _mt5_blocked_reason()
+    if blocked_reason:
+        cached = _cached_payload("XAUUSDm", blocked_reason)
+        if cached is not None:
+            log.warning("get_ai_payload_xau: using cached payload due mt5_block=%s", blocked_reason)
+            return cached
+        log.error("get_ai_payload_xau blocked: %s", blocked_reason)
+        return None
+
     try:
         xau = GetXauDataRealTimeForAi()
         meta = xau._symbol_meta()
         p15 = xau._build_pack("M15")
         p5 = xau._build_pack("M5")
         p1 = xau._build_pack("M1")
-        return _payload_from_packs("XAUUSDm", p15, p5, p1, meta)
+        payload = _payload_from_packs("XAUUSDm", p15, p5, p1, meta)
+        _cache_payload("XAUUSDm", payload)
+        return payload
     except Exception as e:
         log.error("get_ai_payload_xau failed: %s", e)
+        cached = _cached_payload("XAUUSDm", str(e))
+        if cached is not None:
+            log.warning("get_ai_payload_xau: fallback cached after exception")
+            return cached
         return None
 
 
 def get_ai_payload_btc() -> Optional[Dict[str, Any]]:
+    blocked_reason = _mt5_blocked_reason()
+    if blocked_reason:
+        cached = _cached_payload("BTCUSDm", blocked_reason)
+        if cached is not None:
+            log.warning("get_ai_payload_btc: using cached payload due mt5_block=%s", blocked_reason)
+            return cached
+        log.error("get_ai_payload_btc blocked: %s", blocked_reason)
+        return None
+
     try:
         btc = GetBtcDataRealTimeForAi()
         meta = btc._symbol_meta()
         p15 = btc._build_pack("M15")
         p5 = btc._build_pack("M5")
         p1 = btc._build_pack("M1")
-        return _payload_from_packs("BTCUSDm", p15, p5, p1, meta)
+        payload = _payload_from_packs("BTCUSDm", p15, p5, p1, meta)
+        _cache_payload("BTCUSDm", payload)
+        return payload
     except Exception as e:
         log.error("get_ai_payload_btc failed: %s", e)
+        cached = _cached_payload("BTCUSDm", str(e))
+        if cached is not None:
+            log.warning("get_ai_payload_btc: fallback cached after exception")
+            return cached
         return None

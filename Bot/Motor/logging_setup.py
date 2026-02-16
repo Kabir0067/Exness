@@ -25,6 +25,20 @@ log_health.propagate = False
 log_err.propagate = False
 log_diag.propagate = False
 
+# Route core risk logs to health file
+log_core_risk = logging.getLogger("core.portfolio_risk")
+log_core_risk.setLevel(logging.INFO)
+log_core_risk.propagate = False
+log_core_feature = logging.getLogger("core.feature_engine")
+log_core_feature.setLevel(logging.ERROR)
+log_core_feature.propagate = False
+log_core_signal = logging.getLogger("core.signal_engine")
+log_core_signal.setLevel(logging.ERROR)
+log_core_signal.propagate = False
+log_core_risk_engine = logging.getLogger("core.risk_engine")
+log_core_risk_engine.setLevel(logging.ERROR)
+log_core_risk_engine.propagate = False
+
 _FMT = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 
@@ -46,5 +60,9 @@ def _add_handler(logger: logging.Logger, filename: str, level: int) -> None:
 
 _add_handler(log_health, "portfolio_engine_health.log", logging.INFO)
 _add_handler(log_err, "portfolio_engine_error.log", logging.ERROR)
+_add_handler(log_core_risk, "portfolio_engine_health.log", logging.INFO)
+_add_handler(log_core_feature, "portfolio_engine_error.log", logging.ERROR)
+_add_handler(log_core_signal, "portfolio_engine_error.log", logging.ERROR)
+_add_handler(log_core_risk_engine, "portfolio_engine_error.log", logging.ERROR)
 if _DIAG_ENABLED:
     _add_handler(log_diag, "portfolio_engine_diag.jsonl", logging.INFO)

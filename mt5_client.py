@@ -39,6 +39,9 @@ _lock_acquired = False
 # Auth failure throttling (prevents restart storms)
 _auth_block_until_mono: float = 0.0
 _auth_block_reason: str = ""
+# Non-retriable runtime throttling (prevents slow repeated attempts on terminal config blocks)
+_non_retriable_block_until_mono: float = 0.0
+_non_retriable_block_reason: str = ""
 
 
 # =============================================================================
@@ -71,6 +74,8 @@ class MT5ClientConfig:
 
     # NEW: if auth failed, block re-tries for N seconds (engine will stop storming)
     auth_fail_cooldown_sec: float = 600.0
+    # NEW: short cooldown for non-retriable runtime states (algo-trading disabled, wrong account, etc.)
+    non_retriable_cooldown_sec: float = 20.0
 
     log_level: int = logging.ERROR
     log_max_bytes: int = 5_242_880
@@ -176,6 +181,8 @@ def _validate_cfg(cfg: MT5ClientConfig) -> None:
         raise RuntimeError("ready_timeout_sec must be > 0")
     if int(cfg.max_retries) <= 0:
         raise RuntimeError("max_retries must be > 0")
+    if float(cfg.non_retriable_cooldown_sec) < 0:
+        raise RuntimeError("non_retriable_cooldown_sec must be >= 0")
 
 
 def _is_auth_failed(err: Tuple[int, str]) -> bool:
@@ -377,6 +384,13 @@ class Health:
     reason: str
 
 
+_NON_RETRIABLE_HEALTH_REASONS = {
+    "algo_trading_disabled_in_terminal",
+    "trading_disabled_for_account",
+    "wrong_account",
+}
+
+
 def _health(cfg: MT5ClientConfig) -> Health:
     try:
         ti = mt5.terminal_info()
@@ -413,11 +427,21 @@ def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
         last = h.reason
         if h.ok:
             return
+        # Operator/config failures won't recover by waiting.
+        if str(last) in _NON_RETRIABLE_HEALTH_REASONS:
+            break
         time.sleep(0.20)
     hint = ""
     if last == "algo_trading_disabled_in_terminal":
-        hint = " Enable Algo Trading in MT5: Tools → Options → Expert Advisors → Allow Algo Trading (or press AutoTrading button on toolbar)."
+        hint = " Enable Algo Trading in MT5: Tools -> Options -> Expert Advisors -> Allow Algo Trading (or press AutoTrading button on toolbar)."
     raise RuntimeError(f"mt5_health_failed:{last}{hint}")
+
+
+def _is_non_retriable_runtime_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    if "mt5_health_failed:" in msg:
+        return any(reason in msg for reason in _NON_RETRIABLE_HEALTH_REASONS)
+    return False
 
 
 # =============================================================================
@@ -504,14 +528,10 @@ def _is_ipc_timeout(cfg: MT5ClientConfig, exc: Exception) -> bool:
 # =============================================================================
 def _default_config_from_env() -> MT5ClientConfig:
     try:
-        from config_xau import get_config_from_env as _get_cfg  # lazy import
+        from core.config import get_config_from_env as _get_cfg  # lazy import
         cfg = _get_cfg()
-    except Exception:
-        try:
-            from config_btc import get_config_from_env as _get_cfg  # lazy import
-            cfg = _get_cfg()
-        except Exception as exc:
-            raise RuntimeError("Unable to build MT5 config from env-backed config files") from exc
+    except Exception as exc:
+        raise RuntimeError("Unable to build MT5 config from env-backed config files") from exc
 
     creds = MT5Credentials(
         login=int(getattr(cfg, "login", 0) or 0),
@@ -527,6 +547,7 @@ def _default_config_from_env() -> MT5ClientConfig:
         timeout_ms=int(getattr(cfg, "mt5_timeout_ms", 300_000) or 300_000),
         require_path_on_windows=False,
         auth_fail_cooldown_sec=float(getattr(cfg, "mt5_auth_cooldown_sec", 600.0) or 600.0),
+        non_retriable_cooldown_sec=float(getattr(cfg, "mt5_non_retriable_cooldown_sec", 20.0) or 20.0),
         ready_timeout_sec=float(getattr(cfg, "mt5_ready_timeout_sec", 120.0) or 120.0),
     )
 
@@ -536,6 +557,7 @@ def _default_config_from_env() -> MT5ClientConfig:
 # =============================================================================
 def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
     global _initialized, _last_health_reason, _auth_block_until_mono, _auth_block_reason
+    global _non_retriable_block_until_mono, _non_retriable_block_reason
 
     if cfg is None:
         cfg = _default_config_from_env()
@@ -547,6 +569,12 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
     now = _mono()
     if now < _auth_block_until_mono:
         raise MT5AuthError(f"auth_blocked:{_auth_block_reason}")
+    # Fast-fail gate for non-retriable runtime states to avoid repeated heavy init attempts.
+    if now < _non_retriable_block_until_mono:
+        cached_reason = str(_non_retriable_block_reason or "mt5_health_failed:non_retriable_cached")
+        with MT5_LOCK:
+            _last_health_reason = f"blocked_cooldown:{cached_reason}"
+        raise RuntimeError(cached_reason)
 
     _acquire_single_instance_lock(cfg)
 
@@ -603,6 +631,8 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
                 with MT5_LOCK:
                     _initialized = True
                     _last_health_reason = "ok"
+                _non_retriable_block_until_mono = 0.0
+                _non_retriable_block_reason = ""
 
                 return mt5
 
@@ -653,7 +683,17 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
                     except Exception:
                         pass
                     _initialized = False
-                    _last_health_reason = f"init_failed:{type(exc).__name__}"
+                    exc_txt = str(exc).replace("\n", " ").strip()
+                    if len(exc_txt) > 240:
+                        exc_txt = exc_txt[:240]
+                    _last_health_reason = f"init_failed:{exc_txt or type(exc).__name__}"
+
+                # Fatal runtime states should fail immediately (no retry storm / no long blocking).
+                if _is_non_retriable_runtime_error(exc):
+                    _non_retriable_block_reason = str(exc)
+                    _non_retriable_block_until_mono = _mono() + float(cfg.non_retriable_cooldown_sec)
+                    logger.warning("ensure_mt5 non-retriable failure: %s", exc)
+                    raise
 
                 logger.error(
                     "ensure_mt5 attempt %d/%d failed: %s | tb=%s",
@@ -671,6 +711,7 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> mt5:
 
 def shutdown_mt5() -> None:
     global _initialized, _last_health_reason
+    global _non_retriable_block_until_mono, _non_retriable_block_reason
     with _INIT_LOCK:
         with MT5_LOCK:
             try:
@@ -679,6 +720,8 @@ def shutdown_mt5() -> None:
                 logger.error("MT5 shutdown error: %s | tb=%s", exc, traceback.format_exc())
             _initialized = False
             _last_health_reason = "shutdown"
+            _non_retriable_block_until_mono = 0.0
+            _non_retriable_block_reason = ""
     _release_single_instance_lock()
 
 

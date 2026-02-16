@@ -184,6 +184,10 @@ class _AssetPipeline:
         try:
             # Feed.get_rates(symbol, timeframe) — no tf= or count= kwargs
             df = self.feed.get_rates(symbol, tf)
+            if df is None:
+                self.last_market_reason = (
+                    "no_rates_dry_run" if bool(getattr(self.cfg, "dry_run", False)) else "no_rates"
+                )
             return df
         except Exception:
             self.last_market_reason = "feed_exception"

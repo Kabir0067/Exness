@@ -1,4 +1,3 @@
-
 def main():
     capital = 100
     profit = 0.020
