@@ -38,15 +38,20 @@ class ModelAgeChecker:
             return age_seconds / 3600.0
 
     def needs_retraining(self, assets: Iterable[str]) -> bool:
-        """Check if any asset needs retraining based on min threshold."""
-        age = self.get_model_age_hours()
-        if age is None:
-            return True
-
-        thresholds: list[float] = []
+        """Check if any asset needs retraining based on per-asset age thresholds."""
         for asset in assets:
             key = _normalize_asset(asset)
-            thresholds.append(float(MAX_MODEL_AGE_HOURS.get(key, 48)))
-
-        min_threshold = min(thresholds) if thresholds else min(MAX_MODEL_AGE_HOURS.values())
-        return age > float(min_threshold)
+            threshold = float(MAX_MODEL_AGE_HOURS.get(key, 48))
+            # Check per-asset state file first
+            asset_state = self.model_path.parent / f"model_state_{key}.pkl"
+            if asset_state.exists():
+                try:
+                    age_sec = max(0.0, time.time() - float(asset_state.stat().st_mtime))
+                    if (age_sec / 3600.0) > threshold:
+                        return True
+                except Exception:
+                    return True
+            else:
+                # Missing per-asset state file = needs training
+                return True
+        return False

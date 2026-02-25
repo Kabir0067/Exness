@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import http.client
@@ -30,6 +30,8 @@ from log_config import (
     get_artifact_dir,
     get_artifact_path,
 )
+from core.config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
+from core.model_gate import DEFAULT_REQUIRED_ASSETS, gate_details
 
 bot: Any = None
 ADMIN: int = 0
@@ -37,7 +39,8 @@ bot_commands: Optional[Callable[[], None]] = None
 send_signal_notification: Optional[Callable[[str, Any], None]] = None
 engine: Any = None
 _tg_available: bool = True
-_system_log_handler = configure_logging(level="INFO", system_log_name="system.log", console=True)
+# Disable global aggregate file log. Each module writes to its own log file.
+_system_log_handler = configure_logging(level="INFO", system_log_name=None, console=True)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -45,26 +48,72 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _required_gate_assets() -> tuple[str, ...]:
+    raw = str(os.getenv("GATE_REQUIRED_ASSETS", ",".join(DEFAULT_REQUIRED_ASSETS)) or ",".join(DEFAULT_REQUIRED_ASSETS))
+    out: list[str] = []
+    seen = set()
+    for item in raw.split(","):
+        a = str(item or "").upper().strip()
+        if not a or a in seen:
+            continue
+        seen.add(a)
+        out.append(a)
+    if not out:
+        return tuple(DEFAULT_REQUIRED_ASSETS)
+    return tuple(out)
+
+
+def _model_gate_ready() -> tuple[bool, str]:
+    details = gate_details(required_assets=_required_gate_assets(), allow_legacy_fallback=True)
+    assets = details.get("assets", {}) if isinstance(details, dict) else {}
+    for asset, st in assets.items():
+        try:
+            log.info(
+                "ASSET_GATE_STATUS | asset=%s ok=%s reason=%s version=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f legacy=%s",
+                asset,
+                bool(st.get("ok", False)),
+                str(st.get("reason", "unknown")),
+                str(st.get("model_version", "")),
+                float(st.get("sharpe", 0.0) or 0.0),
+                float(st.get("win_rate", 0.0) or 0.0),
+                float(st.get("max_drawdown_pct", 0.0) or 0.0),
+                bool(st.get("legacy_fallback", False)),
+            )
+        except Exception:
+            continue
+    return bool(details.get("ok", False)), str(details.get("reason", "unknown"))
+
+
+def _partial_gate_assets() -> list[str]:
+    """Return list of assets that pass gate individually (partial mode)."""
+    passing: list[str] = []
+    for asset in _required_gate_assets():
+        try:
+            details = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
+            asset_st = (details.get("assets", {}) or {}).get(asset, {})
+            if isinstance(asset_st, dict) and bool(asset_st.get("ok", False)):
+                passing.append(asset)
+        except Exception:
+            continue
+    return passing
+
+
 def _models_ready() -> tuple[bool, str]:
     try:
-        models_dir = get_artifact_dir("models")
-        state_path = get_artifact_path("models", "model_state.pkl")
-        if not state_path.exists():
-            return False, f"missing_state:{state_path}"
-        try:
-            import pickle
-            with state_path.open("rb") as f:
-                state = pickle.load(f)
-            if not isinstance(state, dict):
-                return False, "state_invalid"
-            if not bool(state.get("real_backtest", False)):
-                return False, "non_real_backtest_artifact"
-        except Exception as exc:
-            return False, f"state_unreadable:{exc}"
-        has_pkl = any(models_dir.glob("v*_institutional.pkl"))
-        has_json = any(models_dir.glob("v*_institutional.json"))
-        if not has_pkl or not has_json:
-            return False, "missing_model_files"
+        details = gate_details(required_assets=_required_gate_assets(), allow_legacy_fallback=True)
+        gate_ok = bool(details.get("ok", False))
+        gate_reason = str(details.get("reason", "unknown"))
+        if not gate_ok:
+            return False, gate_reason
+        assets = details.get("assets", {}) if isinstance(details, dict) else {}
+        for asset in _required_gate_assets():
+            st = assets.get(asset, {}) if isinstance(assets, dict) else {}
+            model_path = str(st.get("model_path", "") or "")
+            meta_path = str(st.get("meta_path", "") or "")
+            if not model_path or not os.path.exists(model_path):
+                return False, f"{asset}:missing_model_payload"
+            if not meta_path or not os.path.exists(meta_path):
+                return False, f"{asset}:missing_model_meta"
         return True, "ok"
     except Exception as exc:
         return False, f"error:{exc}"
@@ -85,7 +134,7 @@ def _auto_train_models() -> bool:
             pass
 
     _con("\n" + "=" * 60)
-    _con("🔄 AUTO-TRAINING STARTED — This may take several minutes.")
+    _con("🔄 Auto-training оғоз шуд — метавонад чанд дақиқа гирад.")
     _con("   You will see iteration-by-iteration progress below.")
     _con("=" * 60 + "\n")
 
@@ -97,6 +146,25 @@ def _auto_train_models() -> bool:
 
     ok = True
     for asset in ("XAU", "BTC"):
+        # Skip assets that already pass gate AND have fresh models (< 24h)
+        try:
+            from core.model_gate import gate_details as _gate_check
+            _det = _gate_check(required_assets=(asset,), allow_legacy_fallback=True)
+            _ast = (_det.get("assets", {}) or {}).get(asset, {})
+            if isinstance(_ast, dict) and bool(_ast.get("ok", False)):
+                _sp = str(_ast.get("state_path", ""))
+                age_hours = 0.0
+                if _sp:
+                    import pathlib as _pl
+                    _p = _pl.Path(_sp)
+                    if _p.exists():
+                        age_hours = (time.time() - _p.stat().st_mtime) / 3600.0
+                if age_hours < 24.0:
+                    log_local.info("Auto-train SKIP | asset=%s reason=gate_ok+fresh (age=%.1fh < 24h)", asset, age_hours)
+                    continue
+        except Exception:
+            pass
+        
         try:
             run_institutional_backtest(asset)
         except Exception as exc:
@@ -106,19 +174,19 @@ def _auto_train_models() -> bool:
     if ok:
         artifacts_dir = str(get_artifact_dir("models"))
         _con("\n" + "=" * 60)
-        _con(f"✅ TRAINING COMPLETE. Model saved to {artifacts_dir}")
+        _con(f"✅ Training анҷом ёфт. Модел дар ин роҳ сабт шуд: {artifacts_dir}")
         _con("   Starting Trading Engine...")
         _con("=" * 60 + "\n")
     else:
-        _con("\n⚠️  TRAINING FINISHED WITH ERRORS. Check logs above.")
+        _con("\n⚠️ Training бо хато анҷом ёфт. Логҳоро санҷед.")
     return ok
 
 
 def _auto_train_models_strict() -> bool:
     """
     Strict auto-train:
-    - Accept success only if at least one trained asset passes quality gate
-    - Optional asset list via AUTO_TRAIN_ASSETS (default: XAU,BTC)
+    - Retrain all required assets (default strict: XAU + BTC)
+    - Success only after post-training gate check passes
     """
     log_local = logging.getLogger("main")
     try:
@@ -127,17 +195,36 @@ def _auto_train_models_strict() -> bool:
         log_local.error("Auto-train(strict) import failed: %s", exc)
         return False
 
-    assets_env = str(os.getenv("AUTO_TRAIN_ASSETS", "XAU,BTC") or "XAU,BTC")
+    assets_default = ",".join(_required_gate_assets())
+    assets_env = str(os.getenv("AUTO_TRAIN_ASSETS", assets_default) or assets_default)
     assets = [a.strip().upper() for a in assets_env.split(",") if a.strip()]
     if not assets:
-        assets = ["XAU", "BTC"]
+        assets = list(_required_gate_assets())
+    for asset in _required_gate_assets():
+        if asset not in assets:
+            assets.append(asset)
 
-    any_passed = False
+    passed_assets: list[str] = []
+    failed_assets: list[str] = []
     for asset in assets:
+        # Smart retrain: skip assets that already pass gate
+        try:
+            details = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
+            asset_st = (details.get("assets", {}) or {}).get(asset, {})
+            if isinstance(asset_st, dict) and bool(asset_st.get("ok", False)):
+                log_local.info(
+                    "Auto-train(strict) SKIP | asset=%s reason=gate_already_ok sharpe=%.3f",
+                    asset, float(asset_st.get("sharpe", 0.0) or 0.0),
+                )
+                passed_assets.append(asset)
+                continue
+        except Exception:
+            pass
+
         try:
             metrics = run_institutional_backtest(asset)
             if _check_backtest_passed(metrics):
-                any_passed = True
+                passed_assets.append(asset)
                 log_local.info(
                     "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
                     asset,
@@ -145,17 +232,53 @@ def _auto_train_models_strict() -> bool:
                     float(getattr(metrics, "win_rate", 0.0) or 0.0),
                     float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
                 )
-                break
-            log_local.warning(
-                "Auto-train(strict) failed quality gate | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
-                asset,
-                float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
-                float(getattr(metrics, "win_rate", 0.0) or 0.0),
-                float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
-            )
+            else:
+                failed_assets.append(asset)
+                log_local.warning(
+                    "Auto-train(strict) failed quality gate | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                    asset,
+                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                )
         except Exception as exc:
             log_local.error("Auto-train(strict) failed | asset=%s err=%s", asset, exc)
-    return any_passed
+            failed_assets.append(asset)
+            continue
+
+    required_assets = set(_required_gate_assets())
+    passed_required_assets = required_assets.issubset(set(passed_assets))
+    if failed_assets:
+        log_local.error(
+            "AUTO_TRAIN_QUALITY_FAILED | failed_assets=%s",
+            ",".join(failed_assets),
+        )
+
+    post_ok, post_reason = _model_gate_ready()
+    if post_ok:
+        return True
+    
+    # Bug #16: Partial gate mode — if at least one asset passes, allow partial startup
+    partial_mode = _env_truthy("PARTIAL_GATE_MODE", "1")
+    if not post_ok and partial_mode:
+        passing = _partial_gate_assets()
+        if passing:
+            log_local.warning(
+                "AUTO_TRAIN_PARTIAL_GATE | passing=%s failed=%s reason=%s",
+                ",".join(passing),
+                ",".join(sorted(set(_required_gate_assets()) - set(passing))),
+                post_reason,
+            )
+            return True  # Allow startup with partial assets
+    
+    if not passed_required_assets:
+        missing = sorted(required_assets.difference(set(passed_assets)))
+        log_local.error(
+            "AUTO_TRAIN_REQUIRED_ASSET_NOT_PASSED | missing=%s passed=%s",
+            ",".join(missing) if missing else "-",
+            ",".join(sorted(set(passed_assets))) if passed_assets else "-",
+        )
+    return False
 
 
 def _setup_exception_hooks() -> None:
@@ -492,7 +615,7 @@ class GracefulShutdown:
 
     def _handle(self, signum, frame) -> None:
         if self._received:
-            log.warning("Сигнал такрорӣ (%s). Баромади маҷбурӣ.", signum)
+            log.warning("Сигнали такрорӣ (%s). Баромади маҷбурӣ.", signum)
             raise SystemExit(2)
         self._received = True
         log.info("Сигнали қатъ (%s). Оромона қатъ мекунем...", signum)
@@ -641,6 +764,51 @@ class LogMonitor:
 # ==========================
 # Engine Supervisor (never crash)
 # ==========================
+def _run_retraining_cycle(notifier: Notifier, *, reason: str) -> bool:
+    """Run one retraining cycle and hot-reload on success."""
+    log.warning("Retraining cycle started | reason=%s", reason)
+    success = False
+    try:
+        try:
+            engine._retraining_mode = True
+            log.info("Trading paused during retraining")
+        except Exception:
+            pass
+
+        retrain_ok = _safe_retrain_models(notifier)
+        if retrain_ok:
+            log.info("Retraining complete. Resuming trading.")
+            notifier.notify("✅ Бозомӯзӣ анҷом ёфт.\nМодели нав бор шуд.")
+            try:
+                engine.reload_model()
+                post_ok, post_reason = _model_gate_ready()
+                if not post_ok:
+                    log.error("RETRAIN_POSTCHECK_FAILED | reason=%s", post_reason)
+                    notifier.notify(f"⚠️ Санҷиши пас аз бозомӯзӣ нагузашт: {post_reason}")
+                    success = False
+                else:
+                    success = True
+                try:
+                    engine.clear_manual_stop()
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.error("Model reload failed: %s", exc)
+                log.error("RETRAIN_POSTCHECK_FAILED | reason=model_reload_failed:%s", exc)
+                notifier.notify(f"⚠️ Санҷиши пас аз бозомӯзӣ нагузашт: model_reload_failed:{exc}")
+                success = False
+        else:
+            log.warning("Retraining failed. Using old model.")
+            notifier.notify("⚠️ Бозомӯзӣ ноком шуд.\nМодели пешина истифода мешавад.")
+            success = False
+        return bool(success)
+    finally:
+        try:
+            engine._retraining_mode = False
+        except Exception:
+            pass
+
+
 def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     """
     High-reliability engine supervisor:
@@ -657,12 +825,26 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     from core.model_retrainer import ModelAgeChecker, MAX_MODEL_AGE_HOURS
 
     RETRAIN_CHECK_INTERVAL = 3600.0  # 1 hour
-    retrain_assets = ["XAU", "BTC"]
+    GATE_RETRAIN_COOLDOWN_SEC = float(os.getenv("GATE_RETRAIN_COOLDOWN_SEC", "300") or "300")
+    retrain_assets = list(_required_gate_assets())
     last_retrain_check = 0.0
+    dry_run_mode = bool(getattr(engine, "dry_run", False))
+    if dry_run_mode:
+        gate_ready_at_start, gate_reason_at_start = True, "dry_run_bypass"
+    else:
+        gate_ready_at_start, gate_reason_at_start = _model_gate_ready()
+    last_gate_retrain_attempt = 0.0 if gate_ready_at_start else time.time()
     retraining_in_progress = False
+    gate_block_rl = RateLimiter(30.0)
     model_checker = ModelAgeChecker(get_artifact_path("models", "model_state.pkl"))
 
-    notifier.notify("🧠 Engine supervisor started")
+    notifier.notify("🧠 Нозири мотор оғоз шуд.")
+    if not gate_ready_at_start:
+        log.warning(
+            "Engine gate initially blocked | reason=%s | delaying next retrain by %.0fs",
+            gate_reason_at_start,
+            GATE_RETRAIN_COOLDOWN_SEC,
+        )
 
     while not stop_event.is_set():
         # Cheap status probe first (avoid engine.start() spam)
@@ -679,14 +861,8 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
             ok_trading = True
             manual_stop = False
 
-        if manual_stop:
-            if manual_stop_rl.allow("engine_manual_stop"):
-                log.info("Engine idle (manual stop active); supervisor waiting")
-            sleep_interruptible(stop_event, 1.0)
-            continue
-
         # HOURLY RETRAINING CHECK
-        if not retraining_in_progress:
+        if not retraining_in_progress and not dry_run_mode:
             now = time.time()
             if (now - last_retrain_check) > RETRAIN_CHECK_INTERVAL:
                 last_retrain_check = now
@@ -698,34 +874,56 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                         age_txt,
                         MAX_MODEL_AGE_HOURS,
                     )
-                    notifier.notify(f"🔄 Model Retraining Started\nAge: {age_txt}")
+                    notifier.notify(f"🔄 Бозомӯзии модел оғоз шуд.\nСинни модел: {age_txt}")
 
                     retraining_in_progress = True
                     try:
-                        try:
-                            engine._retraining_mode = True
-                            log.info("Trading paused during retraining")
-                        except Exception:
-                            pass
-
-                        success = _safe_retrain_models(notifier)
-
-                        if success:
-                            log.info("Retraining complete. Resuming trading.")
-                            notifier.notify("✅ Retraining Complete\nNew model loaded")
-                            try:
-                                engine.reload_model()
-                            except Exception as exc:
-                                log.error("Model reload failed: %s", exc)
-                        else:
-                            log.warning("Retraining failed. Using old model.")
-                            notifier.notify("⚠️ Retraining Failed\nContinuing with old model")
+                        _run_retraining_cycle(notifier, reason=f"age_expired:{age_txt}")
                     finally:
-                        try:
-                            engine._retraining_mode = False
-                        except Exception:
-                            pass
                         retraining_in_progress = False
+
+        # Re-probe state after potential retraining/reload.
+        try:
+            st = engine.status()
+            ok_connected = bool(getattr(st, "connected", True))
+            ok_trading = bool(getattr(st, "trading", True))
+            manual_stop = bool(getattr(st, "manual_stop", False))
+        except Exception:
+            ok_connected = True
+            ok_trading = True
+            manual_stop = False
+
+        # If gate is blocked, avoid engine.start() spam and trigger controlled retraining.
+        if not ok_trading and not retraining_in_progress and not dry_run_mode:
+            gate_ok, gate_reason = _model_gate_ready()
+            if not gate_ok:
+                now = time.time()
+                elapsed = now - last_gate_retrain_attempt
+                if elapsed >= GATE_RETRAIN_COOLDOWN_SEC:
+                    last_gate_retrain_attempt = now
+                    retraining_in_progress = True
+                    try:
+                        log.warning("Engine gate blocked | reason=%s | triggering retrain", gate_reason)
+                        notifier.notify(f"⛔ Дарвозаи модел баста аст: {gate_reason}\n🔁 Бозомӯзӣ оғоз мешавад...")
+                        _run_retraining_cycle(notifier, reason=f"gate_blocked:{gate_reason}")
+                    finally:
+                        retraining_in_progress = False
+                else:
+                    remain = max(1.0, GATE_RETRAIN_COOLDOWN_SEC - elapsed)
+                    if gate_block_rl.allow("engine_gate_blocked_wait"):
+                        log.warning(
+                            "Engine gate blocked | reason=%s | next retrain in %.0fs",
+                            gate_reason,
+                            remain,
+                        )
+                    sleep_interruptible(stop_event, min(5.0, remain))
+                continue
+
+        if manual_stop:
+            if manual_stop_rl.allow("engine_manual_stop"):
+                log.info("Engine idle (manual stop active); supervisor waiting")
+            sleep_interruptible(stop_event, 1.0)
+            continue
 
         # Ensure engine running
         if not ok_trading:
@@ -746,13 +944,13 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
                     raise RuntimeError("engine.start returned False")
                 if not started_once:
                     started_once = True
-                    notifier.notify("🟢 Мотори тиҷорат оғоз шуд")
+                    notifier.notify("🟢 Мотори тиҷорат оғоз шуд.")
                 attempt = 0
             except Exception as exc:
                 delay = backoff.delay(attempt)
                 if attempt == 1 or attempt % 5 == 0:
                     log.error("Engine start failed: %s | retry in %.1fs", exc, delay)
-                    notifier.notify(f"⚠️ Engine start failed: {exc} | retry in {delay:.0f}s")
+                    notifier.notify(f"⚠️ Оғози мотор ноком шуд: {exc}\n⏳ Кӯшиши навбатӣ пас аз {delay:.0f}с")
                 sleep_interruptible(stop_event, delay)
                 continue
 
@@ -761,7 +959,7 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
             if restart_guard.allow("engine_unhealthy"):
                 log.warning("Engine unhealthy (connected=%s trading=%s) -> waiting/recovering", ok_connected, ok_trading)
                 if TG_HEALTH_NOTIFY:
-                    notifier.notify("🟠 Engine unhealthy -> waiting for reconnect")
+                    notifier.notify("🟠 Ҳолати мотор ноустувор аст, интизори барқароршавӣ...")
             sleep_interruptible(stop_event, 2.0)
             continue
 
@@ -772,7 +970,7 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
         engine.stop()
     except Exception as exc:
         log.error("Engine stop error: %s | tb=%s", exc, traceback.format_exc())
-    notifier.notify("🔴 Мотори тиҷорат қатъ шуд")
+    notifier.notify("🔴 Мотори тиҷорат қатъ шуд.")
 
 
 def _backup_model_artifacts(models_dir):
@@ -820,24 +1018,65 @@ def _safe_retrain_models(notifier: Notifier) -> bool:
     models_dir = get_artifact_dir("models")
     backup_dir = _backup_model_artifacts(models_dir)
 
+    required_assets = list(_required_gate_assets())
+
     try:
-        # Retrain XAU
-        log.info("Retraining XAU model...")
-        xau_result = run_institutional_backtest("XAU")
-        if not _check_backtest_passed(xau_result):
-            log.error("XAU retraining failed quality checks")
-            _restore_model_artifacts(backup_dir, models_dir)
-            return False
+        assets_env = str(os.getenv("RETRAIN_ASSETS", "XAU,BTC") or "XAU,BTC")
+        assets = [a.strip().upper() for a in assets_env.split(",") if a.strip()]
+        if not assets:
+            assets = list(required_assets)
+        for a in required_assets:
+            if a not in assets:
+                assets.append(a)
 
-        # Retrain BTC
-        log.info("Retraining BTC model...")
-        btc_result = run_institutional_backtest("BTC")
-        if not _check_backtest_passed(btc_result):
-            log.error("BTC retraining failed quality checks")
-            _restore_model_artifacts(backup_dir, models_dir)
-            return False
+        passed_assets: list[str] = []
+        failed_assets: list[str] = []
 
-        return True
+        for asset in assets:
+            # Bug #17: Smart retrain — skip already-passing assets
+            details = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
+            asset_status = (details.get("assets", {}) or {}).get(asset, {})
+            if isinstance(asset_status, dict) and bool(asset_status.get("ok", False)):
+                log.info("RETRAIN_SKIP_ALREADY_PASS | asset=%s reason=gate_already_ok", asset)
+                passed_assets.append(asset)
+                continue
+            
+            log.info("Retraining %s model...", asset)
+            metrics = run_institutional_backtest(asset)
+            if _check_backtest_passed(metrics):
+                passed_assets.append(asset)
+                log.info(
+                    "Retraining quality gate passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
+                    asset,
+                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                )
+            else:
+                failed_assets.append(asset)
+                log.error(
+                    "Retraining quality gate failed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
+                    asset,
+                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                )
+        passed_required = set(required_assets).issubset(set(passed_assets))
+        gate_ok, gate_reason = _model_gate_ready()
+        if passed_required and gate_ok:
+            return True
+        log.error(
+            "RETRAIN_POSTCHECK_FAILED | reason=%s | passed_assets=%s failed_assets=%s required_assets=%s",
+            gate_reason,
+            ",".join(passed_assets) if passed_assets else "-",
+            ",".join(failed_assets) if failed_assets else "-",
+            ",".join(required_assets),
+        )
+
+        # Only restore backup if NO required assets passed (preserve partial success)
+        if not passed_assets:
+            _restore_model_artifacts(backup_dir, models_dir)
+        return False
     except Exception as exc:
         log.error("Retraining exception: %s", exc, exc_info=True)
         _restore_model_artifacts(backup_dir, models_dir)
@@ -853,9 +1092,9 @@ def _check_backtest_passed(metrics) -> bool:
     except Exception:
         return False
     return (
-        sharpe >= 1.5 and
-        win_rate >= 0.55 and
-        max_dd <= 0.25
+        sharpe >= MIN_GATE_SHARPE and
+        win_rate >= MIN_GATE_WIN_RATE and
+        max_dd <= MAX_GATE_DRAWDOWN
     )
 
 
@@ -877,7 +1116,7 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
     except Exception as exc:
         log.error("bot_commands error: %s | tb=%s", exc, traceback.format_exc())
 
-    notifier.notify("🚀 Боти Telegram ОҒОЗ ШУД")
+    notifier.notify("🚀 Боти Telegram оғоз шуд.")
 
     backoff = Backoff(base=1.0, factor=2.0, max_delay=60.0)
     log_rl = RateLimiter(20.0)
@@ -919,7 +1158,7 @@ def run_telegram_supervisor(stop_event: Event, notifier: Notifier) -> None:
     except Exception:
         pass
 
-    notifier.notify("⏹️ Telegram бот қатъ шуд")
+    notifier.notify("⏹️ Боти Telegram қатъ шуд.")
 
 
 # ==========================
@@ -1006,21 +1245,28 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
     # Default to LIVE (Production)
     if args.dry_run:
         engine.dry_run = True
-
-    # Preflight: ensure trained models exist (auto-train if missing)
-    ready, reason = _models_ready()
-    if not ready:
-        log.warning("MODELS_MISSING | reason=%s", reason)
-        ok = _auto_train_models_strict()
-        if ok:
-            log.info("Auto-training completed")
-        else:
-            log.error("Auto-training failed; continuing startup")
-
         try:
-            engine._check_model_health()  # refresh gatekeeper after training
+            engine._check_model_health()
         except Exception:
             pass
+
+    if not args.dry_run:
+        # Preflight: ensure trained models exist (auto-train if missing)
+        ready, reason = _models_ready()
+        if not ready:
+            log.warning("MODELS_MISSING | reason=%s", reason)
+            ok = _auto_train_models_strict()
+            if ok:
+                log.info("Auto-training completed")
+            else:
+                log.error("Auto-training failed; continuing startup")
+
+            try:
+                engine._check_model_health()  # refresh gatekeeper after training
+            except Exception:
+                pass
+    else:
+        log.info("DRY_RUN_STARTUP | skipping strict model preflight")
 
     # Print System Matrix (Quantum Status)
     engine.print_startup_matrix()
@@ -1089,7 +1335,7 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
 
     except Exception as exc:
         log.error("Fatal main error: %s | tb=%s", exc, traceback.format_exc())
-        notifier.notify(f"🛑 Fatal main error: {exc}")
+        notifier.notify(f"🛑 Хатои ҷиддии система: {exc}")
         shutdown.request_stop()
         return 1
 
@@ -1120,7 +1366,7 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
         except Exception:
             pass
 
-        notifier.notify("⏹️ System stopped")
+        notifier.notify("⏹️ Система қатъ шуд.")
         sleep_interruptible(shutdown.stop_event, 0.2)
 
 

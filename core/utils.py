@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import traceback
+from types import MappingProxyType
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
@@ -65,12 +66,12 @@ def percentile_rank(series: np.ndarray, value: float) -> float:
 # Side normalization
 # =============================================================================
 
-_SIDE_MAP = {
+_SIDE_MAP = MappingProxyType({
     "buy": "Buy", "long": "Buy", "b": "Buy", "1": "Buy",
     "order_type_buy": "Buy", "op_buy": "Buy",
     "sell": "Sell", "short": "Sell", "s": "Sell", "-1": "Sell",
     "order_type_sell": "Sell", "op_sell": "Sell",
-}
+})
 
 
 def _side_norm(side: str) -> str:
@@ -452,12 +453,12 @@ def breakeven_price(
 # Timeframe helpers
 # =============================================================================
 
-_TF_SECONDS = {
+_TF_SECONDS = MappingProxyType({
     "M1": 60, "M2": 120, "M3": 180, "M5": 300, "M10": 600,
     "M15": 900, "M20": 1200, "M30": 1800,
     "H1": 3600, "H2": 7200, "H4": 14400, "H6": 21600, "H8": 28800,
     "D1": 86400, "W1": 604800,
-}
+})
 
 
 def tf_seconds(tf: str) -> int:

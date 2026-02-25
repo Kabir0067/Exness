@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import pickle
+import sys
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -70,6 +71,49 @@ class _NumpyStandardScaler:
         return (arr - self.mean_) / self.scale_
 
 
+class _NumpyLinearRegressor:
+    """Minimal numpy-only linear regressor fallback when external ML libs are unavailable."""
+
+    def __init__(self, l2: float = 1e-6) -> None:
+        self.l2 = float(max(l2, 0.0))
+        self.coef_: Optional[np.ndarray] = None
+        self.intercept_: float = 0.0
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> "_NumpyLinearRegressor":
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if x_arr.ndim != 2 or y_arr.ndim != 1:
+            raise RuntimeError("numpy_linear_invalid_shape")
+        if x_arr.shape[0] != y_arr.shape[0]:
+            raise RuntimeError("numpy_linear_len_mismatch")
+        if x_arr.shape[0] <= 0:
+            raise RuntimeError("numpy_linear_empty_fit")
+
+        ones = np.ones((x_arr.shape[0], 1), dtype=np.float64)
+        x_aug = np.concatenate([x_arr, ones], axis=1)
+        gram = x_aug.T @ x_aug
+        if self.l2 > 0.0:
+            gram += self.l2 * np.eye(gram.shape[0], dtype=np.float64)
+        rhs = x_aug.T @ y_arr
+
+        try:
+            beta = np.linalg.solve(gram, rhs)
+        except np.linalg.LinAlgError:
+            beta = np.linalg.lstsq(x_aug, y_arr, rcond=None)[0]
+
+        self.coef_ = np.asarray(beta[:-1], dtype=np.float64)
+        self.intercept_ = float(beta[-1])
+        return self
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        if self.coef_ is None:
+            raise RuntimeError("numpy_linear_not_fitted")
+        x_arr = np.asarray(x, dtype=np.float64)
+        if x_arr.ndim == 1:
+            x_arr = x_arr.reshape(1, -1)
+        return (x_arr @ self.coef_ + self.intercept_).astype(np.float64, copy=False)
+
+
 class ScalerProtocol(Protocol):
     def fit(self, x: np.ndarray) -> "ScalerProtocol":
         ...
@@ -111,11 +155,14 @@ class InstitutionalTrainConfig:
     mean_price_indc: str = "Close"
     
     # Target prediction (ZERO look-ahead)
-    target_type: str = "returns_direction"  # or "returns_magnitude"
+    target_type: str = "returns_magnitude"  # "returns_direction" is classifier-oriented
     prediction_horizon: int = 15  # Bars ahead to predict
+    percent_increase: float = field(
+        default_factory=lambda: float(os.getenv("TRAIN_SIGNAL_THRESHOLD_XAU", "0.0008") or "0.0008")
+    )
     
     # Features - expanded for institutional use
-    window_size: int = 60  # Longer lookback
+    window_size: int = 20
     cci_period: int = 20
     mom_period: int = 10
     roc_period: int = 10
@@ -149,18 +196,20 @@ class InstitutionalTrainConfig:
     
     # Model parameters - institutional grade
     regressor_params: Dict[str, Any] = field(default_factory=lambda: {
-        "iterations": 100,
-        "learning_rate": 0.045,
-        "depth": 10,
-        "l2_leaf_reg": 5.0,
+        "iterations": 2000,
+        "learning_rate": 0.03,
+        "depth": 7,
+        "l2_leaf_reg": 3.0,
         "random_seed": 42,
         "verbose": 100,  # Show progress every 100 iterations
-        "early_stopping_rounds": 10,
         "task_type": "CPU",
         "loss_function": "RMSE",
         "eval_metric": "RMSE",
         "train_dir": str(_ART_CATBOOST),
     })
+    early_stopping_rounds: int = field(
+        default_factory=lambda: int(os.getenv("TRAIN_EARLY_STOPPING_ROUNDS", "0") or "0")
+    )
     
     # Data splits - institutional: train/val/test/holdout
     train_split: float = 0.60
@@ -169,8 +218,8 @@ class InstitutionalTrainConfig:
     
     normalize_data: bool = True
     float_dtype: str = field(default_factory=lambda: str(os.getenv("TRAIN_DTYPE", "float32") or "float32"))
-    max_window_samples: int = field(default_factory=lambda: int(os.getenv("TRAIN_MAX_SAMPLES", "20000") or "20000"))
-    model_version: str = "1.0_institutional"
+    max_window_samples: int = field(default_factory=lambda: int(os.getenv("TRAIN_MAX_SAMPLES", "50000") or "50000"))
+    model_version: str = "1.0_xau_institutional"
     dataname: str = "data/XAUUSD_1m.csv"
     dump_path: str = str(get_artifact_path("dumps", "xau_model_institutional.pkl"))
 
@@ -178,7 +227,8 @@ class InstitutionalTrainConfig:
 BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
     symbol="BTCUSD",
     prediction_horizon=12,
-    window_size=90,
+    percent_increase=float(os.getenv("TRAIN_SIGNAL_THRESHOLD_BTC", "0.0012") or "0.0012"),
+    window_size=30,
     cci_period=30,
     mom_period=14,
     roc_period=14,
@@ -200,20 +250,20 @@ BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
         "price_acceleration", "volume_acceleration",
     ],
     regressor_params={
-        "iterations": 100,
-        "learning_rate": 0.040,
-        "depth": 11,
-        "l2_leaf_reg": 6.0,
+        "iterations": 2000,
+        "learning_rate": 0.03,
+        "depth": 7,
+        "l2_leaf_reg": 3.0,
         "random_seed": 42,
         "verbose": 100,  # Show progress every 100 iterations
-        "early_stopping_rounds": 10,
         "task_type": "CPU",
         "loss_function": "RMSE",
         "train_dir": str(_ART_CATBOOST),
     },
+    early_stopping_rounds=int(os.getenv("TRAIN_EARLY_STOPPING_ROUNDS", "0") or "0"),
     dataname="data/BTCUSD_1m.csv",
     dump_path=str(get_artifact_path("dumps", "btc_model_institutional.pkl")),
-    model_version="1.0_institutional",
+    model_version="1.0_btc_institutional",
 )
 
 XAU_TRAIN_CONFIG = InstitutionalTrainConfig()
@@ -597,9 +647,27 @@ class RegressionModel:
     
     def __init__(self, cfg: InstitutionalTrainConfig) -> None:
         self.cfg = cfg
+        self._catboost_fit_kwargs: Dict[str, Any] = {}
         
         if CatBoostRegressor is not None:
-            self.model = CatBoostRegressor(**cfg.regressor_params)
+            # Keep fit-only knobs out of constructor kwargs.
+            catboost_params = dict(cfg.regressor_params)
+            verbose_step = int(catboost_params.pop("verbose", 100) or 100)
+            es_rounds_raw = catboost_params.pop(
+                "early_stopping_rounds",
+                getattr(cfg, "early_stopping_rounds", 0),
+            )
+            es_rounds = int(es_rounds_raw or 0)
+            use_best_model = bool(catboost_params.pop("use_best_model", True))
+
+            self._catboost_fit_kwargs = {
+                "verbose": verbose_step,
+                "use_best_model": use_best_model,
+            }
+            if es_rounds > 0:
+                self._catboost_fit_kwargs["early_stopping_rounds"] = es_rounds
+
+            self.model = CatBoostRegressor(**catboost_params)
             self.backend = "catboost"
         elif HistGradientBoostingRegressor is not None:
             self.model = HistGradientBoostingRegressor(
@@ -610,9 +678,12 @@ class RegressionModel:
             )
             self.backend = "sklearn_hgb"
         else:
-            raise RuntimeError("no_ml_backend_available")
+            self.model = _NumpyLinearRegressor(
+                l2=float(cfg.regressor_params.get("l2_leaf_reg", 1.0)) * 1e-3
+            )
+            self.backend = "numpy_linear"
     
-    def train(self, splits: Dict) -> None:
+    def train(self, splits: Dict, *, announce: bool = True) -> None:
         """Train with train set, validate on val set"""
         dtype = _cfg_dtype(self.cfg)
         X_train = _stack_series(splits["train"]["X"], dtype)
@@ -621,25 +692,32 @@ class RegressionModel:
         y_val = splits["val"]["y"].values
         
         total_iters = int(self.cfg.regressor_params.get("iterations", 3000))
-        _console(f"\n   ⏳ Starting model training: {self.cfg.symbol} | backend={self.backend} | iterations={total_iters}")
-        _console(f"   Progress will print every 100 iterations...")
+        if announce:
+            _console(f"\n   ⏳ Starting model training: {self.cfg.symbol} | backend={self.backend} | iterations={total_iters}")
+            _console(f"   Progress will print every 100 iterations...")
         
         if self.backend == "catboost":
             # Use CatBoost's built-in verbose=100 for direct console output
             # This bypasses Python's sys.stdout redirect and writes to real console
+            fit_kwargs: Dict[str, Any] = dict(self._catboost_fit_kwargs)
+            fit_kwargs["eval_set"] = (X_val, y_val)
             self.model.fit(
                 X_train, y_train,
-                eval_set=(X_val, y_val),
-                use_best_model=True,
-                verbose=100,
+                **fit_kwargs,
             )
-        else:
+        elif self.backend == "sklearn_hgb":
             # sklearn HistGradientBoosting
-            _console(f"   Training {self.cfg.symbol}: sklearn HGB ({total_iters} max iterations)...")
+            if announce:
+                _console(f"   Training {self.cfg.symbol}: sklearn HGB ({total_iters} max iterations)...")
             self.model.set_params(verbose=1)
             self.model.fit(X_train, y_train)
+        else:
+            if announce:
+                _console(f"   Training {self.cfg.symbol}: numpy linear fallback...")
+            self.model.fit(X_train, y_train)
         
-        _console(f"   ✅ Model training finished: {self.cfg.symbol} | backend={self.backend}")
+        if announce:
+            _console(f"   ✅ Model training finished: {self.cfg.symbol} | backend={self.backend}")
         log.info("Model training complete: %s | backend=%s", self.cfg.symbol, self.backend)
     
     def predict(self, X: pd.Series) -> np.ndarray:
@@ -875,6 +953,17 @@ def train_and_register(asset: str) -> Dict[str, Any]:
         else XAU_TRAIN_CONFIG
     )
     return train(cfg=cfg)
+
+
+def load_training_dataframe_for_asset(asset: str) -> pd.DataFrame:
+    """Public helper for backtest fallback: load dataframe with the same logic as training."""
+    asset_u = str(asset).upper().strip()
+    cfg = (
+        BTC_TRAIN_CONFIG
+        if asset_u in ("BTC", "BTCUSD", "BTCUSDM")
+        else XAU_TRAIN_CONFIG
+    )
+    return _load_training_dataframe(cfg)
 
 
 if __name__ == "__main__":

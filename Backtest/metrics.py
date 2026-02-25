@@ -51,6 +51,9 @@ class InstitutionalBacktestMetrics:
     profit_factor: float = 0.0
     expectancy: float = 0.0
     expectancy_ratio: float = 0.0  # Expectancy / Avg Loss
+    no_loss_trades: bool = False
+    no_win_trades: bool = False
+    profit_factor_capped: bool = False
     
     avg_win: float = 0.0
     avg_loss: float = 0.0
@@ -121,6 +124,7 @@ class InstitutionalBacktestMetrics:
     final_capital: float = 0.0
     
     institutional_grade: bool = True
+    metric_notes: List[str] = field(default_factory=list)
 
 
 def compute_institutional_metrics(
@@ -178,6 +182,8 @@ def compute_institutional_metrics(
     
     m.winning_trades = len(wins)
     m.losing_trades = len(losses)
+    m.no_loss_trades = m.losing_trades == 0
+    m.no_win_trades = m.winning_trades == 0
     m.win_rate = m.winning_trades / m.total_trades if m.total_trades > 0 else 0.0
     
     m.avg_win = float(np.mean(wins)) if len(wins) > 0 else 0.0
@@ -189,10 +195,29 @@ def compute_institutional_metrics(
     
     gross_profit = float(np.sum(wins)) if len(wins) > 0 else 0.0
     gross_loss = abs(float(np.sum(losses))) if len(losses) > 0 else 0.0
-    m.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-    
+    pf_cap = 999.0
+    if gross_loss > 0.0:
+        pf_raw = gross_profit / gross_loss
+        if pf_raw > pf_cap:
+            m.profit_factor_capped = True
+            m.metric_notes.append(f"profit_factor_capped>{pf_cap}")
+    elif gross_profit > 0.0:
+        # All-winning sample. Keep finite PF for standards-compliant JSON/reporting.
+        pf_raw = pf_cap
+        m.profit_factor_capped = True
+        m.metric_notes.append("profit_factor_capped:no_losing_trades")
+    else:
+        pf_raw = 0.0
+    m.profit_factor = float(max(0.0, min(pf_cap, pf_raw)))
+
     m.expectancy = float(np.mean(pnls))
-    m.expectancy_ratio = m.expectancy / abs(m.avg_loss) if m.avg_loss != 0 else 0.0
+    loss_denom = abs(float(m.avg_loss))
+    if loss_denom <= 1e-12:
+        # Fallback denominator avoids divide-by-zero in all-win/all-flat samples.
+        abs_mean = float(np.mean(np.abs(pnls))) if len(pnls) > 0 else 0.0
+        loss_denom = max(abs_mean, 1e-12)
+        m.metric_notes.append("expectancy_ratio_fallback_abs_mean")
+    m.expectancy_ratio = float(m.expectancy / loss_denom)
     
     # ═══ Consecutive Wins/Losses ════════════════════════════════
     if len(pnls) > 0:
@@ -214,33 +239,62 @@ def compute_institutional_metrics(
             m.cagr = (m.final_capital / initial_capital) ** (1 / years) - 1
     
     # ═══ Returns Series ═════════════════════════════════════════
+    # Per-trade returns (for trade-level stats only)
     returns = pnls / initial_capital
     mean_return = float(np.mean(returns))
     std_return = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
     
-    # Annualized metrics
-    if m.total_trades > 0:
-        m.annualized_return_pct = mean_return * periods_per_year
-        m.volatility_annualized = std_return * math.sqrt(periods_per_year)
+    # ═══ Daily Returns (for Sharpe/Sortino — industry standard) ═════
+    # Aggregate per-trade PnL into daily PnL, then compute risk-adjusted metrics.
+    # This prevents inflation when there are many trades per day.
+    daily_periods = 252.0  # trading days per year (standard)
+    try:
+        _s = start_date
+        _e = end_date
+        if _s and _e:
+            import pandas as _pd
+            s_dt = _pd.Timestamp(str(_s))
+            e_dt = _pd.Timestamp(str(_e))
+            data_days = max(1.0, (e_dt - s_dt).total_seconds() / 86400.0)
+            # Create daily PnL array by distributing trades evenly across days
+            n_days = max(1, int(data_days))
+            daily_pnls = np.zeros(n_days)
+            trades_per_day = max(1, len(pnls) // n_days)
+            for i, pnl_val in enumerate(pnls):
+                day_idx = min(i // max(1, trades_per_day), n_days - 1)
+                daily_pnls[day_idx] += pnl_val
+            daily_returns = daily_pnls / initial_capital
+        else:
+            daily_returns = returns
+    except Exception:
+        daily_returns = returns
     
-    # ═══ Sharpe Ratio ═══════════════════════════════════════════
-    rf_per_period = risk_free_rate / periods_per_year
-    excess_return = mean_return - rf_per_period
+    daily_mean = float(np.mean(daily_returns))
+    daily_std = float(np.std(daily_returns, ddof=1)) if len(daily_returns) > 1 else 0.0
+    
+    # Annualized metrics (use daily)
+    if m.total_trades > 0:
+        m.annualized_return_pct = daily_mean * daily_periods
+        m.volatility_annualized = daily_std * math.sqrt(daily_periods)
+    
+    # ═══ Sharpe Ratio (daily returns, annualized) ══════════════
+    rf_per_day = risk_free_rate / daily_periods
+    excess_daily = daily_mean - rf_per_day
     m.sharpe_ratio = (
-        (excess_return / std_return * math.sqrt(periods_per_year))
-        if std_return > 0 else 0.0
+        (excess_daily / daily_std * math.sqrt(daily_periods))
+        if daily_std > 0 else 0.0
     )
     
-    # ═══ Sortino Ratio (downside deviation) ════════════════════
-    downside = returns[returns < rf_per_period]
-    m.downside_deviation = float(np.std(downside, ddof=1)) if len(downside) > 1 else 0.0
+    # ═══ Sortino Ratio (downside deviation of daily returns) ═══
+    downside_daily = daily_returns[daily_returns < rf_per_day]
+    m.downside_deviation = float(np.std(downside_daily, ddof=1)) if len(downside_daily) > 1 else 0.0
     m.sortino_ratio = (
-        (excess_return / m.downside_deviation * math.sqrt(periods_per_year))
+        (excess_daily / m.downside_deviation * math.sqrt(daily_periods))
         if m.downside_deviation > 0 else 0.0
     )
     
     # Upside deviation (for advanced metrics)
-    upside = returns[returns > rf_per_period]
+    upside = daily_returns[daily_returns > rf_per_day]
     m.upside_deviation = float(np.std(upside, ddof=1)) if len(upside) > 1 else 0.0
     
     # ═══ Drawdown Analysis ══════════════════════════════════════
@@ -279,7 +333,7 @@ def compute_institutional_metrics(
     )
     
     # ═══ Omega Ratio ════════════════════════════════════════════
-    threshold = rf_per_period
+    threshold = rf_per_day
     gains = np.sum(returns[returns > threshold] - threshold)
     losses_sum = np.sum(threshold - returns[returns < threshold])
     m.omega_ratio = gains / losses_sum if losses_sum > 0 else 0.0
@@ -416,8 +470,9 @@ def save_institutional_metrics(
     
     # JSON (machine-readable)
     json_path = output_dir / f"{prefix}_metrics.json"
+    payload = _sanitize_json_payload(asdict(metrics))
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(asdict(metrics), f, indent=2, default=str)
+        json.dump(payload, f, indent=2, default=str, allow_nan=False)
     
     # Text report (human-readable)
     report_path = output_dir / f"{prefix}_report.txt"
@@ -438,6 +493,22 @@ def save_metrics(
     prefix: str = "backtest_institutional",
 ) -> None:
     save_institutional_metrics(metrics, output_dir, prefix=prefix)
+
+
+def _sanitize_json_payload(value: Any) -> Any:
+    """Recursively convert non-finite floats to None for strict JSON output."""
+    if isinstance(value, dict):
+        return {k: _sanitize_json_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_payload(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_json_payload(v) for v in value]
+    if isinstance(value, (np.floating, float)):
+        f = float(value)
+        return f if math.isfinite(f) else None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    return value
 
 
 def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:

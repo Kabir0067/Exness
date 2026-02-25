@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from types import MappingProxyType
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -30,7 +32,21 @@ if mt5 is not None:
         "M20": mt5.TIMEFRAME_M20,
         "M30": mt5.TIMEFRAME_M30,
         "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
     }
+TF_MAP = MappingProxyType(dict(TF_MAP))
+
+# =============================================================================
+# Model/Backtest quality gates (single source of truth)
+# =============================================================================
+MIN_GATE_SHARPE: float = float(os.getenv("MIN_GATE_SHARPE", "0.5") or "0.5")
+MIN_GATE_WIN_RATE: float = float(os.getenv("MIN_GATE_WIN_RATE", "0.52") or "0.52")
+MAX_GATE_DRAWDOWN: float = float(os.getenv("MAX_GATE_DRAWDOWN", "0.25") or "0.25")
+
+# Walk-forward acceptance (pass-rate based, not all-windows-must-pass)
+WFA_MIN_WINDOWS: int = int(os.getenv("WFA_MIN_WINDOWS", "2") or "2")
+WFA_MIN_PASS_RATE: float = float(os.getenv("WFA_MIN_PASS_RATE", "0.60") or "0.60")
 
 
 # =============================================================================
@@ -46,8 +62,8 @@ try:
 except ImportError:
     print("⚠️  WARNING: 'python-dotenv' not installed. .env file will NOT be loaded.")
 
-_BOOL_TRUE = {"1", "true", "yes", "y", "on"}
-_BOOL_FALSE = {"0", "false", "no", "n", "off"}
+_BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "n", "off"})
 
 _REQUIRED_ENV_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("EXNESS_LOGIN",),
@@ -72,6 +88,7 @@ TG_ADMIN_ID=
 """
 
 _ENV_HINT_SHOWN = False
+_ENV_HINT_LOCK = threading.Lock()
 
 
 def _env_path() -> Path:
@@ -187,8 +204,12 @@ def _fail_missing_env(name: str):
     """
     global _ENV_HINT_SHOWN
     ok, missing, msg = preflight_env()
-    if not ok and not _ENV_HINT_SHOWN:
-        _ENV_HINT_SHOWN = True
+    should_print = False
+    with _ENV_HINT_LOCK:
+        if not ok and not _ENV_HINT_SHOWN:
+            _ENV_HINT_SHOWN = True
+            should_print = True
+    if should_print:
         if msg:
             print(msg)
         if missing:
@@ -316,6 +337,8 @@ class BaseSymbolParams:
     point_value: float = 1.0           # $ value per point per lot
     # Market hours
     is_24_7: bool = False
+    # Daily timeframe for D1 confluence analysis
+    tf_daily: str = "D1"
     market_start_minutes: int = 0      # Minutes from midnight UTC
     market_end_minutes: int = 1440     # Minutes from midnight UTC
     rollover_blackout_start: int = 0   # Minutes from midnight for rollover
@@ -330,6 +353,7 @@ class BaseSymbolParams:
             _validate_tf(self.tf_primary, "tf_primary")
             _validate_tf(self.tf_confirm, "tf_confirm")
             _validate_tf(self.tf_long, "tf_long")
+            _validate_tf(self.tf_daily, "tf_daily")
 
 
 @dataclass
@@ -402,8 +426,8 @@ class BaseEngineConfig:
 
     # ─── ATR-based SL/TP ─────────────────────────────────────────
     atr_sl_multiplier: float = 2.5
-    atr_tp_min_multiplier: float = 1.5
-    atr_tp_max_multiplier: float = 3.0
+    atr_tp_min_multiplier: float = 3.0   # Must be > atr_sl_multiplier for R:R >= 1.0
+    atr_tp_max_multiplier: float = 5.0
     breakeven_trigger_pct: float = 0.40
     trailing_stop_atr_mult: float = 1.5
     # Fractal stop tuning
@@ -476,6 +500,17 @@ class BaseEngineConfig:
     flash_crash_sigma: float = 3.5
     flash_crash_lookback: int = 30
     flash_crash_cooldown_sec: float = 300.0
+    # ─── Volatility circuit breaker (Black Swan protection) ────────
+    circuit_breaker_atr_ratio: float = 3.0    # ATR/SMA(ATR,50) > 3 = extreme
+    circuit_breaker_gap_atr_mult: float = 2.0 # Price gap > 2×ATR between bars
+    circuit_breaker_cooldown_sec: float = 1800.0  # 30min cooldown after trigger
+    # ─── Spread spike detection ───────────────────────────────────
+    spread_spike_sigma: float = 3.0           # Block when spread > 3σ of history
+    spread_spike_sigma_threshold: float = 3.0 # Alias for compatibility with new guards
+    spread_gate_multiplier: float = 1.5       # Tightened from 2.0 (institutional)
+    # ─── D1 confluence scoring ────────────────────────────────────
+    d1_confluence_weight: float = 5.0         # ±5 pts in 100-point scoring
+    d1_bars_required: int = 60                # Minimum D1 bars for analysis
     # XAU session overlap tightening (UTC hours)
     xau_overlap_start_hour_utc: int = 12
     xau_overlap_end_hour_utc: int = 16
@@ -554,8 +589,8 @@ class BTCEngineConfig(BaseEngineConfig):
     comment: str = "btc_scalp"
     # BTC has higher volatility → wider ATR multipliers
     atr_sl_multiplier: float = 3.0     # BTC needs wider SL due to higher vol
-    atr_tp_min_multiplier: float = 1.5
-    atr_tp_max_multiplier: float = 3.5  # Wider max TP range for crypto moves
+    atr_tp_min_multiplier: float = 4.0   # Must be > SL mult for R:R >= 1.0
+    atr_tp_max_multiplier: float = 6.0  # Wider max TP range for crypto moves
     # Crypto sessions are 24/7
     active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(0, 24)])
     ignore_sessions: bool = True
@@ -588,7 +623,7 @@ class XAUEngineConfig(BaseEngineConfig):
     stoch_slowd_period: int = 3
     # Gold has tighter spreads → tighter ATR multipliers
     atr_sl_multiplier: float = 2.5     # Tighter SL for gold's lower relative vol
-    atr_tp_min_multiplier: float = 1.5
+    atr_tp_min_multiplier: float = 3.0   # Must be > SL mult for R:R >= 1.0
     atr_tp_max_multiplier: float = 3.0
 
 

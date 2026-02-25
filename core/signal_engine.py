@@ -174,6 +174,26 @@ class SignalEngine:
             dfc = self._get_rates_df(sym, self.sp.tf_confirm)
             dfl = self._get_rates_df(sym, self.sp.tf_long)
 
+            # D1 timeframe for daily trend confluence
+            tf_daily = getattr(self.sp, "tf_daily", "D1")
+            d1_bars = max(int(getattr(self.cfg, "d1_bars_required", 60) or 60), 60)
+            dfd = self._get_rates_df(
+                sym, tf_daily,
+                bars=d1_bars,
+            )
+            # Dedicated H1 stream for vector alignment math (M1/M15/H1/D1)
+            if str(self.sp.tf_long).upper() == "H1":
+                dfh = dfl
+            else:
+                dfh = self._get_rates_df(sym, "H1", bars=120)
+
+            # ── 1b. Volatility circuit breaker (Black Swan) ──
+            if self._rm.check_volatility_circuit_breaker(dfp):
+                return self._neutral(
+                    sym, ["vol_circuit_breaker"], t0,
+                    trade_blocked=True,
+                )
+
             # ── 2. Compute indicators ──
             df_dict = {
                 self.sp.tf_primary: dfp,
@@ -258,6 +278,7 @@ class SignalEngine:
 
             score_result = self._ensemble_score(
                 indp, indc, indl, book, adapt, spread_pct, tick_stats,
+                dfd=dfd, dfp=dfp, dfl=dfl, dfh=dfh,
             )
 
             net_score = score_result.get("net_score", 0.0)
@@ -302,7 +323,7 @@ class SignalEngine:
                 reasons.append("conformal_warn")
 
             # Apply filters
-            signal_dir, conf = self._apply_filters(signal_dir, conf, indp, indc, indl, reasons)
+            signal_dir, conf = self._apply_filters(signal_dir, conf, indp, indc, indl, reasons, dfd=dfd)
 
             # Cap confidence by strength
             conf = self._cap_conf_by_strength(conf, net_abs)
@@ -522,6 +543,11 @@ class SignalEngine:
         adapt: Dict[str, Any],
         spread_pct: float,
         tick_stats: Any,
+        *,
+        dfd: Optional[pd.DataFrame] = None,
+        dfp: Optional[pd.DataFrame] = None,
+        dfl: Optional[pd.DataFrame] = None,
+        dfh: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
         """
         INSTITUTIONAL 100-POINT SCORING SYSTEM
@@ -557,6 +583,9 @@ class SignalEngine:
             imb = getattr(tick_stats, "imbalance", 0.0)
             flow_score = abs(float(imb)) if _is_finite(imb) else 0.0
             flow_score = min(1.0, flow_score)
+
+        # Momentum ignition (early move trigger)
+        ignition_score = self._momentum_ignition_score(dfp)
 
         # Combine
         buy_score = 0.0
@@ -594,7 +623,59 @@ class SignalEngine:
             else:
                 sell_score += flow_score * weights["flow"]
 
+        # Ignition adds directional weight before lagging confirmation closes.
+        if ignition_score > 0.0 and dfp is not None and len(dfp) >= 22:
+            try:
+                c_arr = self._close_array(dfp)
+                if c_arr is not None and len(c_arr) >= 22:
+                    breakout_hi = float(np.max(c_arr[-21:-1]))
+                    breakout_lo = float(np.min(c_arr[-21:-1]))
+                    last_close = float(c_arr[-1])
+                    ign_weight = min(3.0, 3.0 * ignition_score)
+                    if last_close > breakout_hi:
+                        buy_score += ign_weight
+                    elif last_close < breakout_lo:
+                        sell_score += ign_weight
+                    else:
+                        # No clean directional break: add a small neutral boost.
+                        buy_score += ign_weight * 0.25
+                        sell_score += ign_weight * 0.25
+            except Exception:
+                pass
+
         net = buy_score - sell_score
+
+        # ── D1 Confluence Bonus/Penalty ──
+        d1_weight = float(getattr(self.cfg, 'd1_confluence_weight', 5.0) or 5.0)
+        d1_result = self._d1_confluence_score(dfd)
+        d1_val = d1_result.get("value", 0.0)
+        d1_aligned = False
+        if d1_val != 0.0:
+            if (net > 0 and d1_val > 0) or (net < 0 and d1_val < 0):
+                # D1 aligns with signal → bonus
+                net += d1_val * d1_weight
+                d1_aligned = True
+            else:
+                # D1 conflicts → penalty
+                net -= abs(d1_val) * d1_weight * 0.6
+
+        # ── Vector Alignment Bonus (MTF confluence) ──
+        vec_score = self._vector_alignment(
+            indp=indp,
+            indc=indc,
+            indl=indl,
+            dfp=dfp,
+            dfl=dfl,
+            dfh=dfh,
+            dfd=dfd,
+        )
+        if vec_score > 0.85:
+            # Strong alignment across all timeframes → bonus
+            net *= 1.08
+        elif vec_score < 0.3:
+            # Conflicting timeframes → dampen
+            net *= 0.92
+
         direction = "Buy" if net > 0 else "Sell" if net < 0 else "Neutral"
 
         reasons = []
@@ -604,6 +685,10 @@ class SignalEngine:
         reasons.append(f"mr={mr_val:.2f}")
         reasons.append(f"vol={vol_score:.2f}")
         reasons.append(f"flow={flow_score:.2f}")
+        reasons.append(f"ign={ignition_score:.2f}")
+        d1_tag = "aligned" if d1_aligned else "conflict_or_flat"
+        reasons.append(f"d1={d1_val:+.2f}:{d1_tag}")
+        reasons.append(f"vec={vec_score:.2f}")
         reasons.append(f"net={net:+.1f}")
 
         return {
@@ -612,6 +697,8 @@ class SignalEngine:
             "sell_score": sell_score,
             "direction": direction,
             "reasons": reasons,
+            "d1_value": d1_val,
+            "vec_alignment": vec_score,
         }
 
     # ─── Sub-scores ──────────────────────────────────────────────────
@@ -658,6 +745,224 @@ class SignalEngine:
             score -= 0.1
 
         return {"value": max(-1.0, min(1.0, score))}
+
+    # ─── D1 Confluence (Daily Trend) ─────────────────────────────────
+
+    def _d1_confluence_score(
+        self, dfd: Optional[pd.DataFrame],
+    ) -> Dict[str, float]:
+        """
+        Daily trend confluence score [-1, +1].
+
+        Uses D1 bars to determine the primary trend direction via:
+          1. Linear regression slope of last 20 daily closes
+          2. Price position relative to EMA200 (if enough data)
+          3. Daily RSI direction
+
+        Returns positive for bullish daily trend, negative for bearish.
+        """
+        if dfd is None or len(dfd) < 20:
+            return {"value": 0.0, "reason": "insufficient_d1_data"}
+
+        try:
+            cols = {c.lower(): c for c in dfd.columns}
+            c = dfd[cols.get("close", "Close")].values.astype(np.float64)
+
+            if len(c) < 20:
+                return {"value": 0.0, "reason": "insufficient_d1_closes"}
+
+            score = 0.0
+
+            # 1. Linear regression slope of last 20 daily closes
+            window = c[-20:]
+            x = np.arange(len(window), dtype=np.float64)
+            # Normalized slope: rise per bar / mean price
+            mean_p = float(np.mean(window))
+            if mean_p > 0:
+                slope = float(np.polyfit(x, window, 1)[0])
+                norm_slope = slope / mean_p  # dimensionless
+                # Scale: ±0.001/bar on daily = moderate trend
+                if norm_slope > 0.0005:
+                    score += 0.4
+                elif norm_slope > 0.0002:
+                    score += 0.2
+                elif norm_slope < -0.0005:
+                    score -= 0.4
+                elif norm_slope < -0.0002:
+                    score -= 0.2
+
+            # 2. Price vs EMA200 (if enough bars)
+            if len(c) >= 200:
+                # Simple exponential moving average approximation
+                ema200 = float(pd.Series(c).ewm(span=200, min_periods=200).mean().iloc[-1])
+                if ema200 > 0:
+                    price_vs_ema = (float(c[-1]) - ema200) / ema200
+                    if price_vs_ema > 0.01:   # >1% above EMA200
+                        score += 0.3
+                    elif price_vs_ema > 0:
+                        score += 0.1
+                    elif price_vs_ema < -0.01:  # <1% below
+                        score -= 0.3
+                    elif price_vs_ema < 0:
+                        score -= 0.1
+
+            # 3. Daily momentum (5-day vs 20-day)
+            if len(c) >= 21:
+                ret5 = (float(c[-1]) - float(c[-6])) / float(c[-6]) if float(c[-6]) > 0 else 0.0
+                ret20 = (float(c[-1]) - float(c[-21])) / float(c[-21]) if float(c[-21]) > 0 else 0.0
+                # Accelerating trend: short-term > long-term
+                if ret5 > 0 and ret20 > 0 and ret5 > ret20:
+                    score += 0.15
+                elif ret5 < 0 and ret20 < 0 and ret5 < ret20:
+                    score -= 0.15
+
+            return {"value": max(-1.0, min(1.0, score))}
+
+        except Exception as exc:
+            log.debug("_d1_confluence_score error: %s", exc)
+            return {"value": 0.0, "reason": f"error:{exc}"}
+
+    @staticmethod
+    def _close_array(df: Optional[pd.DataFrame]) -> Optional[np.ndarray]:
+        if df is None or len(df) == 0:
+            return None
+        cols = {c.lower(): c for c in df.columns}
+        c_col = cols.get("close")
+        if not c_col:
+            return None
+        arr = df[c_col].values.astype(np.float64)
+        if arr.size == 0:
+            return None
+        return arr
+
+    @staticmethod
+    def _linreg_slope_norm(close_arr: Optional[np.ndarray], window: int = 20) -> float:
+        if close_arr is None or len(close_arr) < window:
+            return 0.0
+        y = close_arr[-window:].astype(np.float64)
+        if not np.all(np.isfinite(y)):
+            return 0.0
+        ref = float(np.mean(y))
+        if abs(ref) < 1e-12:
+            return 0.0
+        x = np.arange(window, dtype=np.float64)
+        slope = float(np.polyfit(x, y, 1)[0])
+        return float(slope / ref)
+
+    def _vector_alignment(
+        self,
+        *,
+        indp: Dict[str, Any],
+        indc: Dict[str, Any],
+        indl: Dict[str, Any],
+        dfp: Optional[pd.DataFrame],
+        dfl: Optional[pd.DataFrame],
+        dfh: Optional[pd.DataFrame],
+        dfd: Optional[pd.DataFrame],
+    ) -> float:
+        """
+        Multi-timeframe Vector Analysis using cosine alignment.
+
+        Builds a normalized slope vector from M1, M15, H1 and D1 closes,
+        then measures its cosine similarity against perfect bullish and
+        perfect bearish vectors. Final score is in [0, 1].
+        """
+        m1 = self._linreg_slope_norm(self._close_array(dfp), window=20)
+        m15 = self._linreg_slope_norm(self._close_array(dfl), window=20)
+        h1 = self._linreg_slope_norm(self._close_array(dfh), window=20)
+        d1 = self._linreg_slope_norm(self._close_array(dfd), window=20)
+
+        # Fallback to indicator slopes if any dataframe is missing.
+        if m1 == 0.0:
+            m1 = float(indp.get("linreg_slope", 0.0) or 0.0)
+        if m15 == 0.0:
+            m15 = float(indl.get("linreg_slope", 0.0) or 0.0)
+        if h1 == 0.0:
+            h1 = float(indc.get("linreg_slope", 0.0) or 0.0)
+
+        raw_vec = np.array([m1, m15, h1, d1], dtype=np.float64)
+        eps = 1e-6
+        vec = np.where(raw_vec > eps, 1.0, np.where(raw_vec < -eps, -1.0, 0.0))
+        if not np.all(np.isfinite(vec)):
+            return 0.5
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-12:
+            return 0.5
+
+        bull = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+        bear = -bull
+        bull_cos = float(np.dot(vec, bull) / (norm * np.linalg.norm(bull)))
+        bear_cos = float(np.dot(vec, bear) / (norm * np.linalg.norm(bear)))
+
+        # Keep pure alignment magnitude in [0, 1].
+        alignment = max(bull_cos, bear_cos)
+        if alignment < 0.0:
+            return 0.0
+        if alignment > 1.0:
+            return 1.0
+        return alignment
+
+    def _momentum_ignition_score(self, dfp: Optional[pd.DataFrame]) -> float:
+        """
+        Detect early-move ignition before lagging candle-close confirmations.
+        Score range: [0, 1].
+        """
+        if dfp is None or len(dfp) < 30:
+            return 0.0
+
+        try:
+            cols = {c.lower(): c for c in dfp.columns}
+            close_col = cols.get("close")
+            high_col = cols.get("high")
+            low_col = cols.get("low")
+            vol_col = cols.get("tick_volume") or cols.get("volume") or cols.get("real_volume")
+            if not close_col or not high_col or not low_col:
+                return 0.0
+
+            c = dfp[close_col].values.astype(np.float64)
+            h = dfp[high_col].values.astype(np.float64)
+            l = dfp[low_col].values.astype(np.float64)
+            v = dfp[vol_col].values.astype(np.float64) if vol_col else None
+
+            score = 0.0
+            lookback = 20
+
+            # 1) Volume spike: current volume above mean + 2 sigma
+            if v is not None and len(v) >= lookback + 1:
+                prev_v = v[-(lookback + 1):-1]
+                mu = float(np.mean(prev_v))
+                sigma = float(np.std(prev_v))
+                cur_v = float(v[-1])
+                if sigma > 0 and cur_v > mu + 2.0 * sigma:
+                    score += 0.40
+                elif sigma > 0 and cur_v > mu + 1.0 * sigma:
+                    score += 0.20
+                elif sigma <= 1e-12 and mu > 0 and cur_v > 1.5 * mu:
+                    # Constant-volume baseline: treat large step-up as ignition.
+                    score += 0.40
+
+            # 2) Price breakout from recent range
+            if len(c) >= lookback + 1 and len(h) >= lookback + 1 and len(l) >= lookback + 1:
+                range_hi = float(np.max(h[-(lookback + 1):-1]))
+                range_lo = float(np.min(l[-(lookback + 1):-1]))
+                if float(c[-1]) > range_hi:
+                    score += 0.40
+                elif float(c[-1]) < range_lo:
+                    score += 0.40
+
+            # 3) Impulse acceleration on the current bar
+            if len(c) >= 3:
+                prev = float(c[-2])
+                prev2 = float(c[-3])
+                if abs(prev) > 1e-12 and abs(prev2) > 1e-12:
+                    ret1 = (float(c[-1]) - prev) / abs(prev)
+                    ret0 = (prev - prev2) / abs(prev2)
+                    if abs(ret1) > max(2.0 * abs(ret0), 3e-4):
+                        score += 0.20
+
+            return clamp01(score)
+        except Exception:
+            return 0.0
 
     def _momentum_score(
         self,
@@ -903,6 +1208,7 @@ class SignalEngine:
         indc: Optional[Dict[str, Any]] = None,
         indl: Optional[Dict[str, Any]] = None,
         reasons: Optional[List[str]] = None,
+        dfd: Optional[pd.DataFrame] = None,
     ) -> Tuple[str, int]:
         """Apply final safety filters."""
         # ADX filter
@@ -943,6 +1249,24 @@ class SignalEngine:
 
             if mult < 1.0:
                 conf = int(conf * mult)
+
+        # D1 conflict penalty (daily trend opposes signal)
+        if signal in ("Buy", "Sell") and dfd is not None:
+            try:
+                d1_result = self._d1_confluence_score(dfd)
+                d1_val = d1_result.get("value", 0.0)
+                if abs(d1_val) > 0.2:  # Only penalize on clear daily trend
+                    d1_conflict = (
+                        (signal == "Buy" and d1_val < -0.2) or
+                        (signal == "Sell" and d1_val > 0.2)
+                    )
+                    if d1_conflict:
+                        d1_pen = 0.15  # 15% confidence penalty for D1 conflict
+                        conf = int(conf * (1.0 - d1_pen))
+                        if reasons is not None:
+                            reasons.append(f"d1_conflict:{d1_val:+.2f}")
+            except Exception:
+                pass
 
         return signal, conf
 

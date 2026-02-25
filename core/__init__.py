@@ -11,11 +11,11 @@ from .utils import (
     tp_multiplier_from_conf,
 )
 
-__all__ = [
+__all__ = (
     "adaptive_risk_money",
     "atr_take_profit",
     "clamp01",
     "lot_and_tp_usd",
     "percentile_rank",
     "tp_multiplier_from_conf",
-]
+)

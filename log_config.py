@@ -36,35 +36,41 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 def configure_logging(
     *,
     level: Union[str, int] = "INFO",
-    system_log_name: str = "system.log",
+    system_log_name: Optional[str] = None,
     console: bool = True,
     max_bytes: int = 15 * 1024 * 1024,
     backup_count: int = 7,
-) -> RotatingFileHandler:
+) -> Optional[RotatingFileHandler]:
     """
-    Global system logger:
+    Global logger bootstrap:
     - Root logger at INFO level
-    - Rotating file handler at Logs/system.log
+    - Optional rotating file handler (disabled when system_log_name is None/empty)
     - Optional console handler
     - Captures warnings
     """
     root = logging.getLogger()
     root.setLevel(level)
 
-    log_path = get_log_path(system_log_name)
-    handler = RotatingFileHandler(
-        str(log_path),
-        maxBytes=int(max_bytes),
-        backupCount=int(backup_count),
-        encoding="utf-8",
-        delay=True,
-    )
-    handler.setLevel(level)
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    handler: Optional[RotatingFileHandler] = None
+    if system_log_name:
+        log_path = get_log_path(system_log_name)
+        handler = RotatingFileHandler(
+            str(log_path),
+            maxBytes=int(max_bytes),
+            backupCount=int(backup_count),
+            encoding="utf-8",
+            delay=True,
+        )
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
 
-    # Avoid duplicate handlers
-    if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == handler.baseFilename for h in root.handlers):
-        root.addHandler(handler)
+        # Avoid duplicate handlers
+        if not any(
+            isinstance(h, RotatingFileHandler)
+            and getattr(h, "baseFilename", "") == handler.baseFilename
+            for h in root.handlers
+        ):
+            root.addHandler(handler)
 
     if console:
         if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
@@ -75,7 +81,7 @@ def configure_logging(
 
     logging.captureWarnings(True)
 
-    # Attach to existing non-propagating loggers so they still show in system.log
+    # Attach to existing non-propagating loggers only when file handler is enabled.
     attach_global_handler_to_loggers(handler)
     return handler
 

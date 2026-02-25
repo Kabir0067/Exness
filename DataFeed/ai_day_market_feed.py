@@ -479,3 +479,5 @@ def get_ai_payload_btc_intraday() -> Optional[Dict[str, Any]]:
             log.warning("get_ai_payload_btc_intraday: fallback cached after exception")
             return cached
         return None
+
+

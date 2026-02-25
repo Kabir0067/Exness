@@ -10,6 +10,7 @@ from typing import Any, Optional, List
 log = logging.getLogger("core.model_manager")
 
 from log_config import get_artifact_dir
+from core.config import MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
 
 @dataclass
 class ModelMetadata:
@@ -54,6 +55,21 @@ class ModelManager:
             
         log.info(f"Model saved: {version} | Sharpe: {metadata.sharpe}")
         return base_path
+
+    def load_model(self, version: str) -> Optional[Any]:
+        """Load a specific model by version (without gate checks)."""
+        ver = str(version or "").strip()
+        if not ver:
+            return None
+        model_path = os.path.join(self.models_dir, f"v{ver}.pkl")
+        if not os.path.exists(model_path):
+            return None
+        try:
+            with open(model_path, "rb") as f:
+                return pickle.load(f)
+        except Exception as exc:
+            log.error("Failed to load model version=%s path=%s err=%s", ver, model_path, exc)
+            return None
 
     def load_latest_verified_model(self) -> Optional[Any]:
         """Load the most recent model that passed backtest verification."""
@@ -103,9 +119,8 @@ class ModelManager:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
                 
-            # QUANTUM GATING LOGIC
-            # STRICT REQUIREMENT: Sharpe >= 1.5
-            is_good = (sharpe >= 1.5) and (win_rate >= 0.55)
+            # QUANTUM GATING LOGIC (centralized thresholds)
+            is_good = (sharpe >= MIN_GATE_SHARPE) and (win_rate >= MIN_GATE_WIN_RATE)
             meta["status"] = "VERIFIED" if is_good else "REJECTED"
             meta["backtest_sharpe"] = sharpe
             meta["backtest_win_rate"] = win_rate
@@ -116,9 +131,23 @@ class ModelManager:
                 json.dump(meta, f, indent=4)
                 
             if is_good:
-                log.info(f"Model {version} VERIFIED (Sharpe={sharpe:.2f} >= 1.5)")
+                log.info(
+                    "Model %s VERIFIED (Sharpe=%.2f >= %.2f, WinRate=%.3f >= %.3f)",
+                    version,
+                    sharpe,
+                    MIN_GATE_SHARPE,
+                    win_rate,
+                    MIN_GATE_WIN_RATE,
+                )
             else:
-                log.warning(f"Model {version} REJECTED (Sharpe={sharpe:.2f} < 1.5)")
+                log.warning(
+                    "Model %s REJECTED (Sharpe=%.2f < %.2f or WinRate=%.3f < %.3f)",
+                    version,
+                    sharpe,
+                    MIN_GATE_SHARPE,
+                    win_rate,
+                    MIN_GATE_WIN_RATE,
+                )
              
             return is_good
         except Exception as e:
