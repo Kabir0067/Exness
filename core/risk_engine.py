@@ -8,6 +8,7 @@ import atexit
 import csv
 import json
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -119,7 +120,10 @@ class RiskManager:
         self._exec_breaker_active: bool = False
         self._exec_breaker_until: float = 0.0
         self._exec_csv_path = Path(f"logs/exec_metrics_{sp.base}.csv")
-        self._exec_csv_flush_interval = 300.0
+        self._exec_csv_flush_interval = max(
+            10.0,
+            float(os.getenv("RISK_EXEC_CSV_FLUSH_SEC", "120") or "120"),
+        )
         self._exec_csv_last_flush: float = 0.0
         self._ensure_exec_csv_exists()
 
@@ -234,6 +238,7 @@ class RiskManager:
         with self._lock:
             if self._hard_stop:
                 return
+            reason = str(reason or "").strip() or "unspecified"
             self._hard_stop = True
             self._hard_stop_reason = reason
             self._set_phase("C", reason)
@@ -255,7 +260,7 @@ class RiskManager:
     @property
     def hard_stop_reason(self) -> str:
         with self._lock:
-            return self._hard_stop_reason
+            return str(self._hard_stop_reason or "unspecified")
 
     @property
     def phase_reason(self) -> str:

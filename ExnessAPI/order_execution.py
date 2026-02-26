@@ -13,9 +13,11 @@ import MetaTrader5 as mt5
 from mt5_client import MT5_LOCK, ensure_mt5
 from log_config import get_log_path
 
+
 # =============================================================================
 # Logging (ERROR-only)
 # =============================================================================
+
 
 def _rotating_file_logger(
     name: str,
@@ -221,8 +223,7 @@ class OrderExecutor:
                 sent_ts = time.time()
 
                 # --- SPIRITUAL SIGNATURE ---
-                verse = "رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ - (Кабир 🤲🏼)"
-                print(f"\n{verse}")
+                verse = "Open order"
                 log_err.info(f"DIGITAL_INTENTION | {verse} | symbol={request.symbol} side={side}")
                 # ---------------------------
 

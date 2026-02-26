@@ -23,6 +23,7 @@ from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 from core.config import (
     XAUEngineConfig as XauConfig,
     BTCEngineConfig as BtcConfig,
+    MAX_GATE_DRAWDOWN,
     MIN_GATE_SHARPE,
     MIN_GATE_WIN_RATE,
     get_config_from_env as _get_core_config,
@@ -103,6 +104,7 @@ class MultiAssetTradingEngine:
         self._model_loaded: bool = False
         self._backtest_passed: bool = False
         self._model_version: str = "N/A"
+        self._gate_last_reason: str = "unknown"
         self._catboost_payloads: Dict[str, Any] = {}  # asset -> {model, pipeline}
         self._catboost_pred_history: Dict[str, Deque[float]] = {}  # asset -> rolling predictions
         self._blocked_assets: List[str] = []
@@ -160,6 +162,9 @@ class MultiAssetTradingEngine:
         self._edge_last_trade: dict[str, tuple[str, str]] = {}
         self._edge_last_notified: dict[str, tuple[str, str]] = {}
         self._last_skip_log_ts: dict[str, float] = {}  # Anti-spam throttle for blocked notifications
+        self._gate_status_log_ttl: float = float(os.getenv("GATE_STATUS_LOG_TTL_SEC", "60") or "60")
+        self._last_gate_status_sig: str = ""
+        self._last_gate_status_ts: float = 0.0
         
         # Order Tracking
         self._seen_index: dict[tuple[str, str], tuple[float, int]] = {}
@@ -223,6 +228,14 @@ class MultiAssetTradingEngine:
 
         # Position tracking for detecting trade closures
         self._last_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
+        self._max_open_positions: Dict[str, int] = {
+            "XAU": max(1, int(os.getenv("PORTFOLIO_MAX_OPEN_XAU", "1") or "1")),
+            "BTC": max(1, int(os.getenv("PORTFOLIO_MAX_OPEN_BTC", "1") or "1")),
+        }
+        self._max_lot_cap: Dict[str, float] = {
+            "XAU": max(0.01, float(os.getenv("PORTFOLIO_MAX_LOT_XAU", "1.00") or "1.00")),
+            "BTC": max(0.01, float(os.getenv("PORTFOLIO_MAX_LOT_BTC", "0.05") or "0.05")),
+        }
 
         self._refresh_signal_cooldowns()
 
@@ -247,6 +260,8 @@ class MultiAssetTradingEngine:
         print("Risk Engine:     OK")
         print(f"Model Loaded:    {model_loaded} (v{self._model_version})")
         print(f"Backtest Status: {bt_status} (Sharpe >= {MIN_BACKTEST_SHARPE:.1f})")
+        if not self._backtest_passed:
+            print(f"Gate Reason:     {self._gate_last_reason}")
         print("Signals:         SNIPER MODE (Conf >= 75%)")
         print("=" * 60 + "\n")
 
@@ -307,6 +322,7 @@ class MultiAssetTradingEngine:
             self._model_loaded = True
             self._backtest_passed = True
             self._model_version = "dry_run"
+            self._gate_last_reason = "dry_run_bypass"
             self._blocked_assets = []
             return
 
@@ -317,23 +333,56 @@ class MultiAssetTradingEngine:
         details = gate_details(required_assets=("XAU", "BTC"), allow_legacy_fallback=True)
         gate_ok = bool(details.get("ok", False))
         gate_reason = str(details.get("reason", "unknown"))
+        self._gate_last_reason = gate_reason
         assets = details.get("assets", {}) if isinstance(details, dict) else {}
+        required_assets = ("XAU", "BTC")
 
-        for asset, st in (assets.items() if isinstance(assets, dict) else []):
-            try:
-                log_health.info(
-                    "ASSET_GATE_STATUS | asset=%s ok=%s reason=%s version=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f legacy=%s",
-                    asset,
-                    bool(st.get("ok", False)),
-                    str(st.get("reason", "unknown")),
-                    str(st.get("model_version", "")),
-                    float(st.get("sharpe", 0.0) or 0.0),
-                    float(st.get("win_rate", 0.0) or 0.0),
-                    float(st.get("max_drawdown_pct", 0.0) or 0.0),
-                    bool(st.get("legacy_fallback", False)),
-                )
-            except Exception:
-                continue
+        gate_items = []
+        if isinstance(assets, dict):
+            for asset, st in sorted(assets.items(), key=lambda kv: str(kv[0])):
+                try:
+                    gate_items.append(
+                        (
+                            str(asset),
+                            bool(st.get("ok", False)),
+                            str(st.get("reason", "unknown")),
+                            str(st.get("model_version", "")),
+                            float(st.get("sharpe", 0.0) or 0.0),
+                            float(st.get("win_rate", 0.0) or 0.0),
+                            float(st.get("max_drawdown_pct", 0.0) or 0.0),
+                            bool(st.get("legacy_fallback", False)),
+                        )
+                    )
+                except Exception:
+                    continue
+
+        gate_sig = "|".join(
+            f"{a}:{int(ok)}:{r}:{v}:{s:.3f}:{w:.3f}:{d:.3f}:{int(lg)}"
+            for a, ok, r, v, s, w, d, lg in gate_items
+        )
+        now = time.time()
+        should_log_gate = (
+            gate_sig != self._last_gate_status_sig
+            or (now - self._last_gate_status_ts) >= self._gate_status_log_ttl
+        )
+        if should_log_gate:
+            self._last_gate_status_sig = gate_sig
+            self._last_gate_status_ts = now
+            for asset, ok, reason, version, sharpe, win_rate, max_dd, legacy in gate_items:
+                try:
+                    log_health.info(
+                        "ASSET_GATE_STATUS | asset=%s ok=%s reason=%s version=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f legacy=%s",
+                        asset,
+                        ok,
+                        reason,
+                        version,
+                        sharpe,
+                        win_rate,
+                        max_dd,
+                        legacy,
+                    )
+                except Exception:
+                    continue
 
         # Check partial gate mode
         partial_mode = str(os.getenv("PARTIAL_GATE_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -341,7 +390,7 @@ class MultiAssetTradingEngine:
         if not gate_ok and partial_mode:
             # Partial mode: find which assets pass individually
             passing_assets: list[str] = []
-            for asset in ("XAU", "BTC"):
+            for asset in required_assets:
                 st = assets.get(asset, {}) if isinstance(assets, dict) else {}
                 if isinstance(st, dict) and bool(st.get("ok", False)):
                     passing_assets.append(asset)
@@ -350,7 +399,7 @@ class MultiAssetTradingEngine:
                 log_health.warning(
                     "MODEL_GATE_PARTIAL | passing=%s blocked=%s reason=%s",
                     ",".join(passing_assets),
-                    ",".join(sorted({"XAU", "BTC"} - set(passing_assets))),
+                    ",".join(sorted(set(required_assets).difference(set(passing_assets)))),
                     gate_reason,
                 )
                 # Load models for passing assets only
@@ -376,8 +425,9 @@ class MultiAssetTradingEngine:
                     self._model_win_rate = min(wins) if wins else 0.0
                     self._model_loaded = True
                     self._backtest_passed = True
+                    self._gate_last_reason = "partial_ok"
                     # Mark which assets are blocked so pipelines can be disabled
-                    self._blocked_assets = sorted({"XAU", "BTC"} - set(passing_assets))
+                    self._blocked_assets = sorted(set(required_assets).difference(set(passing_assets)))
                     log_health.info(
                         "MODEL_GATE_PARTIAL_OK | versions=%s blocked_assets=%s",
                         self._model_version,
@@ -385,21 +435,121 @@ class MultiAssetTradingEngine:
                     )
                     return
 
+        # Degraded fallback: allow selected gate failures when base metrics are strong.
+        allow_soft_wfa_fallback = str(os.getenv("PARTIAL_GATE_ALLOW_WFA_FALLBACK", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        allow_soft_sample_fallback = str(
+            os.getenv("PARTIAL_GATE_ALLOW_SAMPLE_QUALITY_FALLBACK", "1") or "1"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not gate_ok and partial_mode and (allow_soft_wfa_fallback or allow_soft_sample_fallback):
+            soft_assets: list[str] = []
+            soft_wfa_assets: list[str] = []
+            soft_sample_assets: list[str] = []
+            for asset in required_assets:
+                st = assets.get(asset, {}) if isinstance(assets, dict) else {}
+                if not isinstance(st, dict):
+                    continue
+                reason = str(st.get("reason", "") or "")
+                real_bt = bool(st.get("real_backtest", False))
+                sharpe = float(st.get("sharpe", 0.0) or 0.0)
+                win_rate = float(st.get("win_rate", 0.0) or 0.0)
+                max_dd_raw = st.get("max_drawdown_pct", 1.0)
+                max_dd = float(1.0 if max_dd_raw is None else max_dd_raw)
+                version = str(st.get("model_version", "") or "").strip()
+                base_ok = (
+                    real_bt
+                    and sharpe >= MIN_GATE_SHARPE
+                    and win_rate >= MIN_GATE_WIN_RATE
+                    and max_dd <= MAX_GATE_DRAWDOWN
+                    and version
+                )
+                if not base_ok:
+                    continue
+
+                is_wfa_fail = reason.startswith("state_wfa_failed") or reason.startswith("meta_wfa_failed")
+                is_sample_only_unsafe = (
+                    (reason.startswith("state_marked_unsafe:") or reason.startswith("meta_marked_unsafe:"))
+                    and ("sample_quality_fail" in reason)
+                    and ("wfa_fail" not in reason)
+                    and ("stress_fail" not in reason)
+                    and ("risk_of_ruin=" not in reason)
+                )
+
+                if allow_soft_wfa_fallback and is_wfa_fail:
+                    soft_assets.append(asset)
+                    soft_wfa_assets.append(asset)
+                    continue
+                if allow_soft_sample_fallback and is_sample_only_unsafe:
+                    soft_assets.append(asset)
+                    soft_sample_assets.append(asset)
+
+            if soft_assets:
+                soft_assets = sorted(set(soft_assets))
+                mode_parts: list[str] = []
+                if soft_wfa_assets:
+                    mode_parts.append(f"wfa={','.join(sorted(set(soft_wfa_assets)))}")
+                if soft_sample_assets:
+                    mode_parts.append(f"sample_quality={','.join(sorted(set(soft_sample_assets)))}")
+                mode_tag = ";".join(mode_parts) if mode_parts else "mixed"
+
+                log_health.warning(
+                    "MODEL_GATE_SOFT_FALLBACK | mode=%s passing=%s blocked=%s reason=%s",
+                    mode_tag,
+                    ",".join(soft_assets),
+                    ",".join(sorted(set(required_assets).difference(set(soft_assets)))),
+                    gate_reason,
+                )
+                versions: list[str] = []
+                sharpes: list[float] = []
+                wins: list[float] = []
+                for asset in soft_assets:
+                    st = assets.get(asset, {}) if isinstance(assets, dict) else {}
+                    version = str(st.get("model_version", "") or "").strip()
+                    if not version:
+                        continue
+                    model = model_manager.load_model(version)
+                    if model is None:
+                        continue
+                    versions.append(f"{asset}:{version}")
+                    sharpes.append(float(st.get("sharpe", 0.0) or 0.0))
+                    wins.append(float(st.get("win_rate", 0.0) or 0.0))
+                    if isinstance(model, dict) and "model" in model and "pipeline" in model:
+                        self._catboost_payloads[asset] = model
+                        log_health.info("CATBOOST_LOADED | asset=%s version=%s", asset, version)
+
+                if versions:
+                    self._model_version = " | ".join(versions)
+                    self._model_sharpe = min(sharpes) if sharpes else 0.0
+                    self._model_win_rate = min(wins) if wins else 0.0
+                    self._model_loaded = True
+                    self._backtest_passed = True
+                    self._gate_last_reason = "soft_fallback"
+                    self._blocked_assets = sorted(set(required_assets).difference(set(soft_assets)))
+                    log_health.warning(
+                        "MODEL_GATE_SOFT_OK | mode=%s versions=%s blocked_assets=%s",
+                        mode_tag,
+                        self._model_version,
+                        ",".join(self._blocked_assets),
+                    )
+                    return
+
         if not gate_ok:
-            log_health.warning("MODEL_GATE_SKIP | reason=%s", gate_reason)
-            log_err.error("GATE_BLOCK_REASON | reason=%s", gate_reason)
+            if should_log_gate:
+                log_health.warning("MODEL_GATE_SKIP | reason=%s", gate_reason)
+                log_err.error("GATE_BLOCK_REASON | reason=%s", gate_reason)
             self._model_loaded = False
             self._backtest_passed = False
             self._model_version = "N/A"
             self._model_sharpe = 0.0
             self._model_win_rate = 0.0
-            self._blocked_assets = ["BTC", "XAU"]
+            self._blocked_assets = sorted(required_assets)
             return
 
         versions: list[str] = []
         sharpes: list[float] = []
         wins: list[float] = []
-        for asset in ("XAU", "BTC"):
+        for asset in required_assets:
             st = assets.get(asset, {}) if isinstance(assets, dict) else {}
             version = str(st.get("model_version", "") or "").strip()
             if not version:
@@ -425,6 +575,7 @@ class MultiAssetTradingEngine:
         self._model_win_rate = min(wins) if wins else 0.0
         self._model_loaded = True
         self._backtest_passed = True
+        self._gate_last_reason = "ok"
         self._blocked_assets = []
         log_health.info(
             "MODEL_GATE_PASSED | versions=%s sharpe_min=%.3f win_rate_min=%.3f",
@@ -495,15 +646,29 @@ class MultiAssetTradingEngine:
             # Adaptive threshold: 75th percentile of recent predictions
             # This means ~25% of predictions will generate signals
             hist = self._catboost_pred_history[asset]
-            if len(hist) >= 10:
-                adaptive_threshold = float(np.percentile(np.asarray(hist, dtype=np.float64), 75))
+            hist_arr = np.asarray(hist, dtype=np.float64)
+            if len(hist) >= 20:
+                adaptive_threshold = float(np.percentile(hist_arr, 75))
                 threshold = max(adaptive_threshold, 1e-12)
+                p95_mag = max(float(np.percentile(hist_arr, 95)), threshold * 1.05)
+                conf_ref = max(p95_mag - threshold, threshold * 0.10, 1e-12)
             else:
                 # Not enough history yet, use a fraction of static threshold
                 threshold = static_threshold * 0.1
-            
-            confidence = min(abs(pred_val) / max(threshold, 1e-12), 1.0)
-            confidence = max(0.0, min(1.0, confidence))
+                p95_mag = threshold * 2.0
+                conf_ref = max(threshold, 1e-12)
+
+            # Confidence calibration:
+            # - below threshold -> [0.05, 0.74] (never tradeable for ml_router)
+            # - above threshold -> [0.75, 0.99] (tradeable but never hard-saturates at 1.0)
+            mag = abs(pred_val)
+            if mag < threshold:
+                confidence = max(0.05, min(0.74, (mag / max(threshold, 1e-12)) * 0.74))
+            else:
+                rel = (mag - threshold) / conf_ref
+                rel = max(0.0, min(1.0, rel))
+                confidence = 0.75 + (0.24 * rel)
+            confidence = max(0.0, min(0.99, confidence))
 
             last_close = float(df["Close"].iloc[-1])
             atr_arr = None
@@ -544,7 +709,7 @@ class MultiAssetTradingEngine:
             return MLSignal(
                 asset=asset, signal=signal, side=side,
                 confidence=confidence,
-                reason=f"catboost_pred:{pred_val:.6f}",
+                reason=f"catboost_pred:{pred_val:.6f}|thr:{threshold:.6f}|p95:{p95_mag:.6f}",
                 provider="catboost", model="catboost_trained",
                 entry=last_close, stop_loss=None, take_profit=None,
                 scalp_payload={"M1": frame},
@@ -1049,6 +1214,45 @@ class MultiAssetTradingEngine:
             return "BTC"
         return "XAU+BTC"
 
+    def _asset_open_positions(self, asset: str) -> int:
+        pipe = self._xau if str(asset).upper() == "XAU" else self._btc
+        if pipe is None:
+            return 0
+        try:
+            return int(pipe.open_positions())
+        except Exception:
+            return 0
+
+    def _asset_max_positions(self, asset: str) -> int:
+        asset_u = str(asset or "").upper().strip()
+        return max(1, int(self._max_open_positions.get(asset_u, 1) or 1))
+
+    def _asset_lot_cap(self, asset: str) -> float:
+        asset_u = str(asset or "").upper().strip()
+        cfg = self._xau_cfg if asset_u == "XAU" else self._btc_cfg
+        broker_max = float(getattr(getattr(cfg, "symbol_params", None), "lot_max", 0.0) or 0.0)
+        cap = float(self._max_lot_cap.get(asset_u, broker_max if broker_max > 0.0 else 0.0) or 0.0)
+        if broker_max > 0.0:
+            if cap <= 0.0:
+                cap = broker_max
+            else:
+                cap = min(cap, broker_max)
+        return max(0.0, cap)
+
+    def _apply_asset_lot_cap(self, asset: str, lot: float, stage: str) -> float:
+        lot_val = float(lot)
+        cap = self._asset_lot_cap(asset)
+        if cap > 0.0 and lot_val > cap:
+            log_health.warning(
+                "LOT_CAP_APPLIED | asset=%s stage=%s lot=%.4f cap=%.4f",
+                str(asset).upper(),
+                stage,
+                lot_val,
+                cap,
+            )
+            return float(cap)
+        return lot_val
+
     def _enqueue_order(
         self,
         cand: AssetCandidate,
@@ -1150,6 +1354,17 @@ class MultiAssetTradingEngine:
                     self._trade_cooldown_sec - time_since_close,
                     self._cooldown_blocked_count[cand.asset],
                 )
+            return False, None
+
+        open_positions = self._asset_open_positions(cand.asset)
+        max_positions = self._asset_max_positions(cand.asset)
+        if max_positions > 0 and open_positions >= max_positions:
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=max_positions open=%d max=%d",
+                cand.asset,
+                open_positions,
+                max_positions,
+            )
             return False, None
 
         # ============================================================
@@ -1292,6 +1507,7 @@ class MultiAssetTradingEngine:
                 return False, None
 
         lot_val = float(lot_override) if lot_override is not None else float(cand.lot)
+        lot_val = self._apply_asset_lot_cap(cand.asset, lot_val, "enqueue")
         if lot_val <= 0:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset)
             return False, None
@@ -1468,6 +1684,21 @@ class MultiAssetTradingEngine:
                     pass
         except Exception as exc:
             log_err.error("heartbeat error: %s | tb=%s", exc, traceback.format_exc())
+
+    def _track_position_closures(self, open_xau: int, open_btc: int) -> None:
+        now = time.time()
+        for asset, open_now in (("XAU", int(open_xau)), ("BTC", int(open_btc))):
+            prev = int(self._last_open_positions.get(asset, 0))
+            if prev > open_now:
+                self._last_trade_close_ts[asset] = now
+                log_health.info(
+                    "TRADE_CLOSE_DETECTED | asset=%s prev_open=%d open=%d cooldown=%.0fs",
+                    asset,
+                    prev,
+                    open_now,
+                    self._trade_cooldown_sec,
+                )
+            self._last_open_positions[asset] = open_now
 
     # -------------------- status API --------------------
     def status(self) -> PortfolioStatus:
@@ -1928,6 +2159,8 @@ class MultiAssetTradingEngine:
             "confidence": max(0.0, min(1.0, float(sig.confidence))),
             "regime": "ml_router",
         }
+        open_positions = self._asset_open_positions(asset)
+        max_positions = self._asset_max_positions(asset)
 
         plan = pipe.risk.plan_order(
             side=sig.side,
@@ -1935,14 +2168,18 @@ class MultiAssetTradingEngine:
             ind=ind,
             adapt=adapt,
             entry=(entry if entry > 0.0 else None),
+            open_positions=int(open_positions),
+            max_positions=int(max_positions),
             df=None,
         )
         if bool(plan.get("blocked", True)):
             log_health.info(
-                "FSM_RISK_BLOCK | asset=%s signal=%s reason=%s",
+                "FSM_RISK_BLOCK | asset=%s signal=%s reason=%s open=%d max=%d",
                 asset,
                 sig.signal,
                 str(plan.get("reason", "unknown")),
+                int(open_positions),
+                int(max_positions),
             )
             return None
 
@@ -1958,6 +2195,7 @@ class MultiAssetTradingEngine:
             frame=frame,
         )
         lot = float(plan.get("lot", 0.0) or 0.0)
+        lot = self._apply_asset_lot_cap(asset, lot, "build")
         if lot <= 0.0:
             return None
 
@@ -2011,6 +2249,17 @@ class MultiAssetTradingEngine:
 
             if self._manual_stop:
                 log_health.info("FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset)
+                continue
+
+            open_positions = self._asset_open_positions(selected.asset)
+            max_positions = self._asset_max_positions(selected.asset)
+            if max_positions > 0 and open_positions >= max_positions:
+                log_health.info(
+                    "FSM_ORDER_SKIP | asset=%s reason=max_positions open=%d max=%d",
+                    selected.asset,
+                    open_positions,
+                    max_positions,
+                )
                 continue
 
             order_count = self._orders_for_candidate(selected)
@@ -2069,6 +2318,7 @@ class MultiAssetTradingEngine:
 
         open_xau = self._xau.open_positions() if self._xau else 0
         open_btc = self._btc.open_positions() if self._btc else 0
+        self._track_position_closures(open_xau, open_btc)
         self._active_asset = self._select_active_asset(open_xau, open_btc)
         self._heartbeat(open_xau, open_btc)
 

@@ -76,348 +76,378 @@
 </div>
 
 ---
-
 <div align="center">
 
-## 🦁 THE SNIPER DOCTRINE (v2.0)
+## THE SNIPER DOCTRINE (v2.1, REAL STATE)
 
-**"We do not spray and pray. We wait. We align. We kill."**
+**"Train -> Backtest -> Gate -> Trade. If gate fails, no live orders."**
 
 </div>
 
-The system has been upgraded with a new **Risk Engine** that enforces strict institutional discipline.
+This README now reflects the current implementation and current artifacts in this repository, not a marketing target state.
 
-### 1. The "Kill Zone" (Entry Filter)
-Before any trade is considered, the market environment is scanned:
-*   **Volatility Gate**: If the market is dead (low volatility), the signal is **SILENCED**.
-*   **Noise Gate**: If `ATR / Spread < 2.0`, the market is too efficient/expensive. **SILENCED**.
-*   **Result**: The bot only trades when there is sufficient energy to pay for the risk.
+### 1. Entry Doctrine (Live)
+- Signal engine uses a weighted 100-point model (`trend`, `momentum`, `volatility`, `structure`, `flow`, `mean_reversion`).
+- Internal score gate: `signal_min_score=70`.
+- Confidence gate: `min_confidence=80` (strict sniper mode).
+- MTF penalties are active (M5/M15 conflict reduces confidence).
+- D1 confluence is integrated into scoring with `d1_confluence_weight=5.0`.
 
-### 2. Structural Stop-Loss (SMC)
-No more random pips. Every stop loss is anchored to market reality:
-*   **Swing High/Low**: Algorithm looks back **20 bars** to find the true structural pivot.
-*   **Buffer**: Adds **0.5 ATR** padding behind the structure to survive "Stop Hunts".
-*   **Fallback**: If no structure exists, calculates a **2.5x ATR** wide stop for volatility survival.
+### 2. Risk Doctrine (Live)
+- Dynamic ATR-based planning for SL/TP and lot sizing.
+- Tight spread guard: `spread_gate_multiplier=1.5` (not 2.0).
+- Spread spike blocker: 3-sigma guard on spread history.
+- Black Swan circuit breaker:
+  - ATR regime expansion (`ATR / SMA(ATR,50) > 3.0`)
+  - Gap detection (`gap > 2 x ATR`)
+  - Auto hard-stop cooldown (`1800s` default)
 
-### 3. The "Golden Ratio" (R:R > 1:2)
-*   **Hard Constraint**: The bot **REFUSES** to take any trade with less than **1:2** Risk-to-Reward.
-*   **Dynamic Targeting**: If the calculated TP is too close, it is **pushed out** to meet the 1:2 requirement.
-*   **Logic**: One win covers two losses. Mathematical profitability is baked in.
+### 3. Institutional Gate Doctrine (Live)
+An asset is tradable only if all of these pass:
+- State + metadata contract validity
+- `status=VERIFIED` and `real_backtest=true`
+- `unsafe=false`
+- Sharpe/WinRate/Drawdown thresholds
+- WFA passed and stress test passed
+- Model + meta files physically exist
 
 ---
 
 <div align="center">
 
-## 🔬 COMPLETE SYSTEM PIPELINE
-
-**Train → Backtest → Gate → Trade**
+## REAL SYSTEM STATUS SNAPSHOT (2026-02-25)
 
 </div>
 
-The system operates on a **Holy Trinity** architecture. No module can be bypassed.
+Snapshot from `Artifacts/models` and `Artifacts/backtest_institutional`:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     QUANTCORE PRO v2.0                          │
-│                                                                  │
-│  ┌─────────────┐   ┌──────────────┐   ┌─────────────────────┐  │
-│  │ MODEL TRAIN │──▶│   BACKTEST   │──▶│    MODEL GATE       │  │
-│  │ (CatBoost)  │   │ Institutional│   │ Sharpe ≥ 0.5        │  │
-│  │ 2000 iters  │   │ Kelly + WFA  │   │ WinRate ≥ 52%       │  │
-│  │ M1 Data     │   │ Monte Carlo  │   │ MaxDD ≤ 25%         │  │
-│  └─────────────┘   │ Stress Test  │   │ WFA Pass             │  │
-│                     └──────────────┘   └──────────┬──────────┘  │
-│                                                    │ VERIFIED    │
-│                                                    ▼             │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │              LIVE TRADING ENGINE                          │   │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │   │
-│  │  │ Feature  │─▶│ Signal   │─▶│  Risk    │─▶│ Execute │ │   │
-│  │  │ Engine   │  │ Engine   │  │ Engine   │  │ Worker  │ │   │
-│  │  │ (TA-Lib) │  │ 100-pt   │  │ ATR SL/TP│  │ MT5 API │ │   │
-│  │  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │   │
-│  │                                                          │   │
-│  │  ┌──── XAU Pipeline ────┐  ┌──── BTC Pipeline ────┐    │   │
-│  │  │ XAUUSDm / M1 / Scalp │  │ BTCUSDm / M1 / Trend │    │   │
-│  │  └──────────────────────┘  └──────────────────────┘    │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │  Telegram    │  │  Hard Kill   │  │  Model Retrainer     │  │
-│  │  Notifier    │  │  STOP.lock   │  │  Auto-retrain 24h    │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-```
+| Item | Current Value |
+|------|---------------|
+| Gate (`XAU+BTC`) | `ok=false` |
+| Gate reason | `BTC:state_missing:global_state_other_asset:XAU` |
+| XAU model meta | `v1.0_xau_institutional.json` exists |
+| XAU state | `status=UNSAFE`, `verified=false` |
+| XAU sample quality | `insufficient_trades:10<20` |
+| BTC model/state | missing (`v1.0_btc_institutional.*`, `model_state_BTC.pkl`) |
+| Global state | points to XAU only |
+
+Interpretation:
+- The system can start, but strict gate for both assets is currently not satisfied.
+- In partial mode (`PARTIAL_GATE_MODE=1`), engine can run with passing assets only.
+- Right now XAU is also blocked by gate because state is marked `UNSAFE`.
 
 ---
 
 <div align="center">
 
-## 🧠 MODEL TRAINING & VALIDATION
+## COMPLETE SYSTEM PIPELINE (ACTUAL)
 
-</div>
-
-### Phase 1: Institutional Model Training
-*   **Algorithm**: CatBoost Gradient Boosting (2000 iterations, early stopping)
-*   **Data**: M1 (minute) bars from MT5 — up to 120,000 bars (XAU) / 60,000 bars (BTC)
-*   **Features**: 50+ TA-Lib indicators (RSI, MACD, Bollinger, ATR, ADX, OBV, Stochastic, etc.)
-*   **Split**: 60% Train / 15% Validation / 15% Test / 10% Holdout
-*   **Target**: Next-bar return prediction (regression)
-*   **Assets**: Trains per-asset models: `v1.0_xau_institutional.pkl`, `v1.0_btc_institutional.pkl`
-
-### Phase 2: Institutional Backtest
-*   **Zero Look-Ahead Bias**: Strict sliding-window simulation, no future data leakage
-*   **Kelly Position Sizing**: Fractional Kelly with 20% hard cap
-*   **Regime Detection**: Trend Up / Trend Down / Range / High Volatility
-*   **ATR-Based Stops**: Dynamic SL/TP computed per-trade using real-time ATR
-*   **Transaction Costs**: Realistic spread + slippage modeled per-asset
-
-### Phase 3: Robustness Tests
-*   **Walk-Forward Analysis (WFA)**: Rolling train/test windows — must pass ≥60% of sub-periods
-*   **Monte Carlo Simulation**: 10,000 random equity reshuffles — measures Risk of Ruin
-*   **Stress Tests**: Flash crash (−20%) and volatility spike (3× slippage) scenarios
-
-### Phase 4: Model Gate (Quality Control)
-The **Model Gate** acts as a gatekeeper. No model reaches live trading without passing:
-
-| Metric | Requirement | Source |
-|--------|-------------|--------|
-| Sharpe Ratio | ≥ 0.5 | `core/config.py` |
-| Win Rate | ≥ 52% | `core/config.py` |
-| Max Drawdown | ≤ 25% | `core/config.py` |
-| WFA Pass Rate | ≥ 60% | `core/config.py` |
-| Risk of Ruin | ≤ 1% | Monte Carlo |
-| Stress Test | All passed | Backtest engine |
-
-> **Partial Gate Mode**: If one asset passes (e.g. XAU) but another fails (e.g. BTC), the system starts trading with the passing asset only. No asset blocks another.
-
----
-
-<div align="center">
-
-## ⚡ SIGNAL ENGINE
-
-**100-Point Scoring System**
-
-</div>
-
-Every signal is computed through a **unified scoring system** (0–100 points):
-
-| Component | Points | Description |
-|-----------|--------|-------------|
-| Model Prediction | 0–30 | CatBoost predicted return magnitude |
-| Trend Alignment | 0–20 | EMA/MACD/ADX trend confirmation |
-| Momentum | 0–15 | RSI + Stochastic convergence |
-| Volume Confirmation | 0–10 | OBV + volume spike detection |
-| Volatility Quality | 0–10 | ATR regime filter |
-| Structure (SMC) | 0–15 | Support/Resistance + swing levels |
-
-*   **Minimum Score**: 75/100 required to generate a signal (Sniper Mode)
-*   **Direction**: BUY if score > 75 and prediction > 0, SELL if score > 75 and prediction < 0
-*   **Cooldown**: 60-second minimum between trades on same asset
-
----
-
-<div align="center">
-
-## 🛡️ RISK ENGINE
-
-**3-Phase Escalation Protocol**
-
-</div>
-
-The Risk Engine operates a **3-phase escalation** system:
-
-| Phase | Condition | Action |
-|-------|-----------|--------|
-| 🟢 **NORMAL** | DD < 5% | Full position sizing via Kelly |
-| 🟡 **CAUTION** | DD 5–10% | Lot size halved, cooldown doubled |
-| 🔴 **DANGER** | DD > 10% | Trading paused, Telegram alert sent |
-
-**Per-Trade Risk Controls:**
-*   **SL**: ATR × 1.5 (dynamic, never static pips)
-*   **TP**: ATR × 3.0 (ensures R:R ≥ 1:2)
-*   **Lot Size**: Kelly fraction × account balance × confidence
-*   **Max Position**: 20% of equity per trade (hard cap)
-*   **Hard Kill Switch**: Create `STOP.lock` file → all trading immediately stops
-
----
-
-<div align="center">
-
-## 🏗️ SYSTEM ARCHITECTURE & STABILITY
-
-</div>
-
-### 🧩 Multi-Asset Core
-The engine runs **Two Parallel Pipelines** simultaneously on separate threads:
-1.  **Gold Pipeline (XAUUSDm)**: Tuned for mean reversion and volatility breakout.
-2.  **Bitcoin Pipeline (BTCUSDm)**: Tuned for momentum and trend continuation.
-*   **Zero-Crosstalk**: Threads are isolated. A crash in crypto does not stop gold.
-*   **Partial Gate**: Each asset is independently gated — one failing model does not block the other.
-
-### 🛡️ Enterprise Stability
-*   **Singleton Lock**: File-based lock ensures only ONE instance runs. Prevents double-order errors.
-*   **Event Bus**: Internal message queue for 100% signal delivery guarantee.
-*   **Self-Healing**: Auto-reconnects to MT5 and Telegram if the connection drops.
-*   **Smart Retrain**: Only retrains failing assets — skips assets that already pass gate.
-*   **Staleness Check**: Models auto-retrain after 24 hours, not on every restart.
-
-### 📊 Artifact Structure
-```
-Artifacts/
-├── models/
-│   ├── v1.0_xau_institutional.pkl          # XAU trained model
-│   ├── v1.0_xau_institutional.json         # XAU model metadata
-│   ├── v1.0_btc_institutional.pkl          # BTC trained model
-│   ├── v1.0_btc_institutional.json         # BTC model metadata
-│   ├── model_state.pkl                     # Global gate state
-│   ├── model_state_XAU.pkl                 # Per-asset gate state
-│   └── model_state_BTC.pkl                 # Per-asset gate state
-├── backtest_institutional/
-│   ├── xau_*_institutional_metrics.json    # XAU backtest metrics
-│   ├── xau_*_institutional_report.txt      # XAU human-readable report
-│   ├── btc_*_institutional_metrics.json    # BTC backtest metrics
-│   └── btc_*_institutional_report.txt      # BTC human-readable report
-└── catboost_info/                          # CatBoost training logs
-```
-
----
-
-<div align="center">
-
-## 📁 SOURCE CODE MAP
-
-</div>
-
-```
-Exness/
-│
-├── main.py                          # Entry point, supervisor, auto-train
-│
-├── core/
-│   ├── config.py                    # Unified config, env vars, gate thresholds
-│   ├── signal_engine.py             # 100-point signal scoring system
-│   ├── risk_engine.py               # 3-phase risk escalation, ATR SL/TP
-│   └── model_gate.py                # Quality gate: Sharpe/WR/DD/WFA checks
-│
-├── Backtest/
-│   ├── engine.py                    # Institutional backtest + WFA + Monte Carlo
-│   ├── model_train.py               # CatBoost training pipeline
-│   └── metrics.py                   # Institutional metrics (Sharpe, Sortino, VaR)
-│
-├── Bot/
-│   ├── Motor/
-│   │   └── engine.py                # Live multi-asset trading engine
-│   ├── portfolio_engine.py          # Portfolio orchestration
-│   └── bot.py                       # Telegram bot interface
-│
-├── strategies/
-│   ├── btc.py                       # BTC strategy adapter
-│   └── xau.py                       # XAU strategy adapter
-│
-├── mt5_client.py                    # MT5 connection, auth, health, singleton lock
-└── log_config.py                    # Logging, artifact paths, directory management
-```
-
----
-
-<div align="center">
-
-## 🔧 ENVIRONMENT VARIABLES
-
-</div>
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `EXNESS_LOGIN` | ✅ | — | MT5 account login |
-| `EXNESS_PASSWORD` | ✅ | — | MT5 account password |
-| `EXNESS_SERVER` | ✅ | — | MT5 server name |
-| `TG_TOKEN` | ⚠️ | — | Telegram bot token |
-| `TG_ADMIN_ID` | ⚠️ | — | Telegram admin chat ID |
-| `DRY_RUN` | ❌ | `0` | Simulation mode (no real orders) |
-| `PARTIAL_GATE_MODE` | ❌ | `1` | Allow trading on passing assets only |
-| `MIN_GATE_SHARPE` | ❌ | `0.5` | Minimum Sharpe ratio for gate |
-| `MIN_GATE_WIN_RATE` | ❌ | `0.52` | Minimum win rate for gate |
-| `MAX_GATE_DRAWDOWN` | ❌ | `0.25` | Maximum drawdown for gate |
-| `ALLOW_MISSING_TG` | ❌ | `1` | Run without Telegram |
-| `AUTO_DRY_RUN_ON_MISSING_ENV` | ❌ | `1` | Auto dry-run if creds missing |
-| `GATE_RETRAIN_COOLDOWN_SEC` | ❌ | `300` | Seconds between retrain attempts |
-
----
-
-## 🚀 INSTALLATION & RUN
-
-1.  **Requirement**: Windows Server / VPS with MetaTrader 5 installed & logged in.
-2.  **Dependencies**:
-    ```bash
-    pip install MetaTrader5 numpy pandas catboost ta-lib python-dotenv
-    ```
-3.  **Environment**:
-    ```bash
-    cp .env.example .env
-    # Edit .env with your Exness credentials
-    ```
-4.  **Run (Live Mode)**:
-    ```bash
-    python main.py
-    ```
-    The system will:
-    - ✅ Check model gate for each asset independently
-    - 🔄 Auto-train only missing/failing models (skips passing ones)
-    - 🟢 Start trading on verified assets immediately
-    - 📱 Send Telegram notifications for signals and status
-
-5.  **Run (Simulation/Audit Mode)**:
-    ```bash
-    DRY_RUN=1 python main.py
-    ```
-
-6.  **Emergency Stop**:
-    ```bash
-    # Create STOP.lock file in project root — all trading stops immediately
-    echo "stop" > STOP.lock
-    ```
-
----
-
-<div align="center">
-
-## 🔄 STARTUP FLOW
+**Boot -> Preflight -> (Auto-Train if needed) -> Gate -> Engine Supervisor -> Telegram**
 
 </div>
 
 ```
 python main.py
-    │
-    ├── Load .env (auto-create template if missing)
-    ├── Initialize MT5 connection (6 retries with backoff)
-    ├── Check Model Gate per-asset:
-    │   ├── XAU: ok? → SKIP training
-    │   ├── BTC: ok? → SKIP training
-    │   ├── XAU: failed? → Run backtest + training
-    │   └── BTC: failed? → Run backtest + training
-    │
-    ├── Partial Gate Mode (default ON):
-    │   └── Start trading with ANY passing asset
-    │
-    ├── Start Engine Supervisor:
-    │   ├── XAU Pipeline (if gate passed)
-    │   ├── BTC Pipeline (if gate passed)
-    │   ├── Hourly model age check (retrain if > 24h)
-    │   └── Gate-blocked retrain (cooldown 300s)
-    │
-    └── Start Telegram Bot (if configured)
+  |
+  +-- Preflight env + MT5 checks
+  +-- _models_ready()
+  |     |
+  |     +-- if not ready: _auto_train_models_strict()
+  |     |      +-- run_institutional_backtest(XAU/BTC as needed)
+  |     |      +-- post-gate check
+  |     |
+  |     +-- if ready: skip training
+  |
+  +-- engine._check_model_health()
+  |     +-- strict gate or partial gate mode
+  |
+  +-- run_engine_supervisor()
+        +-- hourly model-age retrain check
+        +-- gate-blocked retrain cooldown logic
+        +-- engine start/restart with backoff
+```
+
+Important behavior:
+- `run_institutional_backtest(asset)` always performs fresh model training for that asset when called.
+- Program restart does **not** always retrain; retrain is conditional (missing/failed/expired gate path).
+
+---
+
+<div align="center">
+
+## MODEL TRAINING AND VALIDATION
+
+</div>
+
+### Phase 1: Institutional Training
+- Backend: CatBoost regression.
+- Data source: MT5 historical bars (`M1` base training dataset).
+- Split: train/val/test/holdout in `Backtest/model_train.py`.
+- Output artifacts:
+  - `Artifacts/models/v<version>.pkl`
+  - `Artifacts/models/v<version>.json`
+
+### Phase 2: Institutional Backtest
+Implemented in `Backtest/engine.py`:
+- No look-ahead simulation path.
+- Transaction costs and execution effects.
+- WFA, Monte Carlo (`10000` runs), stress scenarios.
+- Sample quality gate (`MIN_GATE_TRADES`, side-balance checks).
+
+### Phase 3: Gate Decision
+Core thresholds (`core/config.py`):
+- `MIN_GATE_SHARPE = 0.5`
+- `MIN_GATE_WIN_RATE = 0.52`
+- `MAX_GATE_DRAWDOWN = 0.25`
+
+Additional sample-quality controls (`Backtest/engine.py`):
+- `MIN_GATE_TRADES` default `20`
+- `GATE_REQUIRE_BOTH_SIDES` default `1`
+- `MIN_GATE_WINNING_TRADES` default `1`
+- `MIN_GATE_LOSING_TRADES` default `1`
+
+Why your XAU can look "good" but still fail:
+- Even with high Sharpe/WinRate, asset is blocked when sample quality fails (example: only 10 trades).
+
+---
+
+<div align="center">
+
+## SIGNAL ENGINE (CURRENT IMPLEMENTATION)
+
+</div>
+
+Live signal logic in `core/signal_engine.py` includes:
+- M1/M15/H1 + D1 confluence.
+- `_d1_confluence_score()` for daily trend bias.
+- `_vector_alignment()` cosine-like MTF alignment score (`M1/M15/H1/D1`).
+- `_momentum_ignition_score()` for early breakout + volume impulse detection.
+- Final filters include D1 conflict penalty and MTF conflict penalties.
+
+Execution routing in engine:
+- If CatBoost payload exists for asset, prediction path is used first.
+- ML fallback path exists, but gate-blocked assets are skipped in pipeline.
+
+---
+
+<div align="center">
+
+## RISK ENGINE (CURRENT IMPLEMENTATION)
+
+</div>
+
+`core/risk_engine.py` (live state):
+- Uses `threading.RLock` for mutable shared state.
+- Concurrency-safe methods include `update_pnl`, `evaluate_account_state`, and `guard_decision`.
+- Execution metrics tracked and flushed to per-asset CSV:
+  - `Logs/exec_metrics_XAUUSDm.csv`
+  - `Logs/exec_metrics_BTCUSDm.csv`
+  (file appears only after execution metrics are produced for that asset)
+
+Stability guards:
+- Volatility circuit breaker + cooldown.
+- Spread spike detection.
+- Latency/slippage execution breaker.
+
+---
+
+<div align="center">
+
+## ARCHITECTURE AND SCHEDULING
+
+</div>
+
+### Asset scheduling (`Bot/Motor/scheduler.py`)
+- Weekdays: `XAU + BTC`
+- Weekends: `BTC only`
+
+### Core runtime (`main.py` + `Bot/Motor/engine.py`)
+- Multi-asset engine with partial-gate support.
+- Engine supervisor with backoff and controlled retraining.
+- Telegram supervisor isolated from trading loop.
+
+### Data-structure complexity (runtime safety)
+- `_seen_index`: dictionary key lookup (`O(1)` average).
+- `_seen`: deque TTL queue with bounded cleanup budget.
+- `_catboost_pred_history`: per-asset `deque(maxlen=200)` (bounded memory, `O(1)` append).
+
+---
+
+<div align="center">
+
+## ARTIFACTS (EXPECTED VS CURRENT)
+
+</div>
+
+### Current files present now
+```
+Artifacts/
+|-- models/
+|   |-- model_state.pkl
+|   |-- model_state_XAU.pkl
+|   |-- v1.0_xau_institutional.pkl
+|   `-- v1.0_xau_institutional.json
+`-- backtest_institutional/
+    |-- xau_1_0_xau_institutional_institutional_metrics.json
+    `-- xau_1_0_xau_institutional_institutional_report.txt
+```
+
+### Files expected when BTC also passes pipeline
+```
+Artifacts/models/model_state_BTC.pkl
+Artifacts/models/v1.0_btc_institutional.pkl
+Artifacts/models/v1.0_btc_institutional.json
+Artifacts/backtest_institutional/btc_*_institutional_metrics.json
+Artifacts/backtest_institutional/btc_*_institutional_report.txt
 ```
 
 ---
 
 <div align="center">
 
-## 👨‍💻 AUTHOR
+## LOGGING (CURRENT)
+
+</div>
+
+System-wide aggregated `system.log` is disabled.
+
+Active log model:
+- `Logs/main.log`
+- `Logs/telegram.log`
+- `Logs/portfolio_engine_health.log`
+- `Logs/portfolio_engine_error.log`
+- `Logs/portfolio_engine_diag.jsonl`
+- Per-asset execution metrics CSV in `Logs/`
+
+---
+
+<div align="center">
+
+## SOURCE CODE MAP
+
+</div>
+
+```
+Exness/
+|
+|-- main.py
+|-- log_config.py
+|
+|-- core/
+|   |-- config.py
+|   |-- feature_engine.py
+|   |-- signal_engine.py
+|   |-- risk_engine.py
+|   |-- model_gate.py
+|   |-- model_manager.py
+|   |-- model_retrainer.py
+|   `-- portfolio_risk.py
+|
+|-- Backtest/
+|   |-- engine.py
+|   |-- model_train.py
+|   `-- metrics.py
+|
+|-- Bot/
+|   |-- bot.py
+|   |-- bot_utils.py
+|   |-- portfolio_engine.py
+|   `-- Motor/
+|       |-- engine.py
+|       |-- pipeline.py
+|       |-- scheduler.py
+|       |-- execution.py
+|       |-- logging_setup.py
+|       `-- models.py
+|
+|-- DataFeed/
+|-- ExnessAPI/
+|-- strategies/
+`-- tests/
+```
+
+---
+
+<div align="center">
+
+## ENVIRONMENT VARIABLES (KEY ONES)
+
+</div>
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `DRY_RUN` | `0` | simulation mode |
+| `PARTIAL_GATE_MODE` | `1` | allow start with passing assets only |
+| `AUTO_TRAIN_ASSETS` | required assets | startup auto-train asset list |
+| `RETRAIN_ASSETS` | `XAU,BTC` | runtime retrain asset list |
+| `GATE_RETRAIN_COOLDOWN_SEC` | `300` | delay between gate-triggered retrains |
+| `MIN_GATE_SHARPE` | `0.5` | minimum Sharpe gate |
+| `MIN_GATE_WIN_RATE` | `0.52` | minimum WinRate gate |
+| `MAX_GATE_DRAWDOWN` | `0.25` | maximum drawdown gate |
+| `MIN_GATE_TRADES` | `20` | minimum trade count for sample quality |
+| `GATE_REQUIRE_BOTH_SIDES` | `1` | require both winning and losing trades |
+
+---
+
+## INSTALLATION AND RUN
+
+1. Install dependencies:
+   ```bash
+   py -m pip install -r requirements.txt
+   ```
+
+2. Create `.env` with Exness and Telegram credentials.
+
+3. Run live:
+   ```bash
+   py .\main.py
+   ```
+
+4. Run dry-run:
+   ```bash
+   $env:DRY_RUN="1"; py .\main.py
+   ```
+
+---
+
+## FAST VERIFICATION COMMANDS
+
+Gate snapshot:
+```bash
+py -c "from core.model_gate import gate_details; import json; print(json.dumps(gate_details(required_assets=('XAU','BTC')), indent=2))"
+```
+
+Show current model artifacts:
+```bash
+Get-ChildItem Artifacts\models
+Get-ChildItem Artifacts\backtest_institutional
+```
+
+Run concurrency + D1 math tests:
+```bash
+py -m pytest tests/test_risk_thread_safety.py -v
+py -m pytest tests/test_signal_d1_vector.py -v
+```
+
+---
+
+<div align="center">
+
+## NOTE ABOUT METRICS LIKE `profit_factor`
+
+</div>
+
+If you see extreme values (e.g., old `Infinity`), check current metrics code:
+- Profit factor is now capped and tracked with flags (`profit_factor_capped`, `metric_notes`).
+- `expectancy_ratio` uses safe fallback denominator when average loss is ~0.
+- Small trade samples can still make metrics unstable, which is exactly why sample-quality gate exists.
+
+---
+
+<div align="center">
+
+## AUTHOR
 
 **Gafurov Kabir**
-*High-Frequency Trading Architect | Quantitative AI Specialist*
-*Tajikistan, 2026*
 
 </div>

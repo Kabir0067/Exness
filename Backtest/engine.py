@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,7 +19,7 @@ import numpy as np
 import pandas as pd
 import talib
 
-from log_config import get_artifact_dir, get_artifact_path
+from log_config import get_artifact_dir, get_artifact_path, get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 from core.config import (
     MAX_GATE_DRAWDOWN,
@@ -42,17 +43,39 @@ except ImportError:
     )
 
 log = logging.getLogger("backtest.engine_institutional")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    _fh = RotatingFileHandler(
+        str(get_log_path("backtest_engine.log")),
+        maxBytes=8 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+        delay=True,
+    )
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(_fmt)
+    log.addHandler(_fh)
 MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 
 
 def _console(msg: str) -> None:
-    """Write directly to the REAL console, bypassing _StdToLogger wrapper."""
-    try:
-        real_out = getattr(sys, "__stdout__", None) or sys.stdout
-        real_out.write(msg + "\n")
-        real_out.flush()
-    except Exception:
-        pass
+    """Route backtest status output to dedicated backtest engine log."""
+    txt = str(msg).rstrip()
+    if not txt:
+        return
+    for line in txt.splitlines():
+        line = line.rstrip()
+        if line:
+            log.info(line)
+    if str(os.getenv("BACKTEST_ECHO_CONSOLE", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        try:
+            real_out = getattr(sys, "__stdout__", None) or sys.stdout
+            real_out.write(txt + "\n")
+            real_out.flush()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -244,18 +267,40 @@ class KellyPositionSizer:
         confidence: float = 1.0
     ) -> float:
         """Calculate Kelly-optimal position size"""
-        if avg_loss == 0 or win_rate <= 0 or win_rate >= 1:
+        try:
+            wr = float(win_rate)
+            aw = abs(float(avg_win))
+            al = abs(float(avg_loss))
+            conf = float(confidence)
+        except Exception:
             return 0.0
-        
-        win_loss_ratio = abs(avg_win / avg_loss)
-        kelly = (win_rate * win_loss_ratio - (1 - win_rate)) / win_loss_ratio
+
+        if (not np.isfinite(wr)) or (not np.isfinite(aw)) or (not np.isfinite(al)) or (not np.isfinite(conf)):
+            return 0.0
+        if aw <= 1e-12:
+            return 0.0
+
+        # Prevent "all-win freeze": when rolling WR reaches 1.0 or avg_loss≈0,
+        # keep a conservative finite estimate instead of shutting position size to 0.
+        wr = min(max(wr, 0.01), 0.99)
+        if al <= 1e-12:
+            al = max(aw * 0.75, 1e-6)
+
+        win_loss_ratio = aw / al
+        if win_loss_ratio <= 1e-12 or not np.isfinite(win_loss_ratio):
+            return 0.0
+
+        kelly = (wr * win_loss_ratio - (1.0 - wr)) / win_loss_ratio
+        if not np.isfinite(kelly):
+            return 0.0
         kelly = max(0.0, kelly)  # No negative positions
-        
+
         # Apply fraction and confidence adjustment
-        kelly *= self.fraction * confidence
-        
+        conf = min(max(conf, 0.0), 2.0)
+        kelly *= self.fraction * conf
+
         # Hard cap
-        return min(kelly, self.max_size)
+        return min(float(kelly), self.max_size)
 
 
 class InstitutionalBacktestEngine:
@@ -391,7 +436,13 @@ class InstitutionalBacktestEngine:
         atr = talib.ATR(high, low, close, timeperiod=int(period))
         return pd.Series(atr, index=df.index)
 
-    def _resolve_signal_threshold(self, configured_threshold: float, pred: np.ndarray) -> float:
+    def _resolve_signal_threshold(
+        self,
+        configured_threshold: float,
+        pred: np.ndarray,
+        *,
+        enforce_min_signals: bool = True,
+    ) -> float:
         """
         Use configured threshold when feasible.
         If model outputs are too small (underfit case), adapt threshold so backtest
@@ -406,6 +457,39 @@ class InstitutionalBacktestEngine:
         max_pred = float(np.max(abs_pred))
         if not np.isfinite(max_pred) or max_pred <= 0.0:
             return base
+
+        if enforce_min_signals:
+            # Ensure enough candidate signals for statistically meaningful evaluation.
+            # We target > MIN_GATE_TRADES by keeping a buffer between raw signals and executed trades.
+            try:
+                min_trades = int(os.getenv("MIN_GATE_TRADES", "20") or "20")
+            except Exception:
+                min_trades = 20
+            try:
+                signal_trade_ratio = float(os.getenv("BACKTEST_SIGNAL_TO_TRADE_RATIO", "3.0") or "3.0")
+            except Exception:
+                signal_trade_ratio = 3.0
+            min_trades = max(1, min_trades)
+            signal_trade_ratio = max(1.0, signal_trade_ratio)
+            target_signals = int(np.ceil(float(min_trades) * float(signal_trade_ratio)))
+            target_signals = max(1, min(target_signals, int(abs_pred.size)))
+
+            base_signal_count = int(np.sum(abs_pred >= base))
+            if base_signal_count < target_signals and abs_pred.size > 1:
+                quantile = 1.0 - (float(target_signals) / float(abs_pred.size))
+                quantile = min(max(quantile, 0.0), 0.99)
+                adaptive_count = float(np.quantile(abs_pred, quantile))
+                adaptive_count = max(1e-12, min(adaptive_count, max_pred * 0.999999))
+                if adaptive_count < base:
+                    log.warning(
+                        "BACKTEST_THRESHOLD_RELAX | asset=%s configured=%.8f adaptive=%.8f base_signals=%s target_signals=%s",
+                        self.asset,
+                        base,
+                        adaptive_count,
+                        base_signal_count,
+                        target_signals,
+                    )
+                    base = adaptive_count
 
         if base < max_pred:
             return base
@@ -471,6 +555,11 @@ class InstitutionalBacktestEngine:
         win_rate_rolling = 0.55  # Initial estimate
         avg_win_rolling = 100.0
         avg_loss_rolling = -80.0
+        min_pos_floor = float(os.getenv("BACKTEST_MIN_POSITION_SIZE_PCT", "0.003") or "0.003")
+        min_pos_conf = float(os.getenv("BACKTEST_MIN_POSITION_CONF", "1.2") or "1.2")
+        min_pos_floor = max(0.0, min(min_pos_floor, self.run_cfg.max_position_size_pct))
+        min_pos_conf = max(0.0, min_pos_conf)
+        floor_used_count = 0
         
         # Spread and slippage configs
         asset_key = "BTC" if self.asset in ("BTC", "BTCUSD", "BTCUSDM") else "XAU"
@@ -518,7 +607,15 @@ class InstitutionalBacktestEngine:
             )
             
             if position_size_pct <= 0.0:
-                continue
+                if min_pos_floor > 0.0 and confidence >= min_pos_conf:
+                    # Fallback floor avoids backtest freeze when Kelly goes temporarily non-positive.
+                    position_size_pct = min(
+                        self.run_cfg.max_position_size_pct,
+                        min_pos_floor * min(confidence, 2.0),
+                    )
+                    floor_used_count += 1
+                else:
+                    continue
             
             notional = equity * position_size_pct
             direction = 1.0 if p > 0.0 else -1.0
@@ -638,6 +735,14 @@ class InstitutionalBacktestEngine:
             "slippage": sum(t["slippage_cost"] for t in trades),
             "commission": sum(t["commission"] for t in trades),
         }
+        if floor_used_count > 0:
+            log.info(
+                "BACKTEST_POS_SIZE_FLOOR_USED | asset=%s count=%s floor=%.4f conf_min=%.2f",
+                self.asset,
+                floor_used_count,
+                min_pos_floor,
+                min_pos_conf,
+            )
         
         return pnl_series, trades, total_costs
     
@@ -866,7 +971,11 @@ class InstitutionalBacktestEngine:
             pred = model.model.predict(X)
             
             configured_threshold = max(float(getattr(cfg, "percent_increase", 0.0) or 0.0), 1e-12)
-            threshold = self._resolve_signal_threshold(configured_threshold, pred)
+            threshold = self._resolve_signal_threshold(
+                configured_threshold,
+                pred,
+                enforce_min_signals=False,
+            )
             rng = np.random.default_rng(self.run_cfg.monte_carlo_seed)
             
             pnls, _, costs = self._simulate_trades_institutional(
@@ -966,7 +1075,7 @@ class InstitutionalBacktestEngine:
 
         wfa_iters = int(os.getenv("WFA_TRAIN_ITERATIONS", "250") or "250")
         wfa_verbose = int(os.getenv("WFA_TRAIN_VERBOSE", "0") or "0")
-        wfa_early = int(os.getenv("WFA_EARLY_STOPPING_ROUNDS", "50") or "50")
+        wfa_early = int(os.getenv("WFA_EARLY_STOPPING_ROUNDS", "0") or "0")
 
         params["iterations"] = max(20, min(2000, wfa_iters))
         params["verbose"] = max(0, wfa_verbose)

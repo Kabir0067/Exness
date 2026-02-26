@@ -1815,7 +1815,6 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         tp = round(tp, info.digits)
 
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-        print(" رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ - (Кабир 🤲🏼)")
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,

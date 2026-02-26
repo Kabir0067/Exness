@@ -261,6 +261,15 @@ def _asset_gate_status(
     state_unsafe = bool(state.get("unsafe", False))
     state_stress_ok = bool(state.get("stress_test_passed", False))
     state_wfa_ok = bool(state.get("wfa_passed", False))
+    state_wfa_total = int(state.get("wfa_total_windows", 0) or 0)
+    state_wfa_failed = int(state.get("wfa_failed_windows", 0) or 0)
+    state_rou = _safe_float(state.get("risk_of_ruin", 0.0), 0.0)
+    state_sample_quality_passed = bool(state.get("sample_quality_passed", True))
+    _state_issues_raw = state.get("sample_quality_issues", [])
+    if isinstance(_state_issues_raw, (list, tuple)):
+        state_sample_issues = [str(x) for x in _state_issues_raw if str(x).strip()]
+    else:
+        state_sample_issues = []
     required_state_fields = (
         "status",
         "verified",
@@ -337,10 +346,24 @@ def _asset_gate_status(
         )
 
     if state_unsafe:
+        unsafe_tags: list[str] = []
+        if not state_sample_quality_passed:
+            unsafe_tags.append("sample_quality_fail")
+            if state_sample_issues:
+                unsafe_tags.append(f"issues={','.join(state_sample_issues[:3])}")
+        if not state_wfa_ok:
+            unsafe_tags.append("wfa_fail")
+        if not state_stress_ok:
+            unsafe_tags.append("stress_fail")
+        if state_rou > 0.01:
+            unsafe_tags.append(f"risk_of_ruin={state_rou:.4f}")
+        unsafe_reason = "state_marked_unsafe"
+        if unsafe_tags:
+            unsafe_reason = f"{unsafe_reason}:{'|'.join(unsafe_tags)}"
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
-            reason="state_marked_unsafe",
+            reason=unsafe_reason,
             state_path=str(state_p),
             model_path="",
             meta_path="",
@@ -373,10 +396,15 @@ def _asset_gate_status(
         )
 
     if not state_wfa_ok:
+        wfa_tag = (
+            f"{state_wfa_failed}/{state_wfa_total}"
+            if state_wfa_total > 0
+            else "unknown"
+        )
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
-            reason="state_wfa_failed",
+            reason=f"state_wfa_failed:{wfa_tag}",
             state_path=str(state_p),
             model_path="",
             meta_path="",
@@ -553,6 +581,15 @@ def _asset_gate_status(
     meta_unsafe = bool(meta.get("unsafe", False))
     meta_stress_ok = bool(meta.get("stress_test_passed", False))
     meta_wfa_ok = bool(meta.get("wfa_passed", False))
+    meta_wfa_total = int(meta.get("wfa_total_windows", 0) or 0)
+    meta_wfa_failed = int(meta.get("wfa_failed_windows", 0) or 0)
+    meta_rou = _safe_float(meta.get("risk_of_ruin", 0.0), 0.0)
+    meta_sample_quality_passed = bool(meta.get("sample_quality_passed", True))
+    _meta_issues_raw = meta.get("sample_quality_issues", [])
+    if isinstance(_meta_issues_raw, (list, tuple)):
+        meta_sample_issues = [str(x) for x in _meta_issues_raw if str(x).strip()]
+    else:
+        meta_sample_issues = []
     meta_sharpe = _safe_float(meta.get("backtest_sharpe", meta.get("sharpe", 0.0)), 0.0)
     meta_wr = _safe_float(meta.get("backtest_win_rate", meta.get("win_rate", 0.0)), 0.0)
     meta_dd = _safe_float(meta.get("max_drawdown_pct", max_dd), max_dd)
@@ -579,13 +616,31 @@ def _asset_gate_status(
         reason = "meta_non_real_backtest"
         ok = False
     elif meta_unsafe:
+        unsafe_tags: list[str] = []
+        if not meta_sample_quality_passed:
+            unsafe_tags.append("sample_quality_fail")
+            if meta_sample_issues:
+                unsafe_tags.append(f"issues={','.join(meta_sample_issues[:3])}")
+        if not meta_wfa_ok:
+            unsafe_tags.append("wfa_fail")
+        if not meta_stress_ok:
+            unsafe_tags.append("stress_fail")
+        if meta_rou > 0.01:
+            unsafe_tags.append(f"risk_of_ruin={meta_rou:.4f}")
         reason = "meta_marked_unsafe"
+        if unsafe_tags:
+            reason = f"{reason}:{'|'.join(unsafe_tags)}"
         ok = False
     elif not meta_stress_ok:
         reason = "meta_stress_failed"
         ok = False
     elif not meta_wfa_ok:
-        reason = "meta_wfa_failed"
+        wfa_tag = (
+            f"{meta_wfa_failed}/{meta_wfa_total}"
+            if meta_wfa_total > 0
+            else "unknown"
+        )
+        reason = f"meta_wfa_failed:{wfa_tag}"
         ok = False
     elif meta_status != "VERIFIED":
         reason = f"meta_not_verified:{meta_status or 'UNKNOWN'}"

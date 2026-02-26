@@ -41,6 +41,10 @@ engine: Any = None
 _tg_available: bool = True
 # Disable global aggregate file log. Each module writes to its own log file.
 _system_log_handler = configure_logging(level="INFO", system_log_name=None, console=True)
+_GATE_STATUS_LOG_TTL_SEC: float = float(os.getenv("GATE_STATUS_LOG_TTL_SEC", "60") or "60")
+_gate_status_log_lock = Lock()
+_gate_status_last_sig: str = ""
+_gate_status_last_ts: float = 0.0
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -66,21 +70,63 @@ def _required_gate_assets() -> tuple[str, ...]:
 def _model_gate_ready() -> tuple[bool, str]:
     details = gate_details(required_assets=_required_gate_assets(), allow_legacy_fallback=True)
     assets = details.get("assets", {}) if isinstance(details, dict) else {}
-    for asset, st in assets.items():
-        try:
-            log.info(
-                "ASSET_GATE_STATUS | asset=%s ok=%s reason=%s version=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f legacy=%s",
-                asset,
-                bool(st.get("ok", False)),
-                str(st.get("reason", "unknown")),
-                str(st.get("model_version", "")),
-                float(st.get("sharpe", 0.0) or 0.0),
-                float(st.get("win_rate", 0.0) or 0.0),
-                float(st.get("max_drawdown_pct", 0.0) or 0.0),
-                bool(st.get("legacy_fallback", False)),
-            )
-        except Exception:
-            continue
+    items = []
+    if isinstance(assets, dict):
+        for asset, st in sorted(assets.items(), key=lambda kv: str(kv[0])):
+            try:
+                items.append(
+                    (
+                        str(asset),
+                        bool(st.get("ok", False)),
+                        str(st.get("reason", "unknown")),
+                        str(st.get("model_version", "")),
+                        float(st.get("sharpe", 0.0) or 0.0),
+                        float(st.get("win_rate", 0.0) or 0.0),
+                        float(st.get("max_drawdown_pct", 0.0) or 0.0),
+                        bool(st.get("legacy_fallback", False)),
+                    )
+                )
+            except Exception:
+                continue
+
+    sig = "|".join(
+        f"{a}:{int(ok)}:{r}:{v}:{s:.3f}:{w:.3f}:{d:.3f}:{int(lg)}"
+        for a, ok, r, v, s, w, d, lg in items
+    )
+    now = time.time()
+    should_log = False
+    global _gate_status_last_sig, _gate_status_last_ts
+    with _gate_status_log_lock:
+        if (sig != _gate_status_last_sig) or ((now - _gate_status_last_ts) >= _GATE_STATUS_LOG_TTL_SEC):
+            _gate_status_last_sig = sig
+            _gate_status_last_ts = now
+            should_log = True
+
+    if should_log:
+        for asset, ok, reason, version, sharpe, win_rate, max_dd, legacy in items:
+            try:
+                log.info(
+                    "ASSET_GATE_STATUS | asset=%s ok=%s reason=%s version=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f legacy=%s",
+                    asset,
+                    ok,
+                    reason,
+                    version,
+                    sharpe,
+                    win_rate,
+                    max_dd,
+                    legacy,
+                )
+            except Exception:
+                continue
+    return bool(details.get("ok", False)), str(details.get("reason", "unknown"))
+
+
+def _single_asset_gate_status(asset: str) -> tuple[bool, str]:
+    asset_u = str(asset or "").upper().strip()
+    details = gate_details(required_assets=(asset_u,), allow_legacy_fallback=True)
+    st = (details.get("assets", {}) or {}).get(asset_u, {})
+    if isinstance(st, dict):
+        return bool(st.get("ok", False)), str(st.get("reason", details.get("reason", "unknown")))
     return bool(details.get("ok", False)), str(details.get("reason", "unknown"))
 
 
@@ -98,23 +144,163 @@ def _partial_gate_assets() -> list[str]:
     return passing
 
 
+def _soft_wfa_fallback_assets(required_assets: Optional[tuple[str, ...]] = None) -> list[str]:
+    """
+    Return assets that only fail WFA but satisfy base safety metrics.
+    Used as last-resort degraded mode when partial gate has zero fully passing assets.
+    """
+    if not _env_truthy("PARTIAL_GATE_ALLOW_WFA_FALLBACK", "1"):
+        return []
+    assets_req = tuple(required_assets or _required_gate_assets())
+    if not assets_req:
+        return []
+    try:
+        details = gate_details(required_assets=assets_req, allow_legacy_fallback=True)
+        asset_map = details.get("assets", {}) if isinstance(details, dict) else {}
+        out: list[str] = []
+        for asset in assets_req:
+            st = asset_map.get(asset, {}) if isinstance(asset_map, dict) else {}
+            if not isinstance(st, dict):
+                continue
+            reason = str(st.get("reason", ""))
+            if not (reason.startswith("state_wfa_failed") or reason.startswith("meta_wfa_failed")):
+                continue
+            if not bool(st.get("real_backtest", False)):
+                continue
+            sharpe = float(st.get("sharpe", 0.0) or 0.0)
+            win_rate = float(st.get("win_rate", 0.0) or 0.0)
+            max_dd_raw = st.get("max_drawdown_pct", 1.0)
+            max_dd = float(1.0 if max_dd_raw is None else max_dd_raw)
+            version = str(st.get("model_version", "") or "").strip()
+            if (
+                sharpe >= MIN_GATE_SHARPE
+                and win_rate >= MIN_GATE_WIN_RATE
+                and max_dd <= MAX_GATE_DRAWDOWN
+                and version
+            ):
+                out.append(asset)
+        return out
+    except Exception:
+        return []
+
+
+def _soft_sample_quality_fallback_assets(required_assets: Optional[tuple[str, ...]] = None) -> list[str]:
+    """
+    Return assets that only fail sample-quality checks while base risk metrics remain strong.
+    This is a degraded-mode fallback for operational continuity.
+    """
+    if not _env_truthy("PARTIAL_GATE_ALLOW_SAMPLE_QUALITY_FALLBACK", "1"):
+        return []
+    assets_req = tuple(required_assets or _required_gate_assets())
+    if not assets_req:
+        return []
+    try:
+        details = gate_details(required_assets=assets_req, allow_legacy_fallback=True)
+        asset_map = details.get("assets", {}) if isinstance(details, dict) else {}
+        out: list[str] = []
+        for asset in assets_req:
+            st = asset_map.get(asset, {}) if isinstance(asset_map, dict) else {}
+            if not isinstance(st, dict):
+                continue
+            reason = str(st.get("reason", "") or "")
+            is_sample_only_unsafe = (
+                (reason.startswith("state_marked_unsafe:") or reason.startswith("meta_marked_unsafe:"))
+                and ("sample_quality_fail" in reason)
+                and ("wfa_fail" not in reason)
+                and ("stress_fail" not in reason)
+                and ("risk_of_ruin=" not in reason)
+            )
+            if not is_sample_only_unsafe:
+                continue
+            if not bool(st.get("real_backtest", False)):
+                continue
+            sharpe = float(st.get("sharpe", 0.0) or 0.0)
+            win_rate = float(st.get("win_rate", 0.0) or 0.0)
+            max_dd_raw = st.get("max_drawdown_pct", 1.0)
+            max_dd = float(1.0 if max_dd_raw is None else max_dd_raw)
+            version = str(st.get("model_version", "") or "").strip()
+            if (
+                sharpe >= MIN_GATE_SHARPE
+                and win_rate >= MIN_GATE_WIN_RATE
+                and max_dd <= MAX_GATE_DRAWDOWN
+                and version
+            ):
+                out.append(asset)
+        return out
+    except Exception:
+        return []
+
+
+def _model_gate_ready_effective() -> tuple[bool, str, list[str]]:
+    """
+    Effective readiness policy:
+    1) strict gate pass
+    2) partial pass (PARTIAL_GATE_MODE=1)
+    3) soft WFA fallback (PARTIAL_GATE_ALLOW_WFA_FALLBACK=1)
+    """
+    gate_ok, gate_reason = _model_gate_ready()
+    required_assets = list(_required_gate_assets())
+    if gate_ok:
+        return True, gate_reason, required_assets
+
+    if not _env_truthy("PARTIAL_GATE_MODE", "1"):
+        return False, gate_reason, []
+
+    passing = _partial_gate_assets()
+    if passing:
+        blocked = sorted(set(required_assets).difference(set(passing)))
+        reason = (
+            f"partial_ok:passing={','.join(passing)}"
+            f" blocked={','.join(blocked) if blocked else '-'}"
+            f" base_reason={gate_reason}"
+        )
+        return True, reason, passing
+
+    soft_wfa_assets = _soft_wfa_fallback_assets(tuple(required_assets))
+    soft_sample_assets = _soft_sample_quality_fallback_assets(tuple(required_assets))
+    soft_assets = sorted(set(soft_wfa_assets).union(set(soft_sample_assets)))
+    if soft_assets:
+        blocked = sorted(set(required_assets).difference(set(soft_assets)))
+        mode_parts: list[str] = []
+        if soft_wfa_assets:
+            mode_parts.append(f"wfa={','.join(soft_wfa_assets)}")
+        if soft_sample_assets:
+            mode_parts.append(f"sample_quality={','.join(soft_sample_assets)}")
+        mode_tag = ";".join(mode_parts) if mode_parts else "mixed"
+        reason = (
+            f"soft_fallback[{mode_tag}]:passing={','.join(soft_assets)}"
+            f" blocked={','.join(blocked) if blocked else '-'}"
+            f" base_reason={gate_reason}"
+        )
+        return True, reason, soft_assets
+
+    return False, gate_reason, []
+
+
 def _models_ready() -> tuple[bool, str]:
     try:
+        ready, reason, active_assets = _model_gate_ready_effective()
+        if not ready:
+            return False, reason
+
         details = gate_details(required_assets=_required_gate_assets(), allow_legacy_fallback=True)
-        gate_ok = bool(details.get("ok", False))
-        gate_reason = str(details.get("reason", "unknown"))
-        if not gate_ok:
-            return False, gate_reason
         assets = details.get("assets", {}) if isinstance(details, dict) else {}
-        for asset in _required_gate_assets():
+        for asset in active_assets:
             st = assets.get(asset, {}) if isinstance(assets, dict) else {}
+            version = str(st.get("model_version", "") or "").strip()
+
             model_path = str(st.get("model_path", "") or "")
-            meta_path = str(st.get("meta_path", "") or "")
+            if (not model_path or not os.path.exists(model_path)) and version:
+                model_path = str(get_artifact_path("models", f"v{version}.pkl"))
             if not model_path or not os.path.exists(model_path):
                 return False, f"{asset}:missing_model_payload"
+
+            meta_path = str(st.get("meta_path", "") or "")
+            if (not meta_path or not os.path.exists(meta_path)) and version:
+                meta_path = str(get_artifact_path("models", f"v{version}.json"))
             if not meta_path or not os.path.exists(meta_path):
                 return False, f"{asset}:missing_model_meta"
-        return True, "ok"
+        return True, reason
     except Exception as exc:
         return False, f"error:{exc}"
 
@@ -198,6 +384,7 @@ def _auto_train_models_strict() -> bool:
     assets_default = ",".join(_required_gate_assets())
     assets_env = str(os.getenv("AUTO_TRAIN_ASSETS", assets_default) or assets_default)
     assets = [a.strip().upper() for a in assets_env.split(",") if a.strip()]
+    retry_hours = float(os.getenv("AUTO_TRAIN_RETRY_HOURS", "3") or "3")
     if not assets:
         assets = list(_required_gate_assets())
     for asset in _required_gate_assets():
@@ -207,6 +394,35 @@ def _auto_train_models_strict() -> bool:
     passed_assets: list[str] = []
     failed_assets: list[str] = []
     for asset in assets:
+        # Backoff guard: don't retrain same asset repeatedly on every restart.
+        if retry_hours > 0:
+            try:
+                st_path = get_artifact_path("models", f"model_state_{asset}.pkl")
+                if st_path.exists():
+                    age_hours = (time.time() - st_path.stat().st_mtime) / 3600.0
+                    if age_hours < retry_hours:
+                        gate_ok_now, gate_reason_now = _single_asset_gate_status(asset)
+                        if gate_ok_now:
+                            log_local.info(
+                                "Auto-train(strict) SKIP | asset=%s reason=recent_state age=%.2fh < %.2fh gate_ok=%s gate_reason=%s",
+                                asset,
+                                age_hours,
+                                retry_hours,
+                                gate_ok_now,
+                                gate_reason_now,
+                            )
+                            passed_assets.append(asset)
+                            continue
+                        log_local.warning(
+                            "Auto-train(strict) FORCE_RETRAIN | asset=%s reason=recent_state_but_gate_failed age=%.2fh < %.2fh gate_reason=%s",
+                            asset,
+                            age_hours,
+                            retry_hours,
+                            gate_reason_now,
+                        )
+            except Exception:
+                pass
+
         # Smart retrain: skip assets that already pass gate
         try:
             details = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
@@ -223,20 +439,23 @@ def _auto_train_models_strict() -> bool:
 
         try:
             metrics = run_institutional_backtest(asset)
-            if _check_backtest_passed(metrics):
+            gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
+            if gate_ok_asset:
                 passed_assets.append(asset)
                 log_local.info(
-                    "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                    "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f gate_reason=%s",
                     asset,
                     float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
                     float(getattr(metrics, "win_rate", 0.0) or 0.0),
                     float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                    gate_reason_asset,
                 )
             else:
                 failed_assets.append(asset)
                 log_local.warning(
-                    "Auto-train(strict) failed quality gate | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                    "Auto-train(strict) failed gate | asset=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
                     asset,
+                    gate_reason_asset,
                     float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
                     float(getattr(metrics, "win_rate", 0.0) or 0.0),
                     float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
@@ -254,23 +473,20 @@ def _auto_train_models_strict() -> bool:
             ",".join(failed_assets),
         )
 
-    post_ok, post_reason = _model_gate_ready()
+    post_ok, post_reason, post_active_assets = _model_gate_ready_effective()
     if post_ok:
+        required_now = set(_required_gate_assets())
+        active_set = set(post_active_assets)
+        if required_now.issubset(active_set):
+            return True
+        log_local.warning(
+            "AUTO_TRAIN_PARTIAL_GATE | active=%s blocked=%s reason=%s",
+            ",".join(post_active_assets) if post_active_assets else "-",
+            ",".join(sorted(required_now.difference(active_set))) if required_now.difference(active_set) else "-",
+            post_reason,
+        )
         return True
-    
-    # Bug #16: Partial gate mode — if at least one asset passes, allow partial startup
-    partial_mode = _env_truthy("PARTIAL_GATE_MODE", "1")
-    if not post_ok and partial_mode:
-        passing = _partial_gate_assets()
-        if passing:
-            log_local.warning(
-                "AUTO_TRAIN_PARTIAL_GATE | passing=%s failed=%s reason=%s",
-                ",".join(passing),
-                ",".join(sorted(set(_required_gate_assets()) - set(passing))),
-                post_reason,
-            )
-            return True  # Allow startup with partial assets
-    
+
     if not passed_required_assets:
         missing = sorted(required_assets.difference(set(passed_assets)))
         log_local.error(
@@ -781,12 +997,21 @@ def _run_retraining_cycle(notifier: Notifier, *, reason: str) -> bool:
             notifier.notify("✅ Бозомӯзӣ анҷом ёфт.\nМодели нав бор шуд.")
             try:
                 engine.reload_model()
-                post_ok, post_reason = _model_gate_ready()
+                post_ok, post_reason, post_active_assets = _model_gate_ready_effective()
                 if not post_ok:
                     log.error("RETRAIN_POSTCHECK_FAILED | reason=%s", post_reason)
                     notifier.notify(f"⚠️ Санҷиши пас аз бозомӯзӣ нагузашт: {post_reason}")
                     success = False
                 else:
+                    required_now = set(_required_gate_assets())
+                    active_set = set(post_active_assets)
+                    if not required_now.issubset(active_set):
+                        log.warning(
+                            "RETRAIN_POSTCHECK_PARTIAL | active=%s blocked=%s reason=%s",
+                            ",".join(post_active_assets) if post_active_assets else "-",
+                            ",".join(sorted(required_now.difference(active_set))) if required_now.difference(active_set) else "-",
+                            post_reason,
+                        )
                     success = True
                 try:
                     engine.clear_manual_stop()
@@ -830,9 +1055,9 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
     last_retrain_check = 0.0
     dry_run_mode = bool(getattr(engine, "dry_run", False))
     if dry_run_mode:
-        gate_ready_at_start, gate_reason_at_start = True, "dry_run_bypass"
+        gate_ready_at_start, gate_reason_at_start, gate_active_assets_at_start = True, "dry_run_bypass", list(_required_gate_assets())
     else:
-        gate_ready_at_start, gate_reason_at_start = _model_gate_ready()
+        gate_ready_at_start, gate_reason_at_start, gate_active_assets_at_start = _model_gate_ready_effective()
     last_gate_retrain_attempt = 0.0 if gate_ready_at_start else time.time()
     retraining_in_progress = False
     gate_block_rl = RateLimiter(30.0)
@@ -845,6 +1070,16 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
             gate_reason_at_start,
             GATE_RETRAIN_COOLDOWN_SEC,
         )
+    else:
+        required_now = set(_required_gate_assets())
+        active_now = set(gate_active_assets_at_start)
+        if not required_now.issubset(active_now):
+            log.warning(
+                "Engine gate started in partial mode | active=%s blocked=%s reason=%s",
+                ",".join(gate_active_assets_at_start) if gate_active_assets_at_start else "-",
+                ",".join(sorted(required_now.difference(active_now))) if required_now.difference(active_now) else "-",
+                gate_reason_at_start,
+            )
 
     while not stop_event.is_set():
         # Cheap status probe first (avoid engine.start() spam)
@@ -895,7 +1130,7 @@ def run_engine_supervisor(stop_event: Event, notifier: Notifier) -> None:
 
         # If gate is blocked, avoid engine.start() spam and trigger controlled retraining.
         if not ok_trading and not retraining_in_progress and not dry_run_mode:
-            gate_ok, gate_reason = _model_gate_ready()
+            gate_ok, gate_reason, _gate_active_assets = _model_gate_ready_effective()
             if not gate_ok:
                 now = time.time()
                 elapsed = now - last_gate_retrain_attempt
@@ -1043,11 +1278,13 @@ def _safe_retrain_models(notifier: Notifier) -> bool:
             
             log.info("Retraining %s model...", asset)
             metrics = run_institutional_backtest(asset)
-            if _check_backtest_passed(metrics):
+            gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
+            if gate_ok_asset:
                 passed_assets.append(asset)
                 log.info(
-                    "Retraining quality gate passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
+                    "Retraining gate passed | asset=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
                     asset,
+                    gate_reason_asset,
                     float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
                     float(getattr(metrics, "win_rate", 0.0) or 0.0),
                     float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
@@ -1055,15 +1292,24 @@ def _safe_retrain_models(notifier: Notifier) -> bool:
             else:
                 failed_assets.append(asset)
                 log.error(
-                    "Retraining quality gate failed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
+                    "Retraining gate failed | asset=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.5f",
                     asset,
+                    gate_reason_asset,
                     float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
                     float(getattr(metrics, "win_rate", 0.0) or 0.0),
                     float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
                 )
-        passed_required = set(required_assets).issubset(set(passed_assets))
-        gate_ok, gate_reason = _model_gate_ready()
-        if passed_required and gate_ok:
+        gate_ok, gate_reason, gate_active_assets = _model_gate_ready_effective()
+        if gate_ok:
+            required_now = set(required_assets)
+            active_set = set(gate_active_assets)
+            if not required_now.issubset(active_set):
+                log.warning(
+                    "RETRAIN_POSTCHECK_PARTIAL | active=%s blocked=%s reason=%s",
+                    ",".join(gate_active_assets) if gate_active_assets else "-",
+                    ",".join(sorted(required_now.difference(active_set))) if required_now.difference(active_set) else "-",
+                    gate_reason,
+                )
             return True
         log.error(
             "RETRAIN_POSTCHECK_FAILED | reason=%s | passed_assets=%s failed_assets=%s required_assets=%s",
@@ -1255,11 +1501,14 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
         ready, reason = _models_ready()
         if not ready:
             log.warning("MODELS_MISSING | reason=%s", reason)
-            ok = _auto_train_models_strict()
-            if ok:
-                log.info("Auto-training completed")
+            if _env_truthy("AUTO_TRAIN_ON_STARTUP", "1"):
+                ok = _auto_train_models_strict()
+                if ok:
+                    log.info("Auto-training completed")
+                else:
+                    log.error("Auto-training failed; continuing startup")
             else:
-                log.error("Auto-training failed; continuing startup")
+                log.warning("AUTO_TRAIN_ON_STARTUP=0 | skipping startup retraining")
 
             try:
                 engine._check_model_health()  # refresh gatekeeper after training

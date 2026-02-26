@@ -12,6 +12,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -37,11 +38,25 @@ except Exception:
 import MetaTrader5 as mt5
 
 from core.model_manager import ModelMetadata, model_manager
-from log_config import LOG_DIR, get_artifact_dir, get_artifact_path
+from log_config import LOG_DIR, get_artifact_dir, get_artifact_path, get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger("backtest.model_train_institutional")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    _fh = RotatingFileHandler(
+        str(get_log_path("backtest_model_train.log")),
+        maxBytes=8 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+        delay=True,
+    )
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(_fmt)
+    log.addHandler(_fh)
 
 _LOG_DIR = LOG_DIR / "model_training_institutional"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,7 +216,7 @@ class InstitutionalTrainConfig:
         "depth": 7,
         "l2_leaf_reg": 3.0,
         "random_seed": 42,
-        "verbose": 100,  # Show progress every 100 iterations
+        "verbose": int(os.getenv("TRAIN_VERBOSE_STEP", "0") or "0"),
         "task_type": "CPU",
         "loss_function": "RMSE",
         "eval_metric": "RMSE",
@@ -255,7 +270,7 @@ BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
         "depth": 7,
         "l2_leaf_reg": 3.0,
         "random_seed": 42,
-        "verbose": 100,  # Show progress every 100 iterations
+        "verbose": int(os.getenv("TRAIN_VERBOSE_STEP", "0") or "0"),
         "task_type": "CPU",
         "loss_function": "RMSE",
         "train_dir": str(_ART_CATBOOST),
@@ -633,13 +648,47 @@ class Pipeline:
 
 
 def _console(msg: str) -> None:
-    """Write directly to the REAL console, bypassing the _StdToLogger wrapper."""
-    try:
-        real_out = getattr(sys, "__stdout__", None) or sys.stdout
-        real_out.write(msg + "\n")
-        real_out.flush()
-    except Exception:
-        pass
+    """Route progress messages to dedicated backtest training log."""
+    txt = str(msg).rstrip()
+    if not txt:
+        return
+    for line in txt.splitlines():
+        line = line.rstrip()
+        if line:
+            log.info(line)
+    # Optional local echo for debugging sessions.
+    if str(os.getenv("BACKTEST_ECHO_CONSOLE", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        try:
+            real_out = getattr(sys, "__stdout__", None) or sys.stdout
+            real_out.write(txt + "\n")
+            real_out.flush()
+        except Exception:
+            pass
+
+
+class _CatBoostLogSink:
+    """File-like sink to capture CatBoost stdout/stderr into logger."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+        self._buf = ""
+
+    def write(self, data: Any) -> None:
+        s = str(data or "")
+        if not s:
+            return
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._logger.info("CATBOOST | %s", line)
+
+    def flush(self) -> None:
+        line = self._buf.strip()
+        if line:
+            self._logger.info("CATBOOST | %s", line)
+        self._buf = ""
 
 
 class RegressionModel:
@@ -648,7 +697,8 @@ class RegressionModel:
     def __init__(self, cfg: InstitutionalTrainConfig) -> None:
         self.cfg = cfg
         self._catboost_fit_kwargs: Dict[str, Any] = {}
-        
+        self._catboost_verbose_step: int = 0
+
         if CatBoostRegressor is not None:
             # Keep fit-only knobs out of constructor kwargs.
             catboost_params = dict(cfg.regressor_params)
@@ -660,8 +710,9 @@ class RegressionModel:
             es_rounds = int(es_rounds_raw or 0)
             use_best_model = bool(catboost_params.pop("use_best_model", True))
 
+            self._catboost_verbose_step = max(0, verbose_step)
             self._catboost_fit_kwargs = {
-                "verbose": verbose_step,
+                "verbose": (self._catboost_verbose_step if self._catboost_verbose_step > 0 else False),
                 "use_best_model": use_best_model,
             }
             if es_rounds > 0:
@@ -694,13 +745,21 @@ class RegressionModel:
         total_iters = int(self.cfg.regressor_params.get("iterations", 3000))
         if announce:
             _console(f"\n   ⏳ Starting model training: {self.cfg.symbol} | backend={self.backend} | iterations={total_iters}")
-            _console(f"   Progress will print every 100 iterations...")
-        
+            if self.backend == "catboost":
+                if self._catboost_verbose_step > 0:
+                    _console(
+                        f"   CatBoost progress every {self._catboost_verbose_step} iterations"
+                        " (logged to backtest_model_train.log)"
+                    )
+                else:
+                    _console("   CatBoost verbose progress disabled (TRAIN_VERBOSE_STEP=0)")
+
         if self.backend == "catboost":
-            # Use CatBoost's built-in verbose=100 for direct console output
-            # This bypasses Python's sys.stdout redirect and writes to real console
             fit_kwargs: Dict[str, Any] = dict(self._catboost_fit_kwargs)
             fit_kwargs["eval_set"] = (X_val, y_val)
+            sink = _CatBoostLogSink(log)
+            fit_kwargs["log_cout"] = sink
+            fit_kwargs["log_cerr"] = sink
             self.model.fit(
                 X_train, y_train,
                 **fit_kwargs,
@@ -709,7 +768,7 @@ class RegressionModel:
             # sklearn HistGradientBoosting
             if announce:
                 _console(f"   Training {self.cfg.symbol}: sklearn HGB ({total_iters} max iterations)...")
-            self.model.set_params(verbose=1)
+            self.model.set_params(verbose=0)
             self.model.fit(X_train, y_train)
         else:
             if announce:
@@ -736,10 +795,10 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
             df = df.rename(columns={"Date": "datetime"}).set_index("datetime")
             df = df[["Open", "High", "Low", "Close", "Volume"]]
             if len(df) > 100:
-                print(f"   Loaded local data: {csv_path} ({len(df)} rows)")
+                log.info("Loaded local data: %s (%s rows)", csv_path, len(df))
                 return df
         except Exception as e:
-            print(f"   Local data load failed: {e}")
+            log.warning("Local data load failed: %s", e)
     
     # Fallback to MT5
     ensure_mt5()
@@ -779,11 +838,11 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
             try:
                 start_dt = datetime.datetime.fromisoformat(start_env).replace(tzinfo=None)
                 end_dt = datetime.datetime.fromisoformat(end_env).replace(tzinfo=None)
-                print(f"   Fetching range: {start_dt} -> {end_dt} ...")
+                log.info("Fetching range: %s -> %s", start_dt, end_dt)
                 rates = mt5.copy_rates_range(mt5_symbol, mt5.TIMEFRAME_M1, start_dt, end_dt)
                 last_err = mt5.last_error()
             except Exception as e:
-                print(f"   Range fetch error: {e}")
+                log.warning("Range fetch error: %s", e)
 
         # 4. Fallback to count-based fetch
         if rates is None or len(rates) == 0:

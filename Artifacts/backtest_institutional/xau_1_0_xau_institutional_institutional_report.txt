@@ -1,0 +1,98 @@
+================================================================================
+  🏛️  INSTITUTIONAL BACKTEST REPORT — XAU (M1)
+  Period: 2026-01-07 04:37:00+00:00 → 2026-02-26 16:01:00+00:00
+================================================================================
+
+  ══════════════════════════════════════════════════════════════════════════
+  RETURNS & PERFORMANCE
+  ──────────────────────────────────────────────────────────────────────────
+    Initial Capital:        $100,000.00
+    Final Capital:          $175,094.33
+    Total Return:           +75.09%
+    Annualized Return:      +378.48%
+    CAGR:                   +5659.42%
+
+  ══════════════════════════════════════════════════════════════════════════
+  RISK-ADJUSTED METRICS (Institutional Standard)
+  ──────────────────────────────────────────────────────────────────────────
+    Sharpe Ratio:           7.592  ✅ (Target: >= 2.0)
+    Sortino Ratio:          95.952
+    Calmar Ratio:           216.958
+    Omega Ratio:            2.853
+    Information Ratio:      0.000
+
+  ══════════════════════════════════════════════════════════════════════════
+  RISK MEASURES
+  ──────────────────────────────────────────────────────────────────────────
+    Max Drawdown:           1.74%  ✅ (Max: 20%)
+    Average Drawdown:       0.56%
+    DD Duration (days):     504
+    Recovery Factor:        43.05
+    Annualized Vol:         49.85%
+    Downside Deviation:     0.25%
+    Value at Risk (95%):    $-72.46
+    CVaR/ES (95%):          $-134.78
+
+  ══════════════════════════════════════════════════════════════════════════
+  ROBUSTNESS & STRESS TESTS
+  ──────────────────────────────────────────────────────────────────────────
+    Risk of Ruin:           0.00%  ✅ (Max: 1.0%)
+    MC Runs:                10,000
+    MC 95% Confidence:      $163,841.35
+    MC Worst Case:          $152,529.08
+    MC Best Case:           $192,231.80
+
+    Walk-Forward:           ❌ FAIL (5/5 windows failed)
+    WFA Avg Sharpe:         1.13
+    WFA Min Sharpe:         -14.22
+
+    Stress Test:            ✅ PASS
+    Scenarios:
+      ✅ flash_crash: Impact=-6978.55
+      ✅ volatility_spike: Impact=-287.11
+
+  ══════════════════════════════════════════════════════════════════════════
+  TRADE STATISTICS
+  ──────────────────────────────────────────────────────────────────────────
+    Total Trades:           3698
+    Win Rate:               50.6%  ❌ (Target: >= 58%)
+    Profit Factor:          2.85
+    Expectancy:             $20.31
+    Expectancy Ratio:       0.92
+
+    Avg Win:                $61.76
+    Avg Loss:               $-22.19
+    Win/Loss Ratio:         2.78
+    Largest Win:            $670.43
+    Largest Loss:           $-331.61
+
+    Max Consecutive Wins:   64
+    Max Consecutive Losses: 50
+    Avg Consecutive Wins:   5.6
+    Avg Consecutive Losses: 5.4
+
+    Avg Duration (min):     0.0
+    Median Duration (min):  0.0
+
+  ══════════════════════════════════════════════════════════════════════════
+  TRANSACTION COSTS (Reality Check)
+  ──────────────────────────────────────────────────────────────────────────
+    Spread Cost:            $6640.18  ($1.80/trade)
+    Slippage Cost:          $7078.20  ($1.91/trade)
+    Commission:             $0.00
+    Swap/Funding:           $0.00
+    Total Fees:             $13718.39
+    Fee Impact:             13.72%
+
+  ══════════════════════════════════════════════════════════════════════════
+  POSITION MANAGEMENT
+  ──────────────────────────────────────────────────────────────────────────
+    Avg Position Size:      0.0%
+    Max Position Size:      0.0%
+    Kelly Optimal:          32.9%
+
+================================================================================
+
+  ❌ DOES NOT MEET INSTITUTIONAL STANDARDS
+
+================================================================================
