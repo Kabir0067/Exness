@@ -19,7 +19,7 @@
         ║                                   ╚═╝     ╚═╝  ╚═╝ ╚═════╝                                 ║
         ║                                                                                            ║
         ║                                INSTITUTIONAL AI TRADING SYSTEM                             ║
-        ║                               Version 2.0 - Autonomous Sniper Edition                      ║
+        ║                               Version 1.0 - Autonomous Sniper Edition                      ║
         ║                                                                                            ║
         ║                               AI-Powered Gold & Bitcoin Trading                            ║
         ║                                   Sub-200ms Execution Speed                                ║

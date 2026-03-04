@@ -1,4 +1,4 @@
-# Bot/bot_utils.py
+﻿# Bot/bot_utils.py
 from __future__ import annotations
 
 import html
@@ -123,7 +123,7 @@ apihelper.CONNECT_TIMEOUT = int(getattr(cfg, "telegram_connect_timeout", 60) or 
 # Git / README Button (inline URL button)
 # =============================================================================
 GIT_README_URL = "https://github.com/Kabir0067/Exness/blob/main/README.md"
-GIT_README_TEXT = "🔗 System information"
+GIT_README_TEXT = "🔗 Маълумоти система"
 
 
 def build_git_readme_keyboard() -> InlineKeyboardMarkup:
@@ -334,7 +334,7 @@ _notify_skip_cache = TTLCache(maxsize=500, ttl_sec=300)
 
 
 def _format_datetime(dt: Optional[datetime] = None, show_date: bool = False, show_time: bool = True) -> str:
-    """Форматирование даты и времени в красивом HTML формате."""
+    """Р¤РѕСЂРјР°С‚РёСЂРѕРІР°РЅРёРµ РґР°С‚С‹ Рё РІСЂРµРјРµРЅРё РІ РєСЂР°СЃРёРІРѕРј HTML С„РѕСЂРјР°С‚Рµ."""
     if dt is None:
         dt = datetime.now()
 
@@ -348,12 +348,12 @@ def _format_datetime(dt: Optional[datetime] = None, show_date: bool = False, sho
 
 
 def _format_time_only() -> str:
-    """Только время в красивом формате."""
+    """РўРѕР»СЊРєРѕ РІСЂРµРјСЏ РІ РєСЂР°СЃРёРІРѕРј С„РѕСЂРјР°С‚Рµ."""
     return f"<code>{datetime.now().strftime('%H:%M:%S')}</code>"
 
 
 def _format_date_time() -> str:
-    """Дата и время в красивом формате."""
+    """Р”Р°С‚Р° Рё РІСЂРµРјСЏ РІ РєСЂР°СЃРёРІРѕРј С„РѕСЂРјР°С‚Рµ."""
     now = datetime.now()
     return f"<b>{now.strftime('%Y-%m-%d')}</b> <code>{now.strftime('%H:%M:%S')}</code>"
 
@@ -561,14 +561,14 @@ def _notify_order_opened(intent: Any, result: Any) -> None:
         conf_pct = conf * 100.0
 
         sltp = f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0 and tp > 0) else "-"
-        direction_emoji = "🟢" if str(intent.signal).lower() == "buy" else "🔴"
+        direction_emoji = "рџџў" if str(intent.signal).lower() == "buy" else "рџ”ґ"
         time_str = _format_time_only()
 
         msg = (
             f"{direction_emoji} <b>{html.escape(str(intent.signal)).upper()}</b> | <b>{html.escape(str(intent.asset))}</b>\n"
-            f"📌 {html.escape(str(intent.symbol))} | #{intent.order_id} | Lot: <b>{float(intent.lot):.4f}</b>\n"
-            f"🏷 <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | 🛡 {sltp}\n"
-            f"🧠 <b>{conf_pct:.1f}%</b> | {time_str}"
+            f"рџ“Њ {html.escape(str(intent.symbol))} | #{intent.order_id} | Lot: <b>{float(intent.lot):.4f}</b>\n"
+            f"рџЏ· <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b> | рџ›Ў {sltp}\n"
+            f"рџ§  <b>{conf_pct:.1f}%</b> | {time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
@@ -602,19 +602,19 @@ def _notify_order_skipped(candidate: Any) -> None:
         reasons_list = getattr(candidate, "reasons", []) or []
         reasons_str = ", ".join(reasons_list) if reasons_list else "Hard Stop / Filter"
 
-        direction_emoji = "🟢" if str(candidate.signal).lower() == "buy" else "🔴"
+        direction_emoji = "рџџў" if str(candidate.signal).lower() == "buy" else "рџ”ґ"
         time_str = _format_time_only()
 
         # User requested actionable message even if blocked
         msg = (
-            f"⚠️ <b>SIGNAL (BLOCKED)</b> | {direction_emoji} <b>{html.escape(str(candidate.signal)).upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💎 <b>{html.escape(str(candidate.asset))}</b> | {html.escape(str(candidate.symbol))}\n"
-            f"📦 Lot: <b>{lot:.2f}</b> | Conf: <b>{conf:.2f}</b>\n"
-            f"🛡 SL/TP: <b>{sltp}</b>\n"
-            f"🚫 Қатъ шуд: <b>{html.escape(reasons_str)}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Агар хоҳед, дастӣ савдо кунед.</i>\n"
+            f"вљ пёЏ <b>SIGNAL (BLOCKED)</b> | {direction_emoji} <b>{html.escape(str(candidate.signal)).upper()}</b>\n"
+            f"в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
+            f"рџ’Ћ <b>{html.escape(str(candidate.asset))}</b> | {html.escape(str(candidate.symbol))}\n"
+            f"рџ“¦ Lot: <b>{lot:.2f}</b> | Conf: <b>{conf:.2f}</b>\n"
+            f"рџ›Ў SL/TP: <b>{sltp}</b>\n"
+            f"рџљ« ТљР°С‚СЉ С€СѓРґ: <b>{html.escape(reasons_str)}</b>\n"
+            f"в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
+            f"<i>РђРіР°СЂ С…РѕТіРµРґ, РґР°СЃС‚УЈ СЃР°РІРґРѕ РєСѓРЅРµРґ.</i>\n"
             f"{time_str}"
         )
         # Non-blocking: push to queue
@@ -629,11 +629,31 @@ def _notify_signal(asset: str, result: Any) -> None:
         if not is_admin_chat(ADMIN):
             return
 
-        sig = str(getattr(result, "signal", "Neutral"))
-        if sig == "Neutral":
+        def _field(name: str, default: Any = None) -> Any:
+            if isinstance(result, dict):
+                return result.get(name, default)
+            return getattr(result, name, default)
+
+        sig_raw = str(_field("signal", "Neutral") or "Neutral").strip()
+        sig_norm = sig_raw.upper()
+        if sig_norm in ("BUY", "STRONG BUY"):
+            sig = "Buy"
+        elif sig_norm in ("SELL", "STRONG SELL"):
+            sig = "Sell"
+        else:
+            sig = sig_raw
+
+        if sig not in ("Buy", "Sell"):
             return
 
-        conf = float(getattr(result, "confidence", 0.0) or 0.0)
+        sid = str(_field("signal_id", "") or "").strip()
+        if sid:
+            cache_key = f"signal_notify:{sid}"
+            if _notify_skip_cache.get(cache_key):
+                return
+            _notify_skip_cache.set(cache_key, True)
+
+        conf = float(_field("confidence", 0.0) or 0.0)
         # Scale if > 1
         if conf > 1.05:
             conf = conf / 100.0
@@ -642,28 +662,49 @@ def _notify_signal(asset: str, result: Any) -> None:
         # Basic filter (optional, engine usually filters this)
         if conf < 0.50:
             return
-            
-        direction_emoji = "🟢" if sig.lower() == "buy" else "🔴"
+
+        direction_emoji = "рџџў" if sig.lower() == "buy" else "рџ”ґ"
         time_str = _format_time_only()
-        
+
         # Prepare reasons
-        reasons_list = getattr(result, "reasons", []) or []
+        reasons_raw = _field("reasons", [])
+        if isinstance(reasons_raw, (list, tuple, set)):
+            reasons_list = [str(x) for x in reasons_raw if str(x).strip()]
+        elif reasons_raw:
+            reasons_list = [str(reasons_raw)]
+        else:
+            reasons_list = []
         reasons_str = ", ".join(reasons_list[:3]) if reasons_list else "-"
 
+        phase = str(_field("phase", "") or "").strip().upper()
+        blocked = bool(_field("blocked", False))
+        lot = float(_field("lot", 0.0) or 0.0)
+        order_id = str(_field("order_id", "") or "").strip()
+
+        extra = ""
+        if lot > 0.0:
+            extra += f"\nрџ“¦ Lot: <b>{lot:.4f}</b>"
+        if order_id:
+            extra += f"\nрџ§· Queue ID: <b>{html.escape(order_id)}</b>"
+
+        title = "рџ“Ў <b>SIGNAL DETECTED</b>"
+        if blocked or phase == "C":
+            title = "вљ пёЏ <b>PHASE C SHADOW SIGNAL</b>"
+
         msg = (
-            f"📡 <b>SIGNAL DETECTED</b> | {direction_emoji} <b>{html.escape(sig).upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💎 <b>{html.escape(str(asset))}</b>\n"
-            f"🧠 Confidence: <b>{conf*100:.1f}%</b>\n"
-            f"🔍 Reasons: {html.escape(reasons_str)}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{title} | {direction_emoji} <b>{html.escape(sig).upper()}</b>\n"
+            f"в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
+            f"рџ’Ћ <b>{html.escape(str(asset))}</b>\n"
+            f"рџ§  Confidence: <b>{conf*100:.1f}%</b>\n"
+            f"рџ”Ќ Reasons: {html.escape(reasons_str)}\n"
+            f"{extra}"
+            f"в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
             f"<i>Execution pending...</i>\n"
             f"{time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
         return
-
 
 def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str = "") -> None:
     try:
@@ -672,7 +713,7 @@ def _notify_phase_change(asset: str, old_phase: str, new_phase: str, reason: str
         reason_line = f" | <b>{reason}</b>" if reason else ""
         time_str = _format_time_only()
         msg = (
-            f"🔄 <b>{asset}</b>: <b>{old_phase}</b> → <b>{new_phase}</b>{reason_line}\n"
+            f"рџ”„ <b>{asset}</b>: <b>{old_phase}</b> в†’ <b>{new_phase}</b>{reason_line}\n"
             f"{time_str}"
         )
         # Non-blocking: push to queue, don't wait for Telegram
@@ -688,8 +729,8 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
         reason_line = f" | <b>{reason}</b>" if reason else ""
         time_str = _format_time_only()
         msg = (
-            f"🛑 <b>{asset}</b> қатъ шуд{reason_line}\n"
-            f"✅ Барои оғоз: /buttons → «🚀 Оғози Тиҷорат»\n"
+            f"рџ›‘ <b>{asset}</b> Т›Р°С‚СЉ С€СѓРґ{reason_line}\n"
+            f"вњ… Р‘Р°СЂРѕРё РѕТ“РѕР·: /buttons в†’ В«рџљЂ РћТ“РѕР·Рё РўРёТ·РѕСЂР°С‚В»\n"
             f"{time_str}"
         )
         # Non-blocking: push to queue, don't wait for Telegram
@@ -704,8 +745,8 @@ def _notify_daily_start(asset: str, day: str) -> None:
             return
         time_str = _format_time_only()
         msg = (
-            f"🌅 <b>{asset}</b> | Рӯзи нав: <b>{day}</b>\n"
-            f"✅ Лимитҳо ва омор аз нав ҳисоб шуданд\n"
+            f"рџЊ… <b>{asset}</b> | Р УЇР·Рё РЅР°РІ: <b>{day}</b>\n"
+            f"вњ… Р›РёРјРёС‚ТіРѕ РІР° РѕРјРѕСЂ Р°Р· РЅР°РІ ТіРёСЃРѕР± С€СѓРґР°РЅРґ\n"
             f"{time_str}"
         )
         # Non-blocking: push to queue, don't wait for Telegram
@@ -725,13 +766,13 @@ def deny(message: types.Message) -> None:
         return
 
     msg = (
-        "🔒 <b>PRIVATE ACCESS ONLY</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🇬🇧 This bot is private. Access denied.\n"
-        "🇷🇺 Бот приватный. Доступ ограничен.\n"
-        "🇹🇯 Бот хусусӣ. Дастрасӣ маҳдуд.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👤 Owner: @kabir_0067"
+        "рџ”’ <b>PRIVATE ACCESS ONLY</b>\n"
+        "в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
+        "рџ‡¬рџ‡§ This bot is private. Access denied.\n"
+        "рџ‡·рџ‡є Р‘РѕС‚ РїСЂРёРІР°С‚РЅС‹Р№. Р”РѕСЃС‚СѓРї РѕРіСЂР°РЅРёС‡РµРЅ.\n"
+        "рџ‡№рџ‡Ї Р‘РѕС‚ С…СѓСЃСѓСЃУЈ. Р”Р°СЃС‚СЂР°СЃУЈ РјР°ТіРґСѓРґ.\n"
+        "в”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓв”Ѓ\n"
+        "рџ‘¤ Owner: @kabir_0067"
     )
 
     _bot_ref.send_message(
@@ -810,7 +851,7 @@ def _format_status_message(status: Any) -> str:
 
     active_icon = "🟢" if getattr(status, "trading", False) else "🔴"
     trading_status = "ON" if getattr(status, "trading", False) else "OFF"
-    mt5_state = "✓" if getattr(status, "connected", False) else "✗"
+    mt5_state = "✅" if getattr(status, "connected", False) else "✗"
     balance = float(getattr(status, "balance", 0.0))
     equity = float(getattr(status, "equity", 0.0))
     today_pnl = float(getattr(status, "today_pnl", 0.0))
@@ -838,9 +879,9 @@ def _format_status_message(status: Any) -> str:
 
 def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     text = (
-        "📜 <b>DAILY TRADING SUMMARY</b>\n"
+        "📜 <b>Хулосаи савдои рӯзона</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Date: <b>{summary.get('date', '-')}</b>\n"
+        f"📅 Сана: <b>{summary.get('date', '-')}</b>\n"
     )
 
     total_closed = int(summary.get("total_closed", 0) or 0)
@@ -865,7 +906,7 @@ def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
 
     if total_open > 0:
         unrealized = float(summary.get("unrealized_pnl", 0.0) or 0.0)
-        text += f"🔓 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized:+.2f}$</b>\n"
+        text += f"🕒 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized:+.2f}$</b>\n"
 
     balance = float(summary.get("balance", 0.0) or 0.0)
     text += f"\n💰 <b>{balance:.2f}$</b>\n"
@@ -909,44 +950,44 @@ def _build_sl_usd_keyboard(min_usd: int = SL_USD_MIN, max_usd: int = SL_USD_MAX,
             for i in range(int(min_usd), int(max_usd) + 1)
         ]
     )
-    kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
+    kb.add(InlineKeyboardButton(text="вќЊ Р‘РµРєРѕСЂ", callback_data=f"{SL_CALLBACK_PREFIX}cancel"))
     return kb
 
 
 def build_ai_keyboard() -> InlineKeyboardMarkup:
-    """AI меню: XAU/BTC + Intraday."""
+    """AI РјРµРЅСЋ: XAU/BTC + Intraday."""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton(text="🥇 Xau Ai", callback_data=f"{AI_CALLBACK_PREFIX}xau_scalp"),
-        InlineKeyboardButton(text="₿ Btc Ai", callback_data=f"{AI_CALLBACK_PREFIX}btc_scalp"),
+        InlineKeyboardButton(text="рџҐ‡ Xau Ai", callback_data=f"{AI_CALLBACK_PREFIX}xau_scalp"),
+        InlineKeyboardButton(text="в‚ї Btc Ai", callback_data=f"{AI_CALLBACK_PREFIX}btc_scalp"),
     )
     kb.row(
-        InlineKeyboardButton(text="📈 Xau Intraday", callback_data=f"{AI_CALLBACK_PREFIX}xau_intraday"),
-        InlineKeyboardButton(text="📉 Btc Intraday", callback_data=f"{AI_CALLBACK_PREFIX}btc_intraday"),
+        InlineKeyboardButton(text="рџ“€ Xau Intraday", callback_data=f"{AI_CALLBACK_PREFIX}xau_intraday"),
+        InlineKeyboardButton(text="рџ“‰ Btc Intraday", callback_data=f"{AI_CALLBACK_PREFIX}btc_intraday"),
     )
     return kb
 
 
 def build_helpers_keyboard() -> InlineKeyboardMarkup:
-    """Ёвариҳо: TP/SL + харид/фурӯш (монанд ба TP/SL — аввал интихоб, баъд шумора)."""
+    """РЃРІР°СЂРёТіРѕ: TP/SL + С…Р°СЂРёРґ/С„СѓСЂУЇС€ (РјРѕРЅР°РЅРґ Р±Р° TP/SL вЂ” Р°РІРІР°Р» РёРЅС‚РёС…РѕР±, Р±Р°СЉРґ С€СѓРјРѕСЂР°)."""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton(text="📈 Take Profit", callback_data=f"{HELPER_CALLBACK_PREFIX}tp"),
-        InlineKeyboardButton(text="🛡 Stop Loss", callback_data=f"{HELPER_CALLBACK_PREFIX}sl"),
+        InlineKeyboardButton(text="рџ“€ Take Profit", callback_data=f"{HELPER_CALLBACK_PREFIX}tp"),
+        InlineKeyboardButton(text="рџ›Ў Stop Loss", callback_data=f"{HELPER_CALLBACK_PREFIX}sl"),
     )
     kb.row(
-        InlineKeyboardButton(text="🟢 BTC ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_btc"),
-        InlineKeyboardButton(text="🔴 BTC ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_btc"),
+        InlineKeyboardButton(text="рџџў BTC в†‘ РҐР°СЂРёРґ", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_btc"),
+        InlineKeyboardButton(text="рџ”ґ BTC в†“ Р¤СѓСЂУЇС€", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_btc"),
     )
     kb.row(
-        InlineKeyboardButton(text="🟢 XAU ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_xau"),
-        InlineKeyboardButton(text="🔴 XAU ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_xau"),
+        InlineKeyboardButton(text="рџџў XAU в†‘ РҐР°СЂРёРґ", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_xau"),
+        InlineKeyboardButton(text="рџ”ґ XAU в†“ Р¤СѓСЂУЇС€", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_xau"),
     )
     return kb
 
 
 def build_helper_order_count_keyboard(action: str) -> InlineKeyboardMarkup:
-    """Тугмаҳои рақами 2,4,6,8,10,12,14,16 барои ордеркушои (монанд ба TP/SL)."""
+    """РўСѓРіРјР°ТіРѕРё СЂР°Т›Р°РјРё 2,4,6,8,10,12,14,16 Р±Р°СЂРѕРё РѕСЂРґРµСЂРєСѓС€РѕРё (РјРѕРЅР°РЅРґ Р±Р° TP/SL)."""
     kb = InlineKeyboardMarkup(row_width=4)
     kb.add(
         *[
@@ -954,20 +995,20 @@ def build_helper_order_count_keyboard(action: str) -> InlineKeyboardMarkup:
             for c in HELPER_ORDER_COUNTS
         ]
     )
-    kb.add(InlineKeyboardButton(text="❌ Бекор", callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel"))
+    kb.add(InlineKeyboardButton(text="вќЊ Р‘РµРєРѕСЂ", callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel"))
     return kb
 
 
 def format_close_by_profit_result(res: Dict[str, Any]) -> str:
-    """Формати натиҷаи «бастани фақат фоидадор» барои пайғоми бот."""
+    """Р¤РѕСЂРјР°С‚Рё РЅР°С‚РёТ·Р°Рё В«Р±Р°СЃС‚Р°РЅРё С„Р°Т›Р°С‚ С„РѕРёРґР°РґРѕСЂВ» Р±Р°СЂРѕРё РїР°Р№Т“РѕРјРё Р±РѕС‚."""
     closed = int(res.get("closed", 0) or 0)
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
-    status_emoji = "✅" if ok else "⚠️"
-    lines = [f"{status_emoji} <b>Бастани фоидадор:</b> <b>{closed}</b>"]
+    status_emoji = "вњ…" if ok else "вљ пёЏ"
+    lines = [f"{status_emoji} <b>Р‘Р°СЃС‚Р°РЅРё С„РѕРёРґР°РґРѕСЂ:</b> <b>{closed}</b>"]
     if errors:
         preview = " | ".join(html.escape(str(e))[:25] for e in errors[:2])
-        lines.append(f"⚠️ <code>{preview}</code>")
+        lines.append(f"вљ пёЏ <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -978,13 +1019,13 @@ def _format_sl_result(usd: float, res: dict) -> str:
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
 
-    status_emoji = "✅" if ok else "⚠️"
-    lines = [f"{status_emoji} <b>SL: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"]
+    status_emoji = "вњ…" if ok else "вљ пёЏ"
+    lines = [f"{status_emoji} <b>SL: {usd:.0f}$</b> | РќР°РІСЃРѕР·УЈ: <b>{updated}/{total}</b>"]
     if skipped > 0:
-        lines.append(f"⏭️ Skip: <b>{skipped}</b>")
+        lines.append(f"вЏ­пёЏ Skip: <b>{skipped}</b>")
     if errors:
         preview = " | ".join(html.escape(str(e))[:30] for e in errors[:3])
-        lines.append(f"⚠️ <code>{preview}</code>")
+        lines.append(f"вљ пёЏ <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -994,18 +1035,18 @@ _orders_kb_cache = TTLCache(maxsize=256, ttl_sec=120.0)
 
 
 def format_order(order_data: Dict[str, Any]) -> str:
-    direction_emoji = "🟢" if order_data.get("type") == "BUY" else "🔴"
+    direction_emoji = "рџџў" if order_data.get("type") == "BUY" else "рџ”ґ"
     direction_text = "BUY" if order_data.get("type") == "BUY" else "SELL"
     ticket = order_data.get("ticket", "-")
     symbol = order_data.get("symbol", "-")
     volume = float(order_data.get("volume", 0.0) or 0.0)
     price = float(order_data.get("price", 0.0) or 0.0)
     profit = float(order_data.get("profit", 0.0) or 0.0)
-    profit_emoji = "🟢" if profit >= 0 else "🔴"
+    profit_emoji = "рџџў" if profit >= 0 else "рџ”ґ"
 
     return (
         f"{direction_emoji} <b>{direction_text}</b> | <b>{html.escape(str(symbol))}</b> | #{ticket}\n"
-        f"📦 <b>{volume:.2f}</b> | 🏷 <b>{price:.5f}</b> | {profit_emoji} <b>{profit:+.2f}$</b>"
+        f"рџ“¦ <b>{volume:.2f}</b> | рџЏ· <b>{price:.5f}</b> | {profit_emoji} <b>{profit:+.2f}$</b>"
     )
 
 
@@ -1019,59 +1060,59 @@ def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     row: list[InlineKeyboardButton] = []
 
     if index > 0:
-        row.append(InlineKeyboardButton("⬅️ Пеш", callback_data=f"orders:nav:{index-1}"))
+        row.append(InlineKeyboardButton("в¬…пёЏ РџРµС€", callback_data=f"orders:nav:{index-1}"))
     row.append(InlineKeyboardButton(f"{index+1}/{total}", callback_data="noop"))
     if index < total - 1:
-        row.append(InlineKeyboardButton("Баъд ➡️", callback_data=f"orders:nav:{index+1}"))
+        row.append(InlineKeyboardButton("Р‘Р°СЉРґ вћЎпёЏ", callback_data=f"orders:nav:{index+1}"))
 
     if row:
         kb.row(*row)
-    kb.row(InlineKeyboardButton("❌ Бастан ин ордер", callback_data=f"orders:close:{ticket}:{index}"))
-    kb.row(InlineKeyboardButton("🔒 Пӯшидан", callback_data="orders:close_view"))
+    kb.row(InlineKeyboardButton("вќЊ Р‘Р°СЃС‚Р°РЅ РёРЅ РѕСЂРґРµСЂ", callback_data=f"orders:close:{ticket}:{index}"))
+    kb.row(InlineKeyboardButton("рџ”’ РџУЇС€РёРґР°РЅ", callback_data="orders:close_view"))
 
     _orders_kb_cache.set(key, kb)
     return kb
 
 
 def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
-    """Компактный профессиональный формат отчета."""
+    """РљРѕРјРїР°РєС‚РЅС‹Р№ РїСЂРѕС„РµСЃСЃРёРѕРЅР°Р»СЊРЅС‹Р№ С„РѕСЂРјР°С‚ РѕС‚С‡РµС‚Р°."""
     try:
         date_from = report.get("date_from", "")
         date_to = report.get("date_to", "")
         date_str = report.get("date", "")
 
-        if not date_from and period_name == "Имрӯза":
+        if not date_from and period_name == "РРјСЂУЇР·Р°":
             date_str = datetime.now().strftime("%Y-%m-%d")
             date_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
             date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         period_map = {
-            "Имрӯза": "📊 РӮЗОНА",
-            "Ҳафтаина": "📊 ҲАФТАИНА",
-            "Моҳона": "📊 МОҲОНА",
-            "Пурра (Аз ибтидо)": "📊 ПУРРА",
+            "РРјСЂУЇР·Р°": "рџ“Љ Р У®Р—РћРќРђ",
+            "ТІР°С„С‚Р°РёРЅР°": "рџ“Љ ТІРђР¤РўРђРРќРђ",
+            "РњРѕТіРѕРЅР°": "рџ“Љ РњРћТІРћРќРђ",
+            "РџСѓСЂСЂР° (РђР· РёР±С‚РёРґРѕ)": "рџ“Љ РџРЈР Р Рђ",
         }
-        title = period_map.get(period_name, f"📊 {period_name.upper()}")
+        title = period_map.get(period_name, f"рџ“Љ {period_name.upper()}")
 
         text = f"<b>{title}</b>\n"
 
         if date_from and date_to:
             try:
-                if period_name == "Пурра (Аз ибтидо)":
+                if period_name == "РџСѓСЂСЂР° (РђР· РёР±С‚РёРґРѕ)":
                     df = date_from.split()[0] if " " in date_from else date_from
                     dt = date_to.split()[0] if " " in date_to else date_to
-                    text += f"<b>{df}</b> → <b>{dt}</b>\n"
+                    text += f"<b>{df}</b> в†’ <b>{dt}</b>\n"
                 else:
                     df = date_from.split()[0] if " " in date_from else date_from
                     dt_time = date_to.split()[1] if " " in date_to else ""
                     dt_date = date_to.split()[0] if " " in date_to else date_to
                     if dt_time:
                         df_time = date_from.split()[1] if " " in date_from else ""
-                        text += f"<b>{df}</b> <code>{df_time}</code> → <b>{dt_date}</b> <code>{dt_time}</code>\n"
+                        text += f"<b>{df}</b> <code>{df_time}</code> в†’ <b>{dt_date}</b> <code>{dt_time}</code>\n"
                     else:
-                        text += f"<b>{df}</b> → <b>{dt_date}</b>\n"
+                        text += f"<b>{df}</b> в†’ <b>{dt_date}</b>\n"
             except Exception:
-                text += f"<b>{date_from}</b> → <b>{date_to}</b>\n"
+                text += f"<b>{date_from}</b> в†’ <b>{date_to}</b>\n"
         elif date_str:
             text += f"<b>{date_str}</b>\n"
 
@@ -1085,26 +1126,26 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
         unrealized_pnl = float(report.get("unrealized_pnl", 0.0) or 0.0)
 
         if total_closed > 0:
-            pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+            pnl_emoji = "рџџў" if net_pnl >= 0 else "рџ”ґ"
             win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
             profit_factor = profit / loss if loss > 0 else (profit if profit > 0 else 0.0)
 
             text += (
                 f"\n{pnl_emoji} <b>P&L: {net_pnl:+.2f}$</b>\n"
-                f"📊 {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>"
+                f"рџ“Љ {wins}W/{losses}L | WR: <b>{win_rate:.1f}%</b>"
             )
             if profit_factor > 0:
                 text += f" | PF: <b>{profit_factor:.2f}</b>"
-            text += f"\n💹 +{profit:.2f}$ | 📉 -{loss:.2f}$\n"
+            text += f"\nрџ’№ +{profit:.2f}$ | рџ“‰ -{loss:.2f}$\n"
         else:
-            text += "\n🚫 Ордерҳои басташуда: 0\n"
+            text += "\nрџљ« РћСЂРґРµСЂТіРѕРё Р±Р°СЃС‚Р°С€СѓРґР°: 0\n"
 
         if total_open > 0:
-            text += f"🔓 Кушода: <b>{total_open}</b> | P&L: <b>{unrealized_pnl:+.2f}$</b>\n"
+            text += f"рџ”“ РљСѓС€РѕРґР°: <b>{total_open}</b> | P&L: <b>{unrealized_pnl:+.2f}$</b>\n"
 
         return text
     except Exception as exc:
-        return f"⚠️ <code>{exc}</code>"
+        return f"вљ пёЏ <code>{exc}</code>"
 
 
 def check_full_program() -> tuple[bool, str]:
@@ -1118,7 +1159,7 @@ def check_full_program() -> tuple[bool, str]:
             with MT5_LOCK:
                 acc = mt5.account_info()
             if not acc:
-                issues.append("MT5 Account Info дастрас нест.")
+                issues.append("MT5 Account Info РґР°СЃС‚СЂР°СЃ РЅРµСЃС‚.")
         except Exception as exc:
             issues.append(f"MT5 Connection failed: {exc}")
     else:
@@ -1130,9 +1171,9 @@ def check_full_program() -> tuple[bool, str]:
     btc_pipe = getattr(engine, "_btc", None)
 
     if not xau_pipe or not btc_pipe:
-        issues.append("Portfolio Pipelines (XAU/BTC) ҳанӯз сохта нашудаанд (Engine not started?).")
+        issues.append("Portfolio Pipelines (XAU/BTC) ТіР°РЅУЇР· СЃРѕС…С‚Р° РЅР°С€СѓРґР°Р°РЅРґ (Engine not started?).")
     else:
-        # XAU: игнорируем ошибки в выходные дни (суббота/воскресенье)
+        # XAU: РёРіРЅРѕСЂРёСЂСѓРµРј РѕС€РёР±РєРё РІ РІС‹С…РѕРґРЅС‹Рµ РґРЅРё (СЃСѓР±Р±РѕС‚Р°/РІРѕСЃРєСЂРµСЃРµРЅСЊРµ)
         if not xau_pipe.last_market_ok:
             if market_is_open("XAU"):
                 reason = str(xau_pipe.last_market_reason or "")
@@ -1161,8 +1202,9 @@ def check_full_program() -> tuple[bool, str]:
         telemetry = ""
 
     if issues:
-        summary = "⚠️ <b>Мушкилот ёфт шуд</b>:\n" + "\n".join(f"• {i}" for i in issues)
+        summary = "вљ пёЏ <b>РњСѓС€РєРёР»РѕС‚ С‘С„С‚ С€СѓРґ</b>:\n" + "\n".join(f"вЂў {i}" for i in issues)
         return False, summary + ("\n" + telemetry if telemetry else "")
 
-    ok_note = "✅ <b>Санҷиш анҷом ёфт</b>\nҲамаи модулҳо (XAU + BTC) дуруст фаъоланд."
+    ok_note = "вњ… <b>РЎР°РЅТ·РёС€ Р°РЅТ·РѕРј С‘С„С‚</b>\nТІР°РјР°Рё РјРѕРґСѓР»ТіРѕ (XAU + BTC) РґСѓСЂСѓСЃС‚ С„Р°СЉРѕР»Р°РЅРґ."
     return True, ok_note + ("\n" + telemetry if telemetry else "")
+

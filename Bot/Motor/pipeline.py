@@ -8,7 +8,7 @@ from typing import Any, Optional, Tuple
 import MetaTrader5 as mt5
 
 from ExnessAPI.functions import market_is_open
-from mt5_client import MT5_LOCK
+from mt5_client import MT5_LOCK, mt5_async_call
 
 from .logging_setup import log_err, log_health
 from .models import AssetCandidate
@@ -282,8 +282,12 @@ class _AssetPipeline:
             # ==============================================================
             try:
                 symbol = getattr(self.cfg.symbol_params, "resolved", None) or getattr(self.cfg.symbol_params, "base", "")
-                with MT5_LOCK:
-                    tick = mt5.symbol_info_tick(symbol)
+                tick = mt5_async_call(
+                    "symbol_info_tick",
+                    symbol,
+                    timeout=0.35,
+                    default=None,
+                )
                 if tick is not None:
                     tick_time = getattr(tick, "time", 0)
                     if tick_time > 0:

@@ -1,4 +1,5 @@
-"""Centralized logging configuration for the Exness trading stack.
+"""
+Centralized logging configuration for the Exness trading stack.
 
 All modules should import LOG_DIR (or helpers) from here to ensure
 consistent log paths under the project root (./Logs by default).
@@ -6,12 +7,12 @@ consistent log paths under the project root (./Logs by default).
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Final, Iterable, Optional, Union
-
 import logging
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Final, Iterable, Optional, Union
 
 __all__ = [
     "LOG_DIR",
@@ -24,15 +25,63 @@ __all__ = [
     "attach_global_handler_to_loggers",
 ]
 
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
 _BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 
-LOG_DIR = (_BASE_DIR / "Logs").resolve()
-ARTIFACTS_DIR = (_BASE_DIR / "Artifacts").resolve()
+LOG_DIR: Final[Path] = (_BASE_DIR / "Logs").resolve()
+ARTIFACTS_DIR: Final[Path] = (_BASE_DIR / "Artifacts").resolve()
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# -----------------------------------------------------------------------------
+# Internal helpers (safe + idempotent)
+# -----------------------------------------------------------------------------
+_CFG_LOCK = threading.Lock()
 
+
+def _stdout_stream():
+    # ensures console output even if sys.stdout is redirected
+    return getattr(sys, "__stdout__", sys.stdout)
+
+
+def _fmt() -> logging.Formatter:
+    return logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+
+def _as_level(level: Union[str, int]) -> Union[str, int]:
+    # Keep compatibility with logging.setLevel accepting str/int.
+    # But validate unknown strings early (prevents silent misconfig).
+    if isinstance(level, int):
+        return int(level)
+    s = str(level).upper().strip()
+    if s.isdigit():
+        return int(s)
+    if s in logging._nameToLevel:  # type: ignore[attr-defined]
+        return s
+    raise ValueError(f"Invalid log level: {level!r}")
+
+
+def _find_file_handler(root: logging.Logger, base_filename: str) -> Optional[RotatingFileHandler]:
+    for h in root.handlers:
+        if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == base_filename:
+            return h
+    return None
+
+
+def _find_console_handler(root: logging.Logger) -> Optional[logging.StreamHandler]:
+    # CRITICAL FIX: FileHandler is also a StreamHandler -> must exclude FileHandler
+    for h in root.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            return h
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 def configure_logging(
     *,
     level: Union[str, int] = "INFO",
@@ -42,72 +91,84 @@ def configure_logging(
     backup_count: int = 7,
 ) -> Optional[RotatingFileHandler]:
     """
-    Global logger bootstrap:
-    - Root logger at INFO level
+    Global logger bootstrap (idempotent + production-safe):
+    - Root logger configured to `level`
     - Optional rotating file handler (disabled when system_log_name is None/empty)
-    - Optional console handler
-    - Captures warnings
+    - Optional console handler (stdout)
+    - Captures warnings via logging.captureWarnings(True)
+
+    Returns the rotating file handler instance if enabled, else None.
     """
-    root = logging.getLogger()
-    root.setLevel(level)
+    lvl = _as_level(level)
 
-    handler: Optional[RotatingFileHandler] = None
-    if system_log_name:
-        log_path = get_log_path(system_log_name)
-        handler = RotatingFileHandler(
-            str(log_path),
-            maxBytes=int(max_bytes),
-            backupCount=int(backup_count),
-            encoding="utf-8",
-            delay=True,
-        )
-        handler.setLevel(level)
-        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    with _CFG_LOCK:
+        root = logging.getLogger()
+        root.setLevel(lvl)
 
-        # Avoid duplicate handlers
-        if not any(
-            isinstance(h, RotatingFileHandler)
-            and getattr(h, "baseFilename", "") == handler.baseFilename
-            for h in root.handlers
-        ):
-            root.addHandler(handler)
+        file_handler: Optional[RotatingFileHandler] = None
+        if system_log_name:
+            log_path = get_log_path(system_log_name)
+            base_fn = str(log_path)
 
-    if console:
-        if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-            ch = logging.StreamHandler(stream=getattr(sys, "__stdout__", sys.stdout))
-            ch.setLevel(level)
-            ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
-            root.addHandler(ch)
+            existing = _find_file_handler(root, base_fn)
+            if existing is not None:
+                existing.setLevel(lvl)
+                existing.setFormatter(_fmt())
+                file_handler = existing
+            else:
+                fh = RotatingFileHandler(
+                    base_fn,
+                    maxBytes=int(max_bytes),
+                    backupCount=int(backup_count),
+                    encoding="utf-8",
+                    delay=True,
+                )
+                fh.setLevel(lvl)
+                fh.setFormatter(_fmt())
+                root.addHandler(fh)
+                file_handler = fh
 
-    logging.captureWarnings(True)
+        if console:
+            ch = _find_console_handler(root)
+            if ch is None:
+                ch = logging.StreamHandler(stream=_stdout_stream())
+                root.addHandler(ch)
+            ch.setLevel(lvl)
+            ch.setFormatter(_fmt())
 
-    # Attach to existing non-propagating loggers only when file handler is enabled.
-    attach_global_handler_to_loggers(handler)
-    return handler
+        logging.captureWarnings(True)
+
+        # Attach file handler to non-propagating loggers only when file handler exists.
+        attach_global_handler_to_loggers(file_handler)
+
+        return file_handler
 
 
 def attach_global_handler_to_loggers(
-    handler: logging.Handler,
+    handler: Optional[logging.Handler],
     names: Optional[Iterable[str]] = None,
 ) -> None:
     """
     Attach a global handler to existing loggers with propagate=False.
-    If names provided, only matches exact names or name-prefixes.
+    If names provided, matches exact names or name-prefixes (name or name.*).
     """
     if handler is None:
         return
-    prefixes = list(names or [])
+
+    prefixes = tuple(names or ())
     for name, obj in logging.root.manager.loggerDict.items():
         if not isinstance(obj, logging.Logger):
             continue
+
         if prefixes:
-            match = False
+            ok = False
             for p in prefixes:
                 if name == p or name.startswith(f"{p}."):
-                    match = True
+                    ok = True
                     break
-            if not match:
+            if not ok:
                 continue
+
         if obj.propagate:
             continue
         if handler in obj.handlers:
@@ -117,7 +178,6 @@ def attach_global_handler_to_loggers(
 
 def get_log_path(*parts: str) -> Path:
     """Return a path inside LOG_DIR, creating parent directories if needed."""
-
     path = LOG_DIR.joinpath(*parts)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -148,8 +208,9 @@ def log_dir_stats() -> tuple[int, int]:
         for p in LOG_DIR.rglob("*"):
             try:
                 if p.is_file():
+                    st = p.stat()
                     count += 1
-                    total += int(p.stat().st_size)
+                    total += int(st.st_size)
             except Exception:
                 continue
     except Exception:

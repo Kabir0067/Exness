@@ -23,6 +23,21 @@ from .utils import _is_finite, _side_norm, clamp01
 
 log = logging.getLogger("core.signal_engine")
 
+_DUMMY_LOCK = None
+
+
+def _mt5_lock():
+    global _DUMMY_LOCK
+    # Lazy import avoids hard dependency and circular imports at module load.
+    try:
+        from mt5_client import MT5_LOCK as lock  # type: ignore
+        return lock
+    except Exception:
+        if _DUMMY_LOCK is None:
+            import threading
+            _DUMMY_LOCK = threading.RLock()
+        return _DUMMY_LOCK
+
 
 class SignalEngine:
     """
@@ -61,6 +76,9 @@ class SignalEngine:
         self._last_bar_key: str = ""
         self._last_signal_id: str = ""
         self._weights_cache: Optional[Dict[str, float]] = None
+        self._macro_symbol_cache: Dict[str, Optional[str]] = {}
+        self._macro_ctx_cache_ts: float = 0.0
+        self._macro_ctx_cache: Dict[str, float] = {}
 
         log.info(
             "SignalEngine(%s) initialized | tf=%s/%s/%s",
@@ -186,6 +204,11 @@ class SignalEngine:
                 dfh = dfl
             else:
                 dfh = self._get_rates_df(sym, "H1", bars=120)
+            # Dedicated H4 stream for institutional flow confluence gate.
+            if str(self.sp.tf_long).upper() == "H4":
+                dfh4 = dfl
+            else:
+                dfh4 = self._get_rates_df(sym, "H4", bars=120)
 
             # ── 1b. Volatility circuit breaker (Black Swan) ──
             if self._rm.check_volatility_circuit_breaker(dfp):
@@ -200,6 +223,10 @@ class SignalEngine:
                 self.sp.tf_confirm: dfc if dfc is not None else dfp,
                 self.sp.tf_long: dfl if dfl is not None else dfp,
             }
+            if dfh is not None and len(dfh) > 0:
+                df_dict["H1"] = dfh
+            if dfh4 is not None and len(dfh4) > 0:
+                df_dict["H4"] = dfh4
 
             try:
                 indicators = self._fe.compute_indicators(df_dict, shift=1)
@@ -212,6 +239,8 @@ class SignalEngine:
             indp = indicators.get(self.sp.tf_primary, {})
             indc = indicators.get(self.sp.tf_confirm, {})
             indl = indicators.get(self.sp.tf_long, {})
+            ind_h1 = indicators.get("H1", {})
+            ind_h4 = indicators.get("H4", {})
 
             if not indp:
                 return self._neutral(sym, ["no_primary_indicators"], t0)
@@ -223,6 +252,13 @@ class SignalEngine:
 
             spread_pct = (ask - bid) / bid if bid > 0 else 0.0
             bar_key = self._bar_key(dfp)
+            if bar_key != "no_bar":
+                if bar_key == self._last_bar_key:
+                    return self._neutral(
+                        sym, ["same_bar_dedup"], t0,
+                        spread_pct=spread_pct, bar_key=bar_key,
+                    )
+                self._last_bar_key = bar_key
 
             # BTC flash-crash guard
             flash_ok, flash_reason = self._flash_crash_guard(dfp)
@@ -238,7 +274,13 @@ class SignalEngine:
             atr_val = float(indp.get("atr", 0.0))
 
             # Tick stats from feed
-            tick_stats = getattr(self._feed, "tick_stats", None)
+            tick_stats = None
+            tick_stats_fn = getattr(self._feed, "tick_stats", None)
+            if callable(tick_stats_fn):
+                try:
+                    tick_stats = tick_stats_fn(dfp)
+                except TypeError:
+                    tick_stats = tick_stats_fn()
             tick_ok = True
             tick_reason = ""
             if tick_stats is not None:
@@ -272,9 +314,15 @@ class SignalEngine:
                 )
 
             # ── 5. Ensemble scoring ──
-            book = getattr(self._feed, "order_book", {})
-            if not isinstance(book, dict):
-                book = {}
+            book = {}
+            fetch_book_fn = getattr(self._feed, "fetch_book", None)
+            if callable(fetch_book_fn):
+                try:
+                    book = fetch_book_fn(levels=20) or {}
+                except Exception:
+                    book = {}
+            elif isinstance(getattr(self._feed, "order_book", None), dict):
+                book = getattr(self._feed, "order_book", {})
 
             score_result = self._ensemble_score(
                 indp, indc, indl, book, adapt, spread_pct, tick_stats,
@@ -305,6 +353,39 @@ class SignalEngine:
             cl_bonus = self._confirm_layer(ext, sweep, div, near_rn)
             conf = min(100, conf + cl_bonus)
 
+            # Stop-hunt dominance: trade with trap resolution, not against it.
+            try:
+                sh_side = str(indp.get("stop_hunt_side", "") or "")
+                sh_strength = float(indp.get("stop_hunt_strength", 0.0) or 0.0)
+                sh_min = float(getattr(self.cfg, "stop_hunt_min_strength", 0.30) or 0.30)
+                if signal_dir in ("Buy", "Sell") and abs(sh_strength) >= sh_min:
+                    aligned = (signal_dir == "Buy" and sh_strength > 0.0) or (
+                        signal_dir == "Sell" and sh_strength < 0.0
+                    )
+                    if aligned:
+                        bonus = int(max(0, int(getattr(self.cfg, "stop_hunt_align_bonus", 8) or 8)))
+                        conf = min(100, conf + bonus)
+                        reasons.append(f"stop_hunt_align:{sh_side}:{sh_strength:+.2f}")
+                    else:
+                        veto_thr = float(
+                            getattr(self.cfg, "stop_hunt_conflict_veto_strength", 0.55) or 0.55
+                        )
+                        if abs(sh_strength) >= veto_thr:
+                            return self._neutral(
+                                sym,
+                                reasons + [f"stop_hunt_conflict_veto:{sh_side}:{sh_strength:+.2f}"],
+                                t0,
+                                confidence=conf,
+                                spread_pct=spread_pct,
+                                bar_key=bar_key,
+                                trade_blocked=True,
+                            )
+                        pen = int(max(0, int(getattr(self.cfg, "stop_hunt_conflict_penalty", 16) or 16)))
+                        conf = max(0, conf - pen)
+                        reasons.append(f"stop_hunt_conflict:{sh_side}:{sh_strength:+.2f}")
+            except Exception:
+                pass
+
             # Volume gate
             vol_ok = self._sniper_volume_gate(dfp, last_age=last_bar_age)
             if not vol_ok:
@@ -323,7 +404,18 @@ class SignalEngine:
                 reasons.append("conformal_warn")
 
             # Apply filters
-            signal_dir, conf = self._apply_filters(signal_dir, conf, indp, indc, indl, reasons, dfd=dfd)
+            signal_dir, conf = self._apply_filters(
+                signal_dir,
+                conf,
+                indp,
+                indc,
+                indl,
+                reasons,
+                dfd=dfd,
+                ind_h1=ind_h1,
+                ind_h4=ind_h4,
+                df_m15=(dfl if dfl is not None else dfp),
+            )
 
             # Cap confidence by strength
             conf = self._cap_conf_by_strength(conf, net_abs)
@@ -390,7 +482,8 @@ class SignalEngine:
     def _tick_bid_ask(self, sym: str) -> Tuple[float, float]:
         try:
             if mt5 is not None:
-                tick = mt5.symbol_info_tick(sym)
+                with _mt5_lock():
+                    tick = mt5.symbol_info_tick(sym)
                 if tick:
                     return float(tick.bid), float(tick.ask)
             # Fallback to feed
@@ -402,10 +495,12 @@ class SignalEngine:
 
     def _bar_key(self, df: pd.DataFrame) -> str:
         try:
-            last = df.iloc[-1]
+            if df is None or len(df) == 0:
+                return "no_bar"
+            idx = -2 if len(df) >= 2 else -1
+            last = df.iloc[idx]
             t = last.get("time", 0)
-            c = last.get("close", 0)
-            return f"{t}_{c}"
+            return str(int(float(t) or 0))
         except Exception:
             return "no_bar"
 
@@ -534,6 +629,26 @@ class SignalEngine:
 
     # ─── Scoring system ──────────────────────────────────────────────
 
+    @staticmethod
+    def _book_imbalance(book: Dict[str, Any]) -> float:
+        """Compute top-of-book pressure imbalance in [-1, +1]."""
+        try:
+            if not isinstance(book, dict):
+                return 0.0
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            if not bids or not asks:
+                return 0.0
+            bid_vol = float(np.sum([float(v) for _, v in bids[:20]]))
+            ask_vol = float(np.sum([float(v) for _, v in asks[:20]]))
+            denom = bid_vol + ask_vol
+            if denom <= 0.0:
+                return 0.0
+            imb = (bid_vol - ask_vol) / denom
+            return max(-1.0, min(1.0, float(imb)))
+        except Exception:
+            return 0.0
+
     def _ensemble_score(
         self,
         indp: Dict[str, Any],
@@ -557,12 +672,26 @@ class SignalEngine:
           - Momentum Score (20 pts): RSI zone + MACD crossover + histogram direction
           - Volatility Score (15 pts): ATR regime + BB width
           - Structure Score (15 pts): FVG + liquidity sweep + order blocks
-          - Flow Score (10 pts): Tick imbalance + book pressure
+          - Flow Score (10 pts): OFI-style blend from book/tick imbalance
+          - Tick Momentum (10 pts): Micro-trend pressure from tick stream
+          - Volume Delta (10 pts): Signed flow imbalance from delta statistics
           - Mean-Reversion Score (10 pts): BB touch + RSI extremes
         """
         weights = self._get_base_weights()
 
-        trend = self._trend_score(indp, indc, indl, adapt.get("regime", "normal"))
+        h1_slope = 0.0
+        try:
+            h1_slope = self._linreg_slope_norm(self._close_array(dfh), window=20)
+        except Exception:
+            h1_slope = 0.0
+
+        trend = self._trend_score(
+            indp,
+            indc,
+            indl,
+            adapt.get("regime", "normal"),
+            h1_slope=h1_slope,
+        )
         momentum = self._momentum_score(indp, indc)
         meanrev = self._meanrev_score(indp, adapt.get("regime", "normal"))
         structure = self._structure_score(indp)
@@ -577,12 +706,36 @@ class SignalEngine:
         else:
             vol_score = 0.2
 
-        # Flow score from tick stats
-        flow_score = 0.0
+        # Microstructure edge stack:
+        # - flow_imb: OFI-style pressure from tick/book imbalance
+        # - vol_delta: signed volume delta proxy from tick stream
+        # - tick_mom: normalized micro-trend pressure
+        tick_imb = 0.0
+        tick_delta = 0.0
+        aggr_delta = 0.0
+        micro_trend = 0.0
         if tick_stats is not None:
             imb = getattr(tick_stats, "imbalance", 0.0)
-            flow_score = abs(float(imb)) if _is_finite(imb) else 0.0
-            flow_score = min(1.0, flow_score)
+            td = getattr(tick_stats, "tick_delta", 0.0)
+            ad = getattr(tick_stats, "aggr_delta", td)
+            mt = getattr(tick_stats, "micro_trend", 0.0)
+            tick_imb = float(imb) if _is_finite(imb) else 0.0
+            tick_delta = float(td) if _is_finite(td) else 0.0
+            aggr_delta = float(ad) if _is_finite(ad) else 0.0
+            micro_trend = float(mt) if _is_finite(mt) else 0.0
+        tick_imb = max(-1.0, min(1.0, tick_imb))
+        tick_delta = max(-1.0, min(1.0, tick_delta))
+        aggr_delta = max(-1.0, min(1.0, aggr_delta))
+        book_imb = self._book_imbalance(book)
+        flow_imb = max(-1.0, min(1.0, 0.55 * tick_imb + 0.45 * book_imb))
+
+        vol_delta = max(-1.0, min(1.0, 0.60 * tick_delta + 0.40 * aggr_delta))
+        tstat_ref = float(getattr(self.sp, "micro_tstat_thresh", 0.5) or 0.5)
+        tstat_ref = max(1e-6, tstat_ref)
+        tick_mom = max(-1.0, min(1.0, micro_trend / tstat_ref))
+
+        micro_edge = max(-1.0, min(1.0, 0.45 * flow_imb + 0.35 * vol_delta + 0.20 * tick_mom))
+        flow_score = abs(micro_edge)
 
         # Momentum ignition (early move trigger)
         ignition_score = self._momentum_ignition_score(dfp)
@@ -615,13 +768,25 @@ class SignalEngine:
         buy_score += vol_score * weights["volatility"] * 0.5
         sell_score += vol_score * weights["volatility"] * 0.5
 
-        # Flow
-        if tick_stats is not None and hasattr(tick_stats, "imbalance"):
-            imb = float(getattr(tick_stats, "imbalance", 0.0))
-            if imb > 0:
-                buy_score += flow_score * weights["flow"]
-            else:
-                sell_score += flow_score * weights["flow"]
+        # Flow (OFI-style combined edge)
+        if micro_edge > 0.0:
+            buy_score += flow_score * weights.get("flow", 0.0)
+        elif micro_edge < 0.0:
+            sell_score += flow_score * weights.get("flow", 0.0)
+
+        # Explicit tick-momentum weighting
+        tick_mom_w = float(weights.get("tick_momentum", 0.0) or 0.0)
+        if tick_mom > 0.0:
+            buy_score += abs(tick_mom) * tick_mom_w
+        elif tick_mom < 0.0:
+            sell_score += abs(tick_mom) * tick_mom_w
+
+        # Explicit volume-delta weighting
+        vol_delta_w = float(weights.get("volume_delta", 0.0) or 0.0)
+        if vol_delta > 0.0:
+            buy_score += abs(vol_delta) * vol_delta_w
+        elif vol_delta < 0.0:
+            sell_score += abs(vol_delta) * vol_delta_w
 
         # Ignition adds directional weight before lagging confirmation closes.
         if ignition_score > 0.0 and dfp is not None and len(dfp) >= 22:
@@ -684,7 +849,12 @@ class SignalEngine:
         reasons.append(f"struct={struct_val:.2f}")
         reasons.append(f"mr={mr_val:.2f}")
         reasons.append(f"vol={vol_score:.2f}")
-        reasons.append(f"flow={flow_score:.2f}")
+        reasons.append(f"ofi={flow_imb:+.2f}")
+        reasons.append(f"vd={vol_delta:+.2f}")
+        reasons.append(f"tm={tick_mom:+.2f}")
+        reasons.append(f"flow={micro_edge:+.2f}")
+        reasons.append(f"sh={float(indp.get('stop_hunt_strength', 0.0) or 0.0):+.2f}")
+        reasons.append(f"obp={float(indp.get('ob_pretouch_bias', 0.0) or 0.0):+.2f}")
         reasons.append(f"ign={ignition_score:.2f}")
         d1_tag = "aligned" if d1_aligned else "conflict_or_flat"
         reasons.append(f"d1={d1_val:+.2f}:{d1_tag}")
@@ -709,6 +879,8 @@ class SignalEngine:
         indc: Dict[str, Any],
         indl: Dict[str, Any],
         regime: str,
+        *,
+        h1_slope: float = 0.0,
     ) -> Dict[str, float]:
         """[-1, +1]: EMA stack + ADX + H1 slope alignment."""
         score = 0.0
@@ -731,7 +903,8 @@ class SignalEngine:
             score *= 0.5
 
         # H1 slope
-        h1_slope = float(indl.get("linreg_slope", 0))
+        if not _is_finite(h1_slope):
+            h1_slope = float(indl.get("linreg_slope", 0))
         if h1_slope > 0.3:
             score += 0.2
         elif h1_slope < -0.3:
@@ -1041,6 +1214,15 @@ class SignalEngine:
         elif "bear" in ob:
             score -= 0.2
 
+        # Stop-hunt signed strength: +bull trap resolution / -bear trap resolution.
+        sh = float(indp.get("stop_hunt_strength", 0.0) or 0.0)
+        score += float(np.clip(sh, -1.0, 1.0)) * 0.35
+
+        # Pre-touch order-block bias for early anticipatory entries.
+        ob_bias = float(indp.get("ob_pretouch_bias", 0.0) or 0.0)
+        ob_touch = float(indp.get("ob_touch_proximity", 0.0) or 0.0)
+        score += float(np.clip(ob_bias, -1.0, 1.0)) * (0.20 + 0.10 * float(np.clip(ob_touch, 0.0, 1.0)))
+
         # Round number proximity
         near_rn = bool(indp.get("near_round", False))
         if near_rn:
@@ -1098,7 +1280,9 @@ class SignalEngine:
                 return True
             last_vol = float(vols[-1])
             ratio = last_vol / med
-            return ratio >= 0.3
+            thr = float(getattr(self.cfg, "low_volume_sniper", 0.15) or 0.15)
+            thr = max(0.05, min(1.0, thr))
+            return ratio >= thr
         except Exception:
             return True
 
@@ -1125,6 +1309,18 @@ class SignalEngine:
         if self._weights_cache is not None:
             return self._weights_cache
         raw = dict(self.cfg.weights)
+        for k, v in {
+            "trend": 24.0,
+            "momentum": 15.0,
+            "volatility": 10.0,
+            "structure": 12.0,
+            "flow": 15.0,
+            "tick_momentum": 12.0,
+            "volume_delta": 8.0,
+            "mean_reversion": 4.0,
+        }.items():
+            if k not in raw:
+                raw[k] = float(v)
         total = sum(raw.values())
         if total <= 0:
             total = 100.0
@@ -1209,6 +1405,9 @@ class SignalEngine:
         indl: Optional[Dict[str, Any]] = None,
         reasons: Optional[List[str]] = None,
         dfd: Optional[pd.DataFrame] = None,
+        ind_h1: Optional[Dict[str, Any]] = None,
+        ind_h4: Optional[Dict[str, Any]] = None,
+        df_m15: Optional[pd.DataFrame] = None,
     ) -> Tuple[str, int]:
         """Apply final safety filters."""
         # ADX filter
@@ -1250,6 +1449,29 @@ class SignalEngine:
             if mult < 1.0:
                 conf = int(conf * mult)
 
+        # Hard MTF institutional flow gate (H1/H4 veto).
+        if signal in ("Buy", "Sell"):
+            signal, conf = self._apply_hard_mtf_confluence(
+                signal=signal,
+                conf=conf,
+                ind_h1=(ind_h1 or {}),
+                ind_h4=(ind_h4 or {}),
+                reasons=reasons,
+            )
+            if signal == "Neutral":
+                return signal, conf
+
+        # XAU macro gate from DXY + US10Y pressure.
+        if signal in ("Buy", "Sell"):
+            signal, conf = self._apply_macro_gate_xau(
+                signal=signal,
+                conf=conf,
+                reasons=reasons,
+                df_m15=df_m15,
+            )
+            if signal == "Neutral":
+                return signal, conf
+
         # D1 conflict penalty (daily trend opposes signal)
         if signal in ("Buy", "Sell") and dfd is not None:
             try:
@@ -1268,6 +1490,293 @@ class SignalEngine:
             except Exception:
                 pass
 
+        return signal, conf
+
+    def _institutional_flow_score(self, ind: Dict[str, Any]) -> float:
+        """Directional flow proxy in [-1, +1] from trend, slope, structure, and trap context."""
+        if not ind:
+            return 0.0
+        score = 0.0
+        trend = str(ind.get("trend", "") or "").lower()
+        if trend == "bull":
+            score += 0.30
+        elif trend == "bear":
+            score -= 0.30
+
+        slope = float(ind.get("linreg_slope", 0.0) or 0.0)
+        score += float(np.tanh(slope * 10.0)) * 0.28
+
+        mh = float(ind.get("macd_hist", 0.0) or 0.0)
+        score += float(np.tanh(mh * 12.0)) * 0.18
+
+        sweep = str(ind.get("sweep", "") or "")
+        if "bull" in sweep:
+            score += 0.10
+        elif "bear" in sweep:
+            score -= 0.10
+
+        ob = str(ind.get("order_block", "") or "")
+        if "bull" in ob:
+            score += 0.08
+        elif "bear" in ob:
+            score -= 0.08
+
+        sh = float(ind.get("stop_hunt_strength", 0.0) or 0.0)
+        score += float(np.clip(sh, -1.0, 1.0)) * 0.16
+
+        ob_bias = float(ind.get("ob_pretouch_bias", 0.0) or 0.0)
+        score += float(np.clip(ob_bias, -1.0, 1.0)) * 0.10
+
+        return float(np.clip(score, -1.0, 1.0))
+
+    def _apply_hard_mtf_confluence(
+        self,
+        *,
+        signal: str,
+        conf: int,
+        ind_h1: Dict[str, Any],
+        ind_h4: Dict[str, Any],
+        reasons: Optional[List[str]],
+    ) -> Tuple[str, int]:
+        if not bool(getattr(self.cfg, "mtf_hard_gate_enabled", True)):
+            return signal, conf
+        h1 = self._institutional_flow_score(ind_h1)
+        h4 = self._institutional_flow_score(ind_h4)
+        h1_gate = float(getattr(self.cfg, "mtf_h1_flow_gate", 0.18) or 0.18)
+        h4_gate = float(getattr(self.cfg, "mtf_h4_flow_gate", 0.22) or 0.22)
+        h4_veto = bool(getattr(self.cfg, "mtf_h4_veto_enabled", True))
+        is_buy = signal == "Buy"
+
+        h1_conflict = (is_buy and h1 < -h1_gate) or ((not is_buy) and h1 > h1_gate)
+        h4_conflict = (is_buy and h4 < -h4_gate) or ((not is_buy) and h4 > h4_gate)
+
+        if h4_conflict and h4_veto:
+            if reasons is not None:
+                reasons.append(f"mtf_h4_veto:h1={h1:+.2f}|h4={h4:+.2f}")
+            return "Neutral", 0
+
+        if h1_conflict and h4_conflict:
+            if reasons is not None:
+                reasons.append(f"mtf_h1_h4_conflict:h1={h1:+.2f}|h4={h4:+.2f}")
+            return "Neutral", 0
+
+        if h1_conflict or h4_conflict:
+            conf = int(conf * 0.70)
+            if reasons is not None:
+                reasons.append(f"mtf_partial_conflict:h1={h1:+.2f}|h4={h4:+.2f}")
+        else:
+            if reasons is not None:
+                reasons.append(f"mtf_aligned:h1={h1:+.2f}|h4={h4:+.2f}")
+        return signal, conf
+
+    @staticmethod
+    def _tf_enum(tf: str) -> Optional[int]:
+        if mt5 is None:
+            return None
+        t = str(tf or "").upper().strip()
+        if t == "M1":
+            return int(getattr(mt5, "TIMEFRAME_M1", 0) or 0)
+        if t == "M5":
+            return int(getattr(mt5, "TIMEFRAME_M5", 0) or 0)
+        if t == "M15":
+            return int(getattr(mt5, "TIMEFRAME_M15", 0) or 0)
+        if t == "H1":
+            return int(getattr(mt5, "TIMEFRAME_H1", 0) or 0)
+        if t == "H4":
+            return int(getattr(mt5, "TIMEFRAME_H4", 0) or 0)
+        return None
+
+    def _resolve_macro_symbol(self, key: str, candidates: List[str]) -> Optional[str]:
+        k = str(key).upper().strip()
+        if k in self._macro_symbol_cache:
+            return self._macro_symbol_cache[k]
+        resolved: Optional[str] = None
+        try:
+            with _mt5_lock():
+                for sym in candidates:
+                    info = mt5.symbol_info(sym) if mt5 is not None else None
+                    if info is None:
+                        continue
+                    try:
+                        if not bool(getattr(info, "visible", True)):
+                            mt5.symbol_select(sym, True)
+                    except Exception:
+                        pass
+                    resolved = sym
+                    break
+                if resolved is None and mt5 is not None:
+                    symbols = mt5.symbols_get()
+                    if symbols:
+                        names = [str(getattr(s, "name", "")) for s in symbols]
+                        for needle in candidates:
+                            nu = needle.upper()
+                            hit = next((n for n in names if nu in n.upper()), None)
+                            if hit:
+                                resolved = hit
+                                break
+        except Exception:
+            resolved = None
+        self._macro_symbol_cache[k] = resolved
+        return resolved
+
+    def _fetch_close_array(self, symbol: str, tf: str, bars: int) -> Optional[np.ndarray]:
+        tf_id = self._tf_enum(tf)
+        if tf_id is None or tf_id <= 0 or not symbol:
+            return None
+        try:
+            with _mt5_lock():
+                rates = mt5.copy_rates_from_pos(symbol, tf_id, 0, int(max(32, bars)))
+            if rates is None or len(rates) < 16:
+                return None
+            raw = pd.DataFrame(rates)
+            if "close" not in raw.columns:
+                return None
+            arr = pd.to_numeric(raw["close"], errors="coerce").to_numpy(dtype=np.float64)
+            arr = arr[np.isfinite(arr)]
+            if arr.size < 16:
+                return None
+            return arr
+        except Exception:
+            return None
+
+    def _macro_context_xau(self, df_m15: Optional[pd.DataFrame]) -> Dict[str, float]:
+        ttl = float(getattr(self.cfg, "macro_gate_ttl_sec", 15.0) or 15.0)
+        now = time.time()
+        if self._macro_ctx_cache and (now - self._macro_ctx_cache_ts) <= max(1.0, ttl):
+            return dict(self._macro_ctx_cache)
+
+        ctx = {
+            "bias": 0.0,
+            "dxy_z": 0.0,
+            "us10y_z": 0.0,
+            "corr_dxy": 0.0,
+            "corr_us10y": 0.0,
+            "ready": 0.0,
+        }
+        try:
+            if mt5 is None:
+                self._macro_ctx_cache = ctx
+                self._macro_ctx_cache_ts = now
+                return dict(ctx)
+
+            dxy_sym = self._resolve_macro_symbol(
+                "DXY", ["DXY", "DXYm", "USDX", "USDXm", "DX1!", "DOLLAR", "USDINDEX"]
+            )
+            us10y_sym = self._resolve_macro_symbol(
+                "US10Y", ["US10Y", "US10Ym", "UST10Y", "US10YT", "TNX", "US10Y.cash"]
+            )
+            dxy_c = self._fetch_close_array(dxy_sym or "", "M15", 320) if dxy_sym else None
+            us_c = self._fetch_close_array(us10y_sym or "", "M15", 320) if us10y_sym else None
+            if dxy_c is None and us_c is None:
+                self._macro_ctx_cache = ctx
+                self._macro_ctx_cache_ts = now
+                return dict(ctx)
+
+            if df_m15 is not None and len(df_m15) >= 32:
+                ccol = "close" if "close" in df_m15.columns else ("Close" if "Close" in df_m15.columns else None)
+                if ccol is not None:
+                    x = pd.to_numeric(df_m15[ccol], errors="coerce").to_numpy(dtype=np.float64)
+                    x = x[np.isfinite(x)]
+                else:
+                    x = np.array([], dtype=np.float64)
+            else:
+                x = np.array([], dtype=np.float64)
+
+            def _z_last(arr: Optional[np.ndarray]) -> float:
+                if arr is None or arr.size < 70:
+                    return 0.0
+                r = np.diff(arr) / np.maximum(arr[:-1], 1e-12)
+                if r.size < 65:
+                    return 0.0
+                hist = r[-65:-1]
+                mu = float(np.mean(hist))
+                sd = float(np.std(hist))
+                if sd <= 1e-12:
+                    return 0.0
+                return float((r[-1] - mu) / sd)
+
+            dxy_z = _z_last(dxy_c)
+            us_z = _z_last(us_c)
+            w_dxy = float(getattr(self.cfg, "macro_dxy_weight", 0.60) or 0.60)
+            w_us = float(getattr(self.cfg, "macro_us10y_weight", 0.40) or 0.40)
+            raw = -(w_dxy * dxy_z + w_us * us_z)
+            bias = float(np.tanh(raw))
+
+            corr_dxy = 0.0
+            corr_us = 0.0
+            if x.size >= 80:
+                xr = np.diff(x) / np.maximum(x[:-1], 1e-12)
+                if dxy_c is not None and dxy_c.size >= 80:
+                    dr = np.diff(dxy_c) / np.maximum(dxy_c[:-1], 1e-12)
+                    m = min(len(xr), len(dr), 120)
+                    if m >= 30:
+                        corr_dxy = float(np.corrcoef(xr[-m:], dr[-m:])[0, 1])
+                        if not np.isfinite(corr_dxy):
+                            corr_dxy = 0.0
+                if us_c is not None and us_c.size >= 80:
+                    ur = np.diff(us_c) / np.maximum(us_c[:-1], 1e-12)
+                    m = min(len(xr), len(ur), 120)
+                    if m >= 30:
+                        corr_us = float(np.corrcoef(xr[-m:], ur[-m:])[0, 1])
+                        if not np.isfinite(corr_us):
+                            corr_us = 0.0
+
+            ctx = {
+                "bias": float(np.clip(bias, -1.0, 1.0)),
+                "dxy_z": float(np.clip(dxy_z, -5.0, 5.0)),
+                "us10y_z": float(np.clip(us_z, -5.0, 5.0)),
+                "corr_dxy": float(np.clip(corr_dxy, -1.0, 1.0)),
+                "corr_us10y": float(np.clip(corr_us, -1.0, 1.0)),
+                "ready": 1.0,
+            }
+        except Exception:
+            pass
+
+        self._macro_ctx_cache = dict(ctx)
+        self._macro_ctx_cache_ts = now
+        return dict(ctx)
+
+    def _apply_macro_gate_xau(
+        self,
+        *,
+        signal: str,
+        conf: int,
+        reasons: Optional[List[str]],
+        df_m15: Optional[pd.DataFrame],
+    ) -> Tuple[str, int]:
+        if "XAU" not in str(self.sp.base).upper():
+            return signal, conf
+        if not bool(getattr(self.cfg, "macro_gate_enabled", True)):
+            return signal, conf
+        ctx = self._macro_context_xau(df_m15)
+        if float(ctx.get("ready", 0.0)) < 0.5:
+            return signal, conf
+        bias = float(ctx.get("bias", 0.0) or 0.0)
+        block = float(getattr(self.cfg, "macro_bias_block", 0.28) or 0.28)
+        pen = float(getattr(self.cfg, "macro_bias_penalty", 0.12) or 0.12)
+
+        conflict = (signal == "Buy" and bias < 0.0) or (signal == "Sell" and bias > 0.0)
+        hard_conflict = (signal == "Buy" and bias <= -abs(block)) or (signal == "Sell" and bias >= abs(block))
+
+        if hard_conflict:
+            if reasons is not None:
+                reasons.append(
+                    "macro_veto:"
+                    f"bias={bias:+.2f}|dxy_z={float(ctx.get('dxy_z', 0.0)):+.2f}|"
+                    f"us10y_z={float(ctx.get('us10y_z', 0.0)):+.2f}"
+                )
+            return "Neutral", 0
+        if conflict:
+            conf = int(conf * max(0.0, 1.0 - abs(pen)))
+            if reasons is not None:
+                reasons.append(
+                    "macro_conflict:"
+                    f"bias={bias:+.2f}|dxy_z={float(ctx.get('dxy_z', 0.0)):+.2f}|"
+                    f"us10y_z={float(ctx.get('us10y_z', 0.0)):+.2f}"
+                )
+        else:
+            if reasons is not None:
+                reasons.append(f"macro_aligned:bias={bias:+.2f}")
         return signal, conf
 
     # ─── Finalize ────────────────────────────────────────────────────
@@ -1334,7 +1843,8 @@ class SignalEngine:
         """Get current position info for the symbol."""
         try:
             if mt5 is not None:
-                positions = mt5.positions_get(symbol=sym)
+                with _mt5_lock():
+                    positions = mt5.positions_get(symbol=sym)
                 if positions:
                     return {
                         "count": len(positions),

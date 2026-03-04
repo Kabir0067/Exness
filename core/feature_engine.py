@@ -296,6 +296,13 @@ class FeatureEngine:
         fvg = self._detect_fvg(df, atr)
         sweep = self._liquidity_sweep(df, atr_last=atr_last, z_volume=z_vol, adx=adx)
         ob = self._order_block(df, atr_last=atr_last, v=v, z_vol_series=z_vol_series)
+        stop_hunt_side, stop_hunt_strength = self._stop_hunt_profile(
+            df=df,
+            atr_last=atr_last,
+            z_volume=z_vol,
+            sweep=sweep,
+        )
+        ob_touch_prox, ob_pretouch_bias = self._order_block_pretouch(df=df, atr_last=atr_last)
         near_rn = self._near_round_number(price=close_last, atr=atr_last)
 
         # ── Anomalies ──
@@ -366,6 +373,10 @@ class FeatureEngine:
             "fvg": fvg,
             "sweep": sweep,
             "order_block": ob,
+            "stop_hunt_side": stop_hunt_side,
+            "stop_hunt_strength": float(stop_hunt_strength),
+            "ob_touch_proximity": float(ob_touch_prox),
+            "ob_pretouch_bias": float(ob_pretouch_bias),
             "near_round": near_rn,
             "divergence": div,
             "forecast": forecast,
@@ -580,6 +591,107 @@ class FeatureEngine:
         except Exception:
             pass
         return ""
+
+    def _stop_hunt_profile(
+        self,
+        *,
+        df: pd.DataFrame,
+        atr_last: float,
+        z_volume: float,
+        sweep: str,
+    ) -> Tuple[str, float]:
+        """
+        Stop-hunt interpretation:
+          - bull_sweep -> bear_trap (bullish response likely)
+          - bear_sweep -> bull_trap (bearish response likely)
+        Returns (side, signed_strength in [-1, +1]).
+        """
+        try:
+            side = ""
+            signed = 0.0
+            if sweep == "bull_sweep":
+                side = "bear_trap"
+                signed = 1.0
+            elif sweep == "bear_sweep":
+                side = "bull_trap"
+                signed = -1.0
+            else:
+                return "", 0.0
+
+            cols = {c.lower(): c for c in df.columns}
+            h = pd.to_numeric(df[cols.get("high", "High")], errors="coerce")
+            l = pd.to_numeric(df[cols.get("low", "Low")], errors="coerce")
+            o = pd.to_numeric(df[cols.get("open", "Open")], errors="coerce")
+            c = pd.to_numeric(df[cols.get("close", "Close")], errors="coerce")
+            if len(h) < 3:
+                return side, float(signed * 0.30)
+            rng = float((h.iloc[-1] - l.iloc[-1]) or 0.0)
+            if rng <= 0.0:
+                return side, float(signed * 0.30)
+            lower_wick = float(max(0.0, min(o.iloc[-1], c.iloc[-1]) - l.iloc[-1]))
+            upper_wick = float(max(0.0, h.iloc[-1] - max(o.iloc[-1], c.iloc[-1])))
+            wick_dom = (lower_wick - upper_wick) / max(rng, 1e-12)
+            wick_mag = abs(wick_dom)
+            atr_norm = min(1.0, rng / max(float(atr_last), 1e-12))
+            vol_mag = min(1.0, max(0.0, float(z_volume)) / 3.0)
+            strength = min(1.0, 0.40 * wick_mag + 0.35 * atr_norm + 0.25 * vol_mag)
+            return side, float(np.clip(signed * strength, -1.0, 1.0))
+        except Exception:
+            return "", 0.0
+
+    def _order_block_pretouch(
+        self,
+        *,
+        df: pd.DataFrame,
+        atr_last: float,
+    ) -> Tuple[float, float]:
+        """
+        Order-block pre-touch anticipation:
+          - proximity in [0, 1]: closeness to nearest recent OB anchor
+          - bias in [-1, 1]: +bull / -bear pressure into that touch
+        """
+        try:
+            cols = {c.lower(): c for c in df.columns}
+            o = pd.to_numeric(df[cols.get("open", "Open")], errors="coerce")
+            c = pd.to_numeric(df[cols.get("close", "Close")], errors="coerce")
+            if len(o) < 30 or atr_last <= 0.0:
+                return 0.0, 0.0
+            body = c - o
+            body_abs = body.abs()
+            thr = float(max(1e-12, atr_last * 0.55))
+
+            prev_o = o.shift(1)
+            prev_body = body.shift(1)
+            bull_ob = pd.Series(
+                np.where((prev_body < 0.0) & (body > thr), prev_o, np.nan),
+                index=df.index,
+            ).ffill()
+            bear_ob = pd.Series(
+                np.where((prev_body > 0.0) & (body < -thr), prev_o, np.nan),
+                index=df.index,
+            ).ffill()
+
+            cur = float(c.iloc[-1])
+            b_anchor = float(bull_ob.iloc[-1]) if np.isfinite(bull_ob.iloc[-1]) else np.nan
+            s_anchor = float(bear_ob.iloc[-1]) if np.isfinite(bear_ob.iloc[-1]) else np.nan
+            dist_b = abs(cur - b_anchor) / atr_last if np.isfinite(b_anchor) else np.inf
+            dist_s = abs(cur - s_anchor) / atr_last if np.isfinite(s_anchor) else np.inf
+            nearest = float(min(dist_b, dist_s))
+            prox = float(np.clip(1.0 - min(nearest, 3.0) / 3.0, 0.0, 1.0))
+
+            if np.isfinite(dist_b) and np.isfinite(dist_s):
+                bias = float(np.clip((dist_s - dist_b) / 3.0, -1.0, 1.0))
+            elif np.isfinite(dist_b):
+                bias = 0.5
+            elif np.isfinite(dist_s):
+                bias = -0.5
+            else:
+                bias = 0.0
+
+            # Emphasize bias only when we are actually near a block.
+            return prox, float(np.clip(bias * prox, -1.0, 1.0))
+        except Exception:
+            return 0.0, 0.0
 
     def _near_round_number(self, *, price: float, atr: float) -> bool:
         """Check if price is near a psychologically significant round number."""

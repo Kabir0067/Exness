@@ -47,6 +47,17 @@ import logging
 
 log = logging.getLogger("core.risk_engine")
 
+_DUMMY_LOCK = threading.RLock()
+
+
+def _mt5_lock():
+    # Lazy import avoids hard dependency and circular imports at module load.
+    try:
+        from mt5_client import MT5_LOCK as lock  # type: ignore
+        return lock
+    except Exception:
+        return _DUMMY_LOCK
+
 
 class RiskManager:
     """
@@ -120,10 +131,7 @@ class RiskManager:
         self._exec_breaker_active: bool = False
         self._exec_breaker_until: float = 0.0
         self._exec_csv_path = Path(f"logs/exec_metrics_{sp.base}.csv")
-        self._exec_csv_flush_interval = max(
-            10.0,
-            float(os.getenv("RISK_EXEC_CSV_FLUSH_SEC", "120") or "120"),
-        )
+        self._exec_csv_flush_interval: float = 120.0
         self._exec_csv_last_flush: float = 0.0
         self._ensure_exec_csv_exists()
 
@@ -146,6 +154,25 @@ class RiskManager:
         self._vol_breaker_until: float = 0.0
         self._vol_breaker_reason: str = ""
         self._last_bar_close: float = 0.0   # track previous bar close for gap detection
+
+        # Daily target lock: once target is reached, trading stays blocked until UTC reset.
+        self._daily_target_locked: bool = False
+        self._daily_target_lock_reason: str = ""
+        self._daily_target_lock_ts: float = 0.0
+
+        # MT5 connectivity circuit breaker for order-path safety.
+        self._mt5_disconnect_streak: int = 0
+        self._mt5_breaker_active: bool = False
+        self._mt5_breaker_until: float = 0.0
+        self._mt5_breaker_reason: str = ""
+        self._last_mt5_breaker_log_ts: float = 0.0
+
+        # Gate account-refresh throttle (cheap, deterministic).
+        self._gate_refresh_ttl_sec: float = max(
+            0.25,
+            float(getattr(self.cfg, "gate_account_refresh_ttl_sec", 1.0) or 1.0),
+        )
+        self._last_gate_refresh_ts: float = 0.0
 
         # ── shutdown hook ──
         def _shutdown_wrapper():
@@ -207,6 +234,96 @@ class RiskManager:
             return h >= start or h < end
         except Exception:
             return False
+
+    def _daily_target_pct(self) -> float:
+        raw = float(getattr(self.cfg, "daily_target_pct", 0.10) or 0.10)
+        # Business rule hard-floor: daily target must be at least 10%.
+        return max(0.10, min(1.0, raw))
+
+    def _lock_daily_target(self, daily_pnl_pct: float) -> None:
+        """Lock strategy to monitoring-only until UTC reset after target hit."""
+        with self._lock:
+            if self._daily_target_locked:
+                return
+            self._daily_target_locked = True
+            self._daily_target_lock_reason = f"DAILY_TARGET_LOCK={daily_pnl_pct:+.3f}"
+            self._daily_target_lock_ts = time.time()
+        self._enter_soft_stop(self._daily_target_lock_reason)
+        log.warning(
+            "DAILY_TARGET_LOCKED | %s | pnl_pct=%.3f target=%.3f",
+            self.sp.base,
+            float(daily_pnl_pct),
+            self._daily_target_pct(),
+        )
+
+    @property
+    def daily_target_locked(self) -> bool:
+        with self._lock:
+            return bool(self._daily_target_locked)
+
+    @property
+    def daily_target_lock_reason(self) -> str:
+        with self._lock:
+            return str(self._daily_target_lock_reason or "")
+
+    def _mt5_order_path_ok(self) -> bool:
+        if mt5 is None:
+            return False
+        try:
+            with _mt5_lock():
+                term = mt5.terminal_info()
+                acc = mt5.account_info()
+            return bool(
+                term
+                and acc
+                and getattr(term, "connected", False)
+                and getattr(term, "trade_allowed", False)
+                and getattr(acc, "trade_allowed", False)
+            )
+        except Exception:
+            return False
+
+    def _check_mt5_circuit_breaker(self) -> Tuple[bool, str]:
+        """
+        MT5 connectivity breaker:
+        - opens after N consecutive unhealthy checks,
+        - cools down for fixed seconds,
+        - prevents order dispatch while open.
+        """
+        now = time.time()
+        threshold = max(1, int(getattr(self.cfg, "mt5_breaker_fail_threshold", 3) or 3))
+        cooldown = max(1.0, float(getattr(self.cfg, "mt5_breaker_cooldown_sec", 30.0) or 30.0))
+
+        with self._lock:
+            if self._mt5_breaker_active and now < self._mt5_breaker_until:
+                remain = max(0.0, self._mt5_breaker_until - now)
+                return False, f"mt5_breaker_open:{remain:.1f}s"
+            if self._mt5_breaker_active and now >= self._mt5_breaker_until:
+                self._mt5_breaker_active = False
+                self._mt5_breaker_reason = ""
+
+        if self._mt5_order_path_ok():
+            with self._lock:
+                self._mt5_disconnect_streak = 0
+            return True, "ok"
+
+        with self._lock:
+            self._mt5_disconnect_streak += 1
+            streak = int(self._mt5_disconnect_streak)
+            if streak >= threshold:
+                self._mt5_breaker_active = True
+                self._mt5_breaker_until = now + cooldown
+                self._mt5_breaker_reason = "mt5_unhealthy"
+                if (now - self._last_mt5_breaker_log_ts) >= 5.0:
+                    self._last_mt5_breaker_log_ts = now
+                    log.error(
+                        "MT5_CIRCUIT_OPEN | %s | streak=%d cooldown=%.1fs",
+                        self.sp.base,
+                        streak,
+                        cooldown,
+                    )
+                return False, f"mt5_breaker_open:{cooldown:.1f}s"
+        return False, "mt5_unhealthy"
 
     # ─── Phase management ────────────────────────────────────────────
 
@@ -320,6 +437,13 @@ class RiskManager:
             self._vol_breaker_until = 0.0
             self._vol_breaker_reason = ""
             self._last_bar_close = 0.0
+            self._daily_target_locked = False
+            self._daily_target_lock_reason = ""
+            self._daily_target_lock_ts = 0.0
+            self._mt5_disconnect_streak = 0
+            self._mt5_breaker_active = False
+            self._mt5_breaker_until = 0.0
+            self._mt5_breaker_reason = ""
 
             try:
                 self._account_snapshot()
@@ -337,7 +461,8 @@ class RiskManager:
     def _reset_bot_balance_base(self) -> None:
         try:
             if mt5 is not None:
-                info = mt5.account_info()
+                with _mt5_lock():
+                    info = mt5.account_info()
                 if info:
                     with self._lock:
                         self._bot_balance_base = float(info.balance or 0.0)
@@ -386,6 +511,7 @@ class RiskManager:
                 "ks_status": self._ks.status,
                 "signals_today": self._signals_today,
                 "daily_pnl": round(self._daily_pnl, 2),
+                "daily_target_locked": self._daily_target_locked,
             }
 
     # ─── Market hours ────────────────────────────────────────────────
@@ -482,7 +608,8 @@ class RiskManager:
         if mt5 is None:
             return
         try:
-            info = mt5.account_info()
+            with _mt5_lock():
+                info = mt5.account_info()
             if info is None:
                 return
             now = time.time()
@@ -506,7 +633,8 @@ class RiskManager:
         if mt5 is None:
             return
         try:
-            info = mt5.account_info()
+            with _mt5_lock():
+                info = mt5.account_info()
             if info is None:
                 return
             now = time.time()
@@ -547,7 +675,8 @@ class RiskManager:
             from datetime import timedelta
             now = datetime.now(timezone.utc)
             start = now - timedelta(days=1)
-            deals = mt5.history_deals_get(start, now)
+            with _mt5_lock():
+                deals = mt5.history_deals_get(start, now)
             if deals is None:
                 with self._lock:
                     return list(self._trades_today)
@@ -589,7 +718,11 @@ class RiskManager:
 
     def strategy_status(self) -> Dict[str, Any]:
         with self._lock:
-            return {"kill_switch": self._ks.status, "phase": self.phase}
+            return {
+                "kill_switch": self._ks.status,
+                "phase": self.phase,
+                "daily_target_locked": self._daily_target_locked,
+            }
 
     # ─── Phase evaluation ────────────────────────────────────────────
 
@@ -615,6 +748,10 @@ class RiskManager:
                 self._daily_pnl = daily_pnl
         else:
             daily_pnl_pct = 0.0
+
+        target_pct = self._daily_target_pct()
+        if target_pct > 0.0 and daily_pnl_pct >= target_pct:
+            self._lock_daily_target(daily_pnl_pct)
 
         # Update peak
         with self._lock:
@@ -822,8 +959,24 @@ class RiskManager:
             reasons.append(f"TICK_REJECT:{tick_reason}")
             return False, reasons
 
-        if spread_pct > self.sp.spread_limit_pct * float(getattr(self.cfg, 'spread_gate_multiplier', 1.5) or 1.5):
-            reasons.append(f"SPREAD_WIDE:{spread_pct:.5f}")
+        min_age = float(getattr(self.cfg, "market_min_bar_age_sec", 30.0) or 30.0)
+        max_age_mult = float(getattr(self.cfg, "market_max_bar_age_mult", 2.0) or 2.0)
+        max_age = max(min_age * max_age_mult, min_age + 10.0)
+        if _is_finite(last_bar_age) and last_bar_age > max_age:
+            reasons.append(f"STALE_FEED:{last_bar_age:.1f}s>{max_age:.1f}s")
+            return False, reasons
+
+        base_limit = float(getattr(self.sp, "spread_limit_pct", 0.0) or 0.0)
+        cfg_limit = float(getattr(self.cfg, "spread_cb_pct", 0.0) or 0.0)
+        if bool(getattr(self.sp, "is_24_7", False)):
+            eff_limit = max(base_limit, cfg_limit) if cfg_limit > 0 else base_limit
+        else:
+            eff_limit = base_limit
+
+        spread_mult = float(getattr(self.cfg, "spread_gate_multiplier", 1.5) or 1.5)
+        spread_limit = eff_limit * spread_mult
+        if spread_limit > 0 and spread_pct > spread_limit:
+            reasons.append(f"SPREAD_WIDE:{spread_pct:.5f}>{spread_limit:.5f}")
             return False, reasons
 
         # Spread spike detection: block if spread > Nσ above recent history
@@ -897,7 +1050,11 @@ class RiskManager:
             soft_stop = self._soft_stop
             ks_status = self._ks.status
             phase = self.phase
+            daily_locked = self._daily_target_locked
+            daily_lock_reason = self._daily_target_lock_reason
         if soft_stop:
+            if daily_locked:
+                return False, f"daily_target_locked:{daily_lock_reason or 'target_reached'}"
             return False, "soft_stop"
 
         if ks_status != "ACTIVE":
@@ -944,6 +1101,84 @@ class RiskManager:
 
         return True, ""
 
+    def pre_order_gate(
+        self,
+        *,
+        side: str,
+        confidence: float,
+        lot: float,
+        entry_price: float,
+        sl: float,
+        tp: float,
+        signal_id: str = "",
+        stage: str = "enqueue",
+        base_lot: Optional[float] = None,
+        phase_snapshot: str = "",
+    ) -> Tuple[bool, float, str]:
+        """
+        Final fail-safe order gate.
+        Runs before enqueue/dispatch and blocks risk-violating orders.
+        """
+        side_n = _side_norm(side)
+        lot_val = float(lot or 0.0)
+        entry = float(entry_price or 0.0)
+        sl_val = float(sl or 0.0)
+        tp_val = float(tp or 0.0)
+        base_lot_val = float(base_lot) if base_lot is not None else lot_val
+        if base_lot_val <= 0.0:
+            base_lot_val = lot_val
+
+        if side_n not in ("Buy", "Sell"):
+            return False, 0.0, "gate_bad_side"
+        if not _is_finite(lot_val, entry, sl_val, tp_val) or lot_val <= 0.0:
+            return False, 0.0, "gate_bad_values"
+        if side_n == "Buy" and not (sl_val < entry < tp_val):
+            return False, 0.0, "gate_bad_sl_tp_buy"
+        if side_n == "Sell" and not (tp_val < entry < sl_val):
+            return False, 0.0, "gate_bad_sl_tp_sell"
+
+        # Cheap refresh for deterministic gating under high-frequency flow.
+        now = time.time()
+        refresh = False
+        with self._lock:
+            if (now - self._last_gate_refresh_ts) >= self._gate_refresh_ttl_sec:
+                self._last_gate_refresh_ts = now
+                refresh = True
+        if refresh:
+            self._account_snapshot()
+
+        self.evaluate_account_state()
+
+        if mt5 is not None and not bool(getattr(self.cfg, "dry_run", False)):
+            mt5_ok, mt5_reason = self._check_mt5_circuit_breaker()
+            if not mt5_ok:
+                return False, 0.0, mt5_reason
+
+        can, reason = self.can_trade(float(confidence), "order_gate")
+        if not can:
+            return False, 0.0, reason
+
+        with self._lock:
+            phase_now = str(self.phase).upper()
+            daily_locked = bool(self._daily_target_locked)
+            daily_reason = str(self._daily_target_lock_reason or "")
+
+        if daily_locked:
+            return False, 0.0, f"daily_target_locked:{daily_reason or 'target_reached'}"
+
+        if phase_now == "C":
+            return False, 0.0, "phase_C_block"
+
+        # Strict A/B/C exposure gate on dispatch path.
+        if str(stage).lower() == "dispatch":
+            mode_mult = {"A": 1.0, "B": 0.5, "C": 0.0}.get(phase_now, 1.0)
+            allowed_lot = max(0.0, base_lot_val * mode_mult)
+            tol = max(1e-8, allowed_lot * 1e-6)
+            if lot_val > (allowed_lot + tol):
+                return False, 0.0, f"mode_{phase_now}_lot_violation:{lot_val:.8f}>{allowed_lot:.8f}"
+
+        return True, lot_val, "ok"
+
     # ─── SL/TP calculation ───────────────────────────────────────────
 
     def _apply_broker_constraints(
@@ -953,7 +1188,8 @@ class RiskManager:
         if mt5 is None:
             return entry, sl, tp
         try:
-            info = mt5.symbol_info(self.sp.symbol)
+            with _mt5_lock():
+                info = mt5.symbol_info(self.sp.symbol)
             if info is None:
                 return entry, sl, tp
             stops_level = float(info.trade_stops_level or 0) * float(info.point or 0.00001)
@@ -1065,7 +1301,8 @@ class RiskManager:
 
         try:
             if mt5 is not None:
-                info = mt5.symbol_info(self.sp.symbol)
+                with _mt5_lock():
+                    info = mt5.symbol_info(self.sp.symbol)
                 if info:
                     contract_size = float(info.trade_contract_size or contract_size)
                     lot_step = float(info.volume_step or lot_step)
@@ -1279,7 +1516,8 @@ class RiskManager:
         if entry is None or entry <= 0:
             try:
                 if mt5 is not None:
-                    tick = mt5.symbol_info_tick(self.sp.symbol)
+                    with _mt5_lock():
+                        tick = mt5.symbol_info_tick(self.sp.symbol)
                     if tick:
                         entry = float(tick.ask) if _side_norm(side) == "Buy" else float(tick.bid)
             except Exception:
@@ -1393,7 +1631,8 @@ class RiskManager:
 
         try:
             if mt5 is not None:
-                info = mt5.symbol_info(self.sp.symbol)
+                with _mt5_lock():
+                    info = mt5.symbol_info(self.sp.symbol)
                 point = float(info.point) if info else 0.00001
             else:
                 point = 0.00001
@@ -1553,6 +1792,8 @@ class RiskManager:
                     "signals_today": self._signals_today,
                     "ks_status": self._ks.status,
                     "peak_equity": self._peak_equity,
+                    "daily_target_locked": self._daily_target_locked,
+                    "daily_target_lock_reason": self._daily_target_lock_reason,
                     "last_date": self._last_date,
                     "ts": time.time(),
                 }
@@ -1573,6 +1814,8 @@ class RiskManager:
                     self._daily_pnl = state.get("daily_pnl", 0.0)
                     self._signals_today = state.get("signals_today", 0)
                     self._peak_equity = state.get("peak_equity", 0.0)
+                    self._daily_target_locked = bool(state.get("daily_target_locked", False))
+                    self._daily_target_lock_reason = str(state.get("daily_target_lock_reason", "") or "")
                 log.info("Loaded state for %s: phase=%s", self.sp.base, self.phase)
         except Exception:
             pass
@@ -1596,4 +1839,6 @@ class RiskManager:
                 "exec_p95_lat": round(self.exec_p95_latency(), 1),
                 "exec_p95_slip": round(self.exec_p95_slippage(), 2),
                 "vol_breaker": self._vol_breaker_active,
+                "daily_target_locked": self._daily_target_locked,
+                "daily_target_lock_reason": self._daily_target_lock_reason,
             }

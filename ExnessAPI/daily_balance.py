@@ -4,11 +4,14 @@ from __future__ import annotations
 Daily balance anchoring for Phase A/B/C (per-asset).
 
 Goal:
-- At the start of each new UTC day, capture the account balance using ExnessAPI.functions.get_balance()
+- At the start of each new UTC day, capture the account balance using balance_provider()
   (fallback: provided current_balance), and persist it to a small CSV file.
 - RiskManager reads this anchor as daily_start_balance and applies phase rules based on daily return.
 
-This module is intentionally dependency-light and safe to import even if MT5 is temporarily unavailable.
+Design:
+- dependency-light (safe if MT5 / APIs unavailable)
+- single-process thread-safe
+- atomic-ish writes on updates to avoid partial/corrupt CSV
 """
 
 import csv
@@ -18,6 +21,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Tuple
+
+__all__ = [
+    "DailyRow",
+    "initialize_daily_balance",
+    "get_peak_balance",
+    "update_peak_equity",
+]
 
 _LOCK = threading.Lock()
 
@@ -34,8 +44,13 @@ def _safe_float(x: object) -> float:
         return 0.0
 
 
+def _normalize_asset(asset: str) -> str:
+    a = (asset or "GEN").strip().upper()
+    return a if a else "GEN"
+
+
 def _default_path(asset: str) -> Path:
-    name = f"daily_balance_{asset.lower()}.csv"
+    name = f"daily_balance_{_normalize_asset(asset).lower()}.csv"
     try:
         from log_config import get_log_path  # type: ignore
 
@@ -51,6 +66,25 @@ class DailyRow:
     peak_equity: float
 
 
+_FIELDS = ("date_utc", "start_balance", "peak_equity")
+
+
+def _parse_row(r: dict) -> Optional[DailyRow]:
+    try:
+        d = str(r.get("date_utc") or "").strip()
+        if not d:
+            return None
+        sb = _safe_float(r.get("start_balance"))
+        pk = _safe_float(r.get("peak_equity"))
+        if sb <= 0.0:
+            return DailyRow(d, 0.0, 0.0)
+        if pk <= 0.0:
+            pk = sb
+        return DailyRow(d, float(sb), float(pk))
+    except Exception:
+        return None
+
+
 def _read_last_row(path: Path) -> Optional[DailyRow]:
     if not path.exists():
         return None
@@ -59,30 +93,38 @@ def _read_last_row(path: Path) -> Optional[DailyRow]:
             rows = list(csv.DictReader(f))
         if not rows:
             return None
-        r = rows[-1]
-        # Be robust to accidental whitespace in CSV (prevents duplicate rows for same day)
-        d = str(r.get("date_utc") or "").strip()
-        sb = _safe_float(r.get("start_balance"))
-        pk = _safe_float(r.get("peak_equity"))
-        if not d:
-            return None
-        return DailyRow(d, sb, pk if pk > 0 else sb)
+        return _parse_row(rows[-1])
     except Exception:
         return None
+
+
+def _atomic_write(path: Path, rows: list[dict]) -> None:
+    """
+    Best-effort atomic-ish rewrite:
+    write tmp -> replace.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(_FIELDS))
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    tmp.replace(path)
 
 
 def _append_row(path: Path, row: DailyRow) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = path.exists()
     with path.open("a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["date_utc", "start_balance", "peak_equity"])
+        w = csv.DictWriter(f, fieldnames=list(_FIELDS))
         if not file_exists:
             w.writeheader()
         w.writerow(
             {
                 "date_utc": str(row.date_utc).strip(),
-                "start_balance": f"{row.start_balance:.2f}",
-                "peak_equity": f"{row.peak_equity:.2f}",
+                "start_balance": f"{float(row.start_balance):.2f}",
+                "peak_equity": f"{float(row.peak_equity):.2f}",
             }
         )
 
@@ -96,21 +138,20 @@ def initialize_daily_balance(
     Returns (daily_start_balance, saved_mode).
 
     saved_mode is kept for backward compatibility with older RiskManager code;
-    the module always returns "A" and the RiskManager should compute actual phase
-    using its own thresholds.
+    this module always returns "A" and the RiskManager should compute actual phase.
     """
-    asset = (asset or "GEN").strip().upper()
+    asset_u = _normalize_asset(asset)
     today = _utc_date()
-    path = _default_path(asset)
+    path = _default_path(asset_u)
 
     with _LOCK:
         last = _read_last_row(path)
 
-        # If already initialized for today, reuse
+        # Already initialized for today
         if last and last.date_utc == today and last.start_balance > 0:
             return float(last.start_balance), "A"
 
-        # Otherwise create new anchor row
+        # Build new start anchor
         start = 0.0
         if balance_provider is not None:
             try:
@@ -121,8 +162,7 @@ def initialize_daily_balance(
         if start <= 0.0:
             start = _safe_float(current_balance)
 
-        # If still invalid, persist a zero row (RiskManager will fallback)
-        row = DailyRow(today, start, start)
+        row = DailyRow(today, float(start), float(start))
         _append_row(path, row)
         return float(start), "A"
 
@@ -133,18 +173,18 @@ def get_peak_balance(
     asset: str = "GEN",
 ) -> float:
     """
-    Returns a peak equity value.
+    Returns peak equity.
 
-    - If current_equity & previous_peak are provided: returns max(previous_peak, current_equity).
-    - If not provided: returns today's stored peak_equity from CSV (or 0.0).
+    - If current_equity or previous_peak provided: returns max(previous_peak, current_equity).
+    - Else: returns today's stored peak_equity from CSV (or 0.0).
     """
     if current_equity is not None or previous_peak is not None:
         ce = _safe_float(current_equity)
         pp = _safe_float(previous_peak)
         return float(max(ce, pp))
 
-    asset = (asset or "GEN").strip().upper()
-    path = _default_path(asset)
+    asset_u = _normalize_asset(asset)
+    path = _default_path(asset_u)
     with _LOCK:
         last = _read_last_row(path)
         if not last or last.date_utc != _utc_date():
@@ -154,20 +194,23 @@ def get_peak_balance(
 
 def update_peak_equity(asset: str, current_equity: float) -> float:
     """
-    Updates today's peak_equity in the CSV (best-effort). Returns the updated peak.
+    Updates today's peak_equity in the CSV (best-effort). Returns updated peak.
+
+    Critical properties:
+    - Never raises (best-effort), always returns a float.
+    - Avoids duplicate-day bug by trimming whitespace on date_utc.
+    - Uses atomic-ish rewrite for the update path to prevent partial CSV corruption.
     """
-    asset = (asset or "GEN").strip().upper()
+    asset_u = _normalize_asset(asset)
     today = _utc_date()
-    path = _default_path(asset)
+    path = _default_path(asset_u)
     ce = _safe_float(current_equity)
 
     with _LOCK:
-        # Load all rows (small file), update last row if today
         if not path.exists():
-            # If no file yet, initialize with current_equity as both start+peak
             row = DailyRow(today, ce, ce)
             _append_row(path, row)
-            return ce
+            return float(ce)
 
         try:
             with path.open("r", encoding="utf-8", newline="") as f:
@@ -176,38 +219,39 @@ def update_peak_equity(asset: str, current_equity: float) -> float:
             rows = []
 
         if not rows:
-            row = DailyRow(today, ce, ce)
-            # rewrite header+row
-            with path.open("w", encoding="utf-8", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["date_utc", "start_balance", "peak_equity"])
-                w.writeheader()
-                w.writerow({"date_utc": today, "start_balance": f"{ce:.2f}", "peak_equity": f"{ce:.2f}"})
-            return ce
+            # Rewrite clean file
+            _atomic_write(
+                path,
+                [{"date_utc": today, "start_balance": f"{ce:.2f}", "peak_equity": f"{ce:.2f}"}],
+            )
+            return float(ce)
 
         last = rows[-1]
-        last_date = str(last.get("date_utc") or "")
+        last_date = str(last.get("date_utc") or "").strip()
+
         if last_date != today:
-            # append a new day row (start uses current equity as fallback)
             row = DailyRow(today, ce, ce)
             _append_row(path, row)
-            return ce
+            return float(ce)
 
-        # update peak
         start = _safe_float(last.get("start_balance"))
         peak = _safe_float(last.get("peak_equity"))
-        new_peak = max(peak, ce, start)
+        new_peak = float(max(peak, ce, start))
 
-        # rewrite (atomic-ish)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        # Rewrite only with normalized values for last row
+        out_rows = rows[:-1]
+        out_rows.append(
+            {
+                "date_utc": today,
+                "start_balance": f"{start:.2f}",
+                "peak_equity": f"{new_peak:.2f}",
+            }
+        )
+
         try:
-            with tmp.open("w", encoding="utf-8", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=["date_utc", "start_balance", "peak_equity"])
-                w.writeheader()
-                for r in rows[:-1]:
-                    w.writerow(r)
-                w.writerow({"date_utc": today, "start_balance": f"{start:.2f}", "peak_equity": f"{new_peak:.2f}"})
-            tmp.replace(path)
+            _atomic_write(path, out_rows)
         except Exception:
-            # best effort; ignore
+            # best effort: ignore filesystem errors
             pass
+
         return float(new_peak)

@@ -206,6 +206,10 @@ class MarketFeed:
             return 1800.0
         if timeframe == "H1":
             return 3600.0
+        if timeframe == "H4":
+            return 14400.0
+        if timeframe == "D1":
+            return 86400.0
         return 60.0
 
     def _max_allowed_bar_age(self, timeframe: str) -> float:

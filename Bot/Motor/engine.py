@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import builtins
-import json
 import os
 import pickle
 import queue
@@ -9,15 +7,13 @@ import threading
 import time
 import traceback
 from collections import deque
-from enum import Enum
 from datetime import datetime
-from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 
 from ExnessAPI.functions import close_all_position
-from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_status, mt5_async_call
 
 # -------------------- Unified core + strategy adapters --------------------
 from core.config import (
@@ -66,36 +62,24 @@ XauSignalEngine = SignalEngine
 BtcSignalEngine = SignalEngine
 
 from .execution import ExecutionWorker
+from .execution_manager import ExecutionManager
+from .fsm_runtime import DeterministicFSMRunner
+from .fsm_services import EngineFSMStageServices
+from .fsm_types import EngineCycleContext, EngineState
+from .inference_engine import InferenceEngine
 from .logging_setup import _DIAG_ENABLED, _DIAG_EVERY_SEC, log_diag, log_err, log_health
 from .models import AssetCandidate, ExecutionResult, OrderIntent, PortfolioStatus
+from .order_sync_manager import OrderSyncManager
 from .pipeline import _AssetPipeline
 from .scheduler import UTCScheduler
 from .utils import parse_bar_key, safe_json_dumps, tf_seconds
-from core.ml_router import MLSignal, fetch_ml_payloads, infer_from_payloads, validate_payload_schema
+from core.ml_router import MLSignal, validate_payload_schema
 from core.model_manager import model_manager  # <--- HOLY TRINITY GATEKEEPER
 from core.model_gate import gate_details
 
 MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 MIN_BACKTEST_SHARPE = MIN_GATE_SHARPE
 MIN_BACKTEST_WIN_RATE = MIN_GATE_WIN_RATE
-
-
-class EngineState(Enum):
-    BOOT = "BOOT"
-    DATA_SYNC = "DATA_SYNC"
-    ML_INFERENCE = "ML_INFERENCE"
-    RISK_CALC = "RISK_CALC"
-    EXECUTION_QUEUE = "EXECUTION_QUEUE"
-    VERIFICATION = "VERIFICATION"
-    HALT = "HALT"
-
-
-@dataclass
-class EngineCycleContext:
-    payloads: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = field(default_factory=dict)
-    ml_signals: Dict[str, MLSignal] = field(default_factory=dict)
-    candidates: List[AssetCandidate] = field(default_factory=list)
-    halt_reason: str = ""
 
 
 class MultiAssetTradingEngine:
@@ -135,34 +119,132 @@ class MultiAssetTradingEngine:
         self._last_reconcile_ts = 0.0
 
         # Queues and worker
-        self._max_queue = int(os.getenv("PORTFOLIO_MAX_QUEUE", "50") or "50")
+        self._max_queue : int = 50
         self._order_q: "queue.Queue[OrderIntent]" = queue.Queue(maxsize=self._max_queue)
         self._result_q: "queue.Queue[ExecutionResult]" = queue.Queue(maxsize=self._max_queue)
         self._exec_worker: Optional[ExecutionWorker] = None
 
         # IMPORTANT: map order_id -> risk_manager (robust RM routing)
         self._order_rm_by_id: Dict[str, Any] = {}
+        # Pending broker-sync map: order_id -> lightweight intent metadata.
+        self._pending_order_meta: Dict[str, Dict[str, Any]] = {}
+        self._order_sync_interval_sec: float = max(
+            0.15,
+            float(os.getenv("ORDER_SYNC_INTERVAL_SEC", "0.50") or 0.50),
+        )
+        self._order_sync_grace_sec: float = max(
+            0.20,
+            float(os.getenv("ORDER_SYNC_GRACE_SEC", "0.75") or 0.75),
+        )
+        self._order_sync_timeout_sec: float = max(
+            1.0,
+            float(os.getenv("ORDER_SYNC_TIMEOUT_SEC", "8.0") or 8.0),
+        )
+        self._last_order_sync_ts: float = 0.0
 
         # Log suppression for high-frequency skips
         self._last_log_id: Dict[str, str] = {}
 
 
         # Loop tuning
-        self._poll_fast = float(os.getenv("PORTFOLIO_POLL_FAST_SEC", "0.25") or "0.25")
-        self._poll_slow = float(os.getenv("PORTFOLIO_POLL_SLOW_SEC", "0.75") or "0.75")
-        self._pipeline_log_every = float(os.getenv("PORTFOLIO_PIPELINE_LOG_EVERY", "2.0") or "2.0")
+        self._poll_fast : float = 0.25
+        self._poll_slow : float = 0.75
+        self._min_cycle_sec: float = max(
+            0.05,
+            float(os.getenv("ENGINE_MIN_CYCLE_SEC", "0.25") or 0.25),
+        )
+        self._pipeline_log_every : float = 2.0
         self._last_pipeline_log_ts = 0.0
         self._last_pipeline_log_key: Optional[Tuple[Any, ...]] = None
-        self._max_consecutive_errors = int(os.getenv("PORTFOLIO_MAX_CONSEC_ERRORS", "12") or "12")
+        self._max_consecutive_errors : int = 12
+
+        # Emergency flatten controls (prevents orphaned positions on hard halts).
+        self._flatten_retries: int = max(
+            1,
+            int(float(os.getenv("EMERGENCY_FLATTEN_RETRIES", "3") or 3)),
+        )
+        self._flatten_backoff_sec: float = max(
+            0.05,
+            float(os.getenv("EMERGENCY_FLATTEN_BACKOFF_SEC", "0.25") or 0.25),
+        )
+        self._flatten_cooldown_sec: float = max(
+            0.25,
+            float(os.getenv("EMERGENCY_FLATTEN_COOLDOWN_SEC", "2.0") or 2.0),
+        )
+        self._last_flatten_ts: float = 0.0
+        self._last_flatten_reason: str = ""
+
+        # ML inference strictness: prioritize precision over signal frequency.
+        self._allow_llm_fallback: bool = str(
+            os.getenv("ALLOW_LLM_FALLBACK", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._catboost_threshold_q: float = float(
+            os.getenv("CATBOOST_THRESHOLD_Q", "85") or 85.0
+        )
+        self._catboost_hist_min: int = max(
+            20, int(float(os.getenv("CATBOOST_THRESHOLD_MIN_HIST", "40") or 40))
+        )
+        self._catboost_min_zscore: float = float(
+            os.getenv("CATBOOST_MIN_ZSCORE", "0.75") or 0.75
+        )
+        self._catboost_min_flow_confirm: float = float(
+            os.getenv("CATBOOST_MIN_FLOW_CONFIRM", "0.06") or 0.06
+        )
+        self._target_signals_per_24h_min: int = max(
+            1,
+            int(float(os.getenv("TARGET_SIGNALS_PER_24H_MIN", "10") or 10)),
+        )
+        self._target_signals_per_24h_max: int = max(
+            self._target_signals_per_24h_min,
+            int(float(os.getenv("TARGET_SIGNALS_PER_24H_MAX", "20") or 20)),
+        )
+        self._signal_emit_ts_by_asset: Dict[str, Deque[float]] = {
+            "XAU": deque(maxlen=512),
+            "BTC": deque(maxlen=512),
+        }
+        self._signal_emit_ts_global: Deque[float] = deque(maxlen=1024)
+
+        # Real-time operational evidence (latency/slippage/win-rate drift).
+        self._exec_latency_ms_hist: Deque[float] = deque(maxlen=512)
+        self._exec_slippage_hist: Deque[float] = deque(maxlen=512)
+        self._fsm_cycle_ms_hist: Deque[float] = deque(maxlen=512)
+        self._live_monitor_interval_sec: float = max(
+            5.0,
+            float(os.getenv("LIVE_MONITOR_INTERVAL_SEC", "15.0") or 15.0),
+        )
+        self._last_live_monitor_ts: float = 0.0
+        self._last_cycle_spike_log_ts: float = 0.0
+        self._live_max_p95_latency_ms: float = max(
+            50.0,
+            float(os.getenv("LIVE_MAX_P95_LATENCY_MS", "850.0") or 850.0),
+        )
+        self._live_max_p95_slippage_points: float = max(
+            0.1,
+            float(os.getenv("LIVE_MAX_P95_SLIPPAGE_POINTS", "35.0") or 35.0),
+        )
+        self._live_max_winrate_drift: float = max(
+            0.01,
+            float(os.getenv("LIVE_MAX_WINRATE_DRIFT", "0.15") or 0.15),
+        )
+        self._live_evidence_state: Dict[str, Any] = {
+            "status": "BOOT",
+            "reason": "booting",
+            "updated_ts": 0.0,
+            "latency_p95_ms": 0.0,
+            "slippage_p95_points": 0.0,
+            "win_rate_live": 0.0,
+            "win_rate_reference": 0.0,
+            "win_rate_drift": 0.0,
+            "closed_trade_samples": 0,
+            "signals_24h": 0,
+        }
 
         # Analysis state log throttling
         self._last_analysis_paused_state = False
         self._last_analysis_state_log_ts = 0.0
 
-        self._edge_last_trade: dict[str, tuple[str, str]] = {}
-        self._edge_last_notified: dict[str, tuple[str, str]] = {}
         self._last_skip_log_ts: dict[str, float] = {}  # Anti-spam throttle for blocked notifications
-        self._gate_status_log_ttl: float = float(os.getenv("GATE_STATUS_LOG_TTL_SEC", "60") or "60")
+        self._gate_status_log_ttl : float = 60.0
         self._last_gate_status_sig: str = ""
         self._last_gate_status_ts: float = 0.0
         
@@ -223,18 +305,18 @@ class MultiAssetTradingEngine:
         # Prevents rapid re-entry after a trade closes
         # ============================================================
         self._last_trade_close_ts: Dict[str, float] = {"XAU": 0.0, "BTC": 0.0}
-        self._trade_cooldown_sec: float = float(os.getenv("TRADE_COOLDOWN_SEC", "300.0") or "300.0")  # 5 minutes default
+        self._trade_cooldown_sec: float = 300.0  # 5 minutes default
         self._cooldown_blocked_count: Dict[str, int] = {"XAU": 0, "BTC": 0}
 
         # Position tracking for detecting trade closures
         self._last_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
         self._max_open_positions: Dict[str, int] = {
-            "XAU": max(1, int(os.getenv("PORTFOLIO_MAX_OPEN_XAU", "1") or "1")),
-            "BTC": max(1, int(os.getenv("PORTFOLIO_MAX_OPEN_BTC", "1") or "1")),
+            "XAU": 1,
+            "BTC": 1,
         }
         self._max_lot_cap: Dict[str, float] = {
-            "XAU": max(0.01, float(os.getenv("PORTFOLIO_MAX_LOT_XAU", "1.00") or "1.00")),
-            "BTC": max(0.01, float(os.getenv("PORTFOLIO_MAX_LOT_BTC", "0.05") or "0.05")),
+            "XAU": 1.00,
+            "BTC": 0.05,
         }
 
         self._refresh_signal_cooldowns()
@@ -249,6 +331,13 @@ class MultiAssetTradingEngine:
             max_risk_per_trade_pct=self._xau_cfg.max_risk_per_trade,
             max_concurrent_positions=6,
         )
+
+        # Decoupled deterministic runtime (FSM ports + runner).
+        self._fsm_services = EngineFSMStageServices(self)
+        self._fsm_runner = DeterministicFSMRunner(self._fsm_services)
+        self._inference_engine = InferenceEngine(self)
+        self._execution_manager = ExecutionManager(self)
+        self._order_sync_manager = OrderSyncManager(self)
     # -------------------- QUANTUM GATES --------------------
     def print_startup_matrix(self) -> None:
         model_loaded = "YES" if self._model_loaded else "NO"
@@ -312,11 +401,7 @@ class MultiAssetTradingEngine:
             return False
 
     def _check_model_health(self) -> None:
-        """Ensure live trading starts only when required assets pass strict gate.
-        
-        Supports PARTIAL_GATE_MODE: if enabled, engine starts with only 
-        passing assets instead of blocking entirely.
-        """
+        """Ensure live trading starts only when required assets pass strict gate."""
         if self.dry_run:
             log_health.info("MODEL_GATE_BYPASSED | reason=dry_run")
             self._model_loaded = True
@@ -384,156 +469,6 @@ class MultiAssetTradingEngine:
                 except Exception:
                     continue
 
-        # Check partial gate mode
-        partial_mode = str(os.getenv("PARTIAL_GATE_MODE", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-        
-        if not gate_ok and partial_mode:
-            # Partial mode: find which assets pass individually
-            passing_assets: list[str] = []
-            for asset in required_assets:
-                st = assets.get(asset, {}) if isinstance(assets, dict) else {}
-                if isinstance(st, dict) and bool(st.get("ok", False)):
-                    passing_assets.append(asset)
-            
-            if passing_assets:
-                log_health.warning(
-                    "MODEL_GATE_PARTIAL | passing=%s blocked=%s reason=%s",
-                    ",".join(passing_assets),
-                    ",".join(sorted(set(required_assets).difference(set(passing_assets)))),
-                    gate_reason,
-                )
-                # Load models for passing assets only
-                versions: list[str] = []
-                sharpes: list[float] = []
-                wins: list[float] = []
-                for asset in passing_assets:
-                    st = assets.get(asset, {}) if isinstance(assets, dict) else {}
-                    version = str(st.get("model_version", "") or "").strip()
-                    if version:
-                        model = model_manager.load_model(version)
-                        if model is not None:
-                            versions.append(f"{asset}:{version}")
-                            sharpes.append(float(st.get("sharpe", 0.0) or 0.0))
-                            wins.append(float(st.get("win_rate", 0.0) or 0.0))
-                            if isinstance(model, dict) and "model" in model and "pipeline" in model:
-                                self._catboost_payloads[asset] = model
-                                log_health.info("CATBOOST_LOADED | asset=%s version=%s", asset, version)
-                
-                if versions:
-                    self._model_version = " | ".join(versions)
-                    self._model_sharpe = min(sharpes) if sharpes else 0.0
-                    self._model_win_rate = min(wins) if wins else 0.0
-                    self._model_loaded = True
-                    self._backtest_passed = True
-                    self._gate_last_reason = "partial_ok"
-                    # Mark which assets are blocked so pipelines can be disabled
-                    self._blocked_assets = sorted(set(required_assets).difference(set(passing_assets)))
-                    log_health.info(
-                        "MODEL_GATE_PARTIAL_OK | versions=%s blocked_assets=%s",
-                        self._model_version,
-                        ",".join(self._blocked_assets),
-                    )
-                    return
-
-        # Degraded fallback: allow selected gate failures when base metrics are strong.
-        allow_soft_wfa_fallback = str(os.getenv("PARTIAL_GATE_ALLOW_WFA_FALLBACK", "1") or "1").strip().lower() in {
-            "1", "true", "yes", "y", "on"
-        }
-        allow_soft_sample_fallback = str(
-            os.getenv("PARTIAL_GATE_ALLOW_SAMPLE_QUALITY_FALLBACK", "1") or "1"
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-        if not gate_ok and partial_mode and (allow_soft_wfa_fallback or allow_soft_sample_fallback):
-            soft_assets: list[str] = []
-            soft_wfa_assets: list[str] = []
-            soft_sample_assets: list[str] = []
-            for asset in required_assets:
-                st = assets.get(asset, {}) if isinstance(assets, dict) else {}
-                if not isinstance(st, dict):
-                    continue
-                reason = str(st.get("reason", "") or "")
-                real_bt = bool(st.get("real_backtest", False))
-                sharpe = float(st.get("sharpe", 0.0) or 0.0)
-                win_rate = float(st.get("win_rate", 0.0) or 0.0)
-                max_dd_raw = st.get("max_drawdown_pct", 1.0)
-                max_dd = float(1.0 if max_dd_raw is None else max_dd_raw)
-                version = str(st.get("model_version", "") or "").strip()
-                base_ok = (
-                    real_bt
-                    and sharpe >= MIN_GATE_SHARPE
-                    and win_rate >= MIN_GATE_WIN_RATE
-                    and max_dd <= MAX_GATE_DRAWDOWN
-                    and version
-                )
-                if not base_ok:
-                    continue
-
-                is_wfa_fail = reason.startswith("state_wfa_failed") or reason.startswith("meta_wfa_failed")
-                is_sample_only_unsafe = (
-                    (reason.startswith("state_marked_unsafe:") or reason.startswith("meta_marked_unsafe:"))
-                    and ("sample_quality_fail" in reason)
-                    and ("wfa_fail" not in reason)
-                    and ("stress_fail" not in reason)
-                    and ("risk_of_ruin=" not in reason)
-                )
-
-                if allow_soft_wfa_fallback and is_wfa_fail:
-                    soft_assets.append(asset)
-                    soft_wfa_assets.append(asset)
-                    continue
-                if allow_soft_sample_fallback and is_sample_only_unsafe:
-                    soft_assets.append(asset)
-                    soft_sample_assets.append(asset)
-
-            if soft_assets:
-                soft_assets = sorted(set(soft_assets))
-                mode_parts: list[str] = []
-                if soft_wfa_assets:
-                    mode_parts.append(f"wfa={','.join(sorted(set(soft_wfa_assets)))}")
-                if soft_sample_assets:
-                    mode_parts.append(f"sample_quality={','.join(sorted(set(soft_sample_assets)))}")
-                mode_tag = ";".join(mode_parts) if mode_parts else "mixed"
-
-                log_health.warning(
-                    "MODEL_GATE_SOFT_FALLBACK | mode=%s passing=%s blocked=%s reason=%s",
-                    mode_tag,
-                    ",".join(soft_assets),
-                    ",".join(sorted(set(required_assets).difference(set(soft_assets)))),
-                    gate_reason,
-                )
-                versions: list[str] = []
-                sharpes: list[float] = []
-                wins: list[float] = []
-                for asset in soft_assets:
-                    st = assets.get(asset, {}) if isinstance(assets, dict) else {}
-                    version = str(st.get("model_version", "") or "").strip()
-                    if not version:
-                        continue
-                    model = model_manager.load_model(version)
-                    if model is None:
-                        continue
-                    versions.append(f"{asset}:{version}")
-                    sharpes.append(float(st.get("sharpe", 0.0) or 0.0))
-                    wins.append(float(st.get("win_rate", 0.0) or 0.0))
-                    if isinstance(model, dict) and "model" in model and "pipeline" in model:
-                        self._catboost_payloads[asset] = model
-                        log_health.info("CATBOOST_LOADED | asset=%s version=%s", asset, version)
-
-                if versions:
-                    self._model_version = " | ".join(versions)
-                    self._model_sharpe = min(sharpes) if sharpes else 0.0
-                    self._model_win_rate = min(wins) if wins else 0.0
-                    self._model_loaded = True
-                    self._backtest_passed = True
-                    self._gate_last_reason = "soft_fallback"
-                    self._blocked_assets = sorted(set(required_assets).difference(set(soft_assets)))
-                    log_health.warning(
-                        "MODEL_GATE_SOFT_OK | mode=%s versions=%s blocked_assets=%s",
-                        mode_tag,
-                        self._model_version,
-                        ",".join(self._blocked_assets),
-                    )
-                    return
-
         if not gate_ok:
             if should_log_gate:
                 log_health.warning("MODEL_GATE_SKIP | reason=%s", gate_reason)
@@ -544,6 +479,15 @@ class MultiAssetTradingEngine:
             self._model_sharpe = 0.0
             self._model_win_rate = 0.0
             self._blocked_assets = sorted(required_assets)
+            if self._run.is_set():
+                with self._lock:
+                    self._manual_stop = True
+                    self._run.clear()
+                self._drain_queue(self._order_q)
+                self._drain_queue(self._result_q)
+                self._order_rm_by_id.clear()
+                self._pending_order_meta.clear()
+                self._emergency_flatten(f"model_gate_failed:{gate_reason}")
             return
 
         versions: list[str] = []
@@ -585,139 +529,7 @@ class MultiAssetTradingEngine:
         )
 
     def _infer_catboost(self, asset: str) -> Optional[MLSignal]:
-        """Run CatBoost model inference on live M1 data from MT5."""
-        if self._is_asset_blocked(asset):
-            self._log_blocked_asset_skip(asset, "catboost_infer")
-            return None
-        payload = self._catboost_payloads.get(asset)
-        if not payload:
-            return None
-        try:
-            import pandas as pd
-            import numpy as np
-
-            cb_model = payload["model"]
-            pipeline = payload["pipeline"]
-
-            # Fetch live M1 bars from MT5
-            pipe = self._xau if asset == "XAU" else self._btc
-            if pipe is None:
-                return None
-            symbol = pipe.symbol
-            if not symbol:
-                return None
-
-            n_bars = max(int(getattr(pipeline.cfg, 'window_size', 60) or 60) + 200, 500)
-            with MT5_LOCK:
-                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, n_bars)
-            if rates is None or len(rates) < 100:
-                log_health.warning("CATBOOST_SKIP | asset=%s reason=insufficient_bars bars=%s", asset, len(rates) if rates is not None else 0)
-                return None
-
-            df = pd.DataFrame(rates)
-            df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df = df.rename(columns={
-                "open": "Open", "high": "High", "low": "Low",
-                "close": "Close", "tick_volume": "Volume",
-            })
-            df = df.set_index("datetime")[["Open", "High", "Low", "Close", "Volume"]]
-
-            # Transform through pipeline (adds indicators, creates windows)
-            xy = pipeline.transform(df.copy())
-            if xy["X"].empty:
-                log_health.warning("CATBOOST_SKIP | asset=%s reason=empty_features", asset)
-                return None
-
-            # Use only the LAST row (current bar)
-            X_last = np.stack([xy["X"].iloc[-1]])
-            pred = cb_model.predict(X_last)
-            pred_val = float(pred[0])
-
-            # Determine signal from prediction using ADAPTIVE threshold
-            # Static percent_increase from training config is too aggressive for live M1
-            # Use adaptive threshold: median of recent prediction magnitudes
-            static_threshold = max(float(getattr(pipeline.cfg, 'percent_increase', 0.0) or 0.0), 1e-12)
-            
-            # Track prediction history for adaptive threshold
-            if asset not in self._catboost_pred_history:
-                self._catboost_pred_history[asset] = deque(maxlen=200)
-            self._catboost_pred_history[asset].append(abs(pred_val))
-            
-            # Adaptive threshold: 75th percentile of recent predictions
-            # This means ~25% of predictions will generate signals
-            hist = self._catboost_pred_history[asset]
-            hist_arr = np.asarray(hist, dtype=np.float64)
-            if len(hist) >= 20:
-                adaptive_threshold = float(np.percentile(hist_arr, 75))
-                threshold = max(adaptive_threshold, 1e-12)
-                p95_mag = max(float(np.percentile(hist_arr, 95)), threshold * 1.05)
-                conf_ref = max(p95_mag - threshold, threshold * 0.10, 1e-12)
-            else:
-                # Not enough history yet, use a fraction of static threshold
-                threshold = static_threshold * 0.1
-                p95_mag = threshold * 2.0
-                conf_ref = max(threshold, 1e-12)
-
-            # Confidence calibration:
-            # - below threshold -> [0.05, 0.74] (never tradeable for ml_router)
-            # - above threshold -> [0.75, 0.99] (tradeable but never hard-saturates at 1.0)
-            mag = abs(pred_val)
-            if mag < threshold:
-                confidence = max(0.05, min(0.74, (mag / max(threshold, 1e-12)) * 0.74))
-            else:
-                rel = (mag - threshold) / conf_ref
-                rel = max(0.0, min(1.0, rel))
-                confidence = 0.75 + (0.24 * rel)
-            confidence = max(0.0, min(0.99, confidence))
-
-            last_close = float(df["Close"].iloc[-1])
-            atr_arr = None
-            try:
-                import talib
-                h = np.asarray(df["High"].values, dtype=np.float64)
-                l = np.asarray(df["Low"].values, dtype=np.float64)
-                c = np.asarray(df["Close"].values, dtype=np.float64)
-                atr_arr = talib.ATR(h, l, c, timeperiod=14)
-            except Exception:
-                pass
-            atr_val = float(atr_arr[-1]) if atr_arr is not None and len(atr_arr) > 0 and np.isfinite(atr_arr[-1]) else last_close * 0.001
-
-            if abs(pred_val) < threshold:
-                return MLSignal(
-                    asset=asset, signal="HOLD", side="Neutral",
-                    confidence=confidence, reason=f"catboost_below_threshold:{pred_val:.6f}<{threshold:.6f}",
-                    provider="catboost", model="catboost_trained",
-                    entry=None, stop_loss=None, take_profit=None,
-                    scalp_payload={"M1": {"ts_bar": float(df.index[-1].timestamp()), "last_close": last_close, "atr_14": atr_val, "rsi_14": 50.0, "ema_20": last_close, "ema_50": last_close, "ema_200": last_close}},
-                    intraday_payload=None,
-                )
-
-            signal = "STRONG BUY" if pred_val > 0 else "STRONG SELL"
-            side = "Buy" if pred_val > 0 else "Sell"
-
-            # Build payload frame for downstream risk calc
-            frame = {
-                "ts_bar": float(df.index[-1].timestamp()),
-                "last_close": last_close,
-                "atr_14": atr_val,
-                "rsi_14": 50.0,
-                "ema_20": last_close,
-                "ema_50": last_close,
-                "ema_200": last_close,
-            }
-
-            return MLSignal(
-                asset=asset, signal=signal, side=side,
-                confidence=confidence,
-                reason=f"catboost_pred:{pred_val:.6f}|thr:{threshold:.6f}|p95:{p95_mag:.6f}",
-                provider="catboost", model="catboost_trained",
-                entry=last_close, stop_loss=None, take_profit=None,
-                scalp_payload={"M1": frame},
-                intraday_payload={"H1": frame},
-            )
-        except Exception as exc:
-            log_err.error("CATBOOST_INFER_ERROR | asset=%s err=%s | tb=%s", asset, exc, traceback.format_exc())
-            return None
+        return self._inference_engine.infer_catboost(asset)
 
     def reload_model(self) -> None:
         """Hot-reload model from disk after retraining."""
@@ -758,6 +570,9 @@ class MultiAssetTradingEngine:
                 # Immediate Queue Wipe
                 self._drain_queue(self._order_q)
                 self._drain_queue(self._result_q)
+                self._order_rm_by_id.clear()
+                self._pending_order_meta.clear()
+                self._emergency_flatten("stop_lock")
                 
                 # Optional: Send emergency notification
                 if self._engine_stop_notifier:
@@ -912,6 +727,21 @@ class MultiAssetTradingEngine:
             pass
         return n
 
+    def _register_pending_order(self, intent: OrderIntent) -> None:
+        self._order_sync_manager.register_pending_order(intent)
+
+    def _clear_pending_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        return self._order_sync_manager.clear_pending_order(order_id)
+
+    def _resolve_order_result(self, r: ExecutionResult) -> None:
+        self._order_sync_manager.resolve_order_result(r)
+
+    def _probe_pending_order_state(self, order_id: str, meta: Dict[str, Any], now_ts: float) -> Optional[ExecutionResult]:
+        return self._order_sync_manager.probe_pending_order_state(order_id, meta, now_ts)
+
+    def _sync_pending_orders(self) -> None:
+        self._order_sync_manager.sync_pending_orders()
+
     def _recover_all(self) -> bool:
         now = time.time()
         if (now - self._last_recover_ts) < 8.0:
@@ -936,6 +766,7 @@ class MultiAssetTradingEngine:
             self._drain_queue(self._order_q)
             self._drain_queue(self._result_q)
             self._order_rm_by_id.clear()
+            self._pending_order_meta.clear()
 
             try:
                 with MT5_LOCK:
@@ -1138,6 +969,94 @@ class MultiAssetTradingEngine:
                 self._seen_index.pop((a, sid), None)
             cleaned += 1
 
+    @staticmethod
+    def _prune_signal_window(window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0) -> None:
+        while window and (now_ts - float(window[0])) > float(lookback_sec):
+            window.popleft()
+
+    @staticmethod
+    def _p95(values: Deque[float] | List[float]) -> float:
+        seq = [float(v) for v in values if float(v) >= 0.0]
+        if len(seq) < 3:
+            return 0.0
+        seq.sort()
+        idx = int(round((len(seq) - 1) * 0.95))
+        idx = max(0, min(len(seq) - 1, idx))
+        return float(seq[idx])
+
+    @staticmethod
+    def _utc_day_progress() -> float:
+        now = datetime.utcnow()
+        sec = (now.hour * 3600) + (now.minute * 60) + now.second
+        return max(0.0, min(1.0, float(sec) / 86400.0))
+
+    def _signal_density_controls(self, asset: str, now_ts: float) -> Tuple[float, float, float, int]:
+        asset_u = str(asset or "").upper().strip()
+        window = self._signal_emit_ts_by_asset.setdefault(asset_u, deque(maxlen=512))
+        global_window = self._signal_emit_ts_global
+        self._prune_signal_window(window, now_ts)
+        self._prune_signal_window(global_window, now_ts)
+
+        count_24h = int(len(window))
+        global_count_24h = int(len(global_window))
+        try:
+            active_assets = max(1, len(tuple(UTCScheduler.get_active_assets())))
+        except Exception:
+            active_assets = 2
+        min_target = float(max(1.0, float(self._target_signals_per_24h_min) / float(active_assets)))
+        max_target = float(
+            max(
+                min_target,
+                float(self._target_signals_per_24h_max) / float(active_assets),
+            )
+        )
+
+        threshold_mult = 1.0
+        min_zscore = float(self._catboost_min_zscore)
+        min_flow = float(self._catboost_min_flow_confirm)
+
+        if count_24h < min_target:
+            deficit = (min_target - float(count_24h)) / max(min_target, 1.0)
+            relax = min(0.40, 0.40 * deficit)
+            threshold_mult = max(0.60, 1.0 - relax)
+            min_zscore = max(0.20, min_zscore * (1.0 - (0.45 * deficit)))
+            min_flow = max(0.01, min_flow * (1.0 - (0.45 * deficit)))
+        elif count_24h > max_target:
+            excess = (float(count_24h) - max_target) / max(max_target, 1.0)
+            tighten = min(0.25, 0.25 * excess)
+            threshold_mult = min(1.25, 1.0 + tighten)
+            min_zscore = min(1.75, min_zscore * (1.0 + (0.20 * excess)))
+            min_flow = min(0.20, min_flow * (1.0 + (0.20 * excess)))
+
+        # Global pacing controller for 10-20/day target (all active assets combined).
+        day_progress = self._utc_day_progress()
+        min_target_total = float(self._target_signals_per_24h_min)
+        max_target_total = float(self._target_signals_per_24h_max)
+        expected_min_now = min_target_total * day_progress
+
+        if global_count_24h < expected_min_now:
+            pace_deficit = (expected_min_now - float(global_count_24h)) / max(min_target_total, 1.0)
+            urgency = min(1.0, max(0.0, pace_deficit))
+            threshold_mult = max(0.52, float(threshold_mult) * (1.0 - (0.28 * urgency)))
+            min_zscore = max(0.12, float(min_zscore) * (1.0 - (0.35 * urgency)))
+            min_flow = max(0.005, float(min_flow) * (1.0 - (0.35 * urgency)))
+        elif global_count_24h > max_target_total:
+            overflow = (float(global_count_24h) - max_target_total) / max(max_target_total, 1.0)
+            pressure = min(1.0, max(0.0, overflow))
+            threshold_mult = min(1.35, float(threshold_mult) * (1.0 + (0.20 * pressure)))
+            min_zscore = min(1.95, float(min_zscore) * (1.0 + (0.25 * pressure)))
+            min_flow = min(0.25, float(min_flow) * (1.0 + (0.25 * pressure)))
+
+        return threshold_mult, min_zscore, min_flow, count_24h
+
+    def _record_signal_emit(self, asset: str, now_ts: float) -> None:
+        asset_u = str(asset or "").upper().strip()
+        window = self._signal_emit_ts_by_asset.setdefault(asset_u, deque(maxlen=512))
+        self._prune_signal_window(window, now_ts)
+        self._prune_signal_window(self._signal_emit_ts_global, now_ts)
+        window.append(float(now_ts))
+        self._signal_emit_ts_global.append(float(now_ts))
+
     # -------------------- portfolio logic --------------------
     def _next_order_id(self, asset: str) -> str:
         self._order_counter += 1
@@ -1148,8 +1067,8 @@ class MultiAssetTradingEngine:
         cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
         base = float(getattr(cfg, "min_confidence_signal", 0.55) or 0.55)
 
-        env_global = float(os.getenv("PORTFOLIO_MIN_CONF", "0.50") or "0.50")
-        env_asset = float(os.getenv(f"PORTFOLIO_MIN_CONF_{str(c.asset).upper()}", str(env_global)) or str(env_global))
+        env_global : float = 0.50
+        env_asset: float = float(env_global)
         floor = max(0.35, min(0.90, env_asset))
 
         effective_min = max(floor, base)
@@ -1261,320 +1180,12 @@ class MultiAssetTradingEngine:
         order_count: int = 1,
         lot_override: Optional[float] = None,
     ) -> Tuple[bool, Optional[str]]:
-        now = time.time()
-
-        # Resolve risk/cfg for this asset early
-        if cand.asset == "XAU":
-            risk = self._xau.risk if self._xau else None
-            cfg = self._xau_cfg
-        else:
-            risk = self._btc.risk if self._btc else None
-            cfg = self._btc_cfg
-
-        # Ensure phase is fresh
-        try:
-            fn = getattr(risk, "update_phase", None)
-            if callable(fn):
-                fn()
-        except Exception:
-            pass
-
-        # Hard-stop: MUST block trading (even if phase not yet updated)
-        try:
-            fn = getattr(risk, "requires_hard_stop", None)
-            if callable(fn) and bool(fn()):
-                log_health.info("ENQUEUE_SKIP | asset=%s reason=hard_stop", cand.asset)
-                return False, None
-        except Exception:
-            pass
-
-        # ============================================================
-        # PHASE C SHADOW MODE: Block execution but send alert
-        # Shows what trade WOULD have happened for transparency
-        # ============================================================
-        phase = self._get_phase(risk)
-        if phase == "C":
-            log_health.warning(
-                "PHASE_C_SHADOW | asset=%s signal=%s conf=%.2f lot=%.4f sl=%.2f tp=%.2f | BLOCKED - Shadow Mode Active",
-                cand.asset,
-                cand.signal,
-                cand.confidence,
-                cand.lot,
-                cand.sl,
-                cand.tp,
-            )
-            
-            # Send Telegram notification (Shadow Mode alert)
-            if self._signal_notifier:
-                try:
-                    # Get current price for the alert
-                    with MT5_LOCK:
-                        tick = mt5.symbol_info_tick(cand.symbol)
-                    current_price = float(tick.ask if cand.signal == "Buy" else tick.bid) if tick else 0.0
-                    
-                    # Build shadow mode alert payload
-                    shadow_alert = {
-                        "type": "PHASE_C_SHADOW",
-                        "asset": cand.asset,
-                        "symbol": cand.symbol,
-                        "signal": cand.signal,
-                        "confidence": cand.confidence,
-                        "lot": cand.lot,
-                        "sl": cand.sl,
-                        "tp": cand.tp,
-                        "price": current_price,
-                        "blocked": True,
-                        "reason": "Phase C - Daily Risk Limit Reached",
-                        "message": (
-                            f"⚠️ [PHASE C — Shadow Trade] Сигнали тасдиқшудаи {cand.signal} барои {cand.symbol}.\n"
-                            f"Нарх: {current_price:.2f} | Боварӣ: {cand.confidence:.0f}%\n"
-                            f"(Савдо бо лимити риск манъ шуд)\n"
-                            f"Ҳаҷми эҳтимолӣ: {cand.lot:.2f} | SL: {cand.sl:.2f} | TP: {cand.tp:.2f}"
-                        ),
-                    }
-                    self._signal_notifier(cand.asset, shadow_alert)
-                except Exception as e:
-                    log_health.error("PHASE_C_SHADOW notification error: %s", e)
-            
-            return False, None
-
-        # ============================================================
-        # FIX #3: Post-Trade Cooldown Check
-        # Prevents rapid re-entry after a trade closes
-        # ============================================================
-        last_close_ts = self._last_trade_close_ts.get(cand.asset, 0.0)
-        time_since_close = now - last_close_ts
-        if time_since_close < self._trade_cooldown_sec and last_close_ts > 0:
-            self._cooldown_blocked_count[cand.asset] = self._cooldown_blocked_count.get(cand.asset, 0) + 1
-            # Log periodically to avoid spam
-            if self._cooldown_blocked_count[cand.asset] % 10 == 1:
-                log_health.info(
-                    "ENQUEUE_SKIP | asset=%s reason=trade_cooldown remaining=%.0fs total_blocked=%d",
-                    cand.asset,
-                    self._trade_cooldown_sec - time_since_close,
-                    self._cooldown_blocked_count[cand.asset],
-                )
-            return False, None
-
-        open_positions = self._asset_open_positions(cand.asset)
-        max_positions = self._asset_max_positions(cand.asset)
-        if max_positions > 0 and open_positions >= max_positions:
-            log_health.info(
-                "ENQUEUE_SKIP | asset=%s reason=max_positions open=%d max=%d",
-                cand.asset,
-                open_positions,
-                max_positions,
-            )
-            return False, None
-
-        # ============================================================
-        # PORTFOLIO RISK CHECK (Cross-Asset Guard)
-        # ============================================================
-        # Estimate margin (conservative: leverage=1, or ignore if difficult)
-        # For now, we assume simple 1:200 approx check or skip margin cap if 0 
-        # But we MUST pass equity and lot to check correlation/DD.
-        with MT5_LOCK:
-            acc_info = mt5.account_info()
-            equity = getattr(acc_info, "equity", 0.0) if acc_info else 0.0
-            leverage = getattr(acc_info, "leverage", 100) if acc_info else 100
-
-        # Estimate proposed margin
-        # margin = (price * lot * contract_size) / leverage
-        c_size = float(getattr(cfg.symbol_params, "contract_size", 100.0))
-        # Use simple estimation
-        proposed_margin = (float(cand.close if hasattr(cand, 'close') else 0) * float(cand.lot) * c_size) / float(leverage or 1)
-        if proposed_margin <= 0:
-             # fallback if close not in cand
-             with MT5_LOCK:
-                 tick_info = mt5.symbol_info_tick(cand.symbol)
-             p = tick_info.ask if tick_info else 0.0
-             proposed_margin = (p * float(cand.lot) * c_size) / float(leverage or 1)
-
-        allowed, adj_lot, block_reason = self._portfolio_risk.check_before_order(
-            asset=cand.asset,
-            side=cand.signal,
-            equity=equity,
-            proposed_lot=float(cand.lot),
-            proposed_margin=proposed_margin,
+        return self._execution_manager.enqueue_order(
+            cand,
+            order_index=order_index,
+            order_count=order_count,
+            lot_override=lot_override,
         )
-        
-        if not allowed:
-            log_health.warning("PORTFOLIO_BLOCK | asset=%s reason=%s", cand.asset, block_reason)
-            return False, None
-            
-        if adj_lot < cand.lot:
-            log_health.info("PORTFOLIO_REDUCE | asset=%s lot %.2f -> %.2f (Correlation Guard)", cand.asset, cand.lot, adj_lot)
-            # Update candidate lot in place (or just use override)
-            lot_override = adj_lot
-
-        # 1 signal_id => 1 order (edge trigger)
-        last_id, last_sig = self._edge_last_trade.get(cand.asset, ("", "Neutral"))
-        if cand.signal in ("Buy", "Sell") and last_id == str(cand.signal_id) and last_sig == str(cand.signal):
-            # Throttled logging for edge duplicates
-            last_log = self._last_log_id.get(cand.asset)
-            if last_log != str(cand.signal_id):
-                log_health.info(
-                    "ENQUEUE_SKIP | asset=%s reason=edge_same_signal_id signal=%s signal_id=%s",
-                    cand.asset,
-                    cand.signal,
-                    cand.signal_id,
-                )
-                self._last_log_id[cand.asset] = str(cand.signal_id)
-            return False, None
-
-        # SILENT DUPLICATE CHECK: Avoid log spam for the same signal ID
-        # Only log if we haven't seen this specific signal ID skip recently
-        if self._is_duplicate(cand.asset, cand.signal_id, now, max_orders=int(order_count), order_index=int(order_index)):
-            # Check if we already logged this skip for this signal_id
-            last_log = self._last_log_id.get(cand.asset)
-            if last_log != str(cand.signal_id):
-                log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
-                self._last_log_id[cand.asset] = str(cand.signal_id)
-            return False, None
-
-        # Tick + digits
-        with MT5_LOCK:
-            tick = mt5.symbol_info_tick(cand.symbol)
-            info = mt5.symbol_info(cand.symbol)
-        if tick is None:
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=tick_missing", cand.asset)
-            return False, None
-
-        price = float(tick.ask if cand.signal == "Buy" else tick.bid)
-        if price <= 0:
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=bad_price", cand.asset)
-            return False, None
-
-        # ============================================================
-        # FIX #4: SLIPPAGE PROTECTION (Pre-Trade)
-        # ============================================================
-        # 1. Spread Check
-        current_spread_points = float(tick.ask - tick.bid) / float(info.point) if info.point else 99999.0
-        max_spread_pts = float(getattr(cfg, "max_spread_points", 0) or 0)
-        
-        # Default safety defaults if config missing
-        if max_spread_pts <= 0:
-            max_spread_pts = 2500.0 if cand.asset == "BTC" else 350.0  # ~35 pips XAU (3-digit), ~$25 BTC
-            
-        if current_spread_points > max_spread_pts:
-             # Throttle this log to once per 30s per asset to prevent spam
-             _sp_key = f"_spread_skip_ts_{cand.asset}"
-             _sp_last = getattr(self, _sp_key, 0.0)
-             if (now - _sp_last) >= 30.0:
-                 setattr(self, _sp_key, now)
-                 log_health.info(
-                     "ENQUEUE_SKIP | asset=%s reason=spread_too_high spread=%s > max=%s", 
-                     cand.asset, int(current_spread_points), int(max_spread_pts)
-                 )
-             return False, None
-
-        # 2. Volatility/Slip Estimation (Basic)
-        # If market is moving too fast (tick.last != bid/ask midpoint by large margin), maybe unsafe?
-        # For now, spread check is the most reliable "pre-trade" slippage guard.
-
-
-        digits = int(getattr(info, "digits", 0) or 0) if info else 0
-        sl_val = float(cand.sl)
-        tp_val = float(cand.tp)
-        if digits > 0:
-            try:
-                price = float(builtins.round(price, digits))
-                sl_val = float(builtins.round(sl_val, digits))
-                tp_val = float(builtins.round(tp_val, digits))
-            except Exception:
-                pass
-
-        # SL/TP direction sanity (critical)
-        if cand.signal == "Buy":
-            if not (sl_val < price < tp_val):
-                log_health.info(
-                    "ENQUEUE_SKIP | asset=%s reason=bad_sl_tp_relation side=Buy price=%.5f sl=%.5f tp=%.5f",
-                    cand.asset,
-                    price,
-                    sl_val,
-                    tp_val,
-                )
-                return False, None
-        else:
-            if not (tp_val < price < sl_val):
-                log_health.info(
-                    "ENQUEUE_SKIP | asset=%s reason=bad_sl_tp_relation side=Sell price=%.5f sl=%.5f tp=%.5f",
-                    cand.asset,
-                    price,
-                    sl_val,
-                    tp_val,
-                )
-                return False, None
-
-        lot_val = float(lot_override) if lot_override is not None else float(cand.lot)
-        lot_val = self._apply_asset_lot_cap(cand.asset, lot_val, "enqueue")
-        if lot_val <= 0:
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset)
-            return False, None
-
-        # Phase B: reduce lot by 50%
-        if phase == "B":
-            orig = lot_val
-            lot_val = max(0.01, lot_val * 0.5)
-            log_health.info(
-                "PHASE_B_LOT_REDUCE | asset=%s original_lot=%.4f reduced_lot=%.4f",
-                cand.asset,
-                float(orig),
-                float(lot_val),
-            )
-
-        order_id = self._next_order_id(cand.asset)
-        idem = f"{cand.symbol}:{cand.signal_id}:{cand.signal}"
-
-        intent = OrderIntent(
-            asset=cand.asset,
-            symbol=cand.symbol,
-            signal=cand.signal,
-            confidence=float(cand.confidence),
-            lot=float(lot_val),
-            sl=float(sl_val),
-            tp=float(tp_val),
-            price=float(price),
-            enqueue_time=float(now),
-            order_id=str(order_id),
-            signal_id=str(cand.signal_id),
-            idempotency_key=str(idem),
-            risk_manager=risk,
-            cfg=cfg,
-        )
-
-        # Remember RM mapping BEFORE enqueue; rollback on failure
-        self._order_rm_by_id[str(order_id)] = risk
-
-        try:
-            self._order_q.put_nowait(intent)
-        except queue.Full:
-            self._order_rm_by_id.pop(str(order_id), None)
-            if risk and hasattr(risk, "record_execution_failure"):
-                try:
-                    risk.record_execution_failure(order_id, now, now, "queue_backlog_drop")
-                except Exception:
-                    pass
-            log_health.warning("ENQUEUE_FAIL | asset=%s reason=queue_full order_id=%s", cand.asset, order_id)
-            return False, None
-
-        self._mark_seen(cand.asset, cand.signal_id, now)
-        self._last_selected_asset = cand.asset
-        self._edge_last_trade[cand.asset] = (str(cand.signal_id), str(cand.signal))
-
-        if risk:
-            if hasattr(risk, "register_signal_emitted"):
-                try:
-                    risk.register_signal_emitted()
-                except Exception:
-                    pass
-            if hasattr(risk, "track_signal_survival"):
-                try:
-                    risk.track_signal_survival(order_id, cand.signal, price, sl_val, tp_val, now, cand.confidence)
-                except Exception:
-                    pass
-
-        return True, str(order_id)
 
     def _orders_for_candidate(self, cand: AssetCandidate) -> int:
         """STRICT: 1 signal = 1 order. Phase C: 0 orders."""
@@ -1625,6 +1236,150 @@ class MultiAssetTradingEngine:
         lots[-1] = float(lot) - (base * float(int(parts) - 1))
         return lots
 
+    def _report_cycle_latency_ms(self, latency_ms: float) -> None:
+        try:
+            lat = float(latency_ms)
+        except Exception:
+            return
+        if lat < 0.0:
+            return
+        self._fsm_cycle_ms_hist.append(lat)
+        if lat > (self._live_max_p95_latency_ms * 1.75):
+            now = time.time()
+            if (now - self._last_cycle_spike_log_ts) >= 5.0:
+                self._last_cycle_spike_log_ts = now
+                log_health.warning(
+                    "FSM_CYCLE_SPIKE | latency_ms=%.1f threshold_ms=%.1f",
+                    lat,
+                    self._live_max_p95_latency_ms * 1.75,
+                )
+
+    def _record_execution_telemetry(self, r: ExecutionResult) -> None:
+        try:
+            sent = float(getattr(r, "sent_ts", 0.0) or 0.0)
+            fill = float(getattr(r, "fill_ts", 0.0) or 0.0)
+            slip = abs(float(getattr(r, "slippage", 0.0) or 0.0))
+            if fill > sent > 0.0:
+                self._exec_latency_ms_hist.append((fill - sent) * 1000.0)
+            if slip >= 0.0:
+                self._exec_slippage_hist.append(slip)
+        except Exception:
+            return
+
+    def _reference_win_rate(self) -> float:
+        vals: List[float] = []
+        for asset in ("XAU", "BTC"):
+            payload = self._catboost_payloads.get(asset)
+            if not isinstance(payload, dict):
+                continue
+            cal = payload.get("alpha_calibration", {})
+            if not isinstance(cal, dict):
+                continue
+            wr = float(cal.get("holdout_direction_accuracy_active", 0.0) or 0.0)
+            if wr > 0.0:
+                vals.append(wr)
+        if not vals:
+            return 0.0
+        return float(min(vals))
+
+    def _live_trade_win_rate(self) -> Tuple[float, int]:
+        profits: List[float] = []
+        for pipe in (self._xau, self._btc):
+            rm = getattr(pipe, "risk", None) if pipe is not None else None
+            fn = getattr(rm, "_recent_closed_trade_profits", None)
+            if not callable(fn):
+                continue
+            try:
+                p = fn(60)
+                if isinstance(p, list):
+                    profits.extend(float(x) for x in p if x is not None)
+            except Exception:
+                continue
+        if not profits:
+            return 0.0, 0
+        wins = sum(1 for p in profits if float(p) > 0.0)
+        n = int(len(profits))
+        return float(wins / max(1, n)), n
+
+    def _update_live_evidence(self, *, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if (not force) and ((now - self._last_live_monitor_ts) < self._live_monitor_interval_sec):
+            return dict(self._live_evidence_state)
+        self._last_live_monitor_ts = now
+
+        lat_p95 = max(
+            self._p95(self._exec_latency_ms_hist),
+            self._p95(self._fsm_cycle_ms_hist),
+        )
+        slip_p95 = self._p95(self._exec_slippage_hist)
+
+        risk_lat_candidates: List[float] = []
+        risk_slip_candidates: List[float] = []
+        for pipe in (self._xau, self._btc):
+            rm = getattr(pipe, "risk", None) if pipe is not None else None
+            if rm is None:
+                continue
+            try:
+                if hasattr(rm, "exec_p95_latency"):
+                    risk_lat_candidates.append(float(rm.exec_p95_latency() or 0.0))
+                if hasattr(rm, "exec_p95_slippage"):
+                    risk_slip_candidates.append(float(rm.exec_p95_slippage() or 0.0))
+            except Exception:
+                continue
+        if risk_lat_candidates:
+            lat_p95 = max(lat_p95, max(risk_lat_candidates))
+        if risk_slip_candidates:
+            slip_p95 = max(slip_p95, max(risk_slip_candidates))
+
+        live_wr, wr_samples = self._live_trade_win_rate()
+        ref_wr = self._reference_win_rate()
+        drift = float(live_wr - ref_wr) if (live_wr > 0.0 and ref_wr > 0.0) else 0.0
+
+        reasons: List[str] = []
+        if lat_p95 > self._live_max_p95_latency_ms:
+            reasons.append(f"latency_p95:{lat_p95:.1f}>{self._live_max_p95_latency_ms:.1f}")
+        if slip_p95 > self._live_max_p95_slippage_points:
+            reasons.append(f"slippage_p95:{slip_p95:.2f}>{self._live_max_p95_slippage_points:.2f}")
+        if wr_samples >= 8 and ref_wr > 0.0 and drift < -self._live_max_winrate_drift:
+            reasons.append(f"winrate_drift:{drift:+.3f}")
+
+        status = "HEALTHY" if not reasons else "DEGRADED"
+        if self._manual_stop:
+            status = "MONITORING_ONLY"
+        elif not self._mt5_ready and not self.dry_run:
+            status = "MT5_OFFLINE"
+
+        self._prune_signal_window(self._signal_emit_ts_global, now)
+        snapshot = {
+            "status": status,
+            "reason": "|".join(reasons) if reasons else "ok",
+            "updated_ts": now,
+            "latency_p95_ms": float(lat_p95),
+            "slippage_p95_points": float(slip_p95),
+            "win_rate_live": float(live_wr),
+            "win_rate_reference": float(ref_wr),
+            "win_rate_drift": float(drift),
+            "closed_trade_samples": int(wr_samples),
+            "signals_24h": int(len(self._signal_emit_ts_global)),
+        }
+        self._live_evidence_state = snapshot
+
+        level = log_health.warning if reasons else log_health.info
+        level(
+            "LIVE_EVIDENCE | status=%s reason=%s latency_p95=%.1f slippage_p95=%.2f "
+            "win_rate_live=%.3f win_rate_ref=%.3f drift=%+.3f closed_trades=%d signals_24h=%d",
+            snapshot["status"],
+            snapshot["reason"],
+            snapshot["latency_p95_ms"],
+            snapshot["slippage_p95_points"],
+            snapshot["win_rate_live"],
+            snapshot["win_rate_reference"],
+            snapshot["win_rate_drift"],
+            snapshot["closed_trade_samples"],
+            snapshot["signals_24h"],
+        )
+        return dict(snapshot)
+
     # -------------------- heartbeat/status --------------------
     def _heartbeat(self, open_xau: int, open_btc: int) -> None:
         try:
@@ -1670,6 +1425,7 @@ class MultiAssetTradingEngine:
                 exec_queue_size=int(self._order_q.qsize()),
                 last_reconcile_ts=float(self._last_reconcile_ts),
             )
+            live_evidence = self._update_live_evidence(force=False)
 
             if _DIAG_ENABLED and (time.time() - self._diag_last_ts) >= float(_DIAG_EVERY_SEC):
                 self._diag_last_ts = time.time()
@@ -1677,6 +1433,7 @@ class MultiAssetTradingEngine:
                     "ts_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "engine": st,
                     "mt5": mt5_status(),
+                    "live_evidence": live_evidence,
                 }
                 try:
                     log_diag.info(safe_json_dumps(payload))
@@ -1857,6 +1614,7 @@ class MultiAssetTradingEngine:
                     self._model_loaded,
                     self._backtest_passed,
                 )
+                self._emergency_flatten("start_blocked_gatekeeper_failed")
                 return False
 
         with self._lock:
@@ -1946,6 +1704,7 @@ class MultiAssetTradingEngine:
         self._drain_queue(self._order_q)
         self._drain_queue(self._result_q)
         self._order_rm_by_id.clear()
+        self._pending_order_meta.clear()
 
 
         log_health.info("PORTFOLIO_ENGINE_STOP")
@@ -1968,19 +1727,79 @@ class MultiAssetTradingEngine:
             return bool(self._manual_stop)
 
     def close_all(self) -> bool:
-        """Best-effort close all positions for both symbols."""
-        ok_all = True
+        """Best-effort close all positions for both symbols (even before pipelines boot)."""
+        symbols: List[str] = []
+
+        def _append_symbol(sym: Any) -> None:
+            s = str(sym or "").strip()
+            if s and s not in symbols:
+                symbols.append(s)
+
         try:
             if self._xau and self._xau.symbol:
-                ok_all = bool(close_all_position(self._xau.symbol)) and ok_all
+                _append_symbol(self._xau.symbol)
+            else:
+                sp = getattr(self._xau_cfg, "symbol_params", None)
+                _append_symbol(getattr(sp, "resolved", "") or getattr(sp, "base", ""))
         except Exception:
-            ok_all = False
+            pass
+
         try:
             if self._btc and self._btc.symbol:
-                ok_all = bool(close_all_position(self._btc.symbol)) and ok_all
+                _append_symbol(self._btc.symbol)
+            else:
+                sp = getattr(self._btc_cfg, "symbol_params", None)
+                _append_symbol(getattr(sp, "resolved", "") or getattr(sp, "base", ""))
         except Exception:
-            ok_all = False
+            pass
+
+        ok_all = True
+        for sym in symbols:
+            try:
+                ok_all = bool(close_all_position(sym)) and ok_all
+            except Exception:
+                ok_all = False
         return bool(ok_all)
+
+    def _emergency_flatten(self, reason: str) -> bool:
+        """
+        Force-close all strategy symbols on critical halt paths.
+
+        This is intentionally fail-safe and is called from kill-switch / HALT
+        transitions to prevent orphaned positions.
+        """
+        if self.dry_run:
+            log_health.warning("EMERGENCY_FLATTEN_SKIP | reason=%s mode=dry_run", reason)
+            return True
+
+        reason_s = str(reason or "unspecified")
+        now = time.time()
+        with self._lock:
+            if (
+                (now - self._last_flatten_ts) < self._flatten_cooldown_sec
+                and reason_s == self._last_flatten_reason
+            ):
+                return False
+            self._last_flatten_ts = now
+            self._last_flatten_reason = reason_s
+
+        log_err.critical("EMERGENCY_FLATTEN_START | reason=%s retries=%d", reason_s, self._flatten_retries)
+        ok = False
+        for attempt in range(1, self._flatten_retries + 1):
+            try:
+                ok = bool(self.close_all())
+            except Exception as exc:
+                ok = False
+                log_err.error("EMERGENCY_FLATTEN_EXCEPTION | attempt=%d reason=%s err=%s", attempt, reason_s, exc)
+
+            if ok:
+                log_health.critical("EMERGENCY_FLATTEN_DONE | reason=%s attempt=%d", reason_s, attempt)
+                return True
+
+            time.sleep(self._flatten_backoff_sec * float(attempt))
+
+        log_err.critical("EMERGENCY_FLATTEN_FAILED | reason=%s", reason_s)
+        return False
 
     def _transition_state(self, current: EngineState, nxt: EngineState, reason: str) -> EngineState:
         log_health.info("FSM_TRANSITION | %s -> %s | reason=%s", current.value, nxt.value, reason)
@@ -1994,6 +1813,8 @@ class MultiAssetTradingEngine:
         self._drain_queue(self._order_q)
         self._drain_queue(self._result_q)
         self._order_rm_by_id.clear()
+        self._pending_order_meta.clear()
+        self._emergency_flatten(f"fsm_halt:{reason}")
 
     def _validate_payload_timestamp(self, asset: str, payload: Dict[str, Any], tf: str) -> Tuple[bool, str]:
         if not isinstance(payload, dict):
@@ -2269,6 +2090,7 @@ class MultiAssetTradingEngine:
             risk = self._xau.risk if selected.asset == "XAU" and self._xau else (self._btc.risk if self._btc else None)
             cfg = self._xau_cfg if selected.asset == "XAU" else self._btc_cfg
             lots = self._split_lot(float(selected.lot), order_count, risk, cfg)
+            signal_enqueued = False
 
             for idx, lot_val in enumerate(lots):
                 ok, oid = self._enqueue_order(
@@ -2278,6 +2100,49 @@ class MultiAssetTradingEngine:
                     lot_override=float(lot_val),
                 )
                 if ok:
+                    if not signal_enqueued:
+                        emit_ts = time.time()
+                        self._record_signal_emit(selected.asset, emit_ts)
+
+                        last_notified_id, last_notified_sig = self._edge_last_notified.get(
+                            selected.asset,
+                            ("", "Neutral"),
+                        )
+                        current_sig_id = str(selected.signal_id)
+                        current_sig = str(selected.signal)
+                        if (
+                            self._signal_notifier
+                            and not (
+                                last_notified_id == current_sig_id
+                                and last_notified_sig == current_sig
+                            )
+                        ):
+                            try:
+                                self._signal_notifier(
+                                    selected.asset,
+                                    {
+                                        "type": "LIVE_ENQUEUED",
+                                        "asset": selected.asset,
+                                        "signal": selected.signal,
+                                        "confidence": float(selected.confidence),
+                                        "reasons": list(selected.reasons or ()),
+                                        "signal_id": current_sig_id,
+                                        "order_id": str(oid or ""),
+                                        "lot": float(lot_val),
+                                        "phase": (self._get_phase(risk) if risk is not None else ""),
+                                        "blocked": False,
+                                    },
+                                )
+                            except Exception as exc:
+                                log_err.error(
+                                    "SIGNAL_NOTIFY_ERROR | asset=%s signal_id=%s err=%s",
+                                    selected.asset,
+                                    current_sig_id,
+                                    exc,
+                                )
+                        self._edge_last_notified[selected.asset] = (current_sig_id, current_sig)
+                        signal_enqueued = True
+
                     log_health.info(
                         "FSM_ORDER_ENQUEUED | asset=%s signal=%s conf=%.3f lot=%.4f order_id=%s",
                         selected.asset,
@@ -2295,11 +2160,7 @@ class MultiAssetTradingEngine:
                 break
 
             try:
-                rm = self._order_rm_by_id.pop(str(r.order_id), None)
-                if rm is None:
-                    rm = self._xau.risk if str(r.order_id).startswith("PORD_XAU_") else self._btc.risk
-                if rm and hasattr(rm, "on_execution_result"):
-                    rm.on_execution_result(r)
+                self._resolve_order_result(r)
             except Exception:
                 pass
             finally:
@@ -2307,6 +2168,9 @@ class MultiAssetTradingEngine:
                     self._result_q.task_done()
                 except Exception:
                     pass
+
+        # Hard synchronization pass for pending orders (prevents ghost intents).
+        self._sync_pending_orders()
 
         if self._xau:
             self._xau.reconcile_positions()
@@ -2329,140 +2193,10 @@ class MultiAssetTradingEngine:
             self._run.clear()
             return
 
-        state = EngineState.BOOT
-        ctx = EngineCycleContext()
-
-        while self._run.is_set():
-            t0 = time.time()
-            try:
-                if state == EngineState.BOOT:
-                    if self._manual_stop:
-                        state = self._transition_state(state, EngineState.HALT, "manual_stop")
-                        ctx.halt_reason = "manual_stop_active"
-                    elif not self.dry_run and not (self._model_loaded and self._backtest_passed):
-                        state = self._transition_state(state, EngineState.HALT, "gatekeeper_failed")
-                        ctx.halt_reason = "gatekeeper_failed"
-                    elif not self._check_mt5_health():
-                        state = self._transition_state(state, EngineState.HALT, "mt5_unhealthy")
-                        ctx.halt_reason = "mt5_unhealthy"
-                    else:
-                        state = self._transition_state(state, EngineState.DATA_SYNC, "boot_ok")
-
-                elif state == EngineState.DATA_SYNC:
-                    if not self._check_mt5_health():
-                        state = self._transition_state(state, EngineState.HALT, "mt5_disconnected")
-                        ctx.halt_reason = "mt5_disconnected"
-                    else:
-                        self._check_hard_stop_file()
-                        if self._manual_stop:
-                            state = self._transition_state(state, EngineState.HALT, "manual_stop_triggered")
-                            ctx.halt_reason = "manual_stop_triggered"
-                            continue
-                        payloads: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
-                        active_assets = UTCScheduler.get_active_assets()
-                        data_sync_ok = True
-                        data_sync_reason = ""
-                        for asset in active_assets:
-                            if self._is_asset_blocked(asset):
-                                self._log_blocked_asset_skip(asset, "data_sync")
-                                continue
-                            asset_payloads = fetch_ml_payloads(asset)
-                            ok, reason = self._validate_data_sync_payloads(asset, asset_payloads)
-                            if not ok:
-                                data_sync_ok = False
-                                data_sync_reason = f"{asset}_data_sync_failed:{reason}"
-                                break
-                            payloads[asset] = asset_payloads
-                        if data_sync_ok and active_assets and not payloads:
-                            data_sync_ok = False
-                            data_sync_reason = "all_active_assets_blocked_by_gate"
-                        if data_sync_ok:
-                            ctx = EngineCycleContext(payloads=payloads)
-                            state = self._transition_state(state, EngineState.ML_INFERENCE, "data_sync_ok")
-                        else:
-                            now = time.time()
-                            # Avoid spamming logs on temporary feed gaps
-                            if (
-                                data_sync_reason != self._last_data_sync_fail_reason
-                                or (now - self._last_data_sync_fail_ts) > 5.0
-                            ):
-                                log_health.warning("DATA_SYNC_WAIT | reason=%s", data_sync_reason)
-                                self._last_data_sync_fail_reason = data_sync_reason
-                                self._last_data_sync_fail_ts = now
-
-                elif state == EngineState.ML_INFERENCE:
-                    signals: Dict[str, MLSignal] = {}
-                    for asset, payload in ctx.payloads.items():
-                        if self._is_asset_blocked(asset):
-                            self._log_blocked_asset_skip(asset, "ml_inference")
-                            continue
-                        # Try CatBoost trained model FIRST, fall back to Gemini LLM
-                        sig = None
-                        if asset in self._catboost_payloads:
-                            sig = self._infer_catboost(asset)
-                            if sig is not None:
-                                log_health.info(
-                                    "FSM_ML_SIGNAL | asset=%s signal=%s conf=%.3f provider=%s model=%s reason=%s",
-                                    asset, sig.signal, sig.confidence, sig.provider, sig.model, sig.reason,
-                                )
-                        if sig is None:
-                            # Fallback to Gemini LLM
-                            sig = infer_from_payloads(
-                                asset,
-                                scalp_payload=payload.get("scalp"),
-                                intraday_payload=payload.get("intraday"),
-                            )
-                            log_health.info(
-                                "FSM_ML_SIGNAL | asset=%s signal=%s conf=%.3f provider=%s model=%s reason=%s",
-                                asset, sig.signal, sig.confidence, sig.provider, sig.model, sig.reason,
-                            )
-                        signals[asset] = sig
-                    ctx.ml_signals = signals
-                    state = self._transition_state(state, EngineState.RISK_CALC, "ml_complete")
-
-                elif state == EngineState.RISK_CALC:
-                    candidates: List[AssetCandidate] = []
-                    for asset in ("XAU", "BTC"):
-                        sig = ctx.ml_signals.get(asset)
-                        if sig is None:
-                            continue
-                        cand = self._build_ml_candidate(asset, sig)
-                        if cand is not None:
-                            candidates.append(cand)
-                    ctx.candidates = candidates
-                    self._last_cand_xau = next((c for c in candidates if c.asset == "XAU"), None)
-                    self._last_cand_btc = next((c for c in candidates if c.asset == "BTC"), None)
-                    state = self._transition_state(state, EngineState.EXECUTION_QUEUE, "risk_complete")
-
-                elif state == EngineState.EXECUTION_QUEUE:
-                    if self._retraining_mode:
-                        now = time.time()
-                        if now - self._last_retraining_log_ts > 10.0:
-                            log_health.info("RETRAINING_PAUSE | skipping new orders during retraining")
-                            self._last_retraining_log_ts = now
-                        state = self._transition_state(state, EngineState.VERIFICATION, "retraining_pause")
-                    else:
-                        self._execute_candidates(ctx.candidates)
-                        state = self._transition_state(state, EngineState.VERIFICATION, "queue_complete")
-
-                elif state == EngineState.VERIFICATION:
-                    self._verification_step()
-                    state = self._transition_state(state, EngineState.DATA_SYNC, "verification_complete")
-
-                elif state == EngineState.HALT:
-                    self._halt_fsm(ctx.halt_reason or "unspecified")
-                    break
-
-                dt = time.time() - t0
-                # Minimum cycle time: prevent rapid-fire MT5 calls
-                # CatBoost inference + MT5 fetch per cycle needs throttling
-                min_cycle = max(self._poll_fast, 5.0)  # At least 5s per full cycle
-                time.sleep(max(0.02, min_cycle - dt))
-
-            except Exception as exc:
-                log_err.error("FSM_LOOP_EXCEPTION | err=%s | tb=%s", exc, traceback.format_exc())
-                ctx.halt_reason = f"fsm_exception:{exc}"
-                state = EngineState.HALT
+        self._fsm_runner.run(
+            initial_state=EngineState.BOOT,
+            initial_ctx=EngineCycleContext(),
+        )
 _engine_instance: Optional[MultiAssetTradingEngine] = None
 _engine_instance_lock = threading.Lock()
 

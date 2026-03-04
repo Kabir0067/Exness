@@ -1,17 +1,37 @@
-from typing import Literal, Dict, Any
+from __future__ import annotations
+
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import time
-import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+from zoneinfo import ZoneInfo
+
+import logging
+import time
+from logging.handlers import RotatingFileHandler
 
 import MetaTrader5 as mt5
 
-from mt5_client import ensure_mt5, MT5_LOCK
 from log_config import get_log_path
+from mt5_client import MT5_LOCK, ensure_mt5
 
+__all__ = [
+    "get_profit_period",
+    "get_day_profit",
+    "get_day_loss",
+    "get_day_net",
+    "get_week_profit",
+    "get_week_loss",
+    "get_week_net",
+    "get_month_profit",
+    "get_month_loss",
+    "get_month_net",
+    "format_usdt",
+    "view_all_history_dict",
+]
 
+# -----------------------------------------------------------------------------
+# Cache / state
+# -----------------------------------------------------------------------------
 _cache: Dict[str, Any] | None = None
 _cache_time: datetime | None = None
 _cache_mono: float | None = None
@@ -27,41 +47,45 @@ _CACHE_TTL_SEC = 5.0
 _CONN_TTL_SEC = 1.0
 _PRINT_THROTTLE_SEC = 60.0
 
-# =============================================================================
-# Logging (ERROR-only, rotating)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Logging (ERROR-only, rotating, handler dedupe)
+# -----------------------------------------------------------------------------
 _HISTORY_LOG_PATH = get_log_path("history.log")
 
 
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
-    logger.setLevel(level)
+    logger.setLevel(int(level))
     logger.propagate = False
+    target = str(path.resolve())
 
-    for h in list(logger.handlers):
+    for h in logger.handlers:
         if isinstance(h, RotatingFileHandler):
             try:
-                if Path(getattr(h, "baseFilename", "")).resolve() == path.resolve():
-                    h.setLevel(level)
+                if str(Path(getattr(h, "baseFilename", "")).resolve()) == target:
+                    h.setLevel(int(level))
                     return
             except Exception:
                 continue
 
-    h = RotatingFileHandler(
+    fh = RotatingFileHandler(
         filename=str(path),
         maxBytes=5 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
         delay=True,
     )
-    h.setLevel(level)
-    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
-    logger.addHandler(h)
+    fh.setLevel(int(level))
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
+    logger.addHandler(fh)
 
 
 log_history = logging.getLogger("history")
 _ensure_rotating_handler(log_history, _HISTORY_LOG_PATH, logging.ERROR)
 
 
+# -----------------------------------------------------------------------------
+# Time helpers
+# -----------------------------------------------------------------------------
 def _local_now() -> datetime:
     global _TZ
     if _TZ is None:
@@ -87,6 +111,21 @@ def _naive_local(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
 
 
+def _real_print(msg: str) -> None:
+    # Bypass stdout redirection wrappers (critical in your runner).
+    out = getattr(sys, "__stdout__", None)  # type: ignore[name-defined]
+    if out is None:
+        return
+    try:
+        out.write(str(msg) + "\n")
+        out.flush()
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# MT5 connectivity (cached + throttled notification)
+# -----------------------------------------------------------------------------
 def _connect() -> bool:
     global _conn_ok, _conn_mono, _last_trade_disabled_print_mono
 
@@ -99,48 +138,45 @@ def _connect() -> bool:
         ensure_mt5()
         with MT5_LOCK:
             term = mt5.terminal_info()
-            ok = bool(term and getattr(term, "trade_allowed", False))
+            ok = bool(term and getattr(term, "trade_allowed", False) and getattr(term, "connected", True))
     except Exception:
         ok = False
 
-    if not ok:
-        # Throttle prints (fast + non-spam)
-        if (now_mono - _last_trade_disabled_print_mono) >= _PRINT_THROTTLE_SEC:
-            _last_trade_disabled_print_mono = now_mono
-            try:
-                print("АвтоТорговля дар MT5 хомӯш аст! Лутфан онро фаъол кунед.")
-            except Exception:
-                pass
+    if not ok and (now_mono - _last_trade_disabled_print_mono) >= _PRINT_THROTTLE_SEC:
+        _last_trade_disabled_print_mono = now_mono
+        _real_print("АвтоТорговля дар MT5 хомӯш аст! Лутфан онро фаъол кунед.")
 
     _conn_ok = bool(ok)
     _conn_mono = now_mono
     return bool(ok)
 
 
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 def get_profit_period(period: Literal["day", "week", "month"]) -> dict:
     if not _connect():
         return {"profit": 0.0, "loss": 0.0, "net": 0.0}
 
-    local_now = _local_now()
+    now = _local_now()
 
     if period == "day":
-        from_date = _day_start_local(local_now)
+        from_date = _day_start_local(now)
     elif period == "week":
-        from_date = local_now - timedelta(days=int(local_now.weekday()))
-        from_date = _day_start_local(from_date)
+        from_date = _day_start_local(now - timedelta(days=int(now.weekday())))
     elif period == "month":
         try:
-            from_date = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            from_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         except Exception:
-            from_date = datetime(local_now.year, local_now.month, 1, 0, 0, 0)
+            from_date = datetime(now.year, now.month, 1, 0, 0, 0)
     else:
         return {"profit": 0.0, "loss": 0.0, "net": 0.0}
 
     with MT5_LOCK:
-        deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(local_now))
+        deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(now))
 
     total_profit = 0.0
-    total_loss = 0.0
+    total_loss = 0.0  # keep negative (compat)
 
     if deals:
         entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
@@ -152,13 +188,13 @@ def get_profit_period(period: Literal["day", "week", "month"]) -> dict:
                 if p > 0.0:
                     total_profit += p
                 elif p < 0.0:
-                    total_loss += p  # keep negative (compat)
+                    total_loss += p
             except Exception:
                 continue
 
-    net = round(total_profit + total_loss, 2)
     total_profit = round(total_profit, 2)
     total_loss = round(total_loss, 2)
+    net = round(total_profit + total_loss, 2)
 
     return {"profit": total_profit, "loss": total_loss, "net": net}
 
@@ -230,7 +266,6 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
         or _cache_mono is None
         or (now_mono - float(_cache_mono)) > _CACHE_TTL_SEC
     )
-
     if not need_refresh:
         return _cache  # type: ignore[return-value]
 
@@ -253,8 +288,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
         _cache_mono = now_mono
         return empty_summary
 
-    today_start = _day_start_local(now)
-    from_date = today_start
+    from_date = _day_start_local(now)
     to_date = now
 
     with MT5_LOCK:
@@ -287,15 +321,13 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
     open_map: Dict[int, Any] = {}
     for p in open_positions:
         try:
-            pid = int(getattr(p, "position_id", 0) or 0)
-            if pid == 0:
-                pid = int(getattr(p, "ticket", 0) or 0)
+            pid = int(getattr(p, "position_id", 0) or 0) or int(getattr(p, "ticket", 0) or 0)
             if pid:
                 open_map[pid] = p
         except Exception:
             continue
 
-    # Build trades by position_id: keep first IN, last OUT (best-effort)
+    # Trades by position_id: keep first IN, last OUT
     trades: Dict[int, Dict[str, Any]] = {}
     entry_in = getattr(mt5, "DEAL_ENTRY_IN", 0)
     entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1)
@@ -309,6 +341,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
                 e = getattr(d, "entry", None)
                 if e not in (entry_in, entry_out):
                     continue
+
                 rec = trades.get(pid)
                 if rec is None:
                     rec = {"entry": None, "exit": None, "entry_t": None, "exit_t": None}
@@ -326,14 +359,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             except Exception:
                 continue
 
-    wins = 0
-    losses = 0
-    total_closed = 0
-    total_profit = 0.0
-    total_loss = 0.0
-    net_total = 0.0
-
-    # Unrealized PnL from open positions
+    # Unrealized PnL
     unrealized_pnl = 0.0
     for p in open_positions:
         try:
@@ -341,7 +367,14 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
         except Exception:
             continue
 
-    records = []
+    wins = 0
+    losses = 0
+    total_closed = 0
+    total_profit = 0.0
+    total_loss = 0.0  # positive here (compat with your summary)
+    net_total = 0.0
+
+    records: list[dict[str, Any]] = []
     total_open = int(len(open_positions))
 
     for pid, t in trades.items():
@@ -370,6 +403,7 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
             except Exception:
                 profit = 0.0
             status = "closed"
+
             total_closed += 1
             net_total += profit
             if profit > 0:
@@ -406,4 +440,3 @@ def view_all_history_dict(force_refresh: bool = False) -> Dict[str, Any]:
     _cache_time = now
     _cache_mono = now_mono
     return summary
-

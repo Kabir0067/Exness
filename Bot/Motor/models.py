@@ -56,6 +56,8 @@ class OrderIntent:
     idempotency_key: str
     risk_manager: Any
     cfg: Any
+    base_lot: float = 0.0
+    phase_snapshot: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,3 +73,6 @@ class ExecutionResult:
     volume: float
     slippage: float
     retcode: int = 0
+    order_ticket: int = 0
+    deal_ticket: int = 0
+    position_ticket: int = 0

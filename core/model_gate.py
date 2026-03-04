@@ -263,6 +263,10 @@ def _asset_gate_status(
     state_wfa_ok = bool(state.get("wfa_passed", False))
     state_wfa_total = int(state.get("wfa_total_windows", 0) or 0)
     state_wfa_failed = int(state.get("wfa_failed_windows", 0) or 0)
+    state_wfa_required = int(state.get("wfa_required_windows", 0) or 0)
+    state_wfa_skipped = bool(state.get("wfa_skipped", False))
+    state_anti_overfit_ok = bool(state.get("anti_overfit_passed", False))
+    state_tscv_folds = int(state.get("tscv_folds", 0) or 0)
     state_rou = _safe_float(state.get("risk_of_ruin", 0.0), 0.0)
     state_sample_quality_passed = bool(state.get("sample_quality_passed", True))
     _state_issues_raw = state.get("sample_quality_issues", [])
@@ -278,6 +282,8 @@ def _asset_gate_status(
         "wfa_total_windows",
         "wfa_failed_windows",
         "wfa_required_windows",
+        "anti_overfit_passed",
+        "tscv_folds",
         "stress_test_passed",
         "unsafe",
     )
@@ -399,12 +405,30 @@ def _asset_gate_status(
         wfa_tag = (
             f"{state_wfa_failed}/{state_wfa_total}"
             if state_wfa_total > 0
-            else "unknown"
+            else f"{state_wfa_failed}/{state_wfa_total}:required={state_wfa_required}:skipped={int(state_wfa_skipped)}"
         )
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
             reason=f"state_wfa_failed:{wfa_tag}",
+            state_path=str(state_p),
+            model_path="",
+            meta_path="",
+            model_version=version,
+            status=status,
+            verified=verified,
+            real_backtest=real_bt,
+            sharpe=sharpe,
+            win_rate=win_rate,
+            max_drawdown_pct=max_dd,
+            legacy_fallback=False,
+        )
+
+    if not state_anti_overfit_ok or state_tscv_folds < 2:
+        return AssetGateStatus(
+            asset=asset_u,
+            ok=False,
+            reason=f"state_anti_overfit_failed:passed={int(state_anti_overfit_ok)}:tscv_folds={state_tscv_folds}",
             state_path=str(state_p),
             model_path="",
             meta_path="",
@@ -583,6 +607,10 @@ def _asset_gate_status(
     meta_wfa_ok = bool(meta.get("wfa_passed", False))
     meta_wfa_total = int(meta.get("wfa_total_windows", 0) or 0)
     meta_wfa_failed = int(meta.get("wfa_failed_windows", 0) or 0)
+    meta_wfa_required = int(meta.get("wfa_required_windows", 0) or 0)
+    meta_wfa_skipped = bool(meta.get("wfa_skipped", False))
+    meta_anti_overfit_ok = bool(meta.get("anti_overfit_passed", False))
+    meta_tscv_folds = int(meta.get("tscv_folds", 0) or 0)
     meta_rou = _safe_float(meta.get("risk_of_ruin", 0.0), 0.0)
     meta_sample_quality_passed = bool(meta.get("sample_quality_passed", True))
     _meta_issues_raw = meta.get("sample_quality_issues", [])
@@ -600,6 +628,8 @@ def _asset_gate_status(
         "unsafe",
         "stress_test_passed",
         "wfa_passed",
+        "anti_overfit_passed",
+        "tscv_folds",
         "backtest_sharpe",
         "backtest_win_rate",
         "max_drawdown_pct",
@@ -638,9 +668,12 @@ def _asset_gate_status(
         wfa_tag = (
             f"{meta_wfa_failed}/{meta_wfa_total}"
             if meta_wfa_total > 0
-            else "unknown"
+            else f"{meta_wfa_failed}/{meta_wfa_total}:required={meta_wfa_required}:skipped={int(meta_wfa_skipped)}"
         )
         reason = f"meta_wfa_failed:{wfa_tag}"
+        ok = False
+    elif not meta_anti_overfit_ok or meta_tscv_folds < 2:
+        reason = f"meta_anti_overfit_failed:passed={int(meta_anti_overfit_ok)}:tscv_folds={meta_tscv_folds}"
         ok = False
     elif meta_status != "VERIFIED":
         reason = f"meta_not_verified:{meta_status or 'UNKNOWN'}"

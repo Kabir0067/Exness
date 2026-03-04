@@ -9,8 +9,8 @@ from log_config import LOG_DIR as LOG_ROOT, get_log_path
 LOG_DIR = LOG_ROOT
 
 # Diagnostics toggles
-_DIAG_ENABLED = bool(int(os.getenv("PORTFOLIO_DIAG_ENABLED", "1") or "1"))
-_DIAG_EVERY_SEC = float(os.getenv("PORTFOLIO_DIAG_EVERY_SEC", "60.0") or "60.0")
+_DIAG_ENABLED : bool = True
+_DIAG_EVERY_SEC : float = 60.0
 
 # Loggers
 log_health = logging.getLogger("portfolio.engine.health")

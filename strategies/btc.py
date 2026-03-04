@@ -1,9 +1,8 @@
-# strategies/btc.py — BTC strategy adapter (thin layer over core/).
-# Creates BTC-specific config and instantiates unified core components.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from core.config import BTCEngineConfig, BTCSymbolParams
 from core.feature_engine import FeatureEngine
@@ -13,34 +12,36 @@ from core.signal_engine import SignalEngine
 log = logging.getLogger("strategies.btc")
 
 
+class MarketFeedLike(Protocol):
+    # минимальный контракт; дополни под ваш real feed
+    def get(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@dataclass(frozen=True)
+class BTCStack:
+    cfg: BTCEngineConfig
+    sp: BTCSymbolParams
+    risk_manager: RiskManager
+    feature_engine: FeatureEngine
+    signal_engine: SignalEngine
+
+
 def create_btc_stack(
     *,
-    market_feed: Any,
+    market_feed: MarketFeedLike,
     login: int = 0,
     password: str = "",
     server: str = "",
     telegram_token: str = "",
     admin_id: int = 0,
-) -> dict:
-    """
-    Create the full BTC trading component stack.
-
-    Returns:
-        {
-            "cfg": BTCEngineConfig,
-            "sp": BTCSymbolParams,
-            "risk_manager": RiskManager,
-            "feature_engine": FeatureEngine,
-            "signal_engine": SignalEngine,
-        }
-    """
+) -> BTCStack:
     sp = BTCSymbolParams()
     cfg = BTCEngineConfig(
-        login=login,
-        password=password,
-        server=server,
-        telegram_token=telegram_token,
-        admin_id=admin_id,
+        login=int(login or 0),
+        password=str(password or ""),
+        server=str(server or ""),
+        telegram_token=str(telegram_token or ""),
+        admin_id=int(admin_id or 0),
         symbol_params=sp,
     )
 
@@ -49,11 +50,4 @@ def create_btc_stack(
     se = SignalEngine(cfg, sp, market_feed, fe, rm)
 
     log.info("BTC stack created | symbol=%s magic=%d", sp.symbol, cfg.magic)
-
-    return {
-        "cfg": cfg,
-        "sp": sp,
-        "risk_manager": rm,
-        "feature_engine": fe,
-        "signal_engine": se,
-    }
+    return BTCStack(cfg=cfg, sp=sp, risk_manager=rm, feature_engine=fe, signal_engine=se)

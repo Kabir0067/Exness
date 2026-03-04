@@ -40,13 +40,13 @@ TF_MAP = MappingProxyType(dict(TF_MAP))
 # =============================================================================
 # Model/Backtest quality gates (single source of truth)
 # =============================================================================
-MIN_GATE_SHARPE: float = float(os.getenv("MIN_GATE_SHARPE", "0.5") or "0.5")
-MIN_GATE_WIN_RATE: float = float(os.getenv("MIN_GATE_WIN_RATE", "0.52") or "0.52")
-MAX_GATE_DRAWDOWN: float = float(os.getenv("MAX_GATE_DRAWDOWN", "0.25") or "0.25")
+MIN_GATE_SHARPE: float = 0.5
+MIN_GATE_WIN_RATE: float = 0.52
+MAX_GATE_DRAWDOWN: float = 0.25
 
 # Walk-forward acceptance (pass-rate based, not all-windows-must-pass)
-WFA_MIN_WINDOWS: int = int(os.getenv("WFA_MIN_WINDOWS", "2") or "2")
-WFA_MIN_PASS_RATE: float = float(os.getenv("WFA_MIN_PASS_RATE", "0.60") or "0.60")
+WFA_MIN_WINDOWS: int = 3
+WFA_MIN_PASS_RATE: float = 0.60
 
 
 # =============================================================================
@@ -449,12 +449,14 @@ class BaseEngineConfig:
 
     # ─── Scoring weights ─────────────────────────────────────────
     weights: Dict[str, float] = field(default_factory=lambda: {
-        "trend": 30.0,
-        "momentum": 20.0,
-        "volatility": 15.0,
-        "structure": 15.0,
-        "flow": 10.0,
-        "mean_reversion": 10.0,
+        "trend": 24.0,
+        "momentum": 15.0,
+        "volatility": 10.0,
+        "structure": 12.0,
+        "flow": 15.0,
+        "tick_momentum": 12.0,
+        "volume_delta": 8.0,
+        "mean_reversion": 4.0,
     })
 
     # ─── Signal ──────────────────────────────────────────────────
@@ -469,6 +471,23 @@ class BaseEngineConfig:
     mtf_slope_thresh: float = 0.10
     mtf_m5_penalty: float = 0.20
     mtf_m15_penalty: float = 0.50
+    # Hard confluence veto: M15 entries must agree with H1/H4 institutional flow
+    mtf_hard_gate_enabled: bool = True
+    mtf_h1_flow_gate: float = 0.18
+    mtf_h4_flow_gate: float = 0.22
+    mtf_h4_veto_enabled: bool = True
+    # Stop-hunt / liquidity sweep handling
+    stop_hunt_min_strength: float = 0.30
+    stop_hunt_align_bonus: int = 8
+    stop_hunt_conflict_penalty: int = 16
+    stop_hunt_conflict_veto_strength: float = 0.55
+    # XAU macro pressure gate (DXY + US10Y)
+    macro_gate_enabled: bool = True
+    macro_gate_ttl_sec: float = 15.0
+    macro_dxy_weight: float = 0.60
+    macro_us10y_weight: float = 0.40
+    macro_bias_block: float = 0.28
+    macro_bias_penalty: float = 0.12
 
     # ─── Execution quality ───────────────────────────────────────
     exec_max_p95_latency_ms: float = 550.0
@@ -663,6 +682,21 @@ def get_config_from_env(asset: str = "XAU") -> BaseEngineConfig:
     if asset in ("BTC", "BTCUSD", "BTCUSDm"):
         return get_btc_config_from_env()
     return get_xau_config_from_env()
+
+
+ALLOWED_SYMBOLS = ("XAUUSDm", "XAUUSDm.", "BTCUSDm", "BTCUSDm.")
+
+
+def apply_high_accuracy_mode(cfg: BaseEngineConfig) -> BaseEngineConfig:
+    cfg.high_accuracy_mode = True
+    cfg.min_confidence = max(int(cfg.min_confidence), 85)
+    cfg.signal_min_score = max(float(cfg.signal_min_score), 75.0)
+    cfg.mtf_penalty_enabled = True
+    cfg.spread_gate_multiplier = min(
+        float(getattr(cfg, "spread_gate_multiplier", 1.5) or 1.5),
+        1.5,
+    )
+    return cfg
 
 
 # Back-compat aliases used by legacy callers (mt5_client, bot_utils, etc.)

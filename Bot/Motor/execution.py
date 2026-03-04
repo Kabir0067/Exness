@@ -63,16 +63,84 @@ class ExecutionWorker(threading.Thread):
 
     def _build_executor(self) -> OrderExecutor:
         if self._executor is None:
-            self._executor = OrderExecutor()
+            self._executor = OrderExecutor(
+                auto_ensure_mt5=(not self.dry_run),
+                symbol_cache_ttl=30.0,
+            )
         return self._executor
 
     def _process(self, intent: OrderIntent) -> ExecutionResult:
         sent = time.time()
         try:
+            dispatch_lot = float(intent.lot)
+            rm = intent.risk_manager
+            gate_reason = "ok"
+
+            if rm and hasattr(rm, "pre_order_gate"):
+                gate_fn = getattr(rm, "pre_order_gate", None)
+                if callable(gate_fn):
+                    try:
+                        allowed, gated_lot, gate_reason = gate_fn(
+                            side=str(intent.signal),
+                            confidence=float(intent.confidence),
+                            lot=float(dispatch_lot),
+                            entry_price=float(intent.price),
+                            sl=float(intent.sl),
+                            tp=float(intent.tp),
+                            signal_id=str(intent.signal_id),
+                            stage="dispatch",
+                            base_lot=float(getattr(intent, "base_lot", intent.lot) or intent.lot),
+                            phase_snapshot=str(getattr(intent, "phase_snapshot", "") or ""),
+                        )
+                    except TypeError:
+                        allowed, gated_lot, gate_reason = gate_fn(  # type: ignore[misc]
+                            side=str(intent.signal),
+                            confidence=float(intent.confidence),
+                            lot=float(dispatch_lot),
+                            entry_price=float(intent.price),
+                            sl=float(intent.sl),
+                            tp=float(intent.tp),
+                        )
+                    if not allowed:
+                        reason = f"dispatch_gate:{gate_reason}"
+                        if rm and hasattr(rm, "record_execution_failure"):
+                            try:
+                                rm.record_execution_failure(str(intent.order_id), float(intent.enqueue_time), sent, reason)
+                            except Exception:
+                                pass
+                        return ExecutionResult(
+                            order_id=str(intent.order_id),
+                            signal_id=str(intent.signal_id),
+                            ok=False,
+                            reason=reason,
+                            sent_ts=sent,
+                            fill_ts=sent,
+                            req_price=float(intent.price),
+                            exec_price=float(intent.price),
+                            volume=0.0,
+                            slippage=0.0,
+                            retcode=-2,
+                        )
+                    dispatch_lot = float(gated_lot or dispatch_lot)
+                    if dispatch_lot <= 0.0:
+                        return ExecutionResult(
+                            order_id=str(intent.order_id),
+                            signal_id=str(intent.signal_id),
+                            ok=False,
+                            reason="dispatch_gate:lot_nonpositive",
+                            sent_ts=sent,
+                            fill_ts=sent,
+                            req_price=float(intent.price),
+                            exec_price=float(intent.price),
+                            volume=0.0,
+                            slippage=0.0,
+                            retcode=-2,
+                        )
+
             req = OrderRequest(
                 symbol=str(intent.symbol),
                 signal=str(intent.signal),
-                lot=float(intent.lot),
+                lot=float(dispatch_lot),
                 sl=float(intent.sl),
                 tp=float(intent.tp),
                 price=float(intent.price),
@@ -104,6 +172,9 @@ class ExecutionWorker(threading.Thread):
                 volume=float(getattr(r, "volume", intent.lot) or intent.lot),
                 slippage=float(getattr(r, "slippage", 0.0) or 0.0),
                 retcode=retcode,
+                order_ticket=int(getattr(r, "order_ticket", 0) or 0),
+                deal_ticket=int(getattr(r, "deal_ticket", 0) or 0),
+                position_ticket=int(getattr(r, "position_ticket", 0) or 0),
             )
         except Exception as exc:
             log_err.error("execution worker error: %s | tb=%s", exc, traceback.format_exc())
@@ -119,6 +190,9 @@ class ExecutionWorker(threading.Thread):
                 volume=float(intent.lot),
                 slippage=0.0,
                 retcode=-1,
+                order_ticket=0,
+                deal_ticket=0,
+                position_ticket=0,
             )
 
     def _fallback_risk_update(self, intent: OrderIntent, res: ExecutionResult) -> None:
@@ -143,7 +217,7 @@ class ExecutionWorker(threading.Thread):
                 # Try to publish result to engine
                 published = False
                 try:
-                    self.result_queue.put_nowait(res)
+                    self.result_queue.put(res, timeout=0.25)
                     published = True
                 except Exception:
                     published = False
