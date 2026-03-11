@@ -1387,10 +1387,12 @@ class SignalEngine:
             if len(c) < 10:
                 return True
             recent_change = (c[-1] - c[-5]) / c[-5] if c[-5] > 0 else 0.0
-            if _side_norm(side) == "Buy":
+            side_n = _side_norm(side)
+            if side_n == "Buy":
                 return recent_change > -0.02
-            else:
+            if side_n == "Sell":
                 return recent_change < 0.02
+            return False
         except Exception:
             return True
 
@@ -1729,8 +1731,9 @@ class SignalEngine:
                 "corr_us10y": float(np.clip(corr_us, -1.0, 1.0)),
                 "ready": 1.0,
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("_macro_context_xau failed: %s", exc)
+            return dict(ctx)
 
         self._macro_ctx_cache = dict(ctx)
         self._macro_ctx_cache_ts = now

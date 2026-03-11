@@ -890,6 +890,8 @@ _TP_MIN_RR = 1.5
 _MANUAL_CONFIDENCE = 0.60
 _MANUAL_SL_ATR_MULT = 1.0
 _MANUAL_BASE_RISK_PCT = 0.01
+_MANUAL_FIXED_LOT = 0.02
+_MANUAL_DEFAULT_TP_USD = 2.0
 
 
 def _clamp01(x: float) -> float:
@@ -1063,36 +1065,49 @@ def _atr_tp_from_entry(
 
 
 def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float]:
-    """
-    Deprecated USD-based TP conversion.
-    Now uses ATR-based TP with the USD value acting as a MINIMUM profit floor.
-    """
+    """Convert exact target USD profit to TP price for a position."""
     try:
         symbol = str(getattr(pos, "symbol", ""))
         vol = float(getattr(pos, "volume", 0.0) or 0.0)
         open_price = float(getattr(pos, "price_open", 0.0) or 0.0)
         ptype = int(getattr(pos, "type", 0) or 0)
-        sl_price = float(getattr(pos, "sl", 0.0) or 0.0)
 
-        if not symbol or vol <= 0.0 or open_price <= 0.0:
+        if not symbol or vol <= 0.0 or usd_profit <= 0.0 or open_price <= 0.0:
             return None
 
-        side = "Buy" if ptype == mt5.POSITION_TYPE_BUY else "Sell"
-        tp = _atr_tp_from_entry(
-            symbol,
-            side,
-            open_price,
-            vol,
-            confidence=float(_MANUAL_CONFIDENCE),
-            atr=None,
-            min_profit_usd=float(usd_profit or 0.0),
-            sl_price=sl_price if sl_price > 0 else None,
+        info = _symbol_info_cached(symbol)
+        if info is None:
+            return None
+
+        tick_value = float(
+            (getattr(info, "trade_tick_value", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_value_profit", 0.0) or 0.0)
         )
-        if tp is None or float(tp) <= 0.0:
+        tick_size = float(
+            (getattr(info, "trade_tick_size", 0.0) or 0.0)
+            or (getattr(info, "trade_tick_size_profit", 0.0) or 0.0)
+        )
+        digits = int(getattr(info, "digits", 5) or 5)
+
+        if tick_value <= 0.0 or tick_size <= 0.0:
             return None
 
-        tp = _enforce_stop_distance_for_tp(symbol, ptype, float(tp))
-        return float(tp) if tp > 0 else None
+        ticks_needed = float(usd_profit) / (tick_value * vol)
+        if not math.isfinite(ticks_needed) or ticks_needed <= 0:
+            return None
+
+        price_delta = ticks_needed * tick_size
+        tp = open_price + price_delta if ptype == mt5.POSITION_TYPE_BUY else open_price - price_delta
+        tp = round(float(tp), digits)
+        if tp <= 0:
+            return None
+
+        if ptype == mt5.POSITION_TYPE_BUY and not (tp > open_price):
+            return None
+        if ptype == mt5.POSITION_TYPE_SELL and not (tp < open_price):
+            return None
+
+        return float(tp)
 
     except Exception as exc:
         log_orders.error("_usd_to_tp_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
@@ -1777,7 +1792,7 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Fast market open: adaptive lot + ATR-based SL/TP, sync (no await)
+# Fast market open: fixed lot + fixed TP USD, sync (no await)
 # =============================================================================
 _SYMBOL_BTC = "BTCUSDm"     
 _SYMBOL_XAU = "XAUUSDm"
@@ -1799,8 +1814,8 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         if entry <= 0:
             return False
 
-        lot = 0.01
-        profit_usd = 2.0
+        lot = float(_MANUAL_FIXED_LOT)
+        profit_usd = float(_MANUAL_DEFAULT_TP_USD)
         sl = 0.0  # ❌ NO STOP LOSS
 
         tick_size = info.trade_tick_size
@@ -1843,7 +1858,7 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
 
 
 def open_buy_order_btc(count: int) -> int:
-    """Open `count` market BUY on BTCUSDm. Adaptive lot + ATR SL/TP, sync."""
+    """Open `count` market BUY on BTCUSDm with fixed manual settings."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Buy"):
@@ -1852,7 +1867,7 @@ def open_buy_order_btc(count: int) -> int:
 
 
 def open_buy_order_xau(count: int) -> int:
-    """Open `count` market BUY on XAUUSDm. Adaptive lot + ATR SL/TP, sync."""
+    """Open `count` market BUY on XAUUSDm with fixed manual settings."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Buy"):
@@ -1861,7 +1876,7 @@ def open_buy_order_xau(count: int) -> int:
 
 
 def open_sell_order_btc(count: int) -> int:
-    """Open `count` market SELL on BTCUSDm. Adaptive lot + ATR SL/TP, sync."""
+    """Open `count` market SELL on BTCUSDm with fixed manual settings."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Sell"):
@@ -1870,7 +1885,7 @@ def open_sell_order_btc(count: int) -> int:
 
 
 def open_sell_order_xau(count: int) -> int:
-    """Open `count` market SELL on XAUUSDm. Adaptive lot + ATR SL/TP, sync."""
+    """Open `count` market SELL on XAUUSDm with fixed manual settings."""
     n = 0
     for _ in range(max(0, int(count))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Sell"):

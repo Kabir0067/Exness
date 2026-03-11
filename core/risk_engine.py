@@ -1193,10 +1193,11 @@ class RiskManager:
             if info is None:
                 return entry, sl, tp
             stops_level = float(info.trade_stops_level or 0) * float(info.point or 0.00001)
-            if _side_norm(side) == "Buy":
+            side_n = _side_norm(side)
+            if side_n == "Buy":
                 sl = min(sl, entry - stops_level)
                 tp = max(tp, entry + stops_level)
-            else:
+            elif side_n == "Sell":
                 sl = max(sl, entry + stops_level)
                 tp = min(tp, entry - stops_level)
         except Exception:
@@ -1389,11 +1390,12 @@ class RiskManager:
         try:
             lookback = min(20, len(df) - 1)
             recent = df.iloc[-lookback:]
-            if _side_norm(side) == "Buy":
+            side_n = _side_norm(side)
+            if side_n == "Buy":
                 swing = float(recent["low"].min() if "low" in recent else recent["Low"].min())
                 if swing < entry:
                     return swing
-            else:
+            elif side_n == "Sell":
                 swing = float(recent["high"].max() if "high" in recent else recent["High"].max())
                 if swing > entry:
                     return swing
@@ -1440,21 +1442,23 @@ class RiskManager:
             trail_atr_mult=trail_mult,
         )
 
+        side_n = _side_norm(side)
         # Pick the best (most protective) SL
-        if _side_norm(side) == "Buy":
+        if side_n == "Buy":
             candidates = [sl_price]
             if be is not None:
                 candidates.append(be)
             candidates.append(trail)
             new_sl = max(candidates)
             return new_sl if new_sl > sl_price else None
-        else:
+        if side_n == "Sell":
             candidates = [sl_price]
             if be is not None:
                 candidates.append(be)
             candidates.append(trail)
             new_sl = min(candidates)
             return new_sl if new_sl < sl_price else None
+        return None
 
     # ─── Plan order ──────────────────────────────────────────────────
 
@@ -1481,10 +1485,14 @@ class RiskManager:
         Returns dict with:
           blocked, reason, side, entry, sl, tp, lot, rr
         """
+        side_n = _side_norm(side)
         result: Dict[str, Any] = {
-            "blocked": True, "reason": "init", "side": _side_norm(side),
+            "blocked": True, "reason": "init", "side": side_n,
             "entry": 0.0, "sl": 0.0, "tp": 0.0, "lot": 0.0, "rr": 0.0,
         }
+        if side_n not in ("Buy", "Sell"):
+            result["reason"] = "invalid_side"
+            return result
 
         adapt = dict(adapt or {})
         conf01 = clamp01(confidence)
@@ -1519,7 +1527,7 @@ class RiskManager:
                     with _mt5_lock():
                         tick = mt5.symbol_info_tick(self.sp.symbol)
                     if tick:
-                        entry = float(tick.ask) if _side_norm(side) == "Buy" else float(tick.bid)
+                        entry = float(tick.ask) if side_n == "Buy" else float(tick.bid)
             except Exception:
                 pass
         if entry is None or entry <= 0:
@@ -1540,14 +1548,14 @@ class RiskManager:
 
         # ── SL/TP ──
         # Try structural SL first, fallback to ATR
-        struct_sl = self._calculate_structure_sl(side, entry, df)
-        atr_sl, atr_tp = self._fallback_atr_sl_tp(side, entry, adapt)
+        struct_sl = self._calculate_structure_sl(side_n, entry, df)
+        atr_sl, atr_tp = self._fallback_atr_sl_tp(side_n, entry, adapt)
 
         sl = struct_sl if struct_sl is not None else atr_sl
         tp = atr_tp
 
         # Apply broker constraints
-        entry, sl, tp = self._apply_broker_constraints(side, entry, sl, tp)
+        entry, sl, tp = self._apply_broker_constraints(side_n, entry, sl, tp)
 
         # ── RR check ──
         rr = self._rr(entry, sl, tp)
@@ -1563,7 +1571,7 @@ class RiskManager:
             return result
 
         # ── Position size ──
-        lot = self.calculate_position_size(side, entry, sl, tp, confidence, adapt=adapt)
+        lot = self.calculate_position_size(side_n, entry, sl, tp, confidence, adapt=adapt)
         if lot <= 0:
             result["reason"] = "kelly_zero"
             result["entry"] = entry
@@ -1621,7 +1629,9 @@ class RiskManager:
         if isinstance(side, (int, float)):
             # Old callers pass without 'side'
             log.debug("record_execution_metrics: legacy call, remapping args")
-            filled_price = float(fill_time)
+            # Legacy trailing positional arg represented slippage; keep price mapping correct.
+            filled_price = float(expected_price)
+            expected_price = float(fill_time)
             fill_time = float(send_time)
             send_time = float(enqueue_time)
             enqueue_time = float(side)
@@ -1715,12 +1725,13 @@ class RiskManager:
             self._flush_exec_csv()
 
     def _flush_exec_csv(self, force: bool = False) -> None:
+        rows: List[dict] = []
         with self._lock:
             if not self._exec_hist and not force:
                 return
+            rows = list(self._exec_hist)
+            self._exec_hist.clear()
         try:
-            with self._lock:
-                rows = list(self._exec_hist)
             self._exec_csv_path.parent.mkdir(parents=True, exist_ok=True)
             write_header = not self._exec_csv_path.exists()
             with open(self._exec_csv_path, "a", newline="", encoding="utf-8") as f:
@@ -1734,12 +1745,12 @@ class RiskManager:
                 for m in rows:
                     writer.writerow(m)
             with self._lock:
-                if len(rows) >= len(self._exec_hist):
-                    self._exec_hist.clear()
-                else:
-                    self._exec_hist = self._exec_hist[len(rows):]
                 self._exec_csv_last_flush = time.time()
         except Exception as exc:
+            with self._lock:
+                self._exec_hist = rows + self._exec_hist
+                if len(self._exec_hist) > 1000:
+                    self._exec_hist = self._exec_hist[-500:]
             log.error("_flush_exec_csv: %s", exc)
 
     def _ensure_exec_csv_exists(self) -> None:

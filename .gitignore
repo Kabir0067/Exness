@@ -13,3 +13,6 @@ env/
 
 # Secrets
 .env
+
+# Local artifacts (do not commit)
+Artifacts/

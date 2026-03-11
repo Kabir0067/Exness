@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 import queue
 import time
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from mt5_client import mt5_async_call
 
@@ -369,3 +369,275 @@ class ExecutionManager:
 
         return True, str(order_id)
 
+    def effective_min_conf(self, c: AssetCandidate) -> float:
+        e = self._e
+        cfg = e._xau_cfg if c.asset == "XAU" else e._btc_cfg
+        base = float(getattr(cfg, "min_confidence_signal", 0.55) or 0.55)
+
+        env_global: float = 0.50
+        env_asset: float = float(env_global)
+        floor = max(0.35, min(0.90, env_asset))
+
+        effective_min = max(floor, base)
+        rs = tuple(str(r) for r in (c.reasons or ()))
+
+        if any(r.startswith("early_momentum") for r in rs):
+            effective_min = max(floor, effective_min - 0.08)
+
+        return float(max(0.0, min(1.0, effective_min)))
+
+    def is_asset_blocked(self, asset: str) -> bool:
+        e = self._e
+        asset_u = str(asset or "").upper().strip()
+        return asset_u in e._blocked_assets
+
+    def log_blocked_asset_skip(self, asset: str, stage: str) -> None:
+        e = self._e
+        key = f"{str(asset).upper()}:{stage}"
+        now = time.time()
+        last = float(e._last_skip_log_ts.get(key, 0.0))
+        if now - last < 30.0:
+            return
+        e._last_skip_log_ts[key] = now
+        log_health.info(
+            "ASSET_BLOCKED_SKIP | asset=%s stage=%s blocked_assets=%s",
+            str(asset).upper(),
+            stage,
+            ",".join(sorted(set(e._blocked_assets))),
+        )
+
+    def candidate_is_tradeable(self, c: AssetCandidate) -> bool:
+        if self.is_asset_blocked(c.asset):
+            self.log_blocked_asset_skip(c.asset, "candidate_tradeable")
+            return False
+        if c.signal not in ("Buy", "Sell"):
+            return False
+        if c.blocked:
+            return False
+        if c.lot <= 0.0:
+            return False
+        if c.sl <= 0.0 or c.tp <= 0.0:
+            return False
+
+        conf_val = float(c.confidence)
+        return bool(conf_val >= self.effective_min_conf(c))
+
+    def asset_open_positions(self, asset: str) -> int:
+        e = self._e
+        pipe = e._xau if str(asset).upper() == "XAU" else e._btc
+        if pipe is None:
+            return 0
+        try:
+            return int(pipe.open_positions())
+        except Exception:
+            return 0
+
+    def asset_max_positions(self, asset: str) -> int:
+        e = self._e
+        asset_u = str(asset or "").upper().strip()
+        return max(1, int(e._max_open_positions.get(asset_u, 1) or 1))
+
+    def asset_lot_cap(self, asset: str) -> float:
+        e = self._e
+        asset_u = str(asset or "").upper().strip()
+        cfg = e._xau_cfg if asset_u == "XAU" else e._btc_cfg
+        broker_max = float(getattr(getattr(cfg, "symbol_params", None), "lot_max", 0.0) or 0.0)
+        cap = float(e._max_lot_cap.get(asset_u, broker_max if broker_max > 0.0 else 0.0) or 0.0)
+        if broker_max > 0.0:
+            if cap <= 0.0:
+                cap = broker_max
+            else:
+                cap = min(cap, broker_max)
+        return max(0.0, cap)
+
+    def apply_asset_lot_cap(self, asset: str, lot: float, stage: str) -> float:
+        lot_val = float(lot)
+        cap = self.asset_lot_cap(asset)
+        if cap > 0.0 and lot_val > cap:
+            log_health.warning(
+                "LOT_CAP_APPLIED | asset=%s stage=%s lot=%.4f cap=%.4f",
+                str(asset).upper(),
+                stage,
+                lot_val,
+                cap,
+            )
+            return float(cap)
+        return lot_val
+
+    def orders_for_candidate(self, cand: AssetCandidate) -> int:
+        pipe = self._e._xau if cand.asset == "XAU" else self._e._btc
+        if not pipe or not pipe.risk:
+            return 1
+
+        phase = self._e._get_phase(pipe.risk)
+        if phase == "C":
+            return 0
+
+        try:
+            fn = getattr(pipe.risk, "requires_hard_stop", None)
+            if callable(fn) and bool(fn()):
+                return 0
+        except Exception:
+            pass
+
+        return 1
+
+    @staticmethod
+    def min_lot(risk: Any) -> float:
+        try:
+            if risk and hasattr(risk, "_symbol_meta"):
+                risk._symbol_meta()  # type: ignore[attr-defined]
+            return float(getattr(risk, "_vol_min", 0.01) or 0.01)
+        except Exception:
+            return 0.01
+
+    def split_lot(self, lot: float, parts: int, risk: Any, cfg: Any) -> List[float]:
+        lot = float(lot)
+        if int(parts) <= 1:
+            return [lot]
+
+        min_lot = self.min_lot(risk)
+        split_enabled = bool(getattr(cfg, "multi_order_split_lot", True))
+        if not split_enabled:
+            if min_lot <= 0 or lot < min_lot:
+                return [lot]
+            return [lot for _ in range(int(parts))]
+
+        if min_lot <= 0 or (lot / float(parts)) < min_lot:
+            return [lot]
+
+        base = lot / float(parts)
+        lots = [base for _ in range(int(parts))]
+        lots[-1] = float(lot) - (base * float(int(parts) - 1))
+        return lots
+
+    def execute_candidates(self, candidates: List[AssetCandidate]) -> None:
+        e = self._e
+        for selected in candidates:
+            if not self.candidate_is_tradeable(selected):
+                log_health.info(
+                    "FSM_ORDER_SKIP | asset=%s signal=%s conf=%.3f blocked=%s",
+                    selected.asset,
+                    selected.signal,
+                    selected.confidence,
+                    selected.blocked,
+                )
+                continue
+
+            if e._manual_stop:
+                log_health.info("FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset)
+                continue
+
+            open_positions = self.asset_open_positions(selected.asset)
+            max_positions = self.asset_max_positions(selected.asset)
+            if max_positions > 0 and open_positions >= max_positions:
+                log_health.info(
+                    "FSM_ORDER_SKIP | asset=%s reason=max_positions open=%d max=%d",
+                    selected.asset,
+                    open_positions,
+                    max_positions,
+                )
+                continue
+
+            order_count = self.orders_for_candidate(selected)
+            if int(order_count) <= 0:
+                continue
+
+            risk = e._xau.risk if selected.asset == "XAU" and e._xau else (e._btc.risk if e._btc else None)
+            cfg = e._xau_cfg if selected.asset == "XAU" else e._btc_cfg
+            lots = self.split_lot(float(selected.lot), order_count, risk, cfg)
+            signal_enqueued = False
+
+            for idx, lot_val in enumerate(lots):
+                ok, oid = self.enqueue_order(
+                    selected,
+                    order_index=int(idx),
+                    order_count=int(order_count),
+                    lot_override=float(lot_val),
+                )
+                if ok:
+                    if not signal_enqueued:
+                        emit_ts = time.time()
+                        e._record_signal_emit(selected.asset, emit_ts)
+
+                        last_notified_id, last_notified_sig = e._edge_last_notified.get(
+                            selected.asset,
+                            ("", "Neutral"),
+                        )
+                        current_sig_id = str(selected.signal_id)
+                        current_sig = str(selected.signal)
+                        if (
+                            e._signal_notifier
+                            and not (
+                                last_notified_id == current_sig_id
+                                and last_notified_sig == current_sig
+                            )
+                        ):
+                            try:
+                                e._signal_notifier(
+                                    selected.asset,
+                                    {
+                                        "type": "LIVE_ENQUEUED",
+                                        "asset": selected.asset,
+                                        "signal": selected.signal,
+                                        "confidence": float(selected.confidence),
+                                        "reasons": list(selected.reasons or ()),
+                                        "signal_id": current_sig_id,
+                                        "order_id": str(oid or ""),
+                                        "lot": float(lot_val),
+                                        "phase": (e._get_phase(risk) if risk is not None else ""),
+                                        "blocked": False,
+                                    },
+                                )
+                            except Exception as exc:
+                                log_err.error(
+                                    "SIGNAL_NOTIFY_ERROR | asset=%s signal_id=%s err=%s",
+                                    selected.asset,
+                                    current_sig_id,
+                                    exc,
+                                )
+                        e._edge_last_notified[selected.asset] = (current_sig_id, current_sig)
+                        signal_enqueued = True
+
+                    log_health.info(
+                        "FSM_ORDER_ENQUEUED | asset=%s signal=%s conf=%.3f lot=%.4f order_id=%s",
+                        selected.asset,
+                        selected.signal,
+                        selected.confidence,
+                        float(lot_val),
+                        oid,
+                    )
+
+    def verification_step(self) -> None:
+        e = self._e
+        while True:
+            try:
+                r = e._result_q.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                e._resolve_order_result(r)
+            except Exception:
+                pass
+            finally:
+                try:
+                    e._result_q.task_done()
+                except Exception:
+                    pass
+
+        e._sync_pending_orders()
+
+        if e._xau:
+            e._xau.reconcile_positions()
+        if e._btc:
+            e._btc.reconcile_positions()
+        e._last_reconcile_ts = time.time()
+
+        e._update_portfolio_risk_state()
+
+        open_xau = e._xau.open_positions() if e._xau else 0
+        open_btc = e._btc.open_positions() if e._btc else 0
+        e._track_position_closures(open_xau, open_btc)
+        e._active_asset = e._select_active_asset(open_xau, open_btc)
+        e._heartbeat(open_xau, open_btc)

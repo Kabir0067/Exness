@@ -48,12 +48,17 @@ class KillSwitchState:
         self.last_expectancy = exp
         self.last_winrate = wr
 
-        if now < self.cooling_until_ts:
-            self.status = "COOLING"
+        # Hard kill with cooldown window; allows recovery after cooldown when metrics improve.
+        if exp < kill_expectancy and wr < kill_winrate:
+            self.cooling_until_ts = now + cooling_sec
+            self.status = "KILLED"
             return
 
-        if exp < kill_expectancy and wr < kill_winrate:
-            self.status = "KILLED"
+        if self.status == "KILLED" and now < self.cooling_until_ts:
+            return
+
+        if now < self.cooling_until_ts:
+            self.status = "COOLING"
             return
 
         if exp < cooling_expectancy:
@@ -146,6 +151,7 @@ class OrderIntent:
     order_id: str = ""
     signal_id: str = ""
     enqueue_time: float = 0.0
+    confidence: float = 0.0
     cfg: object = None
     risk_manager: object = None
 
@@ -164,6 +170,9 @@ class ExecutionResult:
     volume: float = 0.0
     slippage: float = 0.0
     retcode: int = 0
+    order_ticket: int = 0
+    deal_ticket: int = 0
+    position_ticket: int = 0
 
 
 @dataclass

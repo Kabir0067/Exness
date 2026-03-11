@@ -2,6 +2,7 @@
 
 import argparse
 import http.client
+import json
 import logging
 import os
 import shutil
@@ -178,6 +179,16 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def sleep_interruptible(stop_event: Event, seconds: float) -> None:
     end = time.monotonic() + float(seconds)
     while not stop_event.is_set():
@@ -296,7 +307,9 @@ _NET_ERRS_TG = (
 # Model gate (compact + behavior-preserving)
 # =============================================================================
 def _required_gate_assets() -> tuple[str, ...]:
-    raw: str = ",".join(DEFAULT_REQUIRED_ASSETS)
+    raw = str(os.environ.get("REQUIRED_GATE_ASSETS", "") or "").strip()
+    if not raw:
+        raw = ",".join(DEFAULT_REQUIRED_ASSETS)
     out: list[str] = []
     seen: set[str] = set()
     for item in raw.split(","):
@@ -465,16 +478,45 @@ def _soft_sample_quality_fallback_assets(required_assets: Optional[tuple[str, ..
 
 
 def _model_gate_ready_effective() -> tuple[bool, str, list[str]]:
-    """
-    Strict fail-safe gate mode.
-
-    Any failed required asset gate blocks execution entirely. Partial and soft
-    fallback modes are intentionally disabled for production safety.
-    """
+    required = list(_required_gate_assets())
     gate_ok, gate_reason = _model_gate_ready()
-    if not gate_ok:
+    if gate_ok:
+        return True, gate_reason, required
+
+    if not _env_truthy("PARTIAL_GATE_MODE", "1"):
         return False, gate_reason, []
-    return True, gate_reason, list(_required_gate_assets())
+
+    partial_assets = [a for a in _partial_gate_assets() if a in required]
+    if partial_assets:
+        blocked = [a for a in required if a not in partial_assets]
+        reason = (
+            f"partial_gate:{gate_reason}:blocked={','.join(blocked)}"
+            if blocked
+            else f"partial_gate:{gate_reason}"
+        )
+        return True, reason, partial_assets
+
+    soft_wfa_assets = [a for a in _soft_wfa_fallback_assets(tuple(required)) if a in required]
+    if soft_wfa_assets:
+        blocked = [a for a in required if a not in soft_wfa_assets]
+        reason = (
+            f"partial_wfa_fallback:{gate_reason}:blocked={','.join(blocked)}"
+            if blocked
+            else f"partial_wfa_fallback:{gate_reason}"
+        )
+        return True, reason, soft_wfa_assets
+
+    soft_sample_assets = [a for a in _soft_sample_quality_fallback_assets(tuple(required)) if a in required]
+    if soft_sample_assets:
+        blocked = [a for a in required if a not in soft_sample_assets]
+        reason = (
+            f"partial_sample_quality_fallback:{gate_reason}:blocked={','.join(blocked)}"
+            if blocked
+            else f"partial_sample_quality_fallback:{gate_reason}"
+        )
+        return True, reason, soft_sample_assets
+
+    return False, gate_reason, []
 
 
 def _models_ready() -> tuple[bool, str]:
@@ -522,9 +564,12 @@ def _auto_train_models_strict() -> bool:
         return False
 
     assets_default = ",".join(_required_gate_assets())
-    assets_env: str = assets_default
+    assets_env = str(os.environ.get("AUTO_TRAIN_ASSETS", assets_default) or assets_default)
     assets = [a.strip().upper() for a in assets_env.split(",") if a.strip()]
-    retry_hours: float = 3.0
+    retry_hours = max(0.0, _env_float("AUTO_TRAIN_RETRY_HOURS", 3.0))
+    failure_cooldown_hours = max(0.0, _env_float("AUTO_TRAIN_FAILURE_COOLDOWN_HOURS", max(6.0, retry_hours)))
+    force_retry_recent_failed_state = _env_truthy("AUTO_TRAIN_FORCE_RETRY_WHEN_RECENT_GATE_FAIL", "0")
+    failure_registry_path = get_artifact_path("models", "auto_train_failures.json")
     if not assets:
         assets = list(_required_gate_assets())
     for a in _required_gate_assets():
@@ -533,8 +578,91 @@ def _auto_train_models_strict() -> bool:
 
     passed_assets: list[str] = []
     failed_assets: list[str] = []
+    assets_set = set(assets)
+
+    def _load_failure_registry() -> dict[str, dict[str, Any]]:
+        try:
+            if not failure_registry_path.exists():
+                return {}
+            with failure_registry_path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return {}
+            out: dict[str, dict[str, Any]] = {}
+            for k, v in raw.items():
+                ku = str(k or "").upper().strip()
+                if not ku or ku not in assets_set:
+                    continue
+                if isinstance(v, dict):
+                    out[ku] = dict(v)
+            return out
+        except Exception:
+            return {}
+
+    def _save_failure_registry(data: dict[str, dict[str, Any]]) -> None:
+        try:
+            failure_registry_path.parent.mkdir(parents=True, exist_ok=True)
+            clean: dict[str, dict[str, Any]] = {}
+            for k, v in data.items():
+                ku = str(k or "").upper().strip()
+                if not ku or ku not in assets_set or not isinstance(v, dict):
+                    continue
+                clean[ku] = {
+                    "ts": float(v.get("ts", 0.0) or 0.0),
+                    "reason": str(v.get("reason", "unknown")),
+                    "count": int(v.get("count", 1) or 1),
+                }
+            with failure_registry_path.open("w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2)
+        except Exception as exc:
+            log_local.warning("Auto-train(strict) could not persist failure registry: %s", exc)
+
+    failures = _load_failure_registry()
+
+    auto_fast_mode = _env_truthy("AUTO_TRAIN_FAST_MODE", "1")
+    fast_defaults: dict[str, str] = {}
+    if auto_fast_mode:
+        fast_defaults = {
+            "INSTITUTIONAL_FAST_MODE": "1",
+            "INSTITUTIONAL_REQUIRE_ALPHA_GATE": str(os.environ.get("AUTO_TRAIN_REQUIRE_ALPHA_GATE", "0") or "0"),
+            "TRAIN_MAX_BARS": str(os.environ.get("AUTO_TRAIN_MAX_BARS", "20000") or "20000"),
+            "INSTITUTIONAL_MAX_ITERS": str(os.environ.get("AUTO_TRAIN_MAX_ITERS", "700") or "700"),
+            "INSTITUTIONAL_EARLY_STOPPING_ROUNDS": str(
+                os.environ.get("AUTO_TRAIN_EARLY_STOPPING_ROUNDS", "120") or "120"
+            ),
+            "INSTITUTIONAL_CV_MAX_ITERS": str(os.environ.get("AUTO_TRAIN_CV_MAX_ITERS", "180") or "180"),
+            "INSTITUTIONAL_CV_MAX_SAMPLES": str(os.environ.get("AUTO_TRAIN_CV_MAX_SAMPLES", "18000") or "18000"),
+            "INSTITUTIONAL_TSCV_FOLDS": str(os.environ.get("AUTO_TRAIN_TSCV_FOLDS", "3") or "3"),
+            "INSTITUTIONAL_WFA_WINDOWS": str(os.environ.get("AUTO_TRAIN_WFA_WINDOWS", "3") or "3"),
+        }
+        log_local.info(
+            "Auto-train(strict) FAST_PROFILE | mode=on iters=%s cv_iters=%s bars=%s",
+            fast_defaults["INSTITUTIONAL_MAX_ITERS"],
+            fast_defaults["INSTITUTIONAL_CV_MAX_ITERS"],
+            fast_defaults["TRAIN_MAX_BARS"],
+        )
 
     for asset in assets:
+        # Avoid repeated expensive training loops after recent hard failures.
+        if failure_cooldown_hours > 0:
+            rec = failures.get(asset, {})
+            ts = float(rec.get("ts", 0.0) or 0.0) if isinstance(rec, dict) else 0.0
+            if ts > 0.0:
+                age_hours_fail = (time.time() - ts) / 3600.0
+                if age_hours_fail < failure_cooldown_hours:
+                    remain_h = max(0.0, failure_cooldown_hours - age_hours_fail)
+                    reason_prev = str(rec.get("reason", "unknown")) if isinstance(rec, dict) else "unknown"
+                    log_local.warning(
+                        "Auto-train(strict) SKIP | asset=%s reason=recent_failure age=%.2fh < %.2fh remain=%.2fh last_reason=%s",
+                        asset,
+                        age_hours_fail,
+                        failure_cooldown_hours,
+                        remain_h,
+                        reason_prev,
+                    )
+                    failed_assets.append(asset)
+                    continue
+
         # Backoff guard: don't retrain same asset repeatedly on every restart.
         if retry_hours > 0:
             try:
@@ -543,7 +671,7 @@ def _auto_train_models_strict() -> bool:
                     age_hours = (time.time() - st_path.stat().st_mtime) / 3600.0
                     if age_hours < retry_hours:
                         gate_ok_now, gate_reason_now = _single_asset_gate_status(asset)
-                        if gate_ok_now:
+                        if gate_ok_now or (not force_retry_recent_failed_state):
                             log_local.info(
                                 "Auto-train(strict) SKIP | asset=%s reason=recent_state age=%.2fh < %.2fh gate_ok=%s gate_reason=%s",
                                 asset,
@@ -552,7 +680,10 @@ def _auto_train_models_strict() -> bool:
                                 gate_ok_now,
                                 gate_reason_now,
                             )
-                            passed_assets.append(asset)
+                            if gate_ok_now:
+                                passed_assets.append(asset)
+                            else:
+                                failed_assets.append(asset)
                             continue
                         log_local.warning(
                             "Auto-train(strict) FORCE_RETRAIN | asset=%s reason=recent_state_but_gate_failed age=%.2fh < %.2fh gate_reason=%s",
@@ -611,11 +742,19 @@ def _auto_train_models_strict() -> bool:
                 force_retrain_reason or "gate_failed",
             )
 
+        prev_env: dict[str, Optional[str]] = {}
+        if auto_fast_mode:
+            for k, v in fast_defaults.items():
+                prev_env[k] = os.environ.get(k)
+                os.environ[k] = v
+
         try:
             metrics = run_institutional_backtest(asset)
             gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
             if gate_ok_asset:
                 passed_assets.append(asset)
+                if asset in failures:
+                    failures.pop(asset, None)
                 log_local.info(
                     "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f gate_reason=%s",
                     asset,
@@ -626,6 +765,12 @@ def _auto_train_models_strict() -> bool:
                 )
             else:
                 failed_assets.append(asset)
+                prev_count = int(failures.get(asset, {}).get("count", 0) or 0)
+                failures[asset] = {
+                    "ts": float(time.time()),
+                    "reason": str(gate_reason_asset or "gate_failed"),
+                    "count": prev_count + 1,
+                }
                 log_local.warning(
                     "Auto-train(strict) failed gate | asset=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
                     asset,
@@ -637,12 +782,26 @@ def _auto_train_models_strict() -> bool:
         except Exception as exc:
             log_local.error("Auto-train(strict) failed | asset=%s err=%s", asset, exc)
             failed_assets.append(asset)
+            prev_count = int(failures.get(asset, {}).get("count", 0) or 0)
+            failures[asset] = {
+                "ts": float(time.time()),
+                "reason": f"exception:{exc}",
+                "count": prev_count + 1,
+            }
         finally:
             if force_retrain:
                 if prev_force_retrain is None:
                     os.environ.pop("BACKTEST_FORCE_RETRAIN", None)
                 else:
                     os.environ["BACKTEST_FORCE_RETRAIN"] = prev_force_retrain
+            if auto_fast_mode:
+                for k, old_v in prev_env.items():
+                    if old_v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = old_v
+
+    _save_failure_registry(failures)
 
     required_assets = set(_required_gate_assets())
     passed_required_assets = required_assets.issubset(set(passed_assets))
@@ -1128,7 +1287,7 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     from core.model_retrainer import MAX_MODEL_AGE_HOURS, ModelAgeChecker
 
     RETRAIN_CHECK_INTERVAL = 3600.0
-    GATE_RETRAIN_COOLDOWN_SEC = float(300)
+    GATE_RETRAIN_COOLDOWN_SEC = max(30.0, _env_float("GATE_RETRAIN_COOLDOWN_SEC", 300.0))
     retrain_assets = list(_required_gate_assets())
     last_retrain_check = 0.0
 

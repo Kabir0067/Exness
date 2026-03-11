@@ -170,6 +170,22 @@ def _make_scaler(dtype: np.dtype) -> ScalerProtocol:
     return _SKStandardScaler()
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    raw = str(os.getenv(name, default) or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int, *, min_v: int, max_v: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        v = int(float(raw))
+    except Exception:
+        return int(default)
+    return int(max(min_v, min(max_v, v)))
+
+
 def _console(msg: str) -> None:
     """Route progress messages to dedicated training log; optionally echo to stdout."""
     txt = str(msg).rstrip()
@@ -342,6 +358,72 @@ BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
 )
 
 XAU_TRAIN_CONFIG = InstitutionalTrainConfig()
+
+
+def _apply_runtime_train_overrides(cfg: InstitutionalTrainConfig) -> InstitutionalTrainConfig:
+    fast_mode = _env_truthy("INSTITUTIONAL_FAST_MODE", "0")
+
+    params = dict(cfg.regressor_params or {})
+    cur_iters = int(params.get("iterations", 2000) or 2000)
+    iters_default = min(cur_iters, 700) if fast_mode else cur_iters
+    new_iters = _env_int("INSTITUTIONAL_MAX_ITERS", iters_default, min_v=60, max_v=6000)
+    params["iterations"] = int(new_iters)
+
+    cur_es = int(cfg.early_stopping_rounds or 0)
+    es_default = max(cur_es, 120) if fast_mode and cur_es <= 0 else cur_es
+    new_es = _env_int("INSTITUTIONAL_EARLY_STOPPING_ROUNDS", es_default, min_v=0, max_v=1200)
+
+    cur_cv_samples = int(cfg.cv_max_samples or 35_000)
+    cv_samples_default = min(cur_cv_samples, 18_000) if fast_mode else cur_cv_samples
+    new_cv_samples = _env_int("INSTITUTIONAL_CV_MAX_SAMPLES", cv_samples_default, min_v=2_000, max_v=250_000)
+
+    cur_win_samples = int(cfg.max_window_samples or 50_000)
+    win_samples_default = min(cur_win_samples, 25_000) if fast_mode else cur_win_samples
+    new_win_samples = _env_int(
+        "INSTITUTIONAL_MAX_WINDOW_SAMPLES",
+        win_samples_default,
+        min_v=2_000,
+        max_v=250_000,
+    )
+
+    cur_tscv = int(cfg.tscv_folds or 4)
+    tscv_default = min(cur_tscv, 3) if fast_mode else cur_tscv
+    new_tscv = _env_int("INSTITUTIONAL_TSCV_FOLDS", tscv_default, min_v=2, max_v=8)
+
+    cur_wfa = int(cfg.wfa_windows or 4)
+    wfa_default = min(cur_wfa, 3) if fast_mode else cur_wfa
+    new_wfa = _env_int("INSTITUTIONAL_WFA_WINDOWS", wfa_default, min_v=1, max_v=8)
+
+    updated = replace(
+        cfg,
+        regressor_params=params,
+        early_stopping_rounds=int(new_es),
+        cv_max_samples=int(new_cv_samples),
+        max_window_samples=int(new_win_samples),
+        tscv_folds=int(new_tscv),
+        wfa_windows=int(new_wfa),
+    )
+
+    if (
+        int(new_iters) != int(cur_iters)
+        or int(new_es) != int(cur_es)
+        or int(new_cv_samples) != int(cur_cv_samples)
+        or int(new_win_samples) != int(cur_win_samples)
+        or int(new_tscv) != int(cur_tscv)
+        or int(new_wfa) != int(cur_wfa)
+    ):
+        log.info(
+            "TRAIN_RUNTIME_PROFILE | fast_mode=%s iters=%s early_stop=%s cv_samples=%s window_samples=%s tscv_folds=%s wfa_windows=%s",
+            int(fast_mode),
+            new_iters,
+            new_es,
+            new_cv_samples,
+            new_win_samples,
+            new_tscv,
+            new_wfa,
+        )
+
+    return updated
 
 _MT5_SYMBOL_BY_BASE = {
     "XAUUSD": "XAUUSDm",
@@ -1266,12 +1348,23 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
     FIXED (v2): Bare `pass` on symbol_select failure replaced with a warning log
     so operators can diagnose broker-side Market Watch issues.
     """
+    env_bars_raw = str(os.getenv("TRAIN_MAX_BARS", "") or "").strip()
+    train_max_bars = 0
+    if env_bars_raw:
+        try:
+            train_max_bars = max(2_000, int(float(env_bars_raw)))
+        except Exception:
+            train_max_bars = 0
+
     csv_path = Path(cfg.dataname)
     if csv_path.exists():
         try:
             df = pd.read_csv(csv_path, parse_dates=["Date"])
             df = df.rename(columns={"Date": "datetime"}).set_index("datetime")
             df = df[["Open", "High", "Low", "Close", "Volume"]]
+            if train_max_bars > 0 and len(df) > train_max_bars:
+                df = df.tail(train_max_bars).copy()
+                log.info("Applied TRAIN_MAX_BARS cap to CSV: %s", len(df))
             if len(df) > 100:
                 log.info("Loaded local data: %s (%s rows)", csv_path, len(df))
                 return df
@@ -1284,15 +1377,8 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
     if not mt5_symbol:
         raise RuntimeError(f"Could not resolve MT5 symbol for {cfg.symbol}")
 
-    default_max  = 60_000 if "BTC" in cfg.symbol.upper() else 100_000
-    env_bars_raw = str(os.getenv("TRAIN_MAX_BARS", "") or "").strip()
-    if env_bars_raw:
-        try:
-            max_bars_env = max(2_000, int(float(env_bars_raw)))
-        except Exception:
-            max_bars_env = int(default_max)
-    else:
-        max_bars_env = int(default_max)
+    default_max = 60_000 if "BTC" in cfg.symbol.upper() else 100_000
+    max_bars_env = int(train_max_bars or default_max)
     candidates: list[int] = [max_bars_env, 50_000, 10_000, 5_000]
 
     start_env: str = ""
@@ -1551,8 +1637,8 @@ def _downsample_xy(
 
 def _cv_training_cfg(cfg: InstitutionalTrainConfig) -> InstitutionalTrainConfig:
     params = dict(cfg.regressor_params or {})
-    env_iters = int(float(os.getenv("INSTITUTIONAL_CV_MAX_ITERS", "450") or 450))
-    max_iters = max(60, min(1200, env_iters))
+    cv_default = 180 if _env_truthy("INSTITUTIONAL_FAST_MODE", "0") else 450
+    max_iters = _env_int("INSTITUTIONAL_CV_MAX_ITERS", cv_default, min_v=60, max_v=1200)
     cur_iters = int(params.get("iterations", max_iters) or max_iters)
     params["iterations"] = max(60, min(max_iters, cur_iters))
     params["verbose"] = 0
@@ -1802,7 +1888,7 @@ def train(
     df       = _load_training_dataframe(cfg)
     _console(f"   Loaded {len(df)} bars")
 
-    cfg_effective = cfg
+    cfg_effective = _apply_runtime_train_overrides(cfg)
     pipeline = Pipeline(cfg_effective)
     splits = pipeline.fit(df)
     _console(

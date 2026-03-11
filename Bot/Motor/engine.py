@@ -45,6 +45,24 @@ def get_btc_config():
     return _get_core_config("BTC")
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    raw = str(os.getenv(name, default) or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _required_gate_assets() -> tuple[str, ...]:
+    raw = str(os.getenv("REQUIRED_GATE_ASSETS", "XAU,BTC") or "XAU,BTC")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        asset = str(item or "").upper().strip()
+        if not asset or asset in seen:
+            continue
+        seen.add(asset)
+        out.append(asset)
+    return tuple(out or ["XAU", "BTC"])
+
+
 def _apply_high_accuracy_mode(cfg, enable=True):
     """Stub — high accuracy params already baked into unified config."""
     pass
@@ -71,9 +89,9 @@ from .logging_setup import _DIAG_ENABLED, _DIAG_EVERY_SEC, log_diag, log_err, lo
 from .models import AssetCandidate, ExecutionResult, OrderIntent, PortfolioStatus
 from .order_sync_manager import OrderSyncManager
 from .pipeline import _AssetPipeline
-from .scheduler import UTCScheduler
-from .utils import parse_bar_key, safe_json_dumps, tf_seconds
-from core.ml_router import MLSignal, validate_payload_schema
+from .scheduler import EngineScheduleManager, UTCScheduler
+from .utils import safe_json_dumps
+from core.ml_router import MLSignal
 from core.model_manager import model_manager  # <--- HOLY TRINITY GATEKEEPER
 from core.model_gate import gate_details
 
@@ -319,6 +337,7 @@ class MultiAssetTradingEngine:
             "BTC": 0.05,
         }
 
+        self._schedule_manager = EngineScheduleManager(self)
         self._refresh_signal_cooldowns()
 
         # ============================================================
@@ -401,7 +420,7 @@ class MultiAssetTradingEngine:
             return False
 
     def _check_model_health(self) -> None:
-        """Ensure live trading starts only when required assets pass strict gate."""
+        """Ensure live trading starts only when gate-approved assets are available."""
         if self.dry_run:
             log_health.info("MODEL_GATE_BYPASSED | reason=dry_run")
             self._model_loaded = True
@@ -415,12 +434,13 @@ class MultiAssetTradingEngine:
         self._catboost_payloads = {}
         self._blocked_assets = []
 
-        details = gate_details(required_assets=("XAU", "BTC"), allow_legacy_fallback=True)
+        required_assets = _required_gate_assets()
+        details = gate_details(required_assets=required_assets, allow_legacy_fallback=True)
         gate_ok = bool(details.get("ok", False))
         gate_reason = str(details.get("reason", "unknown"))
         self._gate_last_reason = gate_reason
         assets = details.get("assets", {}) if isinstance(details, dict) else {}
-        required_assets = ("XAU", "BTC")
+        active_assets = list(required_assets)
 
         gate_items = []
         if isinstance(assets, dict):
@@ -440,6 +460,24 @@ class MultiAssetTradingEngine:
                     )
                 except Exception:
                     continue
+
+        def _fallback_metrics_ok(st: Dict[str, Any]) -> bool:
+            if not isinstance(st, dict):
+                return False
+            if not bool(st.get("real_backtest", False)):
+                return False
+            version = str(st.get("model_version", "") or "").strip()
+            if not version:
+                return False
+            sharpe = float(st.get("sharpe", 0.0) or 0.0)
+            win_rate = float(st.get("win_rate", 0.0) or 0.0)
+            max_dd_raw = st.get("max_drawdown_pct", 1.0)
+            max_dd = float(1.0 if max_dd_raw is None else max_dd_raw)
+            return bool(
+                sharpe >= MIN_GATE_SHARPE
+                and win_rate >= MIN_GATE_WIN_RATE
+                and max_dd <= MAX_GATE_DRAWDOWN
+            )
 
         gate_sig = "|".join(
             f"{a}:{int(ok)}:{r}:{v}:{s:.3f}:{w:.3f}:{d:.3f}:{int(lg)}"
@@ -469,6 +507,65 @@ class MultiAssetTradingEngine:
                 except Exception:
                     continue
 
+        strict_gate_reason = gate_reason
+        if (not gate_ok) and _env_truthy("PARTIAL_GATE_MODE", "1") and isinstance(assets, dict):
+            partial_assets: list[str] = []
+            for asset in required_assets:
+                st = assets.get(asset, {})
+                if isinstance(st, dict) and bool(st.get("ok", False)):
+                    partial_assets.append(asset)
+            partial_mode_reason = "partial_gate"
+
+            if not partial_assets and _env_truthy("PARTIAL_GATE_ALLOW_WFA_FALLBACK", "1"):
+                partial_assets = []
+                for asset in required_assets:
+                    st = assets.get(asset, {})
+                    if not isinstance(st, dict):
+                        continue
+                    reason_s = str(st.get("reason", "") or "")
+                    if reason_s.startswith(("state_wfa_failed", "meta_wfa_failed")) and _fallback_metrics_ok(st):
+                        partial_assets.append(asset)
+                if partial_assets:
+                    partial_mode_reason = "partial_wfa_fallback"
+
+            if not partial_assets and _env_truthy("PARTIAL_GATE_ALLOW_SAMPLE_QUALITY_FALLBACK", "1"):
+                partial_assets = []
+                for asset in required_assets:
+                    st = assets.get(asset, {})
+                    if not isinstance(st, dict):
+                        continue
+                    reason_s = str(st.get("reason", "") or "")
+                    sample_only_unsafe = (
+                        reason_s.startswith(("state_marked_unsafe:", "meta_marked_unsafe:"))
+                        and ("sample_quality_fail" in reason_s)
+                        and ("wfa_fail" not in reason_s)
+                        and ("stress_fail" not in reason_s)
+                        and ("risk_of_ruin=" not in reason_s)
+                    )
+                    if sample_only_unsafe and _fallback_metrics_ok(st):
+                        partial_assets.append(asset)
+                if partial_assets:
+                    partial_mode_reason = "partial_sample_quality_fallback"
+
+            if partial_assets:
+                active_assets = list(partial_assets)
+                blocked_assets = [a for a in required_assets if a not in active_assets]
+                gate_ok = True
+                gate_reason = (
+                    f"{partial_mode_reason}:{strict_gate_reason}:blocked={','.join(blocked_assets)}"
+                    if blocked_assets
+                    else f"{partial_mode_reason}:{strict_gate_reason}"
+                )
+                self._gate_last_reason = gate_reason
+                if should_log_gate:
+                    log_health.warning(
+                        "MODEL_GATE_PARTIAL | active=%s blocked=%s strict_reason=%s mode=%s",
+                        ",".join(active_assets),
+                        ",".join(blocked_assets) if blocked_assets else "-",
+                        strict_gate_reason,
+                        partial_mode_reason,
+                    )
+
         if not gate_ok:
             if should_log_gate:
                 log_health.warning("MODEL_GATE_SKIP | reason=%s", gate_reason)
@@ -478,7 +575,7 @@ class MultiAssetTradingEngine:
             self._model_version = "N/A"
             self._model_sharpe = 0.0
             self._model_win_rate = 0.0
-            self._blocked_assets = sorted(required_assets)
+            self._blocked_assets = sorted(set(required_assets))
             if self._run.is_set():
                 with self._lock:
                     self._manual_stop = True
@@ -493,7 +590,7 @@ class MultiAssetTradingEngine:
         versions: list[str] = []
         sharpes: list[float] = []
         wins: list[float] = []
-        for asset in required_assets:
+        for asset in active_assets:
             st = assets.get(asset, {}) if isinstance(assets, dict) else {}
             version = str(st.get("model_version", "") or "").strip()
             if not version:
@@ -519,13 +616,15 @@ class MultiAssetTradingEngine:
         self._model_win_rate = min(wins) if wins else 0.0
         self._model_loaded = True
         self._backtest_passed = True
-        self._gate_last_reason = "ok"
-        self._blocked_assets = []
+        self._gate_last_reason = gate_reason
+        self._blocked_assets = sorted(set(required_assets).difference(set(active_assets)))
         log_health.info(
-            "MODEL_GATE_PASSED | versions=%s sharpe_min=%.3f win_rate_min=%.3f",
+            "MODEL_GATE_PASSED | versions=%s sharpe_min=%.3f win_rate_min=%.3f blocked=%s reason=%s",
             self._model_version,
             self._model_sharpe,
             self._model_win_rate,
+            ",".join(self._blocked_assets) if self._blocked_assets else "-",
+            gate_reason,
         )
 
     def _infer_catboost(self, asset: str) -> Optional[MLSignal]:
@@ -789,121 +888,29 @@ class MultiAssetTradingEngine:
             return False
 
     def _refresh_signal_cooldowns(self) -> None:
-        """Set per-asset idempotency cooldown.
-
-        Goal: prevent repeated orders within the same bar (especially M1).
-        - If signal_cooldown_sec_override is set (>0), it overrides everything.
-        - Otherwise cooldown defaults to TF seconds of each asset primary timeframe.
-        """
-        try:
-            if self._signal_cooldown_override_sec is not None and self._signal_cooldown_override_sec > 0:
-                cd = float(self._signal_cooldown_override_sec)
-                self._signal_cooldown_sec_by_asset["XAU"] = cd
-                self._signal_cooldown_sec_by_asset["BTC"] = cd
-                return
-
-            def _pipe_tf_sec(pipe: Optional[_AssetPipeline]) -> float:
-                try:
-                    if pipe is None:
-                        return 60.0
-                    tf = getattr(getattr(pipe.cfg, "symbol_params", None), "tf_primary", None)
-                    sec = tf_seconds(tf)
-                    return float(sec) if sec else 60.0
-                except Exception:
-                    return 60.0
-
-            self._signal_cooldown_sec_by_asset["XAU"] = max(_pipe_tf_sec(self._xau), 60.0)
-            self._signal_cooldown_sec_by_asset["BTC"] = max(_pipe_tf_sec(self._btc), 60.0)
-        except Exception:
-            self._signal_cooldown_sec_by_asset["XAU"] = 60.0
-            self._signal_cooldown_sec_by_asset["BTC"] = 60.0
+        self._schedule_manager.refresh_signal_cooldowns()
 
     # -------------------- phase/daily helpers --------------------
     @staticmethod
     def _get_phase(risk: Any) -> str:
-        if risk is None:
-            return "A"
-        for attr in ("current_phase", "phase", "mode", "risk_phase"):
-            v = getattr(risk, attr, None)
-            if v:
-                return str(v)
-        return "A"
+        return EngineScheduleManager.get_phase(risk)
 
     @staticmethod
     def _get_daily_date(risk: Any) -> str:
-        if risk is None:
-            return ""
-        for attr in ("daily_date", "today_date", "day_key", "session_date"):
-            v = getattr(risk, attr, None)
-            if v:
-                return str(v)
-        return ""
+        return EngineScheduleManager.get_daily_date(risk)
 
     def _phase_reason(self, risk: Any, new_phase: str) -> str:
-        if risk is None:
-            return ""
-        fn = getattr(risk, "phase_reason", None)
-        if callable(fn):
-            try:
-                return str(fn() or "")
-            except Exception:
-                return ""
-        if new_phase == "C":
-            fn = getattr(risk, "hard_stop_reason", None)
-            if callable(fn):
-                try:
-                    return str(fn() or "")
-                except Exception:
-                    return ""
-        return ""
+        return self._schedule_manager.phase_reason(risk, new_phase)
 
     def _check_phase_change(self, asset: str, risk: Any) -> None:
-        try:
-            if risk is None:
-                return
-            asset_u = str(asset).upper()
-            if not UTCScheduler.market_status(asset_u):
-                return
-            fn = getattr(risk, "update_phase", None)
-            if callable(fn):
-                try:
-                    fn()
-                except Exception:
-                    pass
-            current = self._get_phase(risk) or "A"
-            prev = str(self._last_phase_by_asset.get(asset_u, "A") or "A")
-            if current != prev:
-                self._last_phase_by_asset[asset_u] = current
-                if self._phase_notifier:
-                    reason = self._phase_reason(risk, current)
-                    self._phase_notifier(asset_u, prev, current, reason)
-        except Exception:
-            return
+        self._schedule_manager.check_phase_change(asset, risk)
 
     def _check_daily_start(self, asset: str, risk: Any) -> None:
-        try:
-            if risk is None:
-                return
-            asset_u = str(asset).upper()
-            if not UTCScheduler.market_status(asset_u):
-                return
-            current_date = self._get_daily_date(risk)
-            if not current_date:
-                return
-            prev_date = str(self._last_daily_date_by_asset.get(asset_u, "") or "")
-            if not prev_date:
-                self._last_daily_date_by_asset[asset_u] = current_date
-                return
-            if current_date != prev_date:
-                self._last_daily_date_by_asset[asset_u] = current_date
-                if self._daily_start_notifier:
-                    self._daily_start_notifier(asset_u, current_date)
-        except Exception:
-            return
+        self._schedule_manager.check_daily_start(asset, risk)
 
     # -------------------- idempotency --------------------
     def _cooldown_for_asset(self, asset: str) -> float:
-        return float(self._signal_cooldown_sec_by_asset.get(asset, 60.0))
+        return self._schedule_manager.cooldown_for_asset(asset)
 
     def _is_duplicate(
         self,
@@ -914,148 +921,34 @@ class MultiAssetTradingEngine:
         *,
         order_index: int = 0,
     ) -> bool:
-        """Duplicate guard with cooldown + order-count.
-
-        - cooldown blocks repeats for same signal_id within TF seconds
-        - max_orders caps per signal_id
-        - order_index allows batch split to bypass scale delay
-        """
-        last = self._seen_index.get((asset, signal_id))
-        if not last:
-            return False
-        last_ts, count = last
-
-        max_orders = max(1, int(max_orders))
-
-        # Hard cap on count
-        if int(count) >= int(max_orders):
-            return True
-
-        # Cooldown: prevent repeated orders within same bar window
-        cd = self._cooldown_for_asset(asset)
-        if (now - float(last_ts)) < float(cd):
-            # If user intentionally split lot into multiple orders in same batch,
-            # allow it ONLY when order_index>0 and count < max_orders.
-            if int(order_index) > 0 and int(count) < int(max_orders):
-                return False
-            return True
-
-        # Scaling throttle: if already have an order, ensure 30s gap before next scaling order (M1 safety)
-        min_scale_delay = 30.0
-        if int(count) > 0 and int(order_index) <= 0 and (now - float(last_ts)) < min_scale_delay:
-            return True
-
-        return False
+        return self._schedule_manager.is_duplicate(
+            asset,
+            signal_id,
+            now,
+            max_orders,
+            order_index=order_index,
+        )
 
     def _mark_seen(self, asset: str, signal_id: str, now: float) -> None:
-        key = (asset, signal_id)
-        last = self._seen_index.get(key)
-        count = 0
-        if last:
-            _, last_count = last
-            count = int(last_count)
-
-        count += 1
-        self._seen_index[key] = (float(now), int(count))
-        self._seen.append((asset, signal_id, now))
-
-        max_cd = max(self._signal_cooldown_sec_by_asset.values(), default=60.0)
-        ttl = max(2.0 * float(max_cd), 120.0)
-        cleaned = 0
-        while self._seen and (now - self._seen[0][2]) > ttl and cleaned < self._seen_cleanup_budget:
-            a, sid, ts = self._seen.popleft()
-            rec = self._seen_index.get((a, sid))
-            if rec and float(rec[0]) == float(ts):
-                self._seen_index.pop((a, sid), None)
-            cleaned += 1
+        self._schedule_manager.mark_seen(asset, signal_id, now)
 
     @staticmethod
     def _prune_signal_window(window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0) -> None:
-        while window and (now_ts - float(window[0])) > float(lookback_sec):
-            window.popleft()
+        EngineScheduleManager.prune_signal_window(window, now_ts, lookback_sec=lookback_sec)
 
     @staticmethod
     def _p95(values: Deque[float] | List[float]) -> float:
-        seq = [float(v) for v in values if float(v) >= 0.0]
-        if len(seq) < 3:
-            return 0.0
-        seq.sort()
-        idx = int(round((len(seq) - 1) * 0.95))
-        idx = max(0, min(len(seq) - 1, idx))
-        return float(seq[idx])
+        return EngineScheduleManager.p95(values)
 
     @staticmethod
     def _utc_day_progress() -> float:
-        now = datetime.utcnow()
-        sec = (now.hour * 3600) + (now.minute * 60) + now.second
-        return max(0.0, min(1.0, float(sec) / 86400.0))
+        return EngineScheduleManager.utc_day_progress()
 
     def _signal_density_controls(self, asset: str, now_ts: float) -> Tuple[float, float, float, int]:
-        asset_u = str(asset or "").upper().strip()
-        window = self._signal_emit_ts_by_asset.setdefault(asset_u, deque(maxlen=512))
-        global_window = self._signal_emit_ts_global
-        self._prune_signal_window(window, now_ts)
-        self._prune_signal_window(global_window, now_ts)
-
-        count_24h = int(len(window))
-        global_count_24h = int(len(global_window))
-        try:
-            active_assets = max(1, len(tuple(UTCScheduler.get_active_assets())))
-        except Exception:
-            active_assets = 2
-        min_target = float(max(1.0, float(self._target_signals_per_24h_min) / float(active_assets)))
-        max_target = float(
-            max(
-                min_target,
-                float(self._target_signals_per_24h_max) / float(active_assets),
-            )
-        )
-
-        threshold_mult = 1.0
-        min_zscore = float(self._catboost_min_zscore)
-        min_flow = float(self._catboost_min_flow_confirm)
-
-        if count_24h < min_target:
-            deficit = (min_target - float(count_24h)) / max(min_target, 1.0)
-            relax = min(0.40, 0.40 * deficit)
-            threshold_mult = max(0.60, 1.0 - relax)
-            min_zscore = max(0.20, min_zscore * (1.0 - (0.45 * deficit)))
-            min_flow = max(0.01, min_flow * (1.0 - (0.45 * deficit)))
-        elif count_24h > max_target:
-            excess = (float(count_24h) - max_target) / max(max_target, 1.0)
-            tighten = min(0.25, 0.25 * excess)
-            threshold_mult = min(1.25, 1.0 + tighten)
-            min_zscore = min(1.75, min_zscore * (1.0 + (0.20 * excess)))
-            min_flow = min(0.20, min_flow * (1.0 + (0.20 * excess)))
-
-        # Global pacing controller for 10-20/day target (all active assets combined).
-        day_progress = self._utc_day_progress()
-        min_target_total = float(self._target_signals_per_24h_min)
-        max_target_total = float(self._target_signals_per_24h_max)
-        expected_min_now = min_target_total * day_progress
-
-        if global_count_24h < expected_min_now:
-            pace_deficit = (expected_min_now - float(global_count_24h)) / max(min_target_total, 1.0)
-            urgency = min(1.0, max(0.0, pace_deficit))
-            threshold_mult = max(0.52, float(threshold_mult) * (1.0 - (0.28 * urgency)))
-            min_zscore = max(0.12, float(min_zscore) * (1.0 - (0.35 * urgency)))
-            min_flow = max(0.005, float(min_flow) * (1.0 - (0.35 * urgency)))
-        elif global_count_24h > max_target_total:
-            overflow = (float(global_count_24h) - max_target_total) / max(max_target_total, 1.0)
-            pressure = min(1.0, max(0.0, overflow))
-            threshold_mult = min(1.35, float(threshold_mult) * (1.0 + (0.20 * pressure)))
-            min_zscore = min(1.95, float(min_zscore) * (1.0 + (0.25 * pressure)))
-            min_flow = min(0.25, float(min_flow) * (1.0 + (0.25 * pressure)))
-
-        return threshold_mult, min_zscore, min_flow, count_24h
+        return self._schedule_manager.signal_density_controls(asset, now_ts)
 
     def _record_signal_emit(self, asset: str, now_ts: float) -> None:
-        asset_u = str(asset or "").upper().strip()
-        window = self._signal_emit_ts_by_asset.setdefault(asset_u, deque(maxlen=512))
-        self._prune_signal_window(window, now_ts)
-        self._prune_signal_window(self._signal_emit_ts_global, now_ts)
-        window.append(float(now_ts))
-        self._signal_emit_ts_global.append(float(now_ts))
+        self._schedule_manager.record_signal_emit(asset, now_ts)
 
     # -------------------- portfolio logic --------------------
     def _next_order_id(self, asset: str) -> str:
@@ -1064,113 +957,31 @@ class MultiAssetTradingEngine:
         return f"PORD_{asset}_{ts}_{self._order_counter}_{os.getpid()}"
 
     def _effective_min_conf(self, c: AssetCandidate) -> float:
-        cfg = self._xau_cfg if c.asset == "XAU" else self._btc_cfg
-        base = float(getattr(cfg, "min_confidence_signal", 0.55) or 0.55)
-
-        env_global : float = 0.50
-        env_asset: float = float(env_global)
-        floor = max(0.35, min(0.90, env_asset))
-
-        effective_min = max(floor, base)
-        rs = tuple(str(r) for r in (c.reasons or ()))
-
-        # Early momentum signals are allowed with a lower floor to avoid late entries.
-        if any(r.startswith("early_momentum") for r in rs):
-            effective_min = max(floor, effective_min - 0.08)
-
-
-
-        return float(max(0.0, min(1.0, effective_min)))
+        return self._execution_manager.effective_min_conf(c)
 
     def _is_asset_blocked(self, asset: str) -> bool:
-        asset_u = str(asset or "").upper().strip()
-        return asset_u in self._blocked_assets
+        return self._execution_manager.is_asset_blocked(asset)
 
     def _log_blocked_asset_skip(self, asset: str, stage: str) -> None:
-        key = f"{str(asset).upper()}:{stage}"
-        now = time.time()
-        last = float(self._last_skip_log_ts.get(key, 0.0))
-        if now - last < 30.0:
-            return
-        self._last_skip_log_ts[key] = now
-        log_health.info(
-            "ASSET_BLOCKED_SKIP | asset=%s stage=%s blocked_assets=%s",
-            str(asset).upper(),
-            stage,
-            ",".join(sorted(set(self._blocked_assets))),
-        )
+        self._execution_manager.log_blocked_asset_skip(asset, stage)
 
     def _candidate_is_tradeable(self, c: AssetCandidate) -> bool:
-        if self._is_asset_blocked(c.asset):
-            self._log_blocked_asset_skip(c.asset, "candidate_tradeable")
-            return False
-        if c.signal not in ("Buy", "Sell"):
-            return False
-        if c.blocked:
-            return False
-        if c.lot <= 0.0:
-            return False
-        if c.sl <= 0.0 or c.tp <= 0.0:
-            return False
-
-        conf_val = float(c.confidence)
-        return bool(conf_val >= self._effective_min_conf(c))
+        return self._execution_manager.candidate_is_tradeable(c)
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
-        active_assets = UTCScheduler.get_active_assets()
-
-        # Weekend -> BTC only (status logic)
-        if "XAU" not in active_assets:
-            if open_xau > 0 and open_btc == 0:
-                return "XAU"
-            return "BTC"
-
-        if open_xau > 0 and open_btc > 0:
-            return "BOTH"
-        if open_xau > 0:
-            return "XAU"
-        if open_btc > 0:
-            return "BTC"
-        return "XAU+BTC"
+        return EngineScheduleManager.select_active_asset(open_xau, open_btc)
 
     def _asset_open_positions(self, asset: str) -> int:
-        pipe = self._xau if str(asset).upper() == "XAU" else self._btc
-        if pipe is None:
-            return 0
-        try:
-            return int(pipe.open_positions())
-        except Exception:
-            return 0
+        return self._execution_manager.asset_open_positions(asset)
 
     def _asset_max_positions(self, asset: str) -> int:
-        asset_u = str(asset or "").upper().strip()
-        return max(1, int(self._max_open_positions.get(asset_u, 1) or 1))
+        return self._execution_manager.asset_max_positions(asset)
 
     def _asset_lot_cap(self, asset: str) -> float:
-        asset_u = str(asset or "").upper().strip()
-        cfg = self._xau_cfg if asset_u == "XAU" else self._btc_cfg
-        broker_max = float(getattr(getattr(cfg, "symbol_params", None), "lot_max", 0.0) or 0.0)
-        cap = float(self._max_lot_cap.get(asset_u, broker_max if broker_max > 0.0 else 0.0) or 0.0)
-        if broker_max > 0.0:
-            if cap <= 0.0:
-                cap = broker_max
-            else:
-                cap = min(cap, broker_max)
-        return max(0.0, cap)
+        return self._execution_manager.asset_lot_cap(asset)
 
     def _apply_asset_lot_cap(self, asset: str, lot: float, stage: str) -> float:
-        lot_val = float(lot)
-        cap = self._asset_lot_cap(asset)
-        if cap > 0.0 and lot_val > cap:
-            log_health.warning(
-                "LOT_CAP_APPLIED | asset=%s stage=%s lot=%.4f cap=%.4f",
-                str(asset).upper(),
-                stage,
-                lot_val,
-                cap,
-            )
-            return float(cap)
-        return lot_val
+        return self._execution_manager.apply_asset_lot_cap(asset, lot, stage)
 
     def _enqueue_order(
         self,
@@ -1188,53 +999,14 @@ class MultiAssetTradingEngine:
         )
 
     def _orders_for_candidate(self, cand: AssetCandidate) -> int:
-        """STRICT: 1 signal = 1 order. Phase C: 0 orders."""
-        pipe = self._xau if cand.asset == "XAU" else self._btc
-        if not pipe or not pipe.risk:
-            return 1
-
-        phase = self._get_phase(pipe.risk)
-        if phase == "C":
-            return 0
-
-        # Extra safety: hard_stop => 0 orders
-        try:
-            fn = getattr(pipe.risk, "requires_hard_stop", None)
-            if callable(fn) and bool(fn()):
-                return 0
-        except Exception:
-            pass
-
-        return 1
+        return self._execution_manager.orders_for_candidate(cand)
 
     @staticmethod
     def _min_lot(risk: Any) -> float:
-        try:
-            if risk and hasattr(risk, "_symbol_meta"):
-                risk._symbol_meta()  # type: ignore[attr-defined]
-            return float(getattr(risk, "_vol_min", 0.01) or 0.01)
-        except Exception:
-            return 0.01
+        return ExecutionManager.min_lot(risk)
 
     def _split_lot(self, lot: float, parts: int, risk: Any, cfg: Any) -> list[float]:
-        lot = float(lot)
-        if int(parts) <= 1:
-            return [lot]
-
-        min_lot = self._min_lot(risk)
-        split_enabled = bool(getattr(cfg, "multi_order_split_lot", True))
-        if not split_enabled:
-            if min_lot <= 0 or lot < min_lot:
-                return [lot]
-            return [lot for _ in range(int(parts))]
-
-        if min_lot <= 0 or (lot / float(parts)) < min_lot:
-            return [lot]
-
-        base = lot / float(parts)
-        lots = [base for _ in range(int(parts))]
-        lots[-1] = float(lot) - (base * float(int(parts) - 1))
-        return lots
+        return self._execution_manager.split_lot(lot, parts, risk, cfg)
 
     def _report_cycle_latency_ms(self, latency_ms: float) -> None:
         try:
@@ -1817,90 +1589,14 @@ class MultiAssetTradingEngine:
         self._emergency_flatten(f"fsm_halt:{reason}")
 
     def _validate_payload_timestamp(self, asset: str, payload: Dict[str, Any], tf: str) -> Tuple[bool, str]:
-        if not isinstance(payload, dict):
-            return False, "payload_not_dict"
-
-        tf_obj = payload.get(tf)
-        if not isinstance(tf_obj, dict):
-            return False, f"tf_missing:{tf}"
-
-        raw_ts = tf_obj.get("ts_bar")
-        ts_value = 0.0
-        if isinstance(raw_ts, (int, float)):
-            ts_value = float(raw_ts)
-        elif isinstance(raw_ts, str):
-            if "_" in raw_ts:
-                return False, f"ts_format_mismatch:{raw_ts}"
-            parsed = parse_bar_key(raw_ts)
-            if parsed is None:
-                return False, f"ts_parse_failed:{raw_ts}"
-            ts_value = float(parsed.timestamp())
-        else:
-            return False, "ts_type_invalid"
-
-        if ts_value < 1_000_000_000.0:
-            return False, f"ts_epoch_invalid:{ts_value}"
-
-        # Optional secondary timestamp from feed text layer.
-        # If present, it must parse and align with ts_bar for this timeframe.
-        raw_t_close = tf_obj.get("t_close")
-        if raw_t_close is not None:
-            if isinstance(raw_t_close, (int, float)):
-                t_close_value = float(raw_t_close)
-            elif isinstance(raw_t_close, str):
-                if "_" in raw_t_close:
-                    return False, f"t_close_format_mismatch:{raw_t_close}"
-                parsed_close = parse_bar_key(raw_t_close)
-                if parsed_close is None:
-                    return False, f"t_close_parse_failed:{raw_t_close}"
-                t_close_value = float(parsed_close.timestamp())
-            else:
-                return False, "t_close_type_invalid"
-
-            bar_sec = float(tf_seconds(tf) or 60.0)
-            tolerance = max(5.0, bar_sec * 2.0)
-            if abs(ts_value - t_close_value) > tolerance:
-                return False, f"t_close_mismatch:{abs(ts_value - t_close_value):.1f}s>{tolerance:.1f}s"
-
-        age = time.time() - ts_value
-        threshold = 180.0 if tf.startswith("M") else 21600.0
-        if age < -15.0:
-            return False, f"ts_in_future:{age:.1f}s"
-        if age > threshold:
-            return False, f"data_gap:{age:.1f}s>{threshold:.1f}s"
-        return True, "ok"
+        return self._inference_engine.validate_payload_timestamp(asset, payload, tf)
 
     def _validate_data_sync_payloads(self, asset: str, payloads: Dict[str, Optional[Dict[str, Any]]]) -> Tuple[bool, str]:
-        scalp = payloads.get("scalp")
-        intraday = payloads.get("intraday")
-        if not scalp and not intraday:
-            return False, "no_payloads"
-
-        if scalp:
-            ok, reason = self._validate_payload_timestamp(asset, scalp, "M1")
-            if not ok:
-                return False, f"scalp_{reason}"
-
-        if intraday:
-            ok, reason = self._validate_payload_timestamp(asset, intraday, "H1")
-            if not ok:
-                return False, f"intraday_{reason}"
-
-        schema_ok, schema_reason = validate_payload_schema(asset, payloads)
-        if not schema_ok:
-            return False, f"schema_{schema_reason}"
-
-        return True, "ok"
+        return self._inference_engine.validate_data_sync_payloads(asset, payloads)
 
     @staticmethod
     def _extract_payload_frame(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not isinstance(payload, dict):
-            return {}
-        if isinstance(payload.get("M1"), dict):
-            return dict(payload.get("M1") or {})
-        if isinstance(payload.get("H1"), dict):
-            return dict(payload.get("H1") or {})
-        return {}
+        return InferenceEngine.extract_payload_frame(payload)
 
     def _probabilistic_levels(
         self,
@@ -1912,279 +1608,23 @@ class MultiAssetTradingEngine:
         confidence: float,
         frame: Dict[str, Any],
     ) -> Tuple[float, float]:
-        c = max(0.0, min(1.0, float(confidence)))
-        atr = float(frame.get("atr_14", 0.0) or 0.0)
-        if atr <= 0.0 and entry > 0.0:
-            atr = max(0.00001, entry * 0.001)
-
-        levels: List[float] = []
-        for k in ("ema_20", "ema_50", "ema_200"):
-            try:
-                v = float(frame.get(k, 0.0) or 0.0)
-                if v > 0.0:
-                    levels.append(v)
-            except Exception:
-                pass
-
-        if not levels:
-            return float(base_sl), float(base_tp)
-
-        support_cluster = min(levels)
-        resistance_cluster = max(levels)
-        variance = max(0.10, 1.0 - c)
-
-        if side == "Buy":
-            sl_cluster = support_cluster - atr * (0.35 + variance)
-            tp_cluster = resistance_cluster + atr * (1.20 + c)
-            sl = min(float(base_sl), sl_cluster) if sl_cluster > 0.0 else float(base_sl)
-            tp = max(float(base_tp), tp_cluster)
-            if not (sl < entry < tp):
-                sl = min(float(base_sl), entry - atr * (1.20 + variance))
-                tp = max(float(base_tp), entry + atr * (1.30 + c))
-            return sl, tp
-
-        sl_cluster = resistance_cluster + atr * (0.35 + variance)
-        tp_cluster = support_cluster - atr * (1.20 + c)
-        sl = max(float(base_sl), sl_cluster)
-        tp = min(float(base_tp), tp_cluster)
-        if not (tp < entry < sl):
-            sl = max(float(base_sl), entry + atr * (1.20 + variance))
-            tp = min(float(base_tp), entry - atr * (1.30 + c))
-        return sl, tp
-
-    def _build_ml_candidate(self, asset: str, sig: MLSignal) -> Optional[AssetCandidate]:
-        if self._is_asset_blocked(asset):
-            self._log_blocked_asset_skip(asset, "build_candidate")
-            return None
-        if sig.signal == "HOLD" or sig.side not in ("Buy", "Sell"):
-            return None
-
-        pipe = self._xau if asset == "XAU" else self._btc
-        if pipe is None or pipe.risk is None:
-            return None
-
-        payload = sig.scalp_payload if isinstance(sig.scalp_payload, dict) else sig.intraday_payload
-        frame = self._extract_payload_frame(payload)
-        entry = float(sig.entry or frame.get("last_close") or 0.0)
-        atr = float(frame.get("atr_14", 0.0) or 0.0)
-        atr_pct = (atr / entry) if atr > 0.0 and entry > 0.0 else 0.0
-
-        ind = {
-            "atr": atr,
-            "atr_pct": atr_pct,
-            "close": float(frame.get("last_close", entry) or entry),
-        }
-        adapt = {
-            "atr": atr,
-            "atr_pct": atr_pct,
-            "confidence": max(0.0, min(1.0, float(sig.confidence))),
-            "regime": "ml_router",
-        }
-        open_positions = self._asset_open_positions(asset)
-        max_positions = self._asset_max_positions(asset)
-
-        plan = pipe.risk.plan_order(
-            side=sig.side,
-            confidence=float(sig.confidence),
-            ind=ind,
-            adapt=adapt,
-            entry=(entry if entry > 0.0 else None),
-            open_positions=int(open_positions),
-            max_positions=int(max_positions),
-            df=None,
-        )
-        if bool(plan.get("blocked", True)):
-            log_health.info(
-                "FSM_RISK_BLOCK | asset=%s signal=%s reason=%s open=%d max=%d",
-                asset,
-                sig.signal,
-                str(plan.get("reason", "unknown")),
-                int(open_positions),
-                int(max_positions),
-            )
-            return None
-
-        plan_entry = float(plan.get("entry", 0.0) or 0.0)
-        plan_sl = float(plan.get("sl", 0.0) or 0.0)
-        plan_tp = float(plan.get("tp", 0.0) or 0.0)
-        sl, tp = self._probabilistic_levels(
-            side=sig.side,
-            entry=plan_entry,
-            base_sl=plan_sl,
-            base_tp=plan_tp,
-            confidence=float(sig.confidence),
+        return self._inference_engine.probabilistic_levels(
+            side=side,
+            entry=entry,
+            base_sl=base_sl,
+            base_tp=base_tp,
+            confidence=confidence,
             frame=frame,
         )
-        lot = float(plan.get("lot", 0.0) or 0.0)
-        lot = self._apply_asset_lot_cap(asset, lot, "build")
-        if lot <= 0.0:
-            return None
 
-        ts_bar = 0
-        try:
-            ts_bar = int(frame.get("ts_bar", 0) or 0)
-        except Exception:
-            ts_bar = 0
-        if ts_bar <= 0:
-            ts_bar = int(time.time())
-
-        reasons = (
-            f"ml_provider:{sig.provider}",
-            f"ml_model:{sig.model}",
-            f"ml_reason:{sig.reason}",
-            "sniper_fsm",
-        )
-
-        return AssetCandidate(
-            asset=asset,
-            symbol=str(pipe.symbol),
-            signal=str(sig.side),
-            confidence=float(sig.confidence),
-            lot=lot,
-            sl=float(sl),
-            tp=float(tp),
-            latency_ms=0.0,
-            blocked=False,
-            reasons=reasons,
-            signal_id=f"ML_{asset}_{ts_bar}_{sig.side}",
-            raw_result={
-                "ml_signal": sig.signal,
-                "provider": sig.provider,
-                "model": sig.model,
-                "reason": sig.reason,
-                "confidence": sig.confidence,
-            },
-        )
+    def _build_ml_candidate(self, asset: str, sig: MLSignal) -> Optional[AssetCandidate]:
+        return self._inference_engine.build_ml_candidate(asset, sig)
 
     def _execute_candidates(self, candidates: List[AssetCandidate]) -> None:
-        for selected in candidates:
-            if not self._candidate_is_tradeable(selected):
-                log_health.info(
-                    "FSM_ORDER_SKIP | asset=%s signal=%s conf=%.3f blocked=%s",
-                    selected.asset,
-                    selected.signal,
-                    selected.confidence,
-                    selected.blocked,
-                )
-                continue
-
-            if self._manual_stop:
-                log_health.info("FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset)
-                continue
-
-            open_positions = self._asset_open_positions(selected.asset)
-            max_positions = self._asset_max_positions(selected.asset)
-            if max_positions > 0 and open_positions >= max_positions:
-                log_health.info(
-                    "FSM_ORDER_SKIP | asset=%s reason=max_positions open=%d max=%d",
-                    selected.asset,
-                    open_positions,
-                    max_positions,
-                )
-                continue
-
-            order_count = self._orders_for_candidate(selected)
-            if int(order_count) <= 0:
-                continue
-
-            risk = self._xau.risk if selected.asset == "XAU" and self._xau else (self._btc.risk if self._btc else None)
-            cfg = self._xau_cfg if selected.asset == "XAU" else self._btc_cfg
-            lots = self._split_lot(float(selected.lot), order_count, risk, cfg)
-            signal_enqueued = False
-
-            for idx, lot_val in enumerate(lots):
-                ok, oid = self._enqueue_order(
-                    selected,
-                    order_index=int(idx),
-                    order_count=int(order_count),
-                    lot_override=float(lot_val),
-                )
-                if ok:
-                    if not signal_enqueued:
-                        emit_ts = time.time()
-                        self._record_signal_emit(selected.asset, emit_ts)
-
-                        last_notified_id, last_notified_sig = self._edge_last_notified.get(
-                            selected.asset,
-                            ("", "Neutral"),
-                        )
-                        current_sig_id = str(selected.signal_id)
-                        current_sig = str(selected.signal)
-                        if (
-                            self._signal_notifier
-                            and not (
-                                last_notified_id == current_sig_id
-                                and last_notified_sig == current_sig
-                            )
-                        ):
-                            try:
-                                self._signal_notifier(
-                                    selected.asset,
-                                    {
-                                        "type": "LIVE_ENQUEUED",
-                                        "asset": selected.asset,
-                                        "signal": selected.signal,
-                                        "confidence": float(selected.confidence),
-                                        "reasons": list(selected.reasons or ()),
-                                        "signal_id": current_sig_id,
-                                        "order_id": str(oid or ""),
-                                        "lot": float(lot_val),
-                                        "phase": (self._get_phase(risk) if risk is not None else ""),
-                                        "blocked": False,
-                                    },
-                                )
-                            except Exception as exc:
-                                log_err.error(
-                                    "SIGNAL_NOTIFY_ERROR | asset=%s signal_id=%s err=%s",
-                                    selected.asset,
-                                    current_sig_id,
-                                    exc,
-                                )
-                        self._edge_last_notified[selected.asset] = (current_sig_id, current_sig)
-                        signal_enqueued = True
-
-                    log_health.info(
-                        "FSM_ORDER_ENQUEUED | asset=%s signal=%s conf=%.3f lot=%.4f order_id=%s",
-                        selected.asset,
-                        selected.signal,
-                        selected.confidence,
-                        float(lot_val),
-                        oid,
-                    )
+        self._execution_manager.execute_candidates(candidates)
 
     def _verification_step(self) -> None:
-        while True:
-            try:
-                r = self._result_q.get_nowait()
-            except queue.Empty:
-                break
-
-            try:
-                self._resolve_order_result(r)
-            except Exception:
-                pass
-            finally:
-                try:
-                    self._result_q.task_done()
-                except Exception:
-                    pass
-
-        # Hard synchronization pass for pending orders (prevents ghost intents).
-        self._sync_pending_orders()
-
-        if self._xau:
-            self._xau.reconcile_positions()
-        if self._btc:
-            self._btc.reconcile_positions()
-        self._last_reconcile_ts = time.time()
-
-        self._update_portfolio_risk_state()
-
-        open_xau = self._xau.open_positions() if self._xau else 0
-        open_btc = self._btc.open_positions() if self._btc else 0
-        self._track_position_closures(open_xau, open_btc)
-        self._active_asset = self._select_active_asset(open_xau, open_btc)
-        self._heartbeat(open_xau, open_btc)
+        self._execution_manager.verification_step()
 
     # -------------------- main loop --------------------
     def _loop(self) -> None:

@@ -71,21 +71,22 @@ _SIDE_MAP = MappingProxyType({
     "order_type_buy": "Buy", "op_buy": "Buy",
     "sell": "Sell", "short": "Sell", "s": "Sell", "-1": "Sell",
     "order_type_sell": "Sell", "op_sell": "Sell",
+    "neutral": "Neutral", "hold": "Neutral", "flat": "Neutral", "0": "Neutral",
 })
 
 
 def _side_norm(side: str) -> str:
-    """Normalize any side string to 'Buy' or 'Sell'."""
+    """Normalize any side string to 'Buy', 'Sell', or 'Neutral'."""
     s = str(side or "").strip().lower()
     if not s:
-        return "Buy"
+        return "Neutral"
     if s in _SIDE_MAP:
         return _SIDE_MAP[s]
     if "buy" in s:
         return "Buy"
     if "sell" in s:
         return "Sell"
-    return str(side)
+    return "Neutral"
 
 
 def is_buy(side: str) -> bool:
