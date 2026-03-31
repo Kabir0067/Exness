@@ -68,6 +68,21 @@ class EngineFSMStageServices(IFSMEnginePorts):
             nxt = self._e._transition_state(state, EngineState.HALT, "manual_stop_triggered")
             return StepDecision(next_state=nxt, ctx=ctx, skip_sleep=True)
 
+        halt_reason = ""
+        halt_fn = getattr(self._e, "_live_risk_halt_reason", None)
+        if callable(halt_fn):
+            try:
+                halt_reason = str(halt_fn() or "")
+            except Exception:
+                halt_reason = ""
+        if halt_reason:
+            ctx.halt_reason = halt_reason
+            nxt = self._e._transition_state(state, EngineState.HALT, "live_risk_breach")
+            return StepDecision(next_state=nxt, ctx=ctx, skip_sleep=True)
+
+        if self._e._live_trading_pause_reason(force=False):
+            return StepDecision(next_state=state, ctx=EngineCycleContext())
+
         payloads: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
         active_assets = self._ordered_active_assets(UTCScheduler.get_active_assets())
         data_sync_ok = True
@@ -113,7 +128,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
             sig = None
             has_catboost = asset in self._e._catboost_payloads
             if has_catboost:
-                sig = self._e._infer_catboost(asset)
+                sig = self._e._infer_catboost(asset, payload)
                 if sig is None:
                     if self._e._allow_llm_fallback:
                         sig = infer_from_payloads(
@@ -196,6 +211,22 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 log_health.info("RETRAINING_PAUSE | skipping new orders during retraining")
                 self._e._last_retraining_log_ts = now
             nxt = self._e._transition_state(state, EngineState.VERIFICATION, "retraining_pause")
+            return StepDecision(next_state=nxt, ctx=ctx)
+
+        halt_reason = ""
+        halt_fn = getattr(self._e, "_live_risk_halt_reason", None)
+        if callable(halt_fn):
+            try:
+                halt_reason = str(halt_fn() or "")
+            except Exception:
+                halt_reason = ""
+        if halt_reason:
+            ctx.halt_reason = halt_reason
+            nxt = self._e._transition_state(state, EngineState.HALT, "live_risk_breach")
+            return StepDecision(next_state=nxt, ctx=ctx, skip_sleep=True)
+
+        if self._e._live_trading_pause_reason(force=False):
+            nxt = self._e._transition_state(state, EngineState.VERIFICATION, "live_evidence_pause")
             return StepDecision(next_state=nxt, ctx=ctx)
 
         self._e._execute_candidates(ctx.candidates)

@@ -154,10 +154,18 @@ class SignalEngine:
         """Safe wrapper around feed.get_rates()."""
         try:
             if bars is not None:
-                ret = self._feed.get_rates(sym, tf, bars=bars)
+                try:
+                    ret = self._feed.get_rates(sym, tf, bars=bars)
+                except TypeError as exc:
+                    msg = str(exc)
+                    if "unexpected keyword argument 'bars'" not in msg:
+                        raise
+                    ret = self._feed.get_rates(sym, tf)
             else:
                 ret = self._feed.get_rates(sym, tf)
             df = self._unwrap_rates_df(ret)
+            if df is not None and bars is not None and len(df) > bars:
+                df = df.iloc[-bars:].copy()
             return self._sanitize_rates(df)
         except Exception as exc:
             log.error("_get_rates_df(%s, %s): %s", sym, tf, exc)
@@ -334,11 +342,21 @@ class SignalEngine:
             signal_dir = score_result.get("direction", "Neutral")
             sub_reasons = score_result.get("reasons", [])
             reasons.extend(sub_reasons)
+            entry_flags = self._entry_quality_flags(
+                signal=signal_dir,
+                indp=indp,
+                dfp=dfp,
+                net_score=float(net_score),
+            )
+            score_floor = float(self.cfg.signal_min_score)
+            if signal_dir in ("Buy", "Sell") and bool(entry_flags.get("early_trigger", False)):
+                score_floor = max(58.0, score_floor - 8.0)
+                reasons.append(f"early_ignition:score_floor={score_floor:.1f}")
 
             # ── 6. Signal decision ──
-            if net_abs < self.cfg.signal_min_score:
+            if net_abs < score_floor:
                 return self._neutral(
-                    sym, reasons + [f"weak_score:{net_abs:.1f}"], t0,
+                    sym, reasons + [f"weak_score:{net_abs:.1f}<{score_floor:.1f}"], t0,
                     spread_pct=spread_pct, bar_key=bar_key,
                 )
 
@@ -352,6 +370,23 @@ class SignalEngine:
             near_rn = self._near_round(bid, indp)
             cl_bonus = self._confirm_layer(ext, sweep, div, near_rn)
             conf = min(100, conf + cl_bonus)
+            if signal_dir in ("Buy", "Sell") and bool(entry_flags.get("late_chase", False)):
+                ext_atr = float(entry_flags.get("extension_atr", 0.0) or 0.0)
+                if bool(entry_flags.get("hard_veto", False)):
+                    return self._neutral(
+                        sym,
+                        reasons + [f"late_chase_veto:{ext_atr:.2f}atr"],
+                        t0,
+                        confidence=conf,
+                        spread_pct=spread_pct,
+                        bar_key=bar_key,
+                        trade_blocked=True,
+                    )
+                conf = max(0, conf - 12)
+                reasons.append(f"late_chase_penalty:{ext_atr:.2f}atr")
+            elif signal_dir in ("Buy", "Sell") and bool(entry_flags.get("early_trigger", False)):
+                conf = min(100, conf + 4)
+                reasons.append("early_ignition_bonus")
 
             # Stop-hunt dominance: trade with trap resolution, not against it.
             try:
@@ -456,6 +491,7 @@ class SignalEngine:
                 bar_key=bar_key,
                 reasons=reasons,
                 dfp=dfp,
+                structure_frames=(dfp, dfc, dfl, dfh),
             )
 
         except Exception as exc:
@@ -625,6 +661,14 @@ class SignalEngine:
             "confidence": 0.5,
             "trend": str(indp.get("trend", "flat")),
             "volatility": str(indp.get("volatility_regime", "normal")),
+            "stop_hunt_strength": float(indp.get("stop_hunt_strength", 0.0) or 0.0),
+            "ob_touch_proximity": float(indp.get("ob_touch_proximity", 0.0) or 0.0),
+            "ob_pretouch_bias": float(indp.get("ob_pretouch_bias", 0.0) or 0.0),
+            "close": float(indp.get("close", 0.0) or 0.0),
+            "vwap": float(indp.get("vwap", 0.0) or 0.0),
+            "ema_medium": float(indp.get("ema_medium", 0.0) or 0.0),
+            "bb_pctb": float(indp.get("bb_pctb", 0.5) or 0.5),
+            "rsi": float(indp.get("rsi", 50.0) or 50.0),
         }
 
     # ─── Scoring system ──────────────────────────────────────────────
@@ -1305,6 +1349,76 @@ class SignalEngine:
 
     # ─── Weights ─────────────────────────────────────────────────────
 
+    def _entry_quality_flags(
+        self,
+        *,
+        signal: str,
+        indp: Dict[str, Any],
+        dfp: pd.DataFrame,
+        net_score: float,
+    ) -> Dict[str, Any]:
+        """
+        Entry-timing profile:
+        - allow genuine impulse ignition a little earlier
+        - block stretched end-of-trend chasing
+        """
+        out: Dict[str, Any] = {
+            "early_trigger": False,
+            "late_chase": False,
+            "hard_veto": False,
+            "extension_atr": 0.0,
+        }
+        if signal not in ("Buy", "Sell"):
+            return out
+        try:
+            net_norm = max(-1.0, min(1.0, float(net_score) / 100.0))
+            out["early_trigger"] = bool(self._early_momentum_trigger(indp, dfp, net_norm))
+
+            atr = float(indp.get("atr", 0.0) or 0.0)
+            close = float(indp.get("close", 0.0) or 0.0)
+            if atr <= 0.0 or close <= 0.0:
+                return out
+
+            anchors = []
+            for key in ("vwap", "ema_medium"):
+                val = float(indp.get(key, 0.0) or 0.0)
+                if val > 0.0 and _is_finite(val):
+                    anchors.append(val)
+            if not anchors:
+                return out
+
+            bb_pctb = float(indp.get("bb_pctb", 0.5) or 0.5)
+            rsi = float(indp.get("rsi", 50.0) or 50.0)
+            sh = float(indp.get("stop_hunt_strength", 0.0) or 0.0)
+            ob_bias = float(indp.get("ob_pretouch_bias", 0.0) or 0.0)
+            regime = str(indp.get("regime", "normal") or "normal").lower()
+
+            if signal == "Buy":
+                ref = max(anchors)
+                extension = max(0.0, (close - ref) / atr)
+                late_zone = bb_pctb > 0.88 or rsi > 67.0
+                trap_aligned = sh > 0.25 or ob_bias > 0.20
+            else:
+                ref = min(anchors)
+                extension = max(0.0, (ref - close) / atr)
+                late_zone = bb_pctb < 0.12 or rsi < 33.0
+                trap_aligned = sh < -0.25 or ob_bias < -0.20
+
+            out["extension_atr"] = float(extension)
+
+            ext_limit = 1.45 if "BTC" in str(self.sp.base).upper() else 1.20
+            if regime in ("volatile", "explosive"):
+                ext_limit += 0.20
+            if bool(out["early_trigger"]):
+                ext_limit += 0.20
+
+            late_chase = bool(late_zone and extension > ext_limit and (not trap_aligned))
+            out["late_chase"] = late_chase
+            out["hard_veto"] = bool(late_chase and extension > (ext_limit + 0.55))
+            return out
+        except Exception:
+            return out
+
     def _get_base_weights(self) -> Dict[str, float]:
         if self._weights_cache is not None:
             return self._weights_cache
@@ -1800,6 +1914,7 @@ class SignalEngine:
         bar_key: str,
         reasons: List[str],
         dfp: Optional[pd.DataFrame] = None,
+        structure_frames: Tuple[Optional[pd.DataFrame], ...] = (),
     ) -> SignalResult:
         """Build final SignalResult, optionally with execution plan."""
         sig_id = self._signal_id(sym, self.sp.tf_primary, bar_key, signal)
@@ -1826,6 +1941,7 @@ class SignalEngine:
                 adapt=adapt,
                 ticks=tick_stats,
                 df=dfp,
+                structure_frames=structure_frames,
             )
 
             if not plan.get("blocked", True):

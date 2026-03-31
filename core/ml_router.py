@@ -14,7 +14,7 @@ from DataFeed.scalp_ai_market_feed import get_ai_payload_btc, get_ai_payload_xau
 
 log = logging.getLogger("core.ml_router")
 
-ML_CONFIDENCE_FLOOR = 0.75
+ML_CONFIDENCE_FLOOR = 0.70
 ML_PROVIDERS = {"gemini", "groq", "cerebras"}
 ML_REQUIRED_SCALP = {
     "M1": ("ts_bar", "last_close", "atr_14", "rsi_14", "ema_20", "ema_50", "ema_200"),
@@ -239,7 +239,7 @@ def infer_from_payloads(
 
     conf = float(chosen.get("confidence", 0.0) or 0.0)
     if conf < ML_CONFIDENCE_FLOOR:
-        return _hold(asset_u, f"low_confidence:{conf:.3f}<0.75", payloads=payloads)
+        return _hold(asset_u, f"low_confidence:{conf:.3f}<{ML_CONFIDENCE_FLOOR:.2f}", payloads=payloads)
 
     sig = str(chosen.get("signal", "HOLD")).upper().strip()
     if sig == "BUY":

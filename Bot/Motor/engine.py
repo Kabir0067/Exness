@@ -63,6 +63,15 @@ def _required_gate_assets() -> tuple[str, ...]:
     return tuple(out or ["XAU", "BTC"])
 
 
+def _partial_gate_enabled(required_assets: Optional[tuple[str, ...]] = None) -> bool:
+    assets = tuple(required_assets or _required_gate_assets())
+    if not _env_truthy("PARTIAL_GATE_MODE", "0"):
+        return False
+    if len(assets) > 1 and _env_truthy("STRICT_DUAL_ASSET_MODE", "1"):
+        return False
+    return True
+
+
 def _apply_high_accuracy_mode(cfg, enable=True):
     """Stub — high accuracy params already baked into unified config."""
     pass
@@ -98,6 +107,7 @@ from core.model_gate import gate_details
 MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 MIN_BACKTEST_SHARPE = MIN_GATE_SHARPE
 MIN_BACKTEST_WIN_RATE = MIN_GATE_WIN_RATE
+RECOVERABLE_HALT_REASONS = frozenset({"mt5_unhealthy", "mt5_disconnected"})
 
 
 class MultiAssetTradingEngine:
@@ -109,6 +119,7 @@ class MultiAssetTradingEngine:
         self._gate_last_reason: str = "unknown"
         self._catboost_payloads: Dict[str, Any] = {}  # asset -> {model, pipeline}
         self._catboost_pred_history: Dict[str, Deque[float]] = {}  # asset -> rolling predictions
+        self._catboost_signal_cache: Dict[str, Dict[str, Any]] = {}  # asset -> {"ts_bar": int, "signal": MLSignal}
         self._blocked_assets: List[str] = []
         self._model_sharpe: float = 0.0
         self._model_win_rate: float = 0.0
@@ -123,6 +134,18 @@ class MultiAssetTradingEngine:
 
         self._run = threading.Event()
         self._lock = threading.Lock()
+        self._order_state_lock = threading.RLock()
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_started_ts: float = 0.0
+        self._last_runtime_heartbeat_ts: float = 0.0
+        self._runtime_start_grace_sec: float = max(
+            3.0,
+            float(os.getenv("ENGINE_RUNTIME_GRACE_SEC", "8.0") or 8.0),
+        )
+        self._runtime_stall_timeout_sec: float = max(
+            6.0,
+            float(os.getenv("ENGINE_RUNTIME_STALL_SEC", "20.0") or 20.0),
+        )
 
 
         self._manual_stop = False
@@ -141,6 +164,11 @@ class MultiAssetTradingEngine:
         self._order_q: "queue.Queue[OrderIntent]" = queue.Queue(maxsize=self._max_queue)
         self._result_q: "queue.Queue[ExecutionResult]" = queue.Queue(maxsize=self._max_queue)
         self._exec_worker: Optional[ExecutionWorker] = None
+        self._exec_aux_workers: List[ExecutionWorker] = []
+        self._exec_parallelism: int = max(
+            2,
+            int(float(os.getenv("EXEC_WORKER_THREADS", "2") or 2)),
+        )
 
         # IMPORTANT: map order_id -> risk_manager (robust RM routing)
         self._order_rm_by_id: Dict[str, Any] = {}
@@ -191,6 +219,18 @@ class MultiAssetTradingEngine:
         )
         self._last_flatten_ts: float = 0.0
         self._last_flatten_reason: str = ""
+        self._portfolio_stop_triggered: bool = False
+        self._portfolio_stop_reason: str = ""
+        self._unsafe_account_reason: str = ""
+        self._unsafe_account_snapshot: Dict[str, Any] = {
+            "reason": "",
+            "total_positions": 0,
+            "symbol_counts": {},
+            "foreign_symbols": [],
+            "unmanaged_positions": 0,
+            "zero_protection_positions": 0,
+            "magic_counts": {},
+        }
 
         # ML inference strictness: prioritize precision over signal frequency.
         self._allow_llm_fallback: bool = str(
@@ -221,6 +261,13 @@ class MultiAssetTradingEngine:
             "BTC": deque(maxlen=512),
         }
         self._signal_emit_ts_global: Deque[float] = deque(maxlen=1024)
+        self._current_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
+        self._last_account_snapshot: Dict[str, float] = {
+            "balance": 0.0,
+            "equity": 0.0,
+            "updated_ts": 0.0,
+        }
+        self._account_anomaly_factor: float = 50.0
 
         # Real-time operational evidence (latency/slippage/win-rate drift).
         self._exec_latency_ms_hist: Deque[float] = deque(maxlen=512)
@@ -255,7 +302,10 @@ class MultiAssetTradingEngine:
             "win_rate_drift": 0.0,
             "closed_trade_samples": 0,
             "signals_24h": 0,
+            "dd_pct": 0.0,
         }
+        self._last_live_pause_reason: str = ""
+        self._last_live_pause_log_ts: float = 0.0
 
         # Analysis state log throttling
         self._last_analysis_paused_state = False
@@ -289,6 +339,7 @@ class MultiAssetTradingEngine:
         xau_apply_high_accuracy_mode(self._xau_cfg, True)
         self._btc_cfg: BtcConfig = get_btc_config()
         btc_apply_high_accuracy_mode(self._btc_cfg, True)
+        self._expected_mt5_login, self._expected_mt5_server = self._expected_mt5_identity()
 
         raw_cd = (
             getattr(self._xau_cfg, "signal_cooldown_sec_override", None)
@@ -508,7 +559,7 @@ class MultiAssetTradingEngine:
                     continue
 
         strict_gate_reason = gate_reason
-        if (not gate_ok) and _env_truthy("PARTIAL_GATE_MODE", "1") and isinstance(assets, dict):
+        if (not gate_ok) and _partial_gate_enabled(required_assets) and isinstance(assets, dict):
             partial_assets: list[str] = []
             for asset in required_assets:
                 st = assets.get(asset, {})
@@ -582,8 +633,9 @@ class MultiAssetTradingEngine:
                     self._run.clear()
                 self._drain_queue(self._order_q)
                 self._drain_queue(self._result_q)
-                self._order_rm_by_id.clear()
-                self._pending_order_meta.clear()
+                with self._order_state_lock:
+                    self._order_rm_by_id.clear()
+                    self._pending_order_meta.clear()
                 self._emergency_flatten(f"model_gate_failed:{gate_reason}")
             return
 
@@ -627,8 +679,12 @@ class MultiAssetTradingEngine:
             gate_reason,
         )
 
-    def _infer_catboost(self, asset: str) -> Optional[MLSignal]:
-        return self._inference_engine.infer_catboost(asset)
+    def _infer_catboost(
+        self,
+        asset: str,
+        payloads: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    ) -> Optional[MLSignal]:
+        return self._inference_engine.infer_catboost(asset, payloads=payloads)
 
     def reload_model(self) -> None:
         """Hot-reload model from disk after retraining."""
@@ -669,8 +725,9 @@ class MultiAssetTradingEngine:
                 # Immediate Queue Wipe
                 self._drain_queue(self._order_q)
                 self._drain_queue(self._result_q)
-                self._order_rm_by_id.clear()
-                self._pending_order_meta.clear()
+                with self._order_state_lock:
+                    self._order_rm_by_id.clear()
+                    self._pending_order_meta.clear()
                 self._emergency_flatten("stop_lock")
                 
                 # Optional: Send emergency notification
@@ -698,7 +755,62 @@ class MultiAssetTradingEngine:
     def set_skip_notifier(self, cb: Optional[Callable[[AssetCandidate], None]]) -> None:
         self._skip_notifier = cb
 
+    def _expected_mt5_identity(self) -> Tuple[int, str]:
+        login = int(getattr(self, "_expected_mt5_login", 0) or 0)
+        server = str(getattr(self, "_expected_mt5_server", "") or "").strip()
+        if login > 0 or server:
+            return login, server
 
+        for cfg in (getattr(self, "_xau_cfg", None), getattr(self, "_btc_cfg", None)):
+            if cfg is None:
+                continue
+            if login <= 0:
+                try:
+                    login = int(getattr(cfg, "login", 0) or 0)
+                except Exception:
+                    login = 0
+            if not server:
+                server = str(getattr(cfg, "server", "") or "").strip()
+        return login, server
+
+    def _mt5_identity_ok(self, acc: Any) -> Tuple[bool, str]:
+        if not acc:
+            return False, "account_missing"
+
+        expected_login, expected_server = self._expected_mt5_identity()
+        actual_login = int(getattr(acc, "login", 0) or 0)
+        actual_server = str(getattr(acc, "server", "") or "").strip()
+
+        if expected_login > 0 and actual_login != expected_login:
+            return False, f"wrong_account:{actual_login}!={expected_login}"
+        if expected_server and actual_server.lower() != expected_server.lower():
+            return False, f"wrong_server:{actual_server or '-'}!={expected_server}"
+        return True, "ok"
+
+    @staticmethod
+    def _mt5_identity_mismatch(reason: str) -> bool:
+        reason_s = str(reason or "").strip().lower()
+        return reason_s.startswith("wrong_account:") or reason_s.startswith("wrong_server:")
+
+    def _mt5_session_status(self) -> Tuple[bool, str]:
+        with MT5_LOCK:
+            term = mt5.terminal_info()
+            acc = mt5.account_info()
+        if not term:
+            return False, "terminal_missing"
+        if not getattr(term, "connected", False):
+            return False, "terminal_not_connected"
+        if not getattr(term, "trade_allowed", False):
+            return False, "terminal_trade_disabled"
+        if not acc:
+            return False, "account_missing"
+        if not getattr(acc, "trade_allowed", True):
+            return False, "account_trade_disabled"
+
+        identity_ok, identity_reason = self._mt5_identity_ok(acc)
+        if not identity_ok:
+            return False, identity_reason
+        return True, "ok"
 
     # -------------------- MT5 init/health --------------------
     def _init_mt5(self) -> bool:
@@ -713,6 +825,19 @@ class MultiAssetTradingEngine:
                     bool(acc),
                     bool(term),
                     getattr(term, "connected", False) if term else None,
+                )
+                return False
+
+            identity_ok, identity_reason = self._mt5_identity_ok(acc)
+            if not identity_ok:
+                self._mt5_ready = False
+                with self._lock:
+                    self._manual_stop = True
+                log_err.critical(
+                    "MT5_INIT_IDENTITY_MISMATCH | reason=%s login=%s server=%s",
+                    identity_reason,
+                    getattr(acc, "login", "-"),
+                    getattr(acc, "server", "-"),
                 )
                 return False
 
@@ -741,23 +866,71 @@ class MultiAssetTradingEngine:
             log_err.error("MT5 init error: %s | tb=%s", exc, traceback.format_exc())
             return False
 
+    def _mt5_session_ok(self) -> bool:
+        ok, _reason = self._mt5_session_status()
+        return ok
+
     def _check_mt5_health(self) -> bool:
         if self.dry_run:
             return True
         try:
-            with MT5_LOCK:
-                term = mt5.terminal_info()
-                acc = mt5.account_info()
-            ok = bool(
-                term
-                and getattr(term, "connected", False)
-                and getattr(term, "trade_allowed", False)
-                and acc
-                and getattr(acc, "trade_allowed", True)
+            session_ok, session_reason = self._mt5_session_status()
+            if session_ok:
+                self._mt5_ready = True
+                return True
+
+            self._mt5_ready = False
+            if self._mt5_identity_mismatch(session_reason):
+                with self._lock:
+                    self._manual_stop = True
+                status_ok, status_reason = mt5_status()
+                log_err.critical(
+                    "MT5_IDENTITY_MISMATCH | reason=%s status_ok=%s status_reason=%s | action=manual_stop",
+                    session_reason,
+                    status_ok,
+                    status_reason,
+                )
+                return False
+
+            status_ok, status_reason = mt5_status()
+            log_health.warning(
+                "MT5_HEALTH_DEGRADED | status_ok=%s reason=%s session_reason=%s | action=ensure_mt5",
+                status_ok,
+                status_reason,
+                session_reason,
             )
-            return ok
+
+            ensure_mt5()
+            recovered, recovered_reason = self._mt5_session_status()
+            self._mt5_ready = bool(recovered)
+            if not recovered:
+                status_ok, status_reason = mt5_status()
+                if self._mt5_identity_mismatch(recovered_reason):
+                    with self._lock:
+                        self._manual_stop = True
+                    log_err.critical(
+                        "MT5_IDENTITY_MISMATCH | reason=%s status_ok=%s status_reason=%s | action=manual_stop",
+                        recovered_reason,
+                        status_ok,
+                        status_reason,
+                    )
+                else:
+                    log_health.warning(
+                        "MT5_HEALTH_RECOVERY_INCOMPLETE | status_ok=%s reason=%s session_reason=%s",
+                        status_ok,
+                        status_reason,
+                        recovered_reason,
+                    )
+            return recovered
         except Exception as exc:
-            log_err.error("mt5 health check error: %s | tb=%s", exc, traceback.format_exc())
+            status_ok, status_reason = mt5_status()
+            log_err.error(
+                "mt5 health check error: %s | status_ok=%s reason=%s | tb=%s",
+                exc,
+                status_ok,
+                status_reason,
+                traceback.format_exc(),
+            )
             return False
 
     # -------------------- pipelines --------------------
@@ -791,17 +964,52 @@ class MultiAssetTradingEngine:
             return False
 
     def _restart_exec_worker(self) -> None:
-        if self._exec_worker:
+        self._stop_exec_workers(timeout=4.0)
+
+        workers: List[ExecutionWorker] = []
+        for idx in range(int(self._exec_parallelism)):
+            worker = ExecutionWorker(
+                self._order_q,
+                self._result_q,
+                self.dry_run,
+                self._order_notify_bridge,
+                self._direct_order_result_bridge,
+                worker_label=f"{idx + 1}",
+            )
+            worker.start()
+            workers.append(worker)
+
+        self._exec_worker = workers[0] if workers else None
+        self._exec_aux_workers = workers[1:] if len(workers) > 1 else []
+        log_health.info("EXEC_WORKERS_STARTED | count=%d", len(workers))
+
+    def _iter_exec_workers(self) -> List[ExecutionWorker]:
+        workers: List[ExecutionWorker] = []
+        if self._exec_worker is not None:
+            workers.append(self._exec_worker)
+        workers.extend(w for w in self._exec_aux_workers if w is not None)
+        return workers
+
+    def _stop_exec_workers(self, timeout: float = 4.0) -> None:
+        workers = self._iter_exec_workers()
+        for worker in workers:
             try:
-                self._exec_worker.stop()
+                worker.stop()
             except Exception:
                 pass
+        for worker in workers:
             try:
-                self._exec_worker.join(timeout=4.0)
+                worker.join(timeout=timeout)
             except Exception:
                 pass
-        self._exec_worker = ExecutionWorker(self._order_q, self._result_q, self.dry_run, self._order_notify_bridge)
-        self._exec_worker.start()
+        self._exec_worker = None
+        self._exec_aux_workers = []
+
+    def _total_exec_queue_size(self) -> int:
+        try:
+            return int(self._order_q.qsize())
+        except Exception:
+            return 0
 
     def _order_notify_bridge(self, intent: OrderIntent, res: ExecutionResult) -> None:
         if self._order_notifier:
@@ -809,6 +1017,9 @@ class MultiAssetTradingEngine:
                 self._order_notifier(intent, res)
             except Exception:
                 pass
+
+    def _direct_order_result_bridge(self, res: ExecutionResult) -> None:
+        self._resolve_order_result(res)
 
     # -------------------- recovery --------------------
     @staticmethod
@@ -851,21 +1062,14 @@ class MultiAssetTradingEngine:
 
 
             # Stop worker first (prevents executing stale intents)
-            if self._exec_worker:
-                try:
-                    self._exec_worker.stop()
-                except Exception:
-                    pass
-                try:
-                    self._exec_worker.join(timeout=4.0)
-                except Exception:
-                    pass
+            self._stop_exec_workers(timeout=4.0)
 
             # Drop stale queues + mapping
             self._drain_queue(self._order_q)
             self._drain_queue(self._result_q)
-            self._order_rm_by_id.clear()
-            self._pending_order_meta.clear()
+            with self._order_state_lock:
+                self._order_rm_by_id.clear()
+                self._pending_order_meta.clear()
 
             try:
                 with MT5_LOCK:
@@ -877,6 +1081,16 @@ class MultiAssetTradingEngine:
             if not self._init_mt5():
                 return False
             if not self._build_pipelines():
+                return False
+            unsafe_account_reason = self._preflight_live_account_state()
+            if unsafe_account_reason:
+                with self._lock:
+                    self._manual_stop = True
+                    self._run.clear()
+                log_err.critical(
+                    "RECOVER_BLOCKED_UNSAFE_ACCOUNT_STATE | reason=%s",
+                    unsafe_account_reason,
+                )
                 return False
 
             self._restart_exec_worker()
@@ -1015,6 +1229,7 @@ class MultiAssetTradingEngine:
             return
         if lat < 0.0:
             return
+        self._mark_runtime_alive()
         self._fsm_cycle_ms_hist.append(lat)
         if lat > (self._live_max_p95_latency_ms * 1.75):
             now = time.time()
@@ -1073,6 +1288,99 @@ class MultiAssetTradingEngine:
         n = int(len(profits))
         return float(wins / max(1, n)), n
 
+    def _account_snapshot_reason(self, *, balance: float, equity: float, now: float) -> str:
+        try:
+            bal = float(balance)
+            eq = float(equity)
+        except Exception:
+            return "account_values_non_numeric"
+
+        if not (bal > 0.0 and eq > 0.0):
+            return f"account_values_invalid:balance={bal:.2f}|equity={eq:.2f}"
+
+        prev_bal = float(self._last_account_snapshot.get("balance", 0.0) or 0.0)
+        prev_eq = float(self._last_account_snapshot.get("equity", 0.0) or 0.0)
+        prev_ts = float(self._last_account_snapshot.get("updated_ts", 0.0) or 0.0)
+        factor = max(2.0, float(self._account_anomaly_factor or 50.0))
+
+        if prev_ts > 0.0 and prev_bal > 0.0:
+            bal_jump = max((bal / prev_bal), (prev_bal / bal))
+            if bal_jump >= factor:
+                return f"balance_jump:{prev_bal:.2f}->{bal:.2f}"
+        if prev_ts > 0.0 and prev_eq > 0.0:
+            eq_jump = max((eq / prev_eq), (prev_eq / eq))
+            if eq_jump >= factor:
+                return f"equity_jump:{prev_eq:.2f}->{eq:.2f}"
+
+        self._last_account_snapshot = {
+            "balance": bal,
+            "equity": eq,
+            "updated_ts": float(now),
+        }
+        return ""
+
+    def _stable_account_snapshot(self, acc: Any, now: float) -> Tuple[float, float, str]:
+        bal = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
+        eq = float(getattr(acc, "equity", 0.0) or 0.0) if acc else 0.0
+        reason = self._account_snapshot_reason(balance=bal, equity=eq, now=now)
+        if not reason:
+            return bal, eq, ""
+
+        prev_bal = float(self._last_account_snapshot.get("balance", 0.0) or 0.0)
+        prev_eq = float(self._last_account_snapshot.get("equity", 0.0) or 0.0)
+        if prev_bal > 0.0 and prev_eq > 0.0:
+            return prev_bal, prev_eq, ""
+
+        return bal, eq, reason
+
+    def _live_drawdown_limit(self) -> float:
+        dd_candidates: List[float] = []
+        for cfg in (getattr(self, "_xau_cfg", None), getattr(self, "_btc_cfg", None)):
+            if cfg is None:
+                continue
+            try:
+                candidate = float(getattr(cfg, "max_drawdown", 0.0) or 0.0)
+            except Exception:
+                candidate = 0.0
+            if candidate > 0.0:
+                dd_candidates.append(candidate)
+        return float(min(dd_candidates)) if dd_candidates else 0.0
+
+    def _live_open_positions_total(self) -> int:
+        total = 0
+        pipes = (("XAU", getattr(self, "_xau", None)), ("BTC", getattr(self, "_btc", None)))
+        for asset, pipe in pipes:
+            if pipe is None:
+                total += max(0, int(self._current_open_positions.get(asset, 0) or 0))
+                continue
+            try:
+                total += max(0, int(pipe.open_positions()))
+            except Exception:
+                total += max(0, int(self._current_open_positions.get(asset, 0) or 0))
+        return int(total)
+
+    def _live_risk_halt_reason(self, snapshot: Optional[Dict[str, Any]] = None) -> str:
+        if self.dry_run or self._manual_stop:
+            return ""
+        snap = dict(snapshot or self._update_live_evidence(force=False))
+        if str(snap.get("status", "") or "").upper() != "DEGRADED":
+            return ""
+
+        dd_limit = self._live_drawdown_limit()
+        try:
+            dd_pct = float(snap.get("dd_pct", 0.0) or 0.0)
+        except Exception:
+            dd_pct = 0.0
+
+        if dd_limit <= 0.0 or dd_pct <= dd_limit:
+            return ""
+
+        open_total = self._live_open_positions_total()
+        if open_total <= 0:
+            return ""
+
+        return f"live_drawdown_breach:{dd_pct:.3f}>{dd_limit:.3f}|open_positions:{open_total}"
+
     def _update_live_evidence(self, *, force: bool = False) -> Dict[str, Any]:
         now = time.time()
         if (not force) and ((now - self._last_live_monitor_ts) < self._live_monitor_interval_sec):
@@ -1106,14 +1414,37 @@ class MultiAssetTradingEngine:
         live_wr, wr_samples = self._live_trade_win_rate()
         ref_wr = self._reference_win_rate()
         drift = float(live_wr - ref_wr) if (live_wr > 0.0 and ref_wr > 0.0) else 0.0
+        bal = 0.0
+        eq = 0.0
+        dd_pct = 0.0
+        dd_limit = self._live_drawdown_limit()
+        if not self.dry_run:
+            try:
+                with MT5_LOCK:
+                    acc = mt5.account_info()
+            except Exception:
+                acc = None
+            bal, eq, account_reason = self._stable_account_snapshot(acc, now)
+            if bal > 0.0:
+                dd_pct = max(0.0, (bal - eq) / bal)
+        else:
+            account_reason = ""
 
         reasons: List[str] = []
+        if account_reason:
+            reasons.append(account_reason)
+        for asset, open_now in self._current_open_positions.items():
+            max_pos = int(self._max_open_positions.get(asset, 0) or 0)
+            if max_pos > 0 and int(open_now) > max_pos:
+                reasons.append(f"open_positions:{asset}:{int(open_now)}>{max_pos}")
         if lat_p95 > self._live_max_p95_latency_ms:
             reasons.append(f"latency_p95:{lat_p95:.1f}>{self._live_max_p95_latency_ms:.1f}")
         if slip_p95 > self._live_max_p95_slippage_points:
             reasons.append(f"slippage_p95:{slip_p95:.2f}>{self._live_max_p95_slippage_points:.2f}")
         if wr_samples >= 8 and ref_wr > 0.0 and drift < -self._live_max_winrate_drift:
             reasons.append(f"winrate_drift:{drift:+.3f}")
+        if dd_limit > 0.0 and dd_pct > dd_limit:
+            reasons.append(f"dd_pct:{dd_pct:.3f}>{dd_limit:.3f}")
 
         status = "HEALTHY" if not reasons else "DEGRADED"
         if self._manual_stop:
@@ -1133,13 +1464,16 @@ class MultiAssetTradingEngine:
             "win_rate_drift": float(drift),
             "closed_trade_samples": int(wr_samples),
             "signals_24h": int(len(self._signal_emit_ts_global)),
+            "dd_pct": float(dd_pct),
+            "balance": float(bal),
+            "equity": float(eq),
         }
         self._live_evidence_state = snapshot
 
         level = log_health.warning if reasons else log_health.info
         level(
             "LIVE_EVIDENCE | status=%s reason=%s latency_p95=%.1f slippage_p95=%.2f "
-            "win_rate_live=%.3f win_rate_ref=%.3f drift=%+.3f closed_trades=%d signals_24h=%d",
+            "win_rate_live=%.3f win_rate_ref=%.3f drift=%+.3f dd_pct=%.3f closed_trades=%d signals_24h=%d",
             snapshot["status"],
             snapshot["reason"],
             snapshot["latency_p95_ms"],
@@ -1147,18 +1481,37 @@ class MultiAssetTradingEngine:
             snapshot["win_rate_live"],
             snapshot["win_rate_reference"],
             snapshot["win_rate_drift"],
+            snapshot["dd_pct"],
             snapshot["closed_trade_samples"],
             snapshot["signals_24h"],
         )
         return dict(snapshot)
 
+    def _live_trading_pause_reason(self, *, force: bool = False) -> str:
+        if self.dry_run:
+            return ""
+        snapshot = self._update_live_evidence(force=force)
+        if str(snapshot.get("status", "") or "").upper() != "DEGRADED":
+            return ""
+
+        reason = str(snapshot.get("reason", "degraded") or "degraded")
+        now = time.time()
+        if reason != self._last_live_pause_reason or (now - self._last_live_pause_log_ts) >= 5.0:
+            self._last_live_pause_reason = reason
+            self._last_live_pause_log_ts = now
+            log_health.warning("LIVE_TRADE_PAUSE | reason=%s", reason)
+        return reason
+
     # -------------------- heartbeat/status --------------------
     def _heartbeat(self, open_xau: int, open_btc: int) -> None:
         try:
+            self._mark_runtime_alive()
+            self._current_open_positions["XAU"] = int(open_xau)
+            self._current_open_positions["BTC"] = int(open_btc)
+            now = time.time()
             with MT5_LOCK:
                 acc = mt5.account_info()
-            bal = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
-            eq = float(getattr(acc, "equity", 0.0) or 0.0) if acc else 0.0
+            bal, eq, _ = self._stable_account_snapshot(acc, now)
 
             # Prefer portfolio DD from account; it is authoritative
             dd = max(0.0, (bal - eq) / bal) if bal > 0 else 0.0
@@ -1194,7 +1547,7 @@ class MultiAssetTradingEngine:
                 last_signal_xau=str(last_sig_x),
                 last_signal_btc=str(last_sig_b),
                 last_selected_asset=str(self._last_selected_asset),
-                exec_queue_size=int(self._order_q.qsize()),
+                exec_queue_size=int(self._total_exec_queue_size()),
                 last_reconcile_ts=float(self._last_reconcile_ts),
             )
             live_evidence = self._update_live_evidence(force=False)
@@ -1206,6 +1559,8 @@ class MultiAssetTradingEngine:
                     "engine": st,
                     "mt5": mt5_status(),
                     "live_evidence": live_evidence,
+                    "runtime": self.runtime_watchdog_snapshot(),
+                    "account_state": dict(self._unsafe_account_snapshot),
                 }
                 try:
                     log_diag.info(safe_json_dumps(payload))
@@ -1239,10 +1594,12 @@ class MultiAssetTradingEngine:
             term = None
             acc = None
 
-        connected = bool(self._mt5_ready and term and getattr(term, "connected", False))
+        identity_ok, _identity_reason = self._mt5_identity_ok(acc)
+        connected = bool(self._mt5_ready and term and getattr(term, "connected", False) and identity_ok)
+        runtime_snapshot = self.runtime_watchdog_snapshot()
+        trading = bool(runtime_snapshot.get("trading_ok", False))
 
-        bal = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
-        eq = float(getattr(acc, "equity", 0.0) or 0.0) if acc else 0.0
+        bal, eq, _ = self._stable_account_snapshot(acc, time.time())
         pnl = float(getattr(acc, "profit", 0.0) or 0.0) if acc else 0.0
         dd = max(0.0, (bal - eq) / bal) if bal > 0 else 0.0
 
@@ -1251,7 +1608,7 @@ class MultiAssetTradingEngine:
 
         return PortfolioStatus(
             connected=connected,
-            trading=bool(self._run.is_set()),
+            trading=trading,
             manual_stop=bool(self._manual_stop),
             active_asset=str(self._active_asset),
             balance=bal,
@@ -1264,7 +1621,7 @@ class MultiAssetTradingEngine:
             last_signal_xau=str(self._xau.last_signal if self._xau else "Neutral"),
             last_signal_btc=str(self._btc.last_signal if self._btc else "Neutral"),
             last_selected_asset=str(self._last_selected_asset),
-            exec_queue_size=int(self._order_q.qsize()),
+            exec_queue_size=int(self._total_exec_queue_size()),
             last_reconcile_ts=float(self._last_reconcile_ts),
         )
 
@@ -1287,10 +1644,24 @@ class MultiAssetTradingEngine:
 
             equity = float(getattr(acc, "equity", 0.0))
             date_str = datetime.utcnow().strftime("%Y-%m-%d")
-            
+            account_state = self._inspect_live_account_positions(positions)
+            unsafe_reason = str(account_state.get("reason", "") or "")
+            should_quarantine = False
+            should_log_unsafe = False
+            with self._lock:
+                prev_unsafe_reason = str(self._unsafe_account_reason or "")
+                self._unsafe_account_snapshot = dict(account_state)
+                self._unsafe_account_reason = unsafe_reason
+                if unsafe_reason:
+                    should_log_unsafe = unsafe_reason != prev_unsafe_reason
+                    if not self._manual_stop:
+                        self._manual_stop = True
+                        should_quarantine = True
+
             # 1. Update daily baseline (only sets if date changed)
             self._portfolio_risk.set_daily_start_equity(equity, date_str)
-            
+            hard_stopped, stop_reason = self._portfolio_risk.evaluate_equity(equity)
+
             # 2. Group positions by asset
             # We assume symbols contain "BTC" or "XAU" to map back to asset strings
             exposures = {"XAU": AssetExposure(symbol="XAUUSDm"), "BTC": AssetExposure(symbol="BTCUSDm")}
@@ -1343,9 +1714,206 @@ class MultiAssetTradingEngine:
                 exp.side = side
                 exp.volume = abs(exp.volume) # Store absolute volume, side is separate
                 self._portfolio_risk.update_exposure(asset, exp)
+
+            if unsafe_reason:
+                if should_log_unsafe:
+                    log_err.critical(
+                        "UNSAFE_ACCOUNT_STATE_RUNTIME | reason=%s",
+                        unsafe_reason,
+                    )
+                if should_quarantine:
+                    self._drain_queue(self._order_q)
+                    self._drain_queue(self._result_q)
+                    with self._order_state_lock:
+                        self._order_rm_by_id.clear()
+                        self._pending_order_meta.clear()
+
+            if hard_stopped:
+                should_flatten = False
+                with self._lock:
+                    if (
+                        not self._portfolio_stop_triggered
+                        or str(self._portfolio_stop_reason or "") != str(stop_reason or "")
+                    ):
+                        self._portfolio_stop_triggered = True
+                        self._portfolio_stop_reason = str(stop_reason or "")
+                        self._manual_stop = True
+                        should_flatten = True
+                if should_flatten:
+                    log_err.critical(
+                        "PORTFOLIO_RUNTIME_HARD_STOP | reason=%s equity=%.2f",
+                        stop_reason,
+                        equity,
+                    )
+                    self._drain_queue(self._order_q)
+                    self._drain_queue(self._result_q)
+                    with self._order_state_lock:
+                        self._order_rm_by_id.clear()
+                        self._pending_order_meta.clear()
+                    self._emergency_flatten(f"portfolio_hard_stop:{stop_reason}")
+            else:
+                with self._lock:
+                    self._portfolio_stop_triggered = False
+                    self._portfolio_stop_reason = ""
                 
         except Exception as exc:
             log_err.error("portfolio update error: %s", exc)
+
+    def _mark_runtime_alive(self) -> None:
+        now = time.time()
+        with self._lock:
+            self._last_runtime_heartbeat_ts = now
+
+    def runtime_watchdog_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            running = bool(self._run.is_set())
+            manual_stop = bool(self._manual_stop)
+            loop_thread = self._loop_thread
+            loop_started_ts = float(self._loop_started_ts or 0.0)
+            last_heartbeat_ts = float(self._last_runtime_heartbeat_ts or 0.0)
+
+        loop_alive = bool(loop_thread and loop_thread.is_alive())
+        now = time.time()
+        last_activity_ts = last_heartbeat_ts if last_heartbeat_ts > 0.0 else loop_started_ts
+        heartbeat_age_sec = max(0.0, now - last_activity_ts) if last_activity_ts > 0.0 else 0.0
+
+        starting = bool(
+            running
+            and loop_alive
+            and last_heartbeat_ts <= 0.0
+            and loop_started_ts > 0.0
+            and (now - loop_started_ts) <= self._runtime_start_grace_sec
+        )
+        stale = bool(
+            running
+            and loop_alive
+            and not starting
+            and last_activity_ts > 0.0
+            and heartbeat_age_sec > self._runtime_stall_timeout_sec
+        )
+        thread_dead = bool(running and loop_started_ts > 0.0 and not loop_alive)
+        trading_ok = bool(running and loop_alive and not stale)
+
+        return {
+            "running": running,
+            "loop_alive": loop_alive,
+            "starting": starting,
+            "stale": stale,
+            "thread_dead": thread_dead,
+            "heartbeat_age_sec": float(heartbeat_age_sec),
+            "last_heartbeat_ts": float(last_heartbeat_ts),
+            "loop_started_ts": float(loop_started_ts),
+            "manual_stop": manual_stop,
+            "trading_ok": trading_ok,
+        }
+
+    def unsafe_account_state_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._unsafe_account_snapshot)
+
+    def _preflight_live_account_state(self) -> str:
+        if self.dry_run:
+            return ""
+        snapshot = self._inspect_live_account_positions()
+        reason = str(snapshot.get("reason", "") or "")
+        with self._lock:
+            self._unsafe_account_snapshot = dict(snapshot)
+            self._unsafe_account_reason = reason
+        return reason
+
+    def _inspect_live_account_positions(self, positions: Optional[List[Any]] = None) -> Dict[str, Any]:
+        if self.dry_run:
+            return {
+                "reason": "",
+                "total_positions": 0,
+                "symbol_counts": {},
+                "foreign_symbols": [],
+                "unmanaged_positions": 0,
+                "zero_protection_positions": 0,
+                "magic_counts": {},
+            }
+
+        if positions is None:
+            try:
+                with MT5_LOCK:
+                    positions = mt5.positions_get() or []
+            except Exception as exc:
+                return {
+                    "reason": f"positions_probe_failed:{exc}",
+                    "total_positions": 0,
+                    "symbol_counts": {},
+                    "foreign_symbols": [],
+                    "unmanaged_positions": 0,
+                    "zero_protection_positions": 0,
+                    "magic_counts": {},
+                }
+
+        total_positions = 0
+        symbol_counts: Dict[str, int] = {}
+        foreign_symbols: List[str] = []
+        magic_counts: Dict[int, int] = {}
+        unmanaged_positions = 0
+        zero_protection_positions = 0
+        known_symbols = {
+            str(getattr(self._xau, "symbol", "XAUUSDm") or "XAUUSDm").upper(): "XAU",
+            str(getattr(self._btc, "symbol", "BTCUSDm") or "BTCUSDm").upper(): "BTC",
+        }
+        expected_magics = {
+            int(getattr(self._xau_cfg, "magic", 777001) or 777001),
+            int(getattr(self._btc_cfg, "magic", 777001) or 777001),
+            777001,
+        }
+
+        for pos in positions or []:
+            try:
+                ticket = int(getattr(pos, "ticket", 0) or 0)
+                if ticket <= 0:
+                    continue
+                total_positions += 1
+                symbol = str(getattr(pos, "symbol", "") or "").strip().upper()
+                if symbol:
+                    symbol_counts[symbol] = int(symbol_counts.get(symbol, 0) or 0) + 1
+                    if symbol not in known_symbols and symbol not in foreign_symbols:
+                        foreign_symbols.append(symbol)
+                magic = int(getattr(pos, "magic", 0) or 0)
+                magic_counts[magic] = int(magic_counts.get(magic, 0) or 0) + 1
+                if magic not in expected_magics:
+                    unmanaged_positions += 1
+                sl = float(getattr(pos, "sl", 0.0) or 0.0)
+                tp = float(getattr(pos, "tp", 0.0) or 0.0)
+                if sl <= 0.0 and tp <= 0.0:
+                    zero_protection_positions += 1
+            except Exception:
+                continue
+
+        reasons: List[str] = []
+        allowed_total = int(sum(max(0, int(v or 0)) for v in self._max_open_positions.values()))
+        if allowed_total > 0 and total_positions > allowed_total:
+            reasons.append(f"total_positions:{total_positions}>{allowed_total}")
+
+        for symbol, asset in known_symbols.items():
+            max_allowed = int(self._max_open_positions.get(asset, 0) or 0)
+            current = int(symbol_counts.get(symbol, 0) or 0)
+            if max_allowed > 0 and current > max_allowed:
+                reasons.append(f"{asset}_positions:{current}>{max_allowed}")
+
+        if foreign_symbols:
+            reasons.append(f"foreign_symbols:{','.join(sorted(foreign_symbols))}")
+        if unmanaged_positions > 0:
+            reasons.append(f"unmanaged_positions:{unmanaged_positions}")
+        if zero_protection_positions > 0:
+            reasons.append(f"zero_protection_positions:{zero_protection_positions}")
+
+        top_magics = dict(sorted(magic_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))[:5])
+        return {
+            "reason": "|".join(reasons),
+            "total_positions": int(total_positions),
+            "symbol_counts": dict(symbol_counts),
+            "foreign_symbols": list(sorted(foreign_symbols)),
+            "unmanaged_positions": int(unmanaged_positions),
+            "zero_protection_positions": int(zero_protection_positions),
+            "magic_counts": top_magics,
+        }
 
     def _check_backtest_integration(self) -> None:
         """
@@ -1389,11 +1957,22 @@ class MultiAssetTradingEngine:
                 self._emergency_flatten("start_blocked_gatekeeper_failed")
                 return False
 
+        runtime_snapshot = self.runtime_watchdog_snapshot()
         with self._lock:
-            if self._run.is_set():
+            if bool(runtime_snapshot.get("trading_ok", False)) or bool(runtime_snapshot.get("starting", False)):
                 return True
+            if self._run.is_set():
+                log_health.warning(
+                    "ENGINE_RUNTIME_RESTART | loop_alive=%s stale=%s heartbeat_age=%.1fs",
+                    runtime_snapshot.get("loop_alive", False),
+                    runtime_snapshot.get("stale", False),
+                    float(runtime_snapshot.get("heartbeat_age_sec", 0.0) or 0.0),
+                )
+                self._run.clear()
             # MONITORING MODE: Allow start even if manual_stop is true
             self._run.set()
+            self._loop_started_ts = time.time()
+            self._last_runtime_heartbeat_ts = 0.0
 
         # Propagate runtime mode to downstream components (feeds/pipelines).
         # This enables dry-run specific fast-fail behavior in data feeds.
@@ -1442,6 +2021,17 @@ class MultiAssetTradingEngine:
             self._run.clear()
             return False
 
+        unsafe_account_reason = self._preflight_live_account_state()
+        if unsafe_account_reason:
+            with self._lock:
+                self._manual_stop = True
+                self._run.clear()
+            log_err.critical(
+                "ENGINE_START_BLOCKED_UNSAFE_ACCOUNT_STATE | reason=%s",
+                unsafe_account_reason,
+            )
+            return False
+
         self._restart_exec_worker()
 
         log_health.info(
@@ -1452,31 +2042,39 @@ class MultiAssetTradingEngine:
             self._manual_stop,
         )
 
-        t = threading.Thread(target=self._loop, daemon=True)
+        t = threading.Thread(target=self._loop, name="portfolio.engine.loop", daemon=True)
+        with self._lock:
+            self._loop_thread = t
         t.start()
         return True
 
     def stop(self) -> bool:
         with self._lock:
-            if not self._run.is_set():
-                return True
             self._run.clear()
 
-        if self._exec_worker:
+        loop_thread = None
+        with self._lock:
+            loop_thread = self._loop_thread
+
+        if loop_thread and loop_thread.is_alive():
             try:
-                self._exec_worker.stop()
+                loop_thread.join(timeout=5.0)
             except Exception:
                 pass
-            try:
-                self._exec_worker.join(timeout=6.0)
-            except Exception:
-                pass
+
+        with self._lock:
+            self._loop_thread = None
+            self._loop_started_ts = 0.0
+            self._last_runtime_heartbeat_ts = 0.0
+
+        self._stop_exec_workers(timeout=6.0)
 
         # Drain queues best-effort + clear mapping
         self._drain_queue(self._order_q)
         self._drain_queue(self._result_q)
-        self._order_rm_by_id.clear()
-        self._pending_order_meta.clear()
+        with self._order_state_lock:
+            self._order_rm_by_id.clear()
+            self._pending_order_meta.clear()
 
 
         log_health.info("PORTFOLIO_ENGINE_STOP")
@@ -1489,7 +2087,15 @@ class MultiAssetTradingEngine:
         return True
 
     def clear_manual_stop(self) -> None:
+        unsafe_reason = self._preflight_live_account_state()
         with self._lock:
+            if unsafe_reason:
+                self._manual_stop = True
+                log_err.error(
+                    "MANUAL_STOP_CLEAR_BLOCKED_UNSAFE_ACCOUNT_STATE | reason=%s",
+                    unsafe_reason,
+                )
+                return
             if self._manual_stop:
                 log_health.info("MANUAL_STOP_CLEAR")
             self._manual_stop = False
@@ -1499,39 +2105,33 @@ class MultiAssetTradingEngine:
             return bool(self._manual_stop)
 
     def close_all(self) -> bool:
-        """Best-effort close all positions for both symbols (even before pipelines boot)."""
-        symbols: List[str] = []
-
-        def _append_symbol(sym: Any) -> None:
-            s = str(sym or "").strip()
-            if s and s not in symbols:
-                symbols.append(s)
-
+        """Best-effort close all open positions and pending orders."""
         try:
-            if self._xau and self._xau.symbol:
-                _append_symbol(self._xau.symbol)
-            else:
-                sp = getattr(self._xau_cfg, "symbol_params", None)
-                _append_symbol(getattr(sp, "resolved", "") or getattr(sp, "base", ""))
-        except Exception:
-            pass
+            res = close_all_position()
+        except Exception as exc:
+            log_err.error("ENGINE_CLOSE_ALL_EXCEPTION | err=%s", exc)
+            return False
 
-        try:
-            if self._btc and self._btc.symbol:
-                _append_symbol(self._btc.symbol)
-            else:
-                sp = getattr(self._btc_cfg, "symbol_params", None)
-                _append_symbol(getattr(sp, "resolved", "") or getattr(sp, "base", ""))
-        except Exception:
-            pass
+        ok = bool(res.get("ok", False))
+        closed = int(res.get("closed", 0) or 0)
+        canceled = int(res.get("canceled", 0) or 0)
+        errors = list(res.get("errors") or [])
 
-        ok_all = True
-        for sym in symbols:
-            try:
-                ok_all = bool(close_all_position(sym)) and ok_all
-            except Exception:
-                ok_all = False
-        return bool(ok_all)
+        if ok:
+            log_health.info(
+                "ENGINE_CLOSE_ALL_DONE | closed=%d canceled=%d",
+                closed,
+                canceled,
+            )
+        else:
+            preview = " | ".join(str(e) for e in errors[:3]) if errors else "unknown"
+            log_err.error(
+                "ENGINE_CLOSE_ALL_FAILED | closed=%d canceled=%d errors=%s",
+                closed,
+                canceled,
+                preview,
+            )
+        return ok
 
     def _emergency_flatten(self, reason: str) -> bool:
         """
@@ -1578,15 +2178,24 @@ class MultiAssetTradingEngine:
         return nxt
 
     def _halt_fsm(self, reason: str) -> None:
-        log_err.critical("FSM_HALT | reason=%s", reason)
+        reason_s = str(reason or "unspecified").strip() or "unspecified"
+        recoverable = reason_s.lower() in RECOVERABLE_HALT_REASONS
+
+        log_err.critical("FSM_HALT | reason=%s", reason_s)
         with self._lock:
-            self._manual_stop = True
+            if not recoverable:
+                self._manual_stop = True
             self._run.clear()
         self._drain_queue(self._order_q)
         self._drain_queue(self._result_q)
-        self._order_rm_by_id.clear()
-        self._pending_order_meta.clear()
-        self._emergency_flatten(f"fsm_halt:{reason}")
+        with self._order_state_lock:
+            self._order_rm_by_id.clear()
+            self._pending_order_meta.clear()
+        if recoverable:
+            log_health.warning("FSM_HALT_RECOVERABLE | reason=%s | auto_restart_allowed=True", reason_s)
+            return
+
+        self._emergency_flatten(f"fsm_halt:{reason_s}")
 
     def _validate_payload_timestamp(self, asset: str, payload: Dict[str, Any], tf: str) -> Tuple[bool, str]:
         return self._inference_engine.validate_payload_timestamp(asset, payload, tf)
@@ -1628,15 +2237,36 @@ class MultiAssetTradingEngine:
 
     # -------------------- main loop --------------------
     def _loop(self) -> None:
+        current_thread = threading.current_thread()
+        self._mark_runtime_alive()
         if not self._xau or not self._btc:
             log_err.error("Portfolio engine loop start failed: pipelines not built")
             self._run.clear()
+            with self._lock:
+                if self._loop_thread is current_thread:
+                    self._loop_thread = None
             return
 
-        self._fsm_runner.run(
-            initial_state=EngineState.BOOT,
-            initial_ctx=EngineCycleContext(),
-        )
+        unexpected_exit = False
+        try:
+            self._fsm_runner.run(
+                initial_state=EngineState.BOOT,
+                initial_ctx=EngineCycleContext(),
+            )
+            with self._lock:
+                unexpected_exit = bool(self._run.is_set())
+                if unexpected_exit:
+                    self._run.clear()
+        except Exception as exc:
+            with self._lock:
+                self._run.clear()
+            log_err.error("ENGINE_LOOP_FATAL | err=%s | tb=%s", exc, traceback.format_exc())
+        finally:
+            with self._lock:
+                if self._loop_thread is current_thread:
+                    self._loop_thread = None
+            if unexpected_exit:
+                log_err.error("ENGINE_LOOP_EXIT_UNEXPECTED | manual_stop=%s mt5_ready=%s", self._manual_stop, self._mt5_ready)
 _engine_instance: Optional[MultiAssetTradingEngine] = None
 _engine_instance_lock = threading.Lock()
 

@@ -24,7 +24,131 @@ class InferenceEngine:
     def __init__(self, engine: "MultiAssetTradingEngine") -> None:
         self._e = engine
 
-    def infer_catboost(self, asset: str) -> Optional[MLSignal]:
+    @staticmethod
+    def _payload_trend_bias(payload: Optional[Dict[str, Any]], tf: str) -> float:
+        if not isinstance(payload, dict):
+            return 0.0
+        frame = payload.get(tf)
+        if not isinstance(frame, dict):
+            return 0.0
+
+        try:
+            close = float(frame.get("last_close", 0.0) or 0.0)
+            ema20 = float(frame.get("ema_20", 0.0) or 0.0)
+            ema50 = float(frame.get("ema_50", 0.0) or 0.0)
+            ema200 = float(frame.get("ema_200", 0.0) or 0.0)
+            rsi = float(frame.get("rsi_14", 50.0) or 50.0)
+        except Exception:
+            return 0.0
+
+        bull = 0.0
+        bear = 0.0
+        if close > ema20 > ema50 > ema200 > 0.0:
+            bull += 0.75
+        elif close < ema20 < ema50 < ema200 and ema200 > 0.0:
+            bear += 0.75
+
+        if rsi >= 57.5:
+            bull += min(0.25, (rsi - 57.5) / 25.0)
+        elif rsi <= 42.5:
+            bear += min(0.25, (42.5 - rsi) / 25.0)
+
+        return float(max(-1.0, min(1.0, bull - bear)))
+
+    @staticmethod
+    def _live_regime_bias(
+        df,
+        *,
+        adx_min: float,
+        adx_trend_min: float,
+    ) -> Tuple[float, Dict[str, float]]:
+        metrics = {
+            "adx": 0.0,
+            "plus_di": 0.0,
+            "minus_di": 0.0,
+            "slope": 0.0,
+        }
+        if df is None or len(df) < 210:
+            return 0.0, metrics
+
+        try:
+            import numpy as np
+            import talib
+
+            h = np.asarray(df["High"].values, dtype=np.float64)
+            l = np.asarray(df["Low"].values, dtype=np.float64)
+            c = np.asarray(df["Close"].values, dtype=np.float64)
+            if len(c) < 210:
+                return 0.0, metrics
+
+            ema20 = talib.EMA(c, timeperiod=20)
+            ema50 = talib.EMA(c, timeperiod=50)
+            ema200 = talib.EMA(c, timeperiod=200)
+            adx = talib.ADX(h, l, c, timeperiod=14)
+            plus_di = talib.PLUS_DI(h, l, c, timeperiod=14)
+            minus_di = talib.MINUS_DI(h, l, c, timeperiod=14)
+            atr = talib.ATR(h, l, c, timeperiod=14)
+
+            last_close = float(c[-1])
+            last_ema20 = float(ema20[-1]) if np.isfinite(ema20[-1]) else 0.0
+            last_ema50 = float(ema50[-1]) if np.isfinite(ema50[-1]) else 0.0
+            last_ema200 = float(ema200[-1]) if np.isfinite(ema200[-1]) else 0.0
+            last_adx = float(adx[-1]) if np.isfinite(adx[-1]) else 0.0
+            last_plus_di = float(plus_di[-1]) if np.isfinite(plus_di[-1]) else 0.0
+            last_minus_di = float(minus_di[-1]) if np.isfinite(minus_di[-1]) else 0.0
+            last_atr = float(atr[-1]) if np.isfinite(atr[-1]) and atr[-1] > 0.0 else max(last_close * 0.001, 1e-6)
+
+            metrics.update(
+                {
+                    "adx": last_adx,
+                    "plus_di": last_plus_di,
+                    "minus_di": last_minus_di,
+                }
+            )
+
+            bull = 0.0
+            bear = 0.0
+
+            if last_close > last_ema20 > last_ema50 > last_ema200 > 0.0:
+                bull += 0.55
+            elif last_close < last_ema20 < last_ema50 < last_ema200 and last_ema200 > 0.0:
+                bear += 0.55
+
+            di_gap = abs(last_plus_di - last_minus_di)
+            if last_plus_di > last_minus_di:
+                bull += min(0.25, di_gap / 50.0)
+            elif last_minus_di > last_plus_di:
+                bear += min(0.25, di_gap / 50.0)
+
+            slope_window = min(20, len(c))
+            if slope_window >= 8:
+                y = c[-slope_window:]
+                x = np.arange(slope_window, dtype=np.float64)
+                slope = float(np.polyfit(x, y, 1)[0])
+                slope_norm = float(np.clip((slope * slope_window) / max(last_atr, 1e-6), -3.0, 3.0) / 3.0)
+                metrics["slope"] = slope_norm
+                if slope_norm > 0.0:
+                    bull += 0.20 * abs(slope_norm)
+                elif slope_norm < 0.0:
+                    bear += 0.20 * abs(slope_norm)
+
+            raw_bias = bull - bear
+            if last_adx >= adx_trend_min:
+                strength = 1.0
+            elif last_adx >= adx_min:
+                strength = 0.7
+            else:
+                strength = 0.35
+
+            return float(max(-1.0, min(1.0, raw_bias * strength))), metrics
+        except Exception:
+            return 0.0, metrics
+
+    def infer_catboost(
+        self,
+        asset: str,
+        payloads: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    ) -> Optional[MLSignal]:
         """Run CatBoost model inference on live M1 data from MT5."""
         e = self._e
         if e._is_asset_blocked(asset):
@@ -33,6 +157,29 @@ class InferenceEngine:
         payload = e._catboost_payloads.get(asset)
         if not payload:
             return None
+        cache = getattr(e, "_catboost_signal_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(e, "_catboost_signal_cache", cache)
+        payload_frame = self.extract_payload_frame(
+            (payloads or {}).get("scalp") if isinstance(payloads, dict) else None
+        )
+        if not payload_frame:
+            payload_frame = self.extract_payload_frame(
+                (payloads or {}).get("intraday") if isinstance(payloads, dict) else None
+            )
+        try:
+            payload_ts_bar = int(float(payload_frame.get("ts_bar", 0) or 0))
+        except Exception:
+            payload_ts_bar = 0
+        cached = cache.get(asset)
+        if (
+            payload_ts_bar > 0
+            and isinstance(cached, dict)
+            and int(cached.get("ts_bar", 0) or 0) == payload_ts_bar
+            and isinstance(cached.get("signal"), MLSignal)
+        ):
+            return cached.get("signal")
         try:
             import numpy as np
             import pandas as pd
@@ -48,11 +195,17 @@ class InferenceEngine:
                 return None
 
             n_bars = max(int(getattr(pipeline.cfg, "window_size", 60) or 60) + 200, 500)
+            req_bars_fn = getattr(pipeline, "required_live_bars", None)
+            if callable(req_bars_fn):
+                try:
+                    n_bars = max(n_bars, int(req_bars_fn()))
+                except Exception:
+                    pass
             rates = mt5_async_call(
                 "copy_rates_from_pos",
                 symbol,
                 mt5.TIMEFRAME_M1,
-                0,
+                1,
                 n_bars,
                 timeout=2.0,
                 default=None,
@@ -64,6 +217,13 @@ class InferenceEngine:
                     len(rates) if rates is not None else 0,
                 )
                 return None
+            if len(rates) < n_bars:
+                log_health.warning(
+                    "CATBOOST_HISTORY_SHORT | asset=%s bars=%s requested=%s",
+                    asset,
+                    len(rates),
+                    n_bars,
+                )
 
             df = pd.DataFrame(rates)
             df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
@@ -77,25 +237,6 @@ class InferenceEngine:
                 }
             )
             df = df.set_index("datetime")[["Open", "High", "Low", "Close", "Volume"]]
-
-            try:
-                tick_now = mt5_async_call(
-                    "symbol_info_tick",
-                    symbol,
-                    timeout=0.35,
-                    default=None,
-                )
-                if tick_now is not None:
-                    bid_now = float(getattr(tick_now, "bid", 0.0) or 0.0)
-                    ask_now = float(getattr(tick_now, "ask", 0.0) or 0.0)
-                    mid_now = 0.5 * (bid_now + ask_now) if bid_now > 0.0 and ask_now > 0.0 else 0.0
-                    if mid_now > 0.0 and len(df) > 0:
-                        last_idx = df.index[-1]
-                        df.at[last_idx, "Close"] = mid_now
-                        df.at[last_idx, "High"] = max(float(df.at[last_idx, "High"]), mid_now)
-                        df.at[last_idx, "Low"] = min(float(df.at[last_idx, "Low"]), mid_now)
-            except Exception:
-                pass
 
             if hasattr(pipeline, "transform_live"):
                 X_series = pipeline.transform_live(df.copy())
@@ -203,7 +344,7 @@ class InferenceEngine:
                 flow_confirm = 0.0
 
             if abs(pred_val) < threshold:
-                return MLSignal(
+                out = MLSignal(
                     asset=asset,
                     signal="HOLD",
                     side="Neutral",
@@ -227,8 +368,11 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
+                if payload_ts_bar > 0:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                return out
             if len(hist) >= int(e._catboost_hist_min) and z_mag < float(density_min_zscore):
-                return MLSignal(
+                out = MLSignal(
                     asset=asset,
                     signal="HOLD",
                     side="Neutral",
@@ -252,8 +396,11 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
+                if payload_ts_bar > 0:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                return out
             if (pred_val * flow_confirm) < -float(density_min_flow):
-                return MLSignal(
+                out = MLSignal(
                     asset=asset,
                     signal="HOLD",
                     side="Neutral",
@@ -277,6 +424,54 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
+                if payload_ts_bar > 0:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                return out
+
+            scalp_payload = (payloads or {}).get("scalp") if isinstance(payloads, dict) else None
+            intraday_payload = (payloads or {}).get("intraday") if isinstance(payloads, dict) else None
+            m1_bias, regime_metrics = self._live_regime_bias(
+                df,
+                adx_min=float(getattr(pipe.cfg, "adx_min", 20.0) or 20.0),
+                adx_trend_min=float(getattr(pipe.cfg, "adx_trend_min", 25.0) or 25.0),
+            )
+            h1_bias = self._payload_trend_bias(intraday_payload, "H1")
+            pred_sign = 1.0 if pred_val > 0.0 else -1.0
+            combined_bias = float(max(-1.0, min(1.0, (0.70 * m1_bias) + (0.30 * h1_bias))))
+            pred_margin = abs(pred_val) / max(threshold, 1e-12)
+            strong_conflict = (
+                (pred_sign * combined_bias) < 0.0
+                and abs(combined_bias) >= 0.35
+                and (
+                    float(regime_metrics.get("adx", 0.0) or 0.0) >= float(getattr(pipe.cfg, "adx_trend_min", 25.0) or 25.0)
+                    or abs(h1_bias) >= 0.55
+                    or pred_margin < 1.35
+                )
+            )
+            if strong_conflict:
+                out = MLSignal(
+                    asset=asset,
+                    signal="HOLD",
+                    side="Neutral",
+                    confidence=max(0.05, min(confidence, 0.74)),
+                    reason=(
+                        f"catboost_regime_conflict:pred={pred_val:.6f}|margin={pred_margin:.3f}|"
+                        f"m1={m1_bias:+.3f}|h1={h1_bias:+.3f}|combo={combined_bias:+.3f}|"
+                        f"adx={float(regime_metrics.get('adx', 0.0) or 0.0):.2f}|"
+                        f"plus_di={float(regime_metrics.get('plus_di', 0.0) or 0.0):.2f}|"
+                        f"minus_di={float(regime_metrics.get('minus_di', 0.0) or 0.0):.2f}"
+                    ),
+                    provider="catboost",
+                    model="catboost_trained",
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    scalp_payload=scalp_payload,
+                    intraday_payload=intraday_payload,
+                )
+                if payload_ts_bar > 0:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                return out
 
             signal = "STRONG BUY" if pred_val > 0 else "STRONG SELL"
             side = "Buy" if pred_val > 0 else "Sell"
@@ -290,7 +485,7 @@ class InferenceEngine:
                 "ema_200": last_close,
             }
 
-            return MLSignal(
+            out = MLSignal(
                 asset=asset,
                 signal=signal,
                 side=side,
@@ -306,9 +501,12 @@ class InferenceEngine:
                 entry=last_close,
                 stop_loss=None,
                 take_profit=None,
-                scalp_payload={"M1": frame},
-                intraday_payload={"H1": frame},
+                scalp_payload=scalp_payload or {"M1": frame},
+                intraday_payload=intraday_payload or {"H1": frame},
             )
+            if payload_ts_bar > 0:
+                cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+            return out
         except Exception as exc:
             log_err.error("CATBOOST_INFER_ERROR | asset=%s err=%s | tb=%s", asset, exc, traceback.format_exc())
             return None
@@ -462,92 +660,83 @@ class InferenceEngine:
         pipe = e._xau if asset == "XAU" else e._btc
         if pipe is None or pipe.risk is None:
             return None
+        compute_candidate_fn = getattr(pipe, "compute_candidate", None)
+        if not callable(compute_candidate_fn):
+            return None
 
-        payload = sig.scalp_payload if isinstance(sig.scalp_payload, dict) else sig.intraday_payload
-        frame = self.extract_payload_frame(payload)
-        entry = float(sig.entry or frame.get("last_close") or 0.0)
-        atr = float(frame.get("atr_14", 0.0) or 0.0)
-        atr_pct = (atr / entry) if atr > 0.0 and entry > 0.0 else 0.0
+        try:
+            inst_candidate = compute_candidate_fn()
+        except Exception as exc:
+            log_err.error("FSM_PIPELINE_CANDIDATE_ERROR | asset=%s err=%s", asset, exc)
+            return None
 
-        ind = {
-            "atr": atr,
-            "atr_pct": atr_pct,
-            "close": float(frame.get("last_close", entry) or entry),
-        }
-        adapt = {
-            "atr": atr,
-            "atr_pct": atr_pct,
-            "confidence": max(0.0, min(1.0, float(sig.confidence))),
-            "regime": "ml_router",
-        }
-        open_positions = e._asset_open_positions(asset)
-        max_positions = e._asset_max_positions(asset)
-
-        plan = pipe.risk.plan_order(
-            side=sig.side,
-            confidence=float(sig.confidence),
-            ind=ind,
-            adapt=adapt,
-            entry=(entry if entry > 0.0 else None),
-            open_positions=int(open_positions),
-            max_positions=int(max_positions),
-            df=None,
-        )
-        if bool(plan.get("blocked", True)):
+        if inst_candidate is None:
             log_health.info(
-                "FSM_RISK_BLOCK | asset=%s signal=%s reason=%s open=%d max=%d",
+                "FSM_PIPELINE_BLOCK | asset=%s ml_signal=%s reason=pipeline_candidate_none",
                 asset,
                 sig.signal,
-                str(plan.get("reason", "unknown")),
-                int(open_positions),
-                int(max_positions),
             )
             return None
 
-        plan_entry = float(plan.get("entry", 0.0) or 0.0)
-        plan_sl = float(plan.get("sl", 0.0) or 0.0)
-        plan_tp = float(plan.get("tp", 0.0) or 0.0)
-        sl, tp = self.probabilistic_levels(
-            side=sig.side,
-            entry=plan_entry,
-            base_sl=plan_sl,
-            base_tp=plan_tp,
-            confidence=float(sig.confidence),
-            frame=frame,
-        )
-        lot = float(plan.get("lot", 0.0) or 0.0)
-        lot = e._apply_asset_lot_cap(asset, lot, "build")
+        if bool(inst_candidate.blocked):
+            log_health.info(
+                "FSM_PIPELINE_BLOCK | asset=%s ml_signal=%s pipeline_signal=%s reasons=%s",
+                asset,
+                sig.signal,
+                inst_candidate.signal,
+                ",".join(tuple(str(r) for r in (inst_candidate.reasons or ()))) or "-",
+            )
+            return None
+
+        if str(inst_candidate.signal) not in ("Buy", "Sell"):
+            log_health.info(
+                "FSM_PIPELINE_NEUTRAL | asset=%s ml_signal=%s pipeline_signal=%s reasons=%s",
+                asset,
+                sig.signal,
+                inst_candidate.signal,
+                ",".join(tuple(str(r) for r in (inst_candidate.reasons or ()))) or "-",
+            )
+            return None
+
+        if str(inst_candidate.signal) != str(sig.side):
+            log_health.info(
+                "FSM_SIGNAL_CONFLICT | asset=%s ml=%s pipeline=%s ml_reason=%s pipeline_reasons=%s",
+                asset,
+                sig.side,
+                inst_candidate.signal,
+                sig.reason,
+                ",".join(tuple(str(r) for r in (inst_candidate.reasons or ()))) or "-",
+            )
+            return None
+
+        lot = e._apply_asset_lot_cap(asset, float(inst_candidate.lot), "build")
         if lot <= 0.0:
             return None
 
-        ts_bar = 0
-        try:
-            ts_bar = int(frame.get("ts_bar", 0) or 0)
-        except Exception:
-            ts_bar = 0
-        if ts_bar <= 0:
-            ts_bar = int(time.time())
-
-        reasons = (
+        base_reasons = tuple(str(r) for r in (inst_candidate.reasons or ()))
+        ml_reasons = (
             f"ml_provider:{sig.provider}",
             f"ml_model:{sig.model}",
             f"ml_reason:{sig.reason}",
             "sniper_fsm",
         )
+        reasons = tuple(list(base_reasons[:12]) + list(ml_reasons))
+        confidence = max(0.0, min(1.0, min(float(inst_candidate.confidence), float(sig.confidence))))
 
         return AssetCandidate(
             asset=asset,
-            symbol=str(pipe.symbol),
-            signal=str(sig.side),
-            confidence=float(sig.confidence),
+            symbol=str(inst_candidate.symbol or pipe.symbol),
+            signal=str(inst_candidate.signal),
+            confidence=confidence,
             lot=lot,
-            sl=float(sl),
-            tp=float(tp),
-            latency_ms=0.0,
+            sl=float(inst_candidate.sl),
+            tp=float(inst_candidate.tp),
+            latency_ms=float(inst_candidate.latency_ms),
             blocked=False,
             reasons=reasons,
-            signal_id=f"ML_{asset}_{ts_bar}_{sig.side}",
+            signal_id=str(inst_candidate.signal_id or f"ML_{asset}_{int(time.time())}_{sig.side}"),
             raw_result={
+                "institutional_candidate": inst_candidate.raw_result,
                 "ml_signal": sig.signal,
                 "provider": sig.provider,
                 "model": sig.model,

@@ -40,6 +40,7 @@ from .utils import (
     kaufman_efficiency_ratio,
     percentile_rank,
     relative_volatility_index,
+    tf_seconds,
     volatility_trailing_stop,
 )
 
@@ -142,8 +143,15 @@ class RiskManager:
         self._trades_today: List[float] = []
         self._signals_today: int = 0
         self._daily_pnl: float = 0.0
+        self._daily_pnl_pct: float = 0.0
         self._daily_realized_pnl: float = 0.0
+        self._daily_unrealized_pnl: float = 0.0
         self._open_lots: float = 0.0
+        self._symbol_pnl_cache_ts: float = 0.0
+        self._symbol_pnl_refresh_ttl_sec: float = max(
+            0.5,
+            float(getattr(self.cfg, "symbol_pnl_refresh_ttl_sec", 2.0) or 2.0),
+        )
 
         # ── bars / ATR cache ──
         self._cached_atr: float = 0.0
@@ -236,9 +244,8 @@ class RiskManager:
             return False
 
     def _daily_target_pct(self) -> float:
-        raw = float(getattr(self.cfg, "daily_target_pct", 0.10) or 0.10)
-        # Business rule hard-floor: daily target must be at least 10%.
-        return max(0.10, min(1.0, raw))
+        raw = float(getattr(self.cfg, "daily_target_pct", 0.02) or 0.02)
+        return max(0.0, min(1.0, raw))
 
     def _lock_daily_target(self, daily_pnl_pct: float) -> None:
         """Lock strategy to monitoring-only until UTC reset after target hit."""
@@ -379,6 +386,28 @@ class RiskManager:
         with self._lock:
             return str(self._hard_stop_reason or "unspecified")
 
+    def _refresh_today_pnl_snapshot(self) -> None:
+        if self._refresh_symbol_daily_pnl():
+            return
+        daily_pnl, daily_pnl_pct = self._fallback_account_daily_pnl()
+        with self._lock:
+            self._daily_pnl = daily_pnl
+            self._daily_pnl_pct = daily_pnl_pct
+
+    @property
+    def today_pnl(self) -> float:
+        self._ensure_ready()
+        self._refresh_today_pnl_snapshot()
+        with self._lock:
+            return float(self._daily_pnl)
+
+    @property
+    def today_pnl_pct(self) -> float:
+        self._ensure_ready()
+        self._refresh_today_pnl_snapshot()
+        with self._lock:
+            return float(self._daily_pnl_pct)
+
     @property
     def phase_reason(self) -> str:
         with self._lock:
@@ -426,7 +455,10 @@ class RiskManager:
             self._trades_today.clear()
             self._signals_today = 0
             self._daily_pnl = 0.0
+            self._daily_pnl_pct = 0.0
             self._daily_realized_pnl = 0.0
+            self._daily_unrealized_pnl = 0.0
+            self._symbol_pnl_cache_ts = 0.0
             self._exec_latencies.clear()
             self._exec_slippages.clear()
             self._exec_spreads.clear()
@@ -665,6 +697,87 @@ class RiskManager:
         with self._lock:
             return self._acc.margin_free
 
+    def _fallback_account_daily_pnl(self) -> Tuple[float, float]:
+        with self._lock:
+            eq = float(self._acc.equity or 0.0)
+            bot_balance_base = float(self._bot_balance_base or 0.0)
+        if bot_balance_base <= 0.0:
+            return 0.0, 0.0
+        daily_pnl = eq - bot_balance_base
+        return float(daily_pnl), float(daily_pnl / bot_balance_base)
+
+    def _refresh_symbol_daily_pnl(self, force: bool = False) -> bool:
+        """
+        Refresh symbol-local daily PnL from MT5 deals + open positions.
+
+        This isolates per-asset daily-loss checks from unrelated account moves.
+        """
+        if mt5 is None:
+            return False
+
+        now_ts = time.time()
+        with self._lock:
+            if (
+                not force
+                and self._symbol_pnl_cache_ts > 0.0
+                and (now_ts - self._symbol_pnl_cache_ts) < self._symbol_pnl_refresh_ttl_sec
+            ):
+                return True
+
+        symbol = str(self.sp.symbol or self.sp.base or "").strip()
+        if not symbol:
+            return False
+
+        day_now = datetime.now(timezone.utc)
+        day_start = day_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        close_entries = {int(getattr(mt5, "DEAL_ENTRY_OUT", 1) or 1)}
+        close_by = getattr(mt5, "DEAL_ENTRY_OUT_BY", None)
+        if close_by is not None:
+            close_entries.add(int(close_by or 0))
+
+        realized = 0.0
+        unrealized = 0.0
+        try:
+            with _mt5_lock():
+                deals = mt5.history_deals_get(day_start, day_now) or []
+                positions = mt5.positions_get(symbol=symbol) or []
+
+            for d in deals:
+                try:
+                    if str(getattr(d, "symbol", "")) != symbol:
+                        continue
+                    entry = int(getattr(d, "entry", -1) or -1)
+                    if entry not in close_entries:
+                        continue
+                    realized += float(getattr(d, "profit", 0.0) or 0.0)
+                    realized += float(getattr(d, "commission", 0.0) or 0.0)
+                    realized += float(getattr(d, "swap", 0.0) or 0.0)
+                    realized += float(getattr(d, "fee", 0.0) or 0.0)
+                except Exception:
+                    continue
+
+            for p in positions:
+                try:
+                    if str(getattr(p, "symbol", "")) != symbol:
+                        continue
+                    unrealized += float(getattr(p, "profit", 0.0) or 0.0)
+                    unrealized += float(getattr(p, "swap", 0.0) or 0.0)
+                except Exception:
+                    continue
+
+            daily_pnl = float(realized + unrealized)
+            with self._lock:
+                base = float(self._bot_balance_base or 0.0)
+                self._daily_realized_pnl = float(realized)
+                self._daily_unrealized_pnl = float(unrealized)
+                self._daily_pnl = daily_pnl
+                self._daily_pnl_pct = (daily_pnl / base) if base > 0.0 else 0.0
+                self._symbol_pnl_cache_ts = now_ts
+            return True
+        except Exception as exc:
+            log.error("_refresh_symbol_daily_pnl(%s): %s", self.sp.base, exc)
+            return False
+
     # ─── Trade history ───────────────────────────────────────────────
 
     def _recent_closed_trade_profits(self, limit: int) -> List[float]:
@@ -738,16 +851,12 @@ class RiskManager:
         if eq <= 0 or bal <= 0:
             return
 
-        # Daily PnL
+        # Daily PnL: prefer symbol-local PnL, fall back to account drift only
+        # when MT5 history/position data is unavailable.
+        self._refresh_today_pnl_snapshot()
         with self._lock:
-            bot_balance_base = self._bot_balance_base
-        if bot_balance_base > 0:
-            daily_pnl = eq - bot_balance_base
-            daily_pnl_pct = daily_pnl / bot_balance_base
-            with self._lock:
-                self._daily_pnl = daily_pnl
-        else:
-            daily_pnl_pct = 0.0
+            daily_pnl = float(self._daily_pnl)
+            daily_pnl_pct = float(self._daily_pnl_pct)
 
         target_pct = self._daily_target_pct()
         if target_pct > 0.0 and daily_pnl_pct >= target_pct:
@@ -800,11 +909,15 @@ class RiskManager:
             new_eq = eq_dec + delta_dec
             self._acc.equity = float(new_eq)
             self._daily_realized_pnl = float(Decimal(str(self._daily_realized_pnl)) + delta_dec)
+            self._daily_unrealized_pnl = 0.0
+            self._symbol_pnl_cache_ts = 0.0
 
             if base_dec > 0:
                 self._daily_pnl = float(new_eq - base_dec)
+                self._daily_pnl_pct = float((new_eq - base_dec) / base_dec)
             else:
                 self._daily_pnl = 0.0
+                self._daily_pnl_pct = 0.0
 
             if self._acc.equity > self._peak_equity:
                 self._peak_equity = self._acc.equity
@@ -1379,29 +1492,101 @@ class RiskManager:
         return sl, tp
 
     def _calculate_structure_sl(
-        self, side: str, entry: float, df: Optional[pd.DataFrame],
+        self,
+        side: str,
+        entry: float,
+        df: Optional[pd.DataFrame],
+        *,
+        adapt: Optional[Dict[str, Any]] = None,
+        structure_frames: Tuple[Optional[pd.DataFrame], ...] = (),
     ) -> Optional[float]:
         """
-        Finds the recent Swing Low (Buy) or Swing High (Sell)
-        to use as a structural Stop Loss.
+        Multi-timeframe structural stop:
+        - finds the nearest valid swing from the analyzed frames
+        - adds ATR/reversal-aware buffer so stops sit beyond noise
         """
-        if df is None or len(df) < 5:
+        frames: List[pd.DataFrame] = []
+        if df is not None and len(df) >= 5:
+            frames.append(df)
+        for frame in structure_frames:
+            if frame is not None and len(frame) >= 5 and frame is not df:
+                frames.append(frame)
+        if not frames:
             return None
+
         try:
-            lookback = min(20, len(df) - 1)
-            recent = df.iloc[-lookback:]
             side_n = _side_norm(side)
+            if side_n not in ("Buy", "Sell"):
+                return None
+
+            adapt = dict(adapt or {})
+            atr = float(adapt.get("atr", 0.0) or 0.0)
+            if atr <= 0.0:
+                atr_pct = float(adapt.get("atr_pct", 0.0) or 0.0)
+                if atr_pct > 0.0 and entry > 0.0:
+                    atr = atr_pct * entry
+            conf = clamp01(float(adapt.get("confidence", 0.5) or 0.5))
+            regime = str(adapt.get("regime", "normal") or "normal").lower()
+            trap = abs(float(adapt.get("stop_hunt_strength", 0.0) or 0.0))
+            ob_touch = float(adapt.get("ob_touch_proximity", 0.0) or 0.0)
+
+            tf_sec = int(tf_seconds(str(getattr(self.sp, "tf_primary", "M1") or "M1")) or 60)
+            if tf_sec <= 60:
+                base_lookback = 24
+            elif tf_sec <= 300:
+                base_lookback = 20
+            elif tf_sec <= 900:
+                base_lookback = 16
+            else:
+                base_lookback = 12
+
+            if regime in ("volatile", "explosive"):
+                base_lookback += 4
+
+            if atr > 0.0:
+                min_dist = atr * (0.95 + 0.30 * (1.0 - conf))
+                if trap > 0.35 or ob_touch > 0.50:
+                    min_dist *= 1.10
+                buffer = atr * (0.10 + 0.08 * (1.0 - conf) + 0.05 * ob_touch + 0.08 * trap)
+                if "BTC" in str(self.sp.base).upper():
+                    buffer *= 1.15
+            else:
+                min_dist = max(entry * 0.0008, 0.00001)
+                buffer = min_dist * 0.20
+
+            candidates: List[Tuple[float, float]] = []
+            for idx, frame in enumerate(frames):
+                lookback = min(max(8, base_lookback - idx * 4), len(frame) - 1)
+                if lookback < 5:
+                    continue
+                recent = frame.iloc[-lookback:]
+                low_col = "low" if "low" in recent.columns else "Low"
+                high_col = "high" if "high" in recent.columns else "High"
+                frame_buffer = buffer * (1.0 + 0.15 * idx)
+
+                if side_n == "Buy":
+                    swing = float(pd.to_numeric(recent[low_col], errors="coerce").min())
+                    candidate = swing - frame_buffer
+                    dist = entry - candidate
+                    if _is_finite(candidate, dist) and candidate < entry and dist > 0.0:
+                        candidates.append((candidate, dist))
+                else:
+                    swing = float(pd.to_numeric(recent[high_col], errors="coerce").max())
+                    candidate = swing + frame_buffer
+                    dist = candidate - entry
+                    if _is_finite(candidate, dist) and candidate > entry and dist > 0.0:
+                        candidates.append((candidate, dist))
+
+            if not candidates:
+                return None
+
+            viable = [c for c in candidates if c[1] >= min_dist]
+            pool = viable or candidates
             if side_n == "Buy":
-                swing = float(recent["low"].min() if "low" in recent else recent["Low"].min())
-                if swing < entry:
-                    return swing
-            elif side_n == "Sell":
-                swing = float(recent["high"].max() if "high" in recent else recent["High"].max())
-                if swing > entry:
-                    return swing
+                return float(max(pool, key=lambda x: x[0])[0])
+            return float(min(pool, key=lambda x: x[0])[0])
         except Exception:
-            pass
-        return None
+            return None
 
     # ─── Trailing stop ───────────────────────────────────────────────
 
@@ -1478,6 +1663,7 @@ class RiskManager:
         unrealized_pl: float = 0.0,
         allow_when_blocked: bool = False,
         df: Optional[pd.DataFrame] = None,
+        structure_frames: Tuple[Optional[pd.DataFrame], ...] = (),
     ) -> Dict[str, Any]:
         """
         Full order planning: entry → SL → TP → lot → validation.
@@ -1548,11 +1734,25 @@ class RiskManager:
 
         # ── SL/TP ──
         # Try structural SL first, fallback to ATR
-        struct_sl = self._calculate_structure_sl(side_n, entry, df)
+        struct_sl = self._calculate_structure_sl(
+            side_n,
+            entry,
+            df,
+            adapt=adapt,
+            structure_frames=structure_frames,
+        )
         atr_sl, atr_tp = self._fallback_atr_sl_tp(side_n, entry, adapt)
 
         sl = struct_sl if struct_sl is not None else atr_sl
         tp = atr_tp
+        if struct_sl is not None:
+            sl_dist = abs(entry - sl)
+            rr_target = 1.05 if regime == "ml_router" else (1.20 if conf01 >= 0.80 else 1.05)
+            if sl_dist > 0.0:
+                if side_n == "Buy":
+                    tp = max(tp, entry + sl_dist * rr_target)
+                else:
+                    tp = min(tp, entry - sl_dist * rr_target)
 
         # Apply broker constraints
         entry, sl, tp = self._apply_broker_constraints(side_n, entry, sl, tp)
@@ -1844,6 +2044,7 @@ class RiskManager:
                 "equity": round(self._acc.equity, 2),
                 "balance": round(self._acc.balance, 2),
                 "daily_pnl": round(self._daily_pnl, 2),
+                "daily_pnl_pct": round(self._daily_pnl_pct, 4),
                 "peak_equity": round(self._peak_equity, 2),
                 "signals_today": self._signals_today,
                 "trades_today": len(self._trades_today),

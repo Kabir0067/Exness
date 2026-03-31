@@ -432,7 +432,13 @@ class MarketFeed:
             if not self._ensure_symbol_ready():
                 with self._data_lock:
                     cached = self._cache.get(key)
-                    return cached.copy(deep=False) if cached is not None else None
+                    if (
+                        cached is not None
+                        and not cached.empty
+                        and self.last_bar_age(cached) <= max_age
+                    ):
+                        return cached.copy(deep=False)
+                return None
 
             tf_id = TF_MAP[timeframe]
             bars = self._bars_for_tf(timeframe)
@@ -447,26 +453,42 @@ class MarketFeed:
             if rates is None or len(rates) == 0:
                 with self._data_lock:
                     cached = self._cache.get(key)
-                    return cached.copy(deep=False) if cached is not None else None
+                    if (
+                        cached is not None
+                        and not cached.empty
+                        and self.last_bar_age(cached) <= max_age
+                    ):
+                        return cached.copy(deep=False)
+                return None
 
             df = pd.DataFrame(rates)
             required = {"time", "open", "high", "low", "close", "tick_volume"}
             if not required.issubset(set(df.columns)):
                 with self._data_lock:
                     cached = self._cache.get(key)
-                    return cached.copy(deep=False) if cached is not None else None
+                    if (
+                        cached is not None
+                        and not cached.empty
+                        and self.last_bar_age(cached) <= max_age
+                    ):
+                        return cached.copy(deep=False)
+                return None
 
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
             if not df["time"].is_monotonic_increasing:
                 df = df.sort_values("time").reset_index(drop=True)
 
-            # stale protection: prefer cache if new df looks stale
+            # HARD stale gate: never pass stale bars downstream.
             if self.last_bar_age(df) > max_age:
                 with self._data_lock:
                     cached = self._cache.get(key)
-                    if cached is not None and not cached.empty:
+                    if (
+                        cached is not None
+                        and not cached.empty
+                        and self.last_bar_age(cached) <= max_age
+                    ):
                         return cached.copy(deep=False)
-                return df
+                return None
 
             ttl_sec = float(
                 self._cache_ttl_sec.get(
@@ -484,7 +506,13 @@ class MarketFeed:
             log_feed.error("get_rates error: %s | tb=%s", exc, traceback.format_exc())
             with self._data_lock:
                 cached = self._cache.get(f"{symbol}_{timeframe}")
-                return cached.copy(deep=False) if cached is not None else None
+                if (
+                    cached is not None
+                    and not cached.empty
+                    and self.last_bar_age(cached) <= self._max_bar_age_sec(timeframe)
+                ):
+                    return cached.copy(deep=False)
+            return None
 
     def last_bar_age(self, df: pd.DataFrame) -> float:
         try:
@@ -686,12 +714,24 @@ class MarketFeed:
             with self._data_lock:
                 self._tick_cache[symbol] = arr
                 self._last_tick_sync = now
+                seed_tail = arr[-min(len(arr), 700):] if len(arr) > 0 else None
+                latest_arr_msc = int(arr[-1, 0]) if len(arr) > 0 else 0
+                last_cached_msc = int(self._tick_deque[-1][0]) if self._tick_deque else 0
 
                 last_msc = int(self._last_tick_msc or 0)
                 if last_msc > 0:
                     new_arr = arr[arr[:, 0] > float(last_msc)]
                 else:
                     new_arr = arr
+                force_reseed = bool(
+                    seed_tail is not None
+                    and latest_arr_msc > 0
+                    and (
+                        last_cached_msc <= 0
+                        or latest_arr_msc < max(0, last_msc - 5000)
+                        or (latest_arr_msc - last_cached_msc) > max(5000, int(min_interval * 4000.0))
+                    )
+                )
 
                 if new_arr is not None and len(new_arr) > 0:
                     tail = new_arr[-min(len(new_arr), 700):]
@@ -714,6 +754,16 @@ class MarketFeed:
 
                     try:
                         self._last_tick_msc = max(int(self._last_tick_msc or 0), int(new_arr[-1, 0]))
+                    except Exception:
+                        self._last_tick_msc = int(self._last_tick_msc or 0)
+                elif seed_tail is not None and (
+                    force_reseed or len(self._tick_deque) < min(32, len(seed_tail))
+                ):
+                    self._tick_deque.clear()
+                    for row in seed_tail:
+                        self._tick_deque.append(row)
+                    try:
+                        self._last_tick_msc = int(seed_tail[-1, 0])
                     except Exception:
                         self._last_tick_msc = int(self._last_tick_msc or 0)
 
@@ -792,14 +842,16 @@ class MarketFeed:
             win_ms = micro_win_sec * 1000.0
 
             with self._data_lock:
-                # Prevent insane min_ticks which can lock the system in quiet markets
+                # BTC on this broker is materially quieter than XAU in short
+                # 3s windows. Keep the sample-size gate meaningful, but do not
+                # hard-lock the pipeline behind an impossible 12-tick floor.
                 min_ticks = int(
                     max(
-                        12,
-                        float(self.sp.micro_min_tps) * micro_win_sec * 2.0,
+                        3,
+                        round(float(self.sp.micro_min_tps) * micro_win_sec),
                     )
                 )
-                min_ticks = int(min(220, max(12, min_ticks)))  # hard cap to avoid permanent block
+                min_ticks = int(min(96, max(3, min_ticks)))
             
             if arr is None or arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 6:
                 return TickStats(ok=False, reason="bad_tick_shape")
@@ -866,7 +918,7 @@ class MarketFeed:
                 )
 
             # Stale tick window protection
-            tick_age_ms = (time.time() * 1000.0) - end_ms
+            tick_age_ms = max(0.0, (time.time() * 1000.0) - end_ms)
             if tick_age_ms > max(2500.0, win_ms * 2.0):
                 return TickStats(ok=False, reason="stale_ticks")
 

@@ -161,6 +161,20 @@ class MarketFeed:
             )
             return False
 
+    def _micro_min_ticks(self, micro_window_sec: int) -> int:
+        """
+        Minimum sample count for microstructure math.
+
+        Keep this aligned with the configured TPS floor, not an arbitrary hard
+        6+ tick gate. Liquidity safety is still enforced later via stable_tps,
+        so this floor should only ensure we have enough points to compute basic
+        microstructure statistics without over-starving quiet but tradable
+        windows.
+        """
+        micro_w = max(1, int(micro_window_sec or 1))
+        cfg_target = float(getattr(self.sp, "micro_min_tps", 1.0) or 1.0) * float(micro_w)
+        return int(min(24, max(2, round(cfg_target))))
+
     def _ensure_book_subscribed(self) -> None:
         if self._book_subscribed:
             return
@@ -435,25 +449,31 @@ class MarketFeed:
         except Exception:
             return 1.0
 
-    def _last_quote(self) -> Tuple[float, float]:
+    def _last_quote_snapshot(self) -> Tuple[float, float, int]:
         bid = ask = 0.0
+        tick_time_msc = 0
         try:
             if not self._ensure_symbol_ready():
-                return 0.0, 0.0
+                return 0.0, 0.0, 0
             with MT5_LOCK:
                 t = mt5.symbol_info_tick(self.symbol)
             if t:
                 bid = float(getattr(t, "bid", 0.0) or 0.0)
                 ask = float(getattr(t, "ask", 0.0) or 0.0)
+                tick_time_msc = int(getattr(t, "time_msc", 0) or 0)
         except Exception:
             pass
+        return bid, ask, tick_time_msc
+
+    def _last_quote(self) -> Tuple[float, float]:
+        bid, ask, _ = self._last_quote_snapshot()
         return bid, ask
 
     # --------------------------- ticks ---------------------------
     def _sync_ticks(self, symbol: str, n_ticks: int = 1200) -> Optional[np.ndarray]:
         """Bounded tick sync. Debounced by cfg.poll_seconds_fast (clamped)."""
         now = time.time()
-        poll_fast = float(getattr(self.cfg, "poll_seconds_fast", 1.0) or 1.0)
+        poll_fast = float(getattr(self.cfg, "poll_seconds_fast", 0.12) or 0.12)
         poll_fast = max(0.05, poll_fast)  # hard clamp for stability
         if (now - self._last_tick_sync) < poll_fast:
             with self._data_lock:
@@ -488,6 +508,33 @@ class MarketFeed:
 
             arr = np.column_stack((tm, bid, ask, vol, last, flg)).astype(np.float64, copy=False)
 
+            # MT5 copy_ticks_* can lag behind the live quote stream on XAU.
+            # If the latest quote is newer than the tick batch, append one
+            # synthetic quote row so the micro-window anchor stays live.
+            bid_q, ask_q, quote_time_msc = self._last_quote_snapshot()
+            if (
+                quote_time_msc > 0
+                and arr.shape[0] > 0
+                and quote_time_msc > int(arr[-1, 0])
+                and bid_q > 0.0
+                and ask_q > 0.0
+                and ask_q >= bid_q
+            ):
+                last_val = float(arr[-1, 4]) if arr.shape[1] > 4 else 0.0
+                synth_last = last_val if last_val > 0.0 else (0.5 * (bid_q + ask_q))
+                synth_row = np.array(
+                    [[
+                        float(quote_time_msc),
+                        float(bid_q),
+                        float(ask_q),
+                        0.0,
+                        float(synth_last),
+                        0.0,
+                    ]],
+                    dtype=np.float64,
+                )
+                arr = np.vstack((arr, synth_row))
+
             last_seen = int(self._last_tick_msc)
             arr_new = None
             if last_seen > 0:
@@ -499,6 +546,18 @@ class MarketFeed:
 
             with self._data_lock:
                 self._tick_cache[symbol] = arr
+                seed_tail = arr[-min(len(arr), 600):] if len(arr) > 0 else None
+                latest_arr_msc = int(arr[-1, 0]) if len(arr) > 0 else 0
+                last_cached_msc = int(self._tick_deque[-1][0]) if self._tick_deque else 0
+                force_reseed = bool(
+                    seed_tail is not None
+                    and latest_arr_msc > 0
+                    and (
+                        last_cached_msc <= 0
+                        or latest_arr_msc < max(0, last_seen - 5000)
+                        or (latest_arr_msc - last_cached_msc) > max(5000, int(poll_fast * 4000.0))
+                    )
+                )
 
                 if arr_new is not None and len(arr_new) > 0:
                     self._last_tick_msc = int(arr_new[-1, 0])
@@ -508,6 +567,15 @@ class MarketFeed:
                         self._tick_deque.append(
                             (float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
                         )
+                elif seed_tail is not None and (
+                    force_reseed or len(self._tick_deque) < min(32, len(seed_tail))
+                ):
+                    self._tick_deque.clear()
+                    for r in seed_tail:
+                        self._tick_deque.append(
+                            (float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+                        )
+                    self._last_tick_msc = int(seed_tail[-1, 0])
 
             return arr
 
@@ -525,7 +593,7 @@ class MarketFeed:
             ignore_micro = bool(getattr(self.cfg, "ignore_microstructure", False))
 
             # Always get last quote first (fast & needed for spread breaker)
-            bid_q, ask_q = self._last_quote()
+            bid_q, ask_q, quote_time_msc = self._last_quote_snapshot()
             if bid_q <= 0 or ask_q <= 0 or ask_q < bid_q:
                 return TickStats(ok=False, reason="no_quote", bid=bid_q, ask=ask_q)
 
@@ -541,27 +609,27 @@ class MarketFeed:
                 return TickStats(ok=True, reason="micro_ignored", bid=bid_q, ask=ask_q)
 
             # Sync ticks + optional book (heavy)
-            self._sync_ticks(self.symbol, n_ticks=1600)
+            arr_live = self._sync_ticks(self.symbol, n_ticks=1600)
             book = self.fetch_book(levels=20)
 
             with self._data_lock:
                 micro_w = max(1, int(self.sp.micro_window_sec))
-                min_ticks = int(max(10, float(self.sp.micro_min_tps) * float(micro_w) * 2.0))
-                buf_len = len(self._tick_deque)
-                if buf_len < min_ticks:
-                    return TickStats(ok=False, reason=f"low_ticks_buf:{buf_len}/{min_ticks}", bid=bid_q, ask=ask_q)
-
-                rows = list(self._tick_deque)
+                min_ticks = self._micro_min_ticks(micro_w)
                 cumulative_delta_prev = float(self._cumulative_delta)
 
-            arr = np.asarray(rows, dtype=np.float64)
+            if arr_live is None:
+                return TickStats(ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q)
+
+            arr = np.asarray(arr_live, dtype=np.float64)
             if arr.ndim != 2 or arr.shape[1] < 6:
                 return TickStats(ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q)
 
-            now_ms = float(time.time() * 1000.0)
             win_ms = float(micro_w * 1000.0)
-
-            w = arr[arr[:, 0] >= (now_ms - win_ms)]
+            # MT5 tick timestamps on this broker can lead local wall-clock time,
+            # so use the feed's own last tick as the window anchor.
+            end_ms = float(arr[-1, 0])
+            start_ms = end_ms - win_ms
+            w = arr[arr[:, 0] >= start_ms]
             w_n = int(w.shape[0])
             # MOVED: Calculate stats even if low ticks, to provide volatility data to Risk Manager
             
@@ -612,19 +680,44 @@ class MarketFeed:
                 self._cumulative_delta = cumulative_delta_prev + cvd_add
                 cumulative_delta = float(self._cumulative_delta)
 
-            # NOW check min_ticks (after calculating volatility)
-            if w_n < min_ticks:
+            freshest_ms = max(end_ms, float(quote_time_msc or 0))
+            tick_age_ms = max(0.0, (time.time() * 1000.0) - freshest_ms)
+            if tick_age_ms > max(2500.0, win_ms * 2.0):
                 return TickStats(
-                    ok=False, 
-                    reason=f"low_ticks:{w_n}/{min_ticks}", 
-                    bid=last_bid, 
+                    ok=False,
+                    reason="stale_ticks",
+                    bid=last_bid,
                     ask=last_ask,
-                    volatility=volatility, # Pass calculated volatility
+                    volatility=volatility,
                     tps=tps,
                     flips=flips,
                     tick_delta=tick_delta,
-                    cumulative_delta=cumulative_delta
+                    cumulative_delta=cumulative_delta,
                 )
+
+            thin_window = bool(w_n < min_ticks)
+            if w_n <= 0:
+                return TickStats(
+                    ok=False,
+                    reason=f"low_ticks:{w_n}/{min_ticks}",
+                    bid=last_bid,
+                    ask=last_ask,
+                    volatility=volatility,
+                    tps=tps,
+                    flips=flips,
+                    tick_delta=tick_delta,
+                    cumulative_delta=cumulative_delta,
+                )
+
+            # XAU on this broker can briefly publish a single fresh tick inside
+            # the micro-window while the broader copy_ticks batch is still
+            # catching up. Treat that as a thin-but-live window instead of a
+            # hard rejection; stale, spread, and noise breakers remain active.
+            allow_thin_window = bool(
+                thin_window
+                and w_n >= 1
+                and tick_age_ms <= max(1200.0, win_ms * 0.5)
+            )
 
             imb = 0.0
             if book and book.get("bids") and book.get("asks"):
@@ -686,12 +779,13 @@ class MarketFeed:
 
             # Guards (scalping breakers)
             ok = True
-            reason = "ok"
+            reason = "thin_window_ok" if allow_thin_window else "ok"
 
-            if tps < float(self.sp.micro_min_tps):
+            stable_tps = float(w_n / float(max(1, micro_w)))
+            if stable_tps < float(self.sp.micro_min_tps) and not allow_thin_window:
                 ok = False
                 reason = "low_liquidity"
-            elif tps > float(self.sp.micro_max_tps):
+            elif stable_tps > float(self.sp.micro_max_tps):
                 ok = False
                 reason = "tps_spike"
 

@@ -25,7 +25,7 @@ from datetime import datetime
 
 import MetaTrader5 as mt5
 
-from mt5_client import MT5_LOCK, ensure_mt5
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 from log_config import get_log_path
 
@@ -163,8 +163,21 @@ class _MT5HealthCache:
     ts_mono: float = 0.0
     ok: bool = False
     trade_allowed: bool = False
+    reason: str = "not_checked"
 
 _MT5_CACHE = _MT5HealthCache()
+
+
+def _term_flags() -> Tuple[bool, bool]:
+    try:
+        with MT5_LOCK:
+            term = mt5.terminal_info()
+        return (
+            bool(term and getattr(term, "connected", False)),
+            bool(term and getattr(term, "trade_allowed", False)),
+        )
+    except Exception:
+        return False, False
 
 def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 0.5) -> bool:
     now = _mono()
@@ -179,18 +192,53 @@ def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 
 
         ok = bool(term and getattr(term, "connected", False) and acc)
         trade_allowed = bool(term and getattr(term, "trade_allowed", False))
+        reason = "ok"
+        if term is None:
+            reason = "terminal_info_none"
+        elif not bool(getattr(term, "connected", False)):
+            reason = "terminal_not_connected"
+        elif acc is None:
+            reason = "account_info_none"
+        elif not trade_allowed:
+            reason = "algo_trading_disabled_in_terminal"
 
         _MT5_CACHE.ts_mono = now
         _MT5_CACHE.ok = ok
         _MT5_CACHE.trade_allowed = trade_allowed
+        _MT5_CACHE.reason = reason
 
         return bool(ok and (not require_trade_allowed or trade_allowed))
 
     except Exception as exc:
+        connected, trade_allowed = _term_flags()
+        exc_text = str(exc or "").strip()
+        last_error = _safe_last_error()
+        try:
+            _, status_reason = mt5_status()
+        except Exception:
+            status_reason = ""
+
+        lower_exc = exc_text.lower()
+        lower_last = str(last_error).lower()
+        if "algo_trading_disabled_in_terminal" in lower_exc:
+            reason = "algo_trading_disabled_in_terminal"
+        elif "no ipc connection" in lower_last:
+            reason = "ipc_disconnected"
+        else:
+            reason = status_reason or exc_text or "mt5_health_exception"
+
         _MT5_CACHE.ts_mono = now
         _MT5_CACHE.ok = False
-        _MT5_CACHE.trade_allowed = False
-        log_orders.error("MT5 health check failed: %s | last_error=%s", exc, _safe_last_error())
+        _MT5_CACHE.trade_allowed = trade_allowed
+        _MT5_CACHE.reason = reason
+        log_orders.error(
+            "MT5 health check failed: %s | status_reason=%s | connected=%s trade_allowed=%s | last_error=%s",
+            exc,
+            status_reason or "-",
+            connected,
+            trade_allowed,
+            last_error,
+        )
         return False
 
 def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
@@ -198,13 +246,20 @@ def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
     if ok:
         return
 
-    with MT5_LOCK:
-        term = mt5.terminal_info()
+    connected, trade_allowed = _term_flags()
+    try:
+        _, status_reason = mt5_status()
+    except Exception:
+        status_reason = ""
+    reason = str(_MT5_CACHE.reason or status_reason or "unknown")
+    last_error = _safe_last_error()
 
     raise RuntimeError(
         "MT5 not ready | "
-        f"connected={bool(term and getattr(term, 'connected', False))} "
-        f"trade_allowed={bool(term and getattr(term, 'trade_allowed', False))}"
+        f"reason={reason} "
+        f"connected={connected} "
+        f"trade_allowed={trade_allowed} "
+        f"last_error={last_error}"
     )
 
 
@@ -596,7 +651,11 @@ def close_order(
 
         def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
             # attempt 0 uses cached tick; retries force refresh
-            tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+            for _ in range(4):
+                tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                if tick is not None:
+                    break
+                time.sleep(0.15)
             if tick is None:
                 return
             price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
@@ -648,7 +707,13 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
         for symbol, plist in by_symbol.items():
             try:
                 _symbol_select(symbol)
-                tick0 = _tick_cached(symbol)
+                tick0 = None
+                for _ in range(4):
+                    tick0 = _tick_cached(symbol)
+                    if tick0 is not None:
+                        break
+                    time.sleep(0.15)
+                
                 if tick0 is None:
                     for pos in plist:
                         ticket = int(getattr(pos, "ticket", 0) or 0)
@@ -690,7 +755,11 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                     }
 
                     def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
-                        tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                        for _ in range(4):
+                            tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                            if tick is not None:
+                                break
+                            time.sleep(0.15)
                         if tick is None:
                             return
                         bid = float(getattr(tick, "bid", 0.0) or 0.0)
@@ -892,6 +961,52 @@ _MANUAL_SL_ATR_MULT = 1.0
 _MANUAL_BASE_RISK_PCT = 0.01
 _MANUAL_FIXED_LOT = 0.02
 _MANUAL_DEFAULT_TP_USD = 2.0
+_MANUAL_HELPER_MAX_PER_SYMBOL = 1
+_MANUAL_HELPER_MAX_TOTAL = 2
+
+
+def manual_open_capacity(symbol: str) -> Tuple[int, str]:
+    """
+    Returns remaining safe capacity for manual helper orders.
+
+    Manual helper orders must never bypass portfolio safety:
+      - max 1 open position per symbol
+      - max 2 open positions total across XAU + BTC
+    """
+    try:
+        _ensure_mt5_connected(require_trade_allowed=True)
+        symbol_s = str(symbol or "").strip().upper()
+        if not symbol_s:
+            return 0, "symbol_empty"
+
+        with MT5_LOCK:
+            positions = mt5.positions_get() or []
+
+        total_positions = 0
+        symbol_positions = 0
+        for pos in positions:
+            try:
+                pos_symbol = str(getattr(pos, "symbol", "") or "").strip().upper()
+                ticket = int(getattr(pos, "ticket", 0) or 0)
+                if ticket <= 0:
+                    continue
+                total_positions += 1
+                if pos_symbol == symbol_s:
+                    symbol_positions += 1
+            except Exception:
+                continue
+
+        total_remaining = max(0, int(_MANUAL_HELPER_MAX_TOTAL) - int(total_positions))
+        symbol_remaining = max(0, int(_MANUAL_HELPER_MAX_PER_SYMBOL) - int(symbol_positions))
+        remaining = min(total_remaining, symbol_remaining)
+        if remaining <= 0:
+            if symbol_positions >= int(_MANUAL_HELPER_MAX_PER_SYMBOL):
+                return 0, f"symbol_limit:{symbol_positions}/{_MANUAL_HELPER_MAX_PER_SYMBOL}"
+            return 0, f"portfolio_limit:{total_positions}/{_MANUAL_HELPER_MAX_TOTAL}"
+        return int(remaining), "ok"
+    except Exception as exc:
+        log_orders.error("manual_open_capacity error symbol=%s: %s | last_error=%s", symbol, exc, _safe_last_error())
+        return 0, "mt5_unavailable"
 
 
 def _clamp01(x: float) -> float:
@@ -1799,58 +1914,110 @@ _SYMBOL_XAU = "XAUUSDm"
 
 
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
-    """DEFAULT SIMPLE ORDER: lot=0.02, TP=2 USD, SL=0"""
+    """Manual market order with live-price execution and ATR-protected SL/TP."""
     try:
+        from ExnessAPI.order_execution import OrderExecutor, OrderRequest
+
+        remaining_capacity, capacity_reason = manual_open_capacity(symbol)
+        if remaining_capacity <= 0:
+            log_orders.error(
+                "manual_open blocked by capacity | symbol=%s side=%s reason=%s",
+                symbol,
+                side,
+                capacity_reason,
+            )
+            return False
+
         _ensure_mt5_connected(require_trade_allowed=True)
         _symbol_select(symbol)
 
-        tick = mt5.symbol_info_tick(symbol)
-        info = mt5.symbol_info(symbol)
+        tick = _tick_refresh(symbol)
+        info = _symbol_info_cached(symbol)
         if not tick or not info:
             return False
 
         is_buy = side.lower() == "buy"
-        entry = float(tick.ask if is_buy else tick.bid)
-        if entry <= 0:
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        if ask <= 0.0 or bid <= 0.0:
+            return False
+
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        spread_points = ((ask - bid) / point) if point > 0.0 else 0.0
+        max_spread_points = 1800.0 if "BTC" in str(symbol).upper() else 350.0
+        if spread_points > max_spread_points:
+            log_orders.error(
+                "manual_open blocked by spread | symbol=%s side=%s spread_pts=%.1f max=%.1f",
+                symbol,
+                side,
+                float(spread_points),
+                float(max_spread_points),
+            )
+            return False
+
+        entry = float(ask if is_buy else bid)
+        if entry <= 0.0:
             return False
 
         lot = float(_MANUAL_FIXED_LOT)
         profit_usd = float(_MANUAL_DEFAULT_TP_USD)
-        sl = 0.0  # ❌ NO STOP LOSS
+        atr_val = float(_get_atr_value(symbol) or 0.0)
+        if atr_val <= 0.0:
+            fallback_pct = 0.0015 if "BTC" in str(symbol).upper() else 0.0008
+            atr_val = max(entry * fallback_pct, point if point > 0.0 else 0.01)
 
-        tick_size = info.trade_tick_size
-        tick_value = info.trade_tick_value
+        sl_mult = 2.4 if "BTC" in str(symbol).upper() else 1.8
+        sl = entry - atr_val * sl_mult if is_buy else entry + atr_val * sl_mult
 
-        if tick_size <= 0 or tick_value <= 0:
-            return False
-
-        price_delta = (profit_usd * tick_size) / (tick_value * lot)
-
-        tp = entry + price_delta if is_buy else entry - price_delta
-        tp = round(tp, info.digits)
+        tp = _atr_tp_from_entry(
+            symbol,
+            side,
+            entry,
+            lot,
+            confidence=float(_MANUAL_CONFIDENCE),
+            atr=atr_val,
+            min_profit_usd=profit_usd,
+            sl_price=sl,
+        )
+        if tp is None or float(tp) <= 0.0:
+            tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+            tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+            if tick_size <= 0.0 or tick_value <= 0.0:
+                return False
+            price_delta = (profit_usd * tick_size) / (tick_value * lot)
+            tp = entry + price_delta if is_buy else entry - price_delta
 
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": order_type,
-            "price": entry,
-            "sl": sl,
-            "tp": tp,
-            "deviation": DEFAULT_DEVIATION,
-            "magic": DEFAULT_MAGIC,
-            "comment": "fixed_lot_tp2_sl0",
-            "type_filling": _best_filling_type(symbol),
-            "type_time": mt5.ORDER_TIME_GTC,
-        }
+        sl = _enforce_stop_distance_for_sl(symbol, order_type, float(sl))
+        tp = _enforce_stop_distance_for_tp(symbol, order_type, float(tp))
+        if sl <= 0.0 or tp <= 0.0:
+            return False
+        if is_buy and not (sl < entry < tp):
+            return False
+        if (not is_buy) and not (tp < entry < sl):
+            return False
 
         print(f"\n[MANUAL EXECUTION] {symbol} {side}")
-        log_orders.info(f"MANUAL_EXEC_START | {symbol} | {side} | Verse Printed")
+        now_ts = time.time()
+        req = OrderRequest(
+            symbol=str(symbol),
+            signal="Buy" if is_buy else "Sell",
+            lot=float(lot),
+            sl=float(sl),
+            tp=float(tp),
+            price=float(entry),
+            order_id=f"MANUAL_{symbol}_{int(now_ts * 1000)}",
+            signal_id=f"MANUAL_{side.upper()}_{symbol}_{int(now_ts * 1000)}",
+            enqueue_time=float(now_ts),
+            deviation=int(DEFAULT_DEVIATION),
+            magic=int(DEFAULT_MAGIC),
+            comment="manual_atr_guarded",
+            cfg=None,
+        )
 
-        result = mt5.order_send(request)
-        return result and result.retcode == mt5.TRADE_RETCODE_DONE
+        executor = OrderExecutor(auto_ensure_mt5=False, symbol_cache_ttl=15.0)
+        result = executor.send_market_order(req, max_attempts=3)
+        return bool(getattr(result, "ok", False))
 
     except Exception as e:
         log_orders.error("fixed simple order error %s %s", symbol, e)
@@ -1860,7 +2027,8 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
 def open_buy_order_btc(count: int) -> int:
     """Open `count` market BUY on BTCUSDm with fixed manual settings."""
     n = 0
-    for _ in range(max(0, int(count))):
+    allowed, _reason = manual_open_capacity(_SYMBOL_BTC)
+    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Buy"):
             n += 1
     return n
@@ -1869,7 +2037,8 @@ def open_buy_order_btc(count: int) -> int:
 def open_buy_order_xau(count: int) -> int:
     """Open `count` market BUY on XAUUSDm with fixed manual settings."""
     n = 0
-    for _ in range(max(0, int(count))):
+    allowed, _reason = manual_open_capacity(_SYMBOL_XAU)
+    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Buy"):
             n += 1
     return n
@@ -1878,7 +2047,8 @@ def open_buy_order_xau(count: int) -> int:
 def open_sell_order_btc(count: int) -> int:
     """Open `count` market SELL on BTCUSDm with fixed manual settings."""
     n = 0
-    for _ in range(max(0, int(count))):
+    allowed, _reason = manual_open_capacity(_SYMBOL_BTC)
+    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
         if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Sell"):
             n += 1
     return n
@@ -1887,7 +2057,8 @@ def open_sell_order_btc(count: int) -> int:
 def open_sell_order_xau(count: int) -> int:
     """Open `count` market SELL on XAUUSDm with fixed manual settings."""
     n = 0
-    for _ in range(max(0, int(count))):
+    allowed, _reason = manual_open_capacity(_SYMBOL_XAU)
+    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
         if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Sell"):
             n += 1
     return n
@@ -1911,6 +2082,7 @@ __all__ = [
     "get_full_report_week",
     "get_full_report_month",
     "get_full_report_all",
+    "manual_open_capacity",
     "open_buy_order_btc",
     "open_buy_order_xau",
     "open_sell_order_btc",

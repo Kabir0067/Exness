@@ -10,7 +10,7 @@ from typing import Any, Optional, List
 log = logging.getLogger("core.model_manager")
 
 from log_config import get_artifact_dir
-from core.config import MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
+from core.config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
 
 @dataclass
 class ModelMetadata:
@@ -165,12 +165,14 @@ class ModelManager:
                 meta["sample_quality_passed"] = True
             if "sample_quality_issues" not in meta:
                 meta["sample_quality_issues"] = []
+            max_dd = float(meta.get("max_drawdown_pct", 0.0) or 0.0)
             stress_ok = bool(meta.get("stress_test_passed", False))
             sample_ok = bool(meta.get("sample_quality_passed", False))
             unsafe = bool(meta.get("unsafe", False))
             is_good = bool(
                 (sharpe >= MIN_GATE_SHARPE)
                 and (win_rate >= MIN_GATE_WIN_RATE)
+                and (max_dd <= MAX_GATE_DRAWDOWN)
                 and bool(meta.get("wfa_passed", False))
                 and stress_ok
                 and sample_ok
@@ -184,21 +186,22 @@ class ModelManager:
                 
             if is_good:
                 log.info(
-                    "Model %s VERIFIED (Sharpe=%.2f >= %.2f, WinRate=%.3f >= %.3f)",
+                    "Model %s VERIFIED (Sharpe=%.2f >= %.2f, WinRate=%.3f >= %.3f, MaxDD=%.3f <= %.3f)",
                     version,
                     sharpe,
                     MIN_GATE_SHARPE,
                     win_rate,
                     MIN_GATE_WIN_RATE,
+                    max_dd,
+                    MAX_GATE_DRAWDOWN,
                 )
             else:
                 log.warning(
-                    "Model %s REJECTED (Sharpe=%.2f < %.2f or WinRate=%.3f < %.3f)",
+                    "Model %s REJECTED (Sharpe=%.2f, WinRate=%.3f, MaxDD=%.3f)",
                     version,
                     sharpe,
-                    MIN_GATE_SHARPE,
                     win_rate,
-                    MIN_GATE_WIN_RATE,
+                    max_dd,
                 )
              
             return is_good

@@ -14,5 +14,8 @@ env/
 # Secrets
 .env
 
-# Local artifacts (do not commit)
+# ...existing code...
+# игнорировать папку артефактов
 Artifacts/
+
+/Artifacts/

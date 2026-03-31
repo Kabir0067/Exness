@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import MetaTrader5 as mt5
-from mt5_client import mt5_async_call
+from mt5_client import MT5_LOCK
 
 from .logging_setup import log_err, log_health
 from .models import ExecutionResult, OrderIntent
@@ -22,33 +23,109 @@ class OrderSyncManager:
 
     def register_pending_order(self, intent: OrderIntent) -> None:
         e = self._e
-        e._pending_order_meta[str(intent.order_id)] = {
-            "asset": str(intent.asset),
-            "symbol": str(intent.symbol),
-            "signal": str(intent.signal),
-            "signal_id": str(intent.signal_id),
-            "lot": float(intent.lot),
-            "req_price": float(intent.price),
-            "enqueue_ts": float(intent.enqueue_time),
-            "magic": int(getattr(intent.cfg, "magic", 777001) or 777001),
-            "risk": intent.risk_manager,
-        }
+        with e._order_state_lock:
+            e._pending_order_meta[str(intent.order_id)] = {
+                "asset": str(intent.asset),
+                "symbol": str(intent.symbol),
+                "signal": str(intent.signal),
+                "signal_id": str(intent.signal_id),
+                "confidence": float(intent.confidence),
+                "lot": float(intent.lot),
+                "sl": float(intent.sl),
+                "tp": float(intent.tp),
+                "req_price": float(intent.price),
+                "enqueue_ts": float(intent.enqueue_time),
+                "magic": int(getattr(intent.cfg, "magic", 777001) or 777001),
+                "risk": intent.risk_manager,
+            }
 
     def clear_pending_order(self, order_id: str) -> Optional[Dict[str, Any]]:
-        return self._e._pending_order_meta.pop(str(order_id), None)
+        with self._e._order_state_lock:
+            return self._e._pending_order_meta.pop(str(order_id), None)
+
+    @staticmethod
+    def _should_defer_result(r: ExecutionResult, meta: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(meta, dict) or bool(r.ok):
+            return False
+        reason = str(r.reason or "").lower()
+        return (
+            reason.startswith("order_send_none")
+            or reason.startswith("retry_retcode_")
+            or reason.startswith("exception_")
+        )
+
+    @staticmethod
+    def _build_intent_snapshot(order_id: str, meta: Dict[str, Any]) -> Any:
+        return SimpleNamespace(
+            asset=str(meta.get("asset", "") or ""),
+            symbol=str(meta.get("symbol", "") or ""),
+            signal=str(meta.get("signal", "") or ""),
+            confidence=float(meta.get("confidence", 0.0) or 0.0),
+            lot=float(meta.get("lot", 0.0) or 0.0),
+            sl=float(meta.get("sl", 0.0) or 0.0),
+            tp=float(meta.get("tp", 0.0) or 0.0),
+            price=float(meta.get("req_price", 0.0) or 0.0),
+            enqueue_time=float(meta.get("enqueue_ts", 0.0) or 0.0),
+            order_id=str(order_id),
+            signal_id=str(meta.get("signal_id", "") or ""),
+        )
+
+    @staticmethod
+    def _call_mt5(method_name: str, *args: Any, **kwargs: Any) -> Any:
+        fn = getattr(mt5, str(method_name), None)
+        if not callable(fn):
+            raise AttributeError(f"mt5.{method_name} not callable")
+        with MT5_LOCK:
+            return fn(*args, **kwargs)
 
     def resolve_order_result(self, r: ExecutionResult) -> None:
         e = self._e
         order_id = str(r.order_id)
+        with e._order_state_lock:
+            meta = e._pending_order_meta.get(order_id)
+        if self._should_defer_result(r, meta):
+            log_health.info(
+                "ORDER_SYNC_WAIT | order_id=%s reason=%s retcode=%s",
+                order_id,
+                r.reason,
+                r.retcode,
+            )
+            return
+
         e._record_execution_telemetry(r)
-        rm = e._order_rm_by_id.pop(order_id, None)
-        meta = self.clear_pending_order(order_id)
+        with e._order_state_lock:
+            rm = e._order_rm_by_id.pop(order_id, None)
+            meta = e._pending_order_meta.pop(order_id, None)
         if rm is None and isinstance(meta, dict):
             rm = meta.get("risk")
         if rm is None:
-            rm = e._xau.risk if order_id.startswith("PORD_XAU_") else e._btc.risk
+            asset_hint = str((meta or {}).get("asset", "") or "").upper().strip()
+            if asset_hint == "XAU" and e._xau is not None:
+                rm = e._xau.risk
+            elif asset_hint == "BTC" and e._btc is not None:
+                rm = e._btc.risk
+            else:
+                log_health.warning(
+                    "ORDER_SYNC_ORPHAN_RESULT | order_id=%s ok=%s reason=%s",
+                    order_id,
+                    r.ok,
+                    r.reason,
+                )
+                return
         if rm and hasattr(rm, "on_execution_result"):
-            rm.on_execution_result(r)
+            try:
+                rm.on_execution_result(r)
+            except Exception as exc:
+                log_err.error("ORDER_SYNC_RISK_UPDATE_ERROR | order_id=%s err=%s", order_id, exc)
+        if (
+            isinstance(meta, dict)
+            and str(r.reason or "").startswith("sync_")
+            and getattr(e, "_order_notifier", None)
+        ):
+            try:
+                e._order_notifier(self._build_intent_snapshot(order_id, meta), r)
+            except Exception:
+                pass
 
     def probe_pending_order_state(
         self,
@@ -72,15 +149,7 @@ class OrderSyncManager:
             magic = int(meta.get("magic", 777001) or 777001)
             signal_id = str(meta.get("signal_id", "") or "")
 
-            positions = mt5_async_call(
-                "positions_get",
-                symbol=symbol,
-                timeout=0.7,
-                default=[],
-                retries=1,
-                repair_on_transport_error=True,
-                direct_fallback=True,
-            ) or []
+            positions = self._call_mt5("positions_get", symbol=symbol) or []
 
             for p in positions:
                 try:
@@ -120,16 +189,7 @@ class OrderSyncManager:
 
             start_dt = datetime.fromtimestamp(max(0.0, enqueue_ts - 5.0))
             end_dt = datetime.fromtimestamp(now_ts + 1.0)
-            deals = mt5_async_call(
-                "history_deals_get",
-                start_dt,
-                end_dt,
-                timeout=0.9,
-                default=[],
-                retries=1,
-                repair_on_transport_error=True,
-                direct_fallback=True,
-            ) or []
+            deals = self._call_mt5("history_deals_get", start_dt, end_dt) or []
             entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0) or 0)
             best: Optional[Tuple[float, float, float, int]] = None
             best_score: Optional[Tuple[float, float]] = None
@@ -200,14 +260,16 @@ class OrderSyncManager:
         e = self._e
         if e.dry_run:
             return
-        if not e._pending_order_meta:
-            return
         now_ts = time.time()
-        if (now_ts - e._last_order_sync_ts) < e._order_sync_interval_sec:
-            return
-        e._last_order_sync_ts = now_ts
+        with e._order_state_lock:
+            if not e._pending_order_meta:
+                return
+            if (now_ts - e._last_order_sync_ts) < e._order_sync_interval_sec:
+                return
+            e._last_order_sync_ts = now_ts
+            pending_items = list(e._pending_order_meta.items())[:64]
 
-        for order_id, meta in list(e._pending_order_meta.items())[:64]:
+        for order_id, meta in pending_items:
             enqueue_ts = float(meta.get("enqueue_ts", 0.0) or 0.0)
             if enqueue_ts > 0.0 and (now_ts - enqueue_ts) < e._order_sync_grace_sec:
                 continue
@@ -224,4 +286,3 @@ class OrderSyncManager:
                 self.resolve_order_result(sync_res)
             except Exception as exc:
                 log_err.error("ORDER_SYNC_RESOLVE_ERROR | order_id=%s err=%s", order_id, exc)
-

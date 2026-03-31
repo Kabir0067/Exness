@@ -18,6 +18,7 @@ __all__ = [
     "LOG_DIR",
     "ARTIFACTS_DIR",
     "get_log_path",
+    "build_logger",
     "get_artifact_path",
     "get_artifact_dir",
     "log_dir_stats",
@@ -181,6 +182,37 @@ def get_log_path(*parts: str) -> Path:
     path = LOG_DIR.joinpath(*parts)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def build_logger(name: str, filename: str, level: int = logging.INFO) -> logging.Logger:
+    """Create or reuse a rotating file logger under the shared Logs directory."""
+    logger = logging.getLogger(name)
+    logger.setLevel(int(level))
+    logger.propagate = False
+
+    log_path = str(get_log_path(filename))
+    existing = None
+    for handler in logger.handlers:
+        if isinstance(handler, RotatingFileHandler) and getattr(handler, "baseFilename", "") == log_path:
+            existing = handler
+            break
+
+    if existing is None:
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+            delay=True,
+        )
+        handler.setLevel(int(level))
+        handler.setFormatter(_fmt())
+        logger.addHandler(handler)
+    else:
+        existing.setLevel(int(level))
+        existing.setFormatter(_fmt())
+
+    return logger
 
 
 def get_artifact_dir(*parts: str) -> Path:

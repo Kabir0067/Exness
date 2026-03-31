@@ -39,12 +39,14 @@ class PortfolioRiskManager:
         self,
         *,
         max_daily_drawdown_pct: float = 0.05,        # 5% max daily loss
+        hard_stop_buffer_pct: float = 0.0001,        # 1 bp early guard against overshoot
         max_total_exposure_factor: float = 3.0,       # 3× equity
         correlation_reduction: float = 0.50,          # Cut sizing 50% when correlated
         max_risk_per_trade_pct: float = 0.015,        # 1.5% of equity per trade
         max_concurrent_positions: int = 6,
     ) -> None:
         self.max_daily_dd_pct = max_daily_drawdown_pct
+        self.hard_stop_buffer_pct = max(0.0, float(hard_stop_buffer_pct or 0.0))
         self.max_exposure_factor = max_total_exposure_factor
         self.correlation_reduction = correlation_reduction
         self.max_risk_per_trade = max_risk_per_trade_pct
@@ -57,6 +59,8 @@ class PortfolioRiskManager:
         self._hard_stop_reason: str = ""
         self._exposures: Dict[str, AssetExposure] = {}
         self._trade_log: List[float] = []
+        self._last_equity: float = 0.0
+        self._last_daily_drawdown_pct: float = 0.0
         self._lock = threading.RLock()
 
     # ─── Public API ──────────────────────────────────────────────────
@@ -90,6 +94,21 @@ class PortfolioRiskManager:
         with self._lock:
             return self._hard_stopped, self._hard_stop_reason
 
+    def evaluate_equity(self, current_equity: float) -> Tuple[bool, str]:
+        """
+        Continuously enforce the portfolio daily drawdown rule.
+
+        This is intended for runtime loop checks, not only pre-order gating.
+        """
+        with self._lock:
+            self._last_equity = float(current_equity or 0.0)
+            dd_blocked, dd_reason = self._check_daily_drawdown(float(current_equity or 0.0))
+            if dd_blocked and not self._hard_stopped:
+                self._hard_stopped = True
+                self._hard_stop_reason = dd_reason
+                log.critical("PORTFOLIO_HARD_STOP | %s", dd_reason)
+            return self._hard_stopped, self._hard_stop_reason
+
     def check_before_order(
         self,
         *,
@@ -121,11 +140,8 @@ class PortfolioRiskManager:
                 return False, 0.0, f"PORTFOLIO_HARD_STOP: {self._hard_stop_reason}"
 
             # 2. Daily drawdown check
-            dd_blocked, dd_reason = self._check_daily_drawdown(equity)
+            dd_blocked, dd_reason = self.evaluate_equity(equity)
             if dd_blocked:
-                self._hard_stopped = True
-                self._hard_stop_reason = dd_reason
-                log.critical("PORTFOLIO_HARD_STOP | %s", dd_reason)
                 return False, 0.0, dd_reason
 
             # 3. Max concurrent positions
@@ -166,6 +182,8 @@ class PortfolioRiskManager:
                 "daily_start_equity": self._daily_start_equity,
                 "unrealized_pnl": total_pnl,
                 "daily_closed_pnl": daily_closed_pnl,
+                "last_equity": self._last_equity,
+                "daily_drawdown_pct": self._last_daily_drawdown_pct,
                 "total_margin": total_margin,
                 "total_positions": total_positions,
                 "hard_stopped": self._hard_stopped,
@@ -186,11 +204,15 @@ class PortfolioRiskManager:
     def _check_daily_drawdown(self, current_equity: float) -> Tuple[bool, str]:
         """Check if daily drawdown exceeds limit."""
         if self._daily_start_equity <= 0:
+            self._last_daily_drawdown_pct = 0.0
             return False, ""
         dd = (self._daily_start_equity - current_equity) / self._daily_start_equity
-        if dd > self.max_daily_dd_pct:
+        self._last_daily_drawdown_pct = float(max(0.0, dd))
+        trip_limit = max(0.0, float(self.max_daily_dd_pct) - float(self.hard_stop_buffer_pct))
+        if dd >= trip_limit:
             reason = (
-                f"DAILY_DRAWDOWN: {dd:.2%} > limit {self.max_daily_dd_pct:.2%} "
+                f"DAILY_DRAWDOWN_GUARD: {dd:.2%} >= guard {trip_limit:.2%} "
+                f"(limit={self.max_daily_dd_pct:.2%}, buffer={self.hard_stop_buffer_pct:.2%}) "
                 f"(start={self._daily_start_equity:.2f}, now={current_equity:.2f})"
             )
             return True, reason

@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 import traceback
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from ExnessAPI.order_execution import (
     OrderExecutor,
@@ -24,15 +24,21 @@ class ExecutionWorker(threading.Thread):
         result_queue: "queue.Queue[ExecutionResult]",
         dry_run: bool,
         order_notify_cb: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None,
+        result_fallback_cb: Optional[Callable[[ExecutionResult], None]] = None,
+        executor_factory: Optional[Callable[[], Any]] = None,
+        worker_label: str = "exec",
     ) -> None:
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name=f"ExecutionWorker-{str(worker_label or 'exec')}")
         self.order_queue = order_queue
         self.result_queue = result_queue
         self.dry_run = bool(dry_run)
         self.order_notify_cb = order_notify_cb
+        self.result_fallback_cb = result_fallback_cb
+        self.executor_factory = executor_factory
+        self.worker_label = str(worker_label or "exec")
         # IMPORTANT: do not shadow threading.Thread._stop
         self._stop_evt = threading.Event()
-        self._executor: Optional[OrderExecutor] = None
+        self._executor: Optional[Any] = None
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -61,12 +67,15 @@ class ExecutionWorker(threading.Thread):
 
         return hooks or None
 
-    def _build_executor(self) -> OrderExecutor:
+    def _build_executor(self) -> Any:
         if self._executor is None:
-            self._executor = OrderExecutor(
-                auto_ensure_mt5=(not self.dry_run),
-                symbol_cache_ttl=30.0,
-            )
+            if self.executor_factory is not None:
+                self._executor = self.executor_factory()
+            else:
+                self._executor = OrderExecutor(
+                    auto_ensure_mt5=(not self.dry_run),
+                    symbol_cache_ttl=30.0,
+                )
         return self._executor
 
     def _process(self, intent: OrderIntent) -> ExecutionResult:
@@ -222,9 +231,22 @@ class ExecutionWorker(threading.Thread):
                 except Exception:
                     published = False
 
-                # If not published, update RM directly
+                # If not published, resolve directly so pending broker-sync state
+                # does not leak and later turn into a false timeout.
                 if not published:
-                    self._fallback_risk_update(intent, res)
+                    resolved = False
+                    if self.result_fallback_cb:
+                        try:
+                            self.result_fallback_cb(res)
+                            resolved = True
+                        except Exception as exc:
+                            log_err.error(
+                                "execution fallback resolve error: %s | tb=%s",
+                                exc,
+                                traceback.format_exc(),
+                            )
+                    if not resolved:
+                        self._fallback_risk_update(intent, res)
 
                 # External notify bridge (telegram, etc.)
                 if self.order_notify_cb:
@@ -236,7 +258,8 @@ class ExecutionWorker(threading.Thread):
                 # Optional executor health log
                 try:
                     exec_health_log.info(
-                        "EXEC_HEALTH | order_id=%s ok=%s reason=%s",
+                        "EXEC_HEALTH | worker=%s order_id=%s ok=%s reason=%s",
+                        self.worker_label,
                         res.order_id,
                         res.ok,
                         res.reason,

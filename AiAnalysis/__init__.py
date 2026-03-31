@@ -1,4 +1,11 @@
-# AiAnalysis — таҳлили ИИ барои сигнал (Xau Ai / BTC Ai)
-from .scalp_ai_analys import analyse
+"""AI analysis package for Exness Telegram workflows."""
 
-__all__ = ["analyse"]
+from .intrd_ai_analys import analyse_intraday, diagnose_providers as diagnose_intraday_providers
+from .scalp_ai_analys import analyse, diagnose_providers as diagnose_scalping_providers
+
+__all__ = [
+    "analyse",
+    "analyse_intraday",
+    "diagnose_scalping_providers",
+    "diagnose_intraday_providers",
+]

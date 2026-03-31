@@ -1,30 +1,36 @@
-﻿capital = 100
-days = 365
+﻿import math
 
-print(f"{'Day':>5} | {'Capital ($)':>15}")
-print("-" * 25)
+def run_capital_projection() -> None:
+    x = 4
+    capital = 100.0
+    days = 365
 
+    print(f"{'Day':>5} | {'Capital ($)':>15} | {'Lot':>6}")
+    print("-" * 34)
 
-for day in range(1, days + 1):
+    for day in range(1, days + 1):
+        if day % 30 == 0:
+            capital += 20
 
-    # Ҳар 30 рӯз 30$ илова
-    if day % 30 == 0:
-        capital += 30
+        if day <= 30:
+            rate = 0.05
+        elif day <= 50:
+            rate = 0.03
+        elif day <= 250:
+            rate = 0.02
+        else:
+            rate = 0.01
 
-    # Фоизи афзоиш
-    if day <= 30:
-        rate = 0.05
-    elif day <= 50:
-        rate = 0.03
-    elif day <= 250:
-        rate = 0.02
-    else:
-        rate = 0.01
+        capital *= (1 + rate)
+        lot = math.floor((capital / 10000) / 0.01) * 0.01
 
-    capital *= (1 + rate)
+        if x >= day:
+            pass
 
-    print(f"{day:>5} | {capital:>15.2f}")
+        print(f"{day:>5} | {capital:>15.2f} | {lot:>6.2f}")
 
-print("-" * 25)
-print(f"FINAL CAPITAL: {capital:.2f}$")
-# FINAL CAPITAL: 147331.06$
+    print("-" * 32)
+    print(f"FINAL CAPITAL: {capital:.2f}$")
+
+if __name__ == "__main__":
+    run_capital_projection()

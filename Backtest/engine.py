@@ -591,6 +591,47 @@ class InstitutionalBacktestEngine:
         )
         return adaptive
 
+    def _effective_signal_threshold(
+        self,
+        configured_threshold: float,
+        pred: np.ndarray,
+        *,
+        alpha_calibration: Optional[Dict[str, Any]] = None,
+        enforce_min_signals: bool = True,
+    ) -> float:
+        base = max(float(configured_threshold or 0.0), 1e-12)
+        abs_pred = np.abs(np.asarray(pred, dtype=np.float64))
+        abs_pred = abs_pred[np.isfinite(abs_pred)]
+
+        model_threshold = 0.0
+        model_quantile = 0.0
+        if isinstance(alpha_calibration, dict):
+            try:
+                model_threshold = float(alpha_calibration.get("pred_abs_threshold", 0.0) or 0.0)
+            except Exception:
+                model_threshold = 0.0
+            try:
+                model_quantile = float(alpha_calibration.get("pred_quantile", 0.0) or 0.0)
+            except Exception:
+                model_quantile = 0.0
+
+        if np.isfinite(model_threshold) and model_threshold > 0.0:
+            base = max(base, model_threshold)
+
+        if abs_pred.size > 0 and np.isfinite(model_quantile) and 0.0 < model_quantile <= 99.9:
+            try:
+                quant_thr = float(np.percentile(abs_pred, model_quantile))
+            except Exception:
+                quant_thr = 0.0
+            if np.isfinite(quant_thr) and quant_thr > 0.0:
+                base = max(base, quant_thr)
+
+        return self._resolve_signal_threshold(
+            base,
+            pred,
+            enforce_min_signals=enforce_min_signals,
+        )
+
     # ------------------------------------------------------------------ #
     # Trade simulation                                                      #
     # ------------------------------------------------------------------ #
@@ -1138,7 +1179,11 @@ class InstitutionalBacktestEngine:
             pred   = model.model.predict(X)
 
             configured_threshold = max(float(getattr(cfg, "percent_increase", 0.0) or 0.0), 1e-12)
-            threshold = configured_threshold
+            threshold = self._effective_signal_threshold(
+                configured_threshold,
+                pred,
+                enforce_min_signals=True,
+            )
             rng_wfa = np.random.default_rng(self.run_cfg.monte_carlo_seed)
 
             pnls, _, costs = self._simulate_trades_institutional(
@@ -1322,7 +1367,12 @@ class InstitutionalBacktestEngine:
         pred   = model.predict(X)
 
         configured_threshold = max(float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 1e-12)
-        threshold = configured_threshold
+        threshold = self._effective_signal_threshold(
+            configured_threshold,
+            pred,
+            alpha_calibration=payload.get("alpha_calibration", {}) if isinstance(payload, dict) else None,
+            enforce_min_signals=True,
+        )
 
         try:
             pred_arr    = np.asarray(pred, dtype=np.float64)
@@ -1711,23 +1761,56 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
             initial_capital=float(run_cfg.initial_capital),
             final_capital=float(run_cfg.initial_capital),
         )
-    if run_exc is None and metrics is not None:
-        save_metrics(metrics, out_dir, prefix=prefix)
+    state: Optional[Dict[str, Any]] = None
+    state_exc: Optional[Exception] = None
+    try:
+        state = engine.save_model_state(metrics or BacktestMetrics())
+    except Exception as exc:
+        state_exc = exc
+        log.error(
+            "INSTITUTIONAL_STATE_SAVE_FAILED | asset=%s version=%s err=%s",
+            asset_u,
+            model_version,
+            exc,
+        )
+        log.debug("INSTITUTIONAL_STATE_SAVE_FAILED traceback", exc_info=True)
 
-    state  = engine.save_model_state(metrics or BacktestMetrics())
+    if run_exc is None and metrics is not None:
+        try:
+            save_metrics(metrics, out_dir, prefix=prefix)
+        except Exception as exc:
+            log.warning(
+                "INSTITUTIONAL_METRICS_SAVE_FAILED | asset=%s version=%s err=%s",
+                asset_u,
+                model_version,
+                exc,
+            )
+            log.debug("INSTITUTIONAL_METRICS_SAVE_FAILED traceback", exc_info=True)
+
+    if state is None:
+        raise RuntimeError(f"institutional_state_save_failed:{asset_u}") from state_exc
+
     status = "PASSED" if state["verified"] else "FAILED"
 
-    _console("\n" + "=" * 60)
-    _console(f"INSTITUTIONAL BACKTEST: {status}")
-    _console("=" * 60)
-    _console(f"Sharpe Ratio:        {metrics.sharpe_ratio:.2f} (Req: >= {MIN_GATE_SHARPE:.2f})")
-    _console(f"Win Rate:            {metrics.win_rate:.1%} (Req: >= {MIN_GATE_WIN_RATE:.1%})")
-    _console(f"Max Drawdown:        {metrics.max_drawdown_pct:.2%} (Max: {MAX_GATE_DRAWDOWN:.0%})")
-    _console(f"Risk of Ruin:        {metrics.risk_of_ruin:.2%} (Max: 1%)")
-    _console(f"WFA:                 {'PASS' if metrics.wfa_passed else 'FAIL'}")
-    _console(f"Stress Test:         {'PASS' if state['stress_test_passed'] else 'FAIL'}")
-    _console(f"Version:             {model_version}")
-    _console("=" * 60 + "\n")
+    try:
+        _console("\n" + "=" * 60)
+        _console(f"INSTITUTIONAL BACKTEST: {status}")
+        _console("=" * 60)
+        _console(f"Sharpe Ratio:        {metrics.sharpe_ratio:.2f} (Req: >= {MIN_GATE_SHARPE:.2f})")
+        _console(f"Win Rate:            {metrics.win_rate:.1%} (Req: >= {MIN_GATE_WIN_RATE:.1%})")
+        _console(f"Max Drawdown:        {metrics.max_drawdown_pct:.2%} (Max: {MAX_GATE_DRAWDOWN:.0%})")
+        _console(f"Risk of Ruin:        {metrics.risk_of_ruin:.2%} (Max: 1%)")
+        _console(f"WFA:                 {'PASS' if metrics.wfa_passed else 'FAIL'}")
+        _console(f"Stress Test:         {'PASS' if state['stress_test_passed'] else 'FAIL'}")
+        _console(f"Version:             {model_version}")
+        _console("=" * 60 + "\n")
+    except Exception as exc:
+        log.warning(
+            "INSTITUTIONAL_SUMMARY_LOG_FAILED | asset=%s version=%s err=%s",
+            asset_u,
+            model_version,
+            exc,
+        )
 
     if run_exc is not None:
         raise RuntimeError(f"institutional_backtest_failed:{asset_u}") from run_exc

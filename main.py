@@ -9,6 +9,7 @@ import shutil
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -44,6 +45,9 @@ engine: Any = None
 
 _tg_available: bool = True
 
+# Never let logging internals dump recursive diagnostics into stderr.
+logging.raiseExceptions = False
+
 # Disable global aggregate file log. Each module writes to its own log file.
 _system_log_handler = configure_logging(level="INFO", system_log_name=None, console=True)
 
@@ -54,6 +58,8 @@ _gate_status_last_ts: float = 0.0
 
 LOG_DIR = LOG_ROOT
 
+_REAL_STDOUT = getattr(sys, "__stdout__", sys.stdout)
+_REAL_STDERR = getattr(sys, "__stderr__", sys.stderr)
 
 # =============================================================================
 # Logger helpers (no duplicates, no recursion, production-safe)
@@ -62,7 +68,7 @@ _FMT = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
 
 def _stdout_stream():
-    return getattr(sys, "__stdout__", sys.stdout)
+    return _REAL_STDOUT
 
 
 def _setup_named_logger(
@@ -77,11 +83,12 @@ def _setup_named_logger(
     lg.setLevel(level)
     lg.propagate = False
 
-    # Avoid duplicates (per-handler type+target)
+    target_file = str(get_log_path(file_name))
+
     has_file = False
     has_console = False
     for h in list(lg.handlers):
-        if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == str(get_log_path(file_name)):
+        if isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == target_file:
             has_file = True
             h.setLevel(level)
             h.setFormatter(_FMT)
@@ -92,7 +99,7 @@ def _setup_named_logger(
 
     if not has_file:
         fh = RotatingFileHandler(
-            str(get_log_path(file_name)),
+            target_file,
             maxBytes=int(max_bytes),
             backupCount=int(backups),
             encoding="utf-8",
@@ -113,26 +120,70 @@ def _setup_named_logger(
 
 log = _setup_named_logger("main", file_name="main.log", level=logging.INFO, backups=5)
 log_super = _setup_named_logger("telegram.supervisor", file_name="telegram.log", level=logging.INFO, backups=3)
-
+log_stdout = _setup_named_logger("stdout", file_name="stdout.log", level=logging.INFO, backups=3)
 
 # =============================================================================
-# StdIO + exception hooks (no-crash)
+# StdIO + exception hooks (no-crash, no recursion)
 # =============================================================================
 class _StdToLogger:
-    def __init__(self, logger: logging.Logger, level: int) -> None:
+    def __init__(self, logger: logging.Logger, level: int, fallback_stream) -> None:
         self._logger = logger
         self._level = int(level)
+        self._fallback = fallback_stream
+        self._local = threading.local()
 
-    def write(self, buf: str) -> None:
+    def write(self, buf: str) -> int:
         s = str(buf)
         if not s:
-            return
-        for line in s.rstrip().splitlines():
-            if line:
-                self._logger.log(self._level, line)
+            return 0
+
+        # Prevent recursive re-entry from logging internals or fallback writes.
+        if getattr(self._local, "busy", False):
+            try:
+                self._fallback.write(s)
+                self._fallback.flush()
+            except Exception:
+                pass
+            return len(s)
+
+        self._local.busy = True
+        try:
+            for line in s.splitlines():
+                line = line.rstrip()
+                if line:
+                    self._logger.log(self._level, line)
+        except Exception:
+            try:
+                self._fallback.write(s)
+                self._fallback.flush()
+            except Exception:
+                pass
+        finally:
+            self._local.busy = False
+
+        return len(s)
 
     def flush(self) -> None:
-        return
+        try:
+            self._fallback.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._fallback.isatty())
+        except Exception:
+            return False
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._fallback, "encoding", "utf-8")
+
+    def fileno(self) -> int:
+        try:
+            return int(self._fallback.fileno())
+        except Exception:
+            raise OSError("No file descriptor available")
 
 
 def _setup_exception_hooks() -> None:
@@ -140,36 +191,46 @@ def _setup_exception_hooks() -> None:
         try:
             tb_txt = "".join(traceback.format_tb(tb)) if tb else ""
             logging.getLogger("main").error("UNCAUGHT_EXCEPTION | %s | tb=%s", exc, tb_txt)
-        finally:
+        except Exception:
+            pass
+
+        # Print original traceback only to the real stderr to avoid recursion.
+        cur_stderr = sys.stderr
+        try:
+            sys.stderr = _REAL_STDERR
             sys.__excepthook__(exc_type, exc, tb)
+        finally:
+            sys.stderr = cur_stderr
 
     sys.excepthook = _handle_exception
 
-    if hasattr(__import__("threading"), "excepthook"):
-        import threading as _threading
-
-        def _thread_excepthook(args):  # type: ignore[no-redef]
+    if hasattr(threading, "excepthook"):
+        def _thread_excepthook(args):
             tb_txt = ""
             try:
                 tb_txt = "".join(traceback.format_tb(getattr(args, "exc_traceback", None)))
             except Exception:
                 tb_txt = ""
-            logging.getLogger("main").error(
-                "THREAD_EXCEPTION | thread=%s exc=%s | tb=%s",
-                getattr(args, "thread", None),
-                getattr(args, "exc_value", None),
-                tb_txt,
-            )
 
-        _threading.excepthook = _thread_excepthook
+            try:
+                logging.getLogger("main").error(
+                    "THREAD_EXCEPTION | thread=%s exc=%s | tb=%s",
+                    getattr(args, "thread", None),
+                    getattr(args, "exc_value", None),
+                    tb_txt,
+                )
+            except Exception:
+                pass
+
+        threading.excepthook = _thread_excepthook
 
 
 _setup_exception_hooks()
 
-# Redirect prints to logger (handlers use sys.__stdout__ so no recursion)
-sys.stdout = _StdToLogger(logging.getLogger("stdout"), logging.INFO)
-sys.stderr = _StdToLogger(logging.getLogger("stderr"), logging.ERROR)
-
+# Safe stdout redirection only.
+# Do NOT redirect stderr into logging; logging itself writes internal errors to stderr.
+sys.stdout = _StdToLogger(log_stdout, logging.INFO, _REAL_STDOUT)
+sys.stderr = _REAL_STDERR
 
 # =============================================================================
 # Utils
@@ -212,7 +273,6 @@ class SingletonInstance:
     def __enter__(self):
         try:
             self._sock.bind(("127.0.0.1", self._port))
-            # keep it bound for entire process lifetime
             self._sock.listen(1)
             self._locked = True
             return self
@@ -302,7 +362,6 @@ _NET_ERRS_TG = (
     http.client.RemoteDisconnected,
 )
 
-
 # =============================================================================
 # Model gate (compact + behavior-preserving)
 # =============================================================================
@@ -319,6 +378,15 @@ def _required_gate_assets() -> tuple[str, ...]:
         seen.add(a)
         out.append(a)
     return tuple(out or list(DEFAULT_REQUIRED_ASSETS))
+
+
+def _partial_gate_enabled(required_assets: Optional[tuple[str, ...]] = None) -> bool:
+    assets = tuple(required_assets or _required_gate_assets())
+    if not _env_truthy("PARTIAL_GATE_MODE", "0"):
+        return False
+    if len(assets) > 1 and _env_truthy("STRICT_DUAL_ASSET_MODE", "1"):
+        return False
+    return True
 
 
 def _gate_assets_tuple(details: Any) -> list[tuple[str, bool, str, str, float, float, float, bool]]:
@@ -483,7 +551,7 @@ def _model_gate_ready_effective() -> tuple[bool, str, list[str]]:
     if gate_ok:
         return True, gate_reason, required
 
-    if not _env_truthy("PARTIAL_GATE_MODE", "1"):
+    if not _partial_gate_enabled(tuple(required)):
         return False, gate_reason, []
 
     partial_assets = [a for a in _partial_gate_assets() if a in required]
@@ -550,6 +618,19 @@ def _models_ready() -> tuple[bool, str]:
         return True, reason
     except Exception as exc:
         return False, f"error:{exc}"
+
+
+def _prime_engine_model_health() -> None:
+    try:
+        engine._check_model_health()
+    except Exception as exc:
+        log.error("ENGINE_MODEL_HEALTH_PREFLIGHT_FAILED | err=%s | tb=%s", exc, traceback.format_exc())
+        try:
+            reason_now = str(getattr(engine, "_gate_last_reason", "") or "").strip().lower()
+            if not reason_now or reason_now == "unknown":
+                engine._gate_last_reason = f"health_check_error:{type(exc).__name__}"
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -643,7 +724,6 @@ def _auto_train_models_strict() -> bool:
         )
 
     for asset in assets:
-        # Avoid repeated expensive training loops after recent hard failures.
         if failure_cooldown_hours > 0:
             rec = failures.get(asset, {})
             ts = float(rec.get("ts", 0.0) or 0.0) if isinstance(rec, dict) else 0.0
@@ -663,7 +743,6 @@ def _auto_train_models_strict() -> bool:
                     failed_assets.append(asset)
                     continue
 
-        # Backoff guard: don't retrain same asset repeatedly on every restart.
         if retry_hours > 0:
             try:
                 st_path = get_artifact_path("models", f"model_state_{asset}.pkl")
@@ -695,7 +774,6 @@ def _auto_train_models_strict() -> bool:
             except Exception:
                 pass
 
-        # Smart retrain: skip assets that already pass gate
         try:
             det = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
             ast = (det.get("assets", {}) or {}).get(asset, {})
@@ -814,6 +892,14 @@ def _auto_train_models_strict() -> bool:
         active_set = set(post_active_assets)
         if required_now.issubset(active_set):
             return True
+        if not _partial_gate_enabled(tuple(sorted(required_now))):
+            log_local.error(
+                "AUTO_TRAIN_STRICT_DUAL_ASSET_BLOCK | active=%s blocked=%s reason=%s",
+                ",".join(post_active_assets) if post_active_assets else "-",
+                ",".join(sorted(required_now.difference(active_set))) if required_now.difference(active_set) else "-",
+                post_reason,
+            )
+            return False
         log_local.warning(
             "AUTO_TRAIN_PARTIAL_GATE | active=%s blocked=%s reason=%s",
             ",".join(post_active_assets) if post_active_assets else "-",
@@ -835,14 +921,15 @@ def _auto_train_models_strict() -> bool:
 # =============================================================================
 # Runtime bootstrap (lazy imports; behavior preserved)
 # =============================================================================
-def _bootstrap_runtime() -> bool:
+def _bootstrap_runtime(*, allow_telegram: bool = True) -> bool:
     global bot, ADMIN, bot_commands, send_signal_notification, engine, _tg_available
 
-    # already loaded?
+    if not allow_telegram:
+        _tg_available = False
+
     if engine is not None and (bot is not None or not _tg_available):
         return True
 
-    # env preflight
     try:
         from core.config import preflight_env
 
@@ -875,7 +962,6 @@ def _bootstrap_runtime() -> bool:
         print(f"Config preflight failed: {exc}")
         return False
 
-    # imports
     try:
         from Bot.portfolio_engine import engine as _engine
 
@@ -1042,7 +1128,6 @@ class Notifier:
 
             sleep_interruptible(self.stop_event, backoff.delay(attempt))
 
-        # best-effort drain
         try:
             while True:
                 _ = self.q.get_nowait()
@@ -1153,7 +1238,6 @@ def _safe_retrain_models(notifier: NotifierLike) -> bool:
         failed_assets: list[str] = []
 
         for asset in assets:
-            # Smart retrain: skip already passing assets
             try:
                 det = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
                 ast = (det.get("assets", {}) or {}).get(asset, {})
@@ -1209,7 +1293,6 @@ def _safe_retrain_models(notifier: NotifierLike) -> bool:
             ",".join(required_assets),
         )
 
-        # Only restore backup if NO assets passed (preserve partial success)
         if not passed_assets:
             _restore_model_artifacts(backup_dir, models_dir)
         return False
@@ -1280,6 +1363,7 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     backoff = Backoff(base=2.0, factor=2.0, max_delay=60.0)
     restart_guard = RateLimiter(20.0)
     manual_stop_rl = RateLimiter(60.0)
+    runtime_recover_after_sec = max(6.0, _env_float("ENGINE_RUNTIME_RECOVER_SEC", 12.0))
 
     started_once = False
     attempt = 0
@@ -1301,7 +1385,6 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     retraining_in_progress = False
     gate_block_rl = RateLimiter(30.0)
 
-    # Preserve original state file path (as in your code)
     model_checker = ModelAgeChecker(get_artifact_path("models", "model_state.pkl"))
 
     notifier.notify("🧠 Нозири мотор оғоз шуд.")
@@ -1323,19 +1406,23 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
             )
 
     while not stop_event.is_set():
-        # Cheap status probe first
         ok_connected = True
         ok_trading = True
         manual_stop = False
+        runtime_snapshot: dict[str, Any] = {}
         try:
             st = engine.status()
             ok_connected = bool(getattr(st, "connected", True))
             ok_trading = bool(getattr(st, "trading", True))
             manual_stop = bool(getattr(st, "manual_stop", False))
+            snap_fn = getattr(engine, "runtime_watchdog_snapshot", None)
+            if callable(snap_fn):
+                snap = snap_fn()
+                if isinstance(snap, dict):
+                    runtime_snapshot = dict(snap)
         except Exception:
             pass
 
-        # Hourly retraining check (only if not dry-run)
         if not retraining_in_progress and not dry_run_mode:
             now = time.time()
             if (now - last_retrain_check) > RETRAIN_CHECK_INTERVAL:
@@ -1355,16 +1442,41 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
                     finally:
                         retraining_in_progress = False
 
-        # Re-probe
         try:
             st = engine.status()
             ok_connected = bool(getattr(st, "connected", True))
             ok_trading = bool(getattr(st, "trading", True))
             manual_stop = bool(getattr(st, "manual_stop", False))
+            snap_fn = getattr(engine, "runtime_watchdog_snapshot", None)
+            if callable(snap_fn):
+                snap = snap_fn()
+                if isinstance(snap, dict):
+                    runtime_snapshot = dict(snap)
         except Exception:
             pass
 
-        # Gate blocked -> controlled retraining (avoid start spam)
+        runtime_thread_dead = bool(runtime_snapshot.get("thread_dead", False))
+        runtime_stale = bool(runtime_snapshot.get("stale", False))
+        runtime_hb_age = float(runtime_snapshot.get("heartbeat_age_sec", 0.0) or 0.0)
+        if (runtime_thread_dead or runtime_stale) and not manual_stop:
+            if restart_guard.allow("engine_runtime_watchdog"):
+                log.error(
+                    "Engine runtime unhealthy (loop_alive=%s stale=%s hb_age=%.1fs) -> recover/restart",
+                    runtime_snapshot.get("loop_alive", False),
+                    runtime_stale,
+                    runtime_hb_age,
+                )
+            recover_fn = getattr(engine, "_recover_all", None)
+            recover_now = runtime_thread_dead or (runtime_hb_age >= runtime_recover_after_sec)
+            if recover_now and callable(recover_fn):
+                try:
+                    if bool(recover_fn()):
+                        attempt = 0
+                except Exception as exc:
+                    log.error("Engine recover failed: %s | tb=%s", exc, traceback.format_exc())
+            sleep_interruptible(stop_event, 1.0)
+            continue
+
         if not ok_trading and not retraining_in_progress and not dry_run_mode:
             gate_ok, gate_reason, _active_assets = _model_gate_ready_effective()
             if not gate_ok:
@@ -1388,11 +1500,23 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
 
         if manual_stop:
             if manual_stop_rl.allow("engine_manual_stop"):
-                log.info("Engine idle (manual stop active); supervisor waiting")
+                unsafe_reason = ""
+                unsafe_snapshot_fn = getattr(engine, "unsafe_account_state_snapshot", None)
+                if callable(unsafe_snapshot_fn):
+                    try:
+                        unsafe_reason = str((unsafe_snapshot_fn() or {}).get("reason", "") or "")
+                    except Exception:
+                        unsafe_reason = ""
+                if unsafe_reason:
+                    log.warning(
+                        "Engine idle (manual stop active); unsafe account state=%s",
+                        unsafe_reason,
+                    )
+                else:
+                    log.info("Engine idle (manual stop active); supervisor waiting")
             sleep_interruptible(stop_event, 1.0)
             continue
 
-        # Ensure engine running
         if not ok_trading:
             try:
                 attempt += 1
@@ -1423,18 +1547,23 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
                 sleep_interruptible(stop_event, delay)
                 continue
 
-        # Connected health
         if not ok_connected:
             if restart_guard.allow("engine_unhealthy"):
                 log.warning("Engine unhealthy (connected=%s trading=%s) -> waiting/recovering", ok_connected, ok_trading)
                 if TG_HEALTH_NOTIFY:
                     notifier.notify("🟠 Ҳолати мотор ноустувор аст, интизори барқароршавӣ...")
+            if callable(getattr(engine, "_recover_all", None)):
+                try:
+                    recover_fn = getattr(engine, "_recover_all", None)
+                    if callable(recover_fn):
+                        recover_fn()
+                except Exception as exc:
+                    log.error("Engine connectivity recover failed: %s | tb=%s", exc, traceback.format_exc())
             sleep_interruptible(stop_event, 2.0)
             continue
 
         sleep_interruptible(stop_event, 1.0)
 
-    # Shutdown
     try:
         engine.stop()
     except Exception as exc:
@@ -1537,7 +1666,6 @@ def run_engine_notify_worker(stop_event: Event) -> None:
             log.error("Engine notify error: %s", exc)
             pending = None
 
-    # best-effort drain
     try:
         while True:
             q.get_nowait()
@@ -1548,18 +1676,57 @@ def run_engine_notify_worker(stop_event: Event) -> None:
 # =============================================================================
 # Main
 # =============================================================================
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None) -> None:
+        if not message:
+            return
+        target = file if file is not None else sys.stderr
+        try:
+            target.write(message)
+        except UnicodeEncodeError:
+            encoding = getattr(target, "encoding", None) or "utf-8"
+            safe_message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            target.write(safe_message)
+
+
 def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="XAUUSDm Scalping System (Exness MT5) - Production Runner")
-    p.add_argument("--headless", action="store_true", help="Оғоз бе Telegram (ҳолати VPS)")
-    p.add_argument("--engine-only", action="store_true", help="Фақат мотор, бе бот")
+    p = _SafeArgumentParser(description="XAUUSDm Scalping System (Exness MT5) - Production Runner")
+    p.add_argument("--headless", action="store_true", help="Start without Telegram (VPS mode).")
+    p.add_argument("--engine-only", action="store_true", help="Run engine only, without the Telegram bot.")
     p.add_argument("--dry-run", action="store_true", help="Run in simulation mode (Mock MT5). Default is LIVE.")
-    return p.parse_args(argv)
+
+    real_stdout = _REAL_STDOUT
+    real_stderr = _REAL_STDERR
+    cur_stdout = sys.stdout
+    cur_stderr = sys.stderr
+    try:
+        sys.stdout = real_stdout
+        sys.stderr = real_stderr
+        return p.parse_args(argv)
+    finally:
+        sys.stdout = cur_stdout
+        sys.stderr = cur_stderr
+
+
+def _args_disable_telegram(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "headless", False) or getattr(args, "engine_only", False))
+
+
+def _effective_dry_run(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "dry_run", False)
+        or _env_truthy("DRY_RUN", "0")
+        or bool(getattr(engine, "dry_run", False))
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    if getattr(args, "dry_run", False):
+        os.environ["DRY_RUN"] = "1"
     try:
         with SingletonInstance(port=12345):
-            return _main_inner(argv)
+            return _main_inner(args)
     except RuntimeError as e:
         print(f"FATAL: {e}")
         return 1
@@ -1568,25 +1735,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
 
-def _main_inner(argv: Optional[list[str]] = None) -> int:
-    if not _bootstrap_runtime():
+def _main_inner(args: argparse.Namespace) -> int:
+    if not _bootstrap_runtime(allow_telegram=not _args_disable_telegram(args)):
         return 1
 
     shutdown = GracefulShutdown()
-    args = _parse_args(argv)
+    effective_dry_run = _effective_dry_run(args)
 
-    # Default to LIVE (Production)
-    if args.dry_run:
+    if effective_dry_run:
         try:
             engine.dry_run = True
         except Exception:
             pass
-        try:
-            engine._check_model_health()
-        except Exception:
-            pass
+        _prime_engine_model_health()
     else:
-        # Preflight: ensure trained models exist (auto-train if missing)
         ready, reason = _models_ready()
         if not ready:
             log.warning("MODELS_MISSING | reason=%s", reason)
@@ -1598,21 +1760,16 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
                     log.error("Auto-training failed; continuing startup")
             else:
                 log.warning("AUTO_TRAIN_ON_STARTUP=0 | skipping startup retraining")
+        _prime_engine_model_health()
 
-            try:
-                engine._check_model_health()
-            except Exception:
-                pass
-    if args.dry_run:
+    if effective_dry_run:
         log.info("DRY_RUN_STARTUP | skipping strict model preflight")
 
-    # Print System Matrix (Quantum Status)
     try:
         engine.print_startup_matrix()
     except Exception:
         pass
 
-    # Wiring: Engine -> Bot
     if send_signal_notification is not None:
         try:
             engine.set_signal_notifier(send_signal_notification)
@@ -1641,30 +1798,61 @@ def _main_inner(argv: Optional[list[str]] = None) -> int:
         )
         notify_worker_thread.start()
 
-    engine_thread = Thread(
-        target=run_engine_supervisor,
-        args=(shutdown.stop_event, notifier),
-        name="engine.supervisor",
-        daemon=False,
-    )
+    def _spawn_engine_thread() -> Thread:
+        return Thread(
+            target=run_engine_supervisor,
+            args=(shutdown.stop_event, notifier),
+            name="engine.supervisor",
+            daemon=False,
+        )
+
+    def _spawn_bot_thread() -> Thread:
+        return Thread(
+            target=run_telegram_supervisor,
+            args=(shutdown.stop_event, notifier),
+            name="telegram.supervisor",
+            daemon=False,
+        )
+
+    engine_thread = _spawn_engine_thread()
 
     bot_thread: Optional[Thread] = None
+    thread_restart_cooldown_sec = 2.0
+    last_engine_thread_restart_ts = 0.0
+    last_bot_thread_restart_ts = 0.0
 
     try:
         engine_thread.start()
 
         if _tg_available and not (args.headless or args.engine_only):
-            bot_thread = Thread(
-                target=run_telegram_supervisor,
-                args=(shutdown.stop_event, notifier),
-                name="telegram.supervisor",
-                daemon=False,
-            )
+            bot_thread = _spawn_bot_thread()
             bot_thread.start()
         elif not _tg_available:
             log.info("Telegram disabled -> running engine-only")
 
         while not shutdown.stop_event.is_set():
+            now = time.time()
+            if not engine_thread.is_alive() and (now - last_engine_thread_restart_ts) >= thread_restart_cooldown_sec:
+                last_engine_thread_restart_ts = now
+                log.error("ENGINE_SUPERVISOR_THREAD_EXITED | restarting")
+                try:
+                    notifier.notify("⚠️ Нозири мотор қатъ шуд. Аз нав оғоз мешавад.")
+                except Exception:
+                    pass
+                engine_thread = _spawn_engine_thread()
+                engine_thread.start()
+
+            if _tg_available and not (args.headless or args.engine_only):
+                if (bot_thread is None or not bot_thread.is_alive()) and (now - last_bot_thread_restart_ts) >= thread_restart_cooldown_sec:
+                    last_bot_thread_restart_ts = now
+                    log.error("TELEGRAM_SUPERVISOR_THREAD_EXITED | restarting")
+                    try:
+                        notifier.notify("⚠️ Telegram supervisor қатъ шуд. Аз нав оғоз мешавад.")
+                    except Exception:
+                        pass
+                    bot_thread = _spawn_bot_thread()
+                    bot_thread.start()
+
             shutdown.stop_event.wait(timeout=1.0)
 
         return 0

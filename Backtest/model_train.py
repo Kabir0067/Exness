@@ -515,6 +515,120 @@ class Pipeline:
         self._dtype = _cfg_dtype(cfg)
         self._aux_cache_ttl_sec = 30.0
 
+    def _feature_live_lookback_m1(self, feat: str) -> int:
+        """
+        Estimate the minimum M1 history needed for a feature to be meaningful
+        during live inference.
+
+        This avoids silently zeroing higher-timeframe features when too little
+        M1 history is fetched from MT5.
+        """
+        name = str(feat or "").strip()
+        if not name:
+            return 0
+
+        if name == "mtf_h1_slope":
+            return (8 + 1) * 60
+        if name == "mtf_h4_slope":
+            return (6 + 1) * 240
+        if name == "mtf_h1_flow_proxy":
+            return 5 * 60
+        if name == "mtf_h4_flow_proxy":
+            return 5 * 240
+        if name in ("xau_dxy_corr_rolling", "xau_us10y_corr_rolling"):
+            return 240
+        if name in ("ofi_proxy", "volume_delta"):
+            return 20
+        if name in ("stop_hunt_flag", "stop_hunt_strength"):
+            return 20
+        if name in ("ob_touch_proximity", "ob_pretouch_bias"):
+            return 20
+        if name in ("liquidity_void_up", "liquidity_void_down", "liquidity_void_score"):
+            return 2
+        if name in ("high_low_ratio", "close_position_in_range"):
+            return 1
+        if name in ("price_acceleration", "volume_acceleration"):
+            return 3
+        if name in ("macd", "macd_signal", "macd_hist"):
+            return 35
+        if name in ("bbands_width", "keltner_width"):
+            return 20
+        if name == "adi":
+            return 1
+        if name == "obv":
+            return 2
+        if name == "cci":
+            return int(getattr(self.cfg, "cci_period", 20) or 20)
+        if name == "mom":
+            return int(getattr(self.cfg, "mom_period", 10) or 10) + 1
+        if name == "roc":
+            return int(getattr(self.cfg, "roc_period", 10) or 10) + 1
+        if name in ("stoch_k", "stoch_d"):
+            return (
+                int(getattr(self.cfg, "stoch_k_period", 14) or 14)
+                + int(getattr(self.cfg, "stoch_slowk_period", 3) or 3)
+                + int(getattr(self.cfg, "stoch_slowd_period", 3) or 3)
+            )
+
+        if name.startswith("ma") and not name.startswith("macd"):
+            try:
+                return int(name[2:])
+            except Exception:
+                return 0
+        if name.startswith("ema"):
+            try:
+                return int(name[3:])
+            except Exception:
+                return 0
+        if name.startswith("rsi"):
+            try:
+                return int(name[3:])
+            except Exception:
+                return 0
+        if name.startswith("atr_"):
+            try:
+                return int(name.split("_", 1)[1])
+            except Exception:
+                return 0
+        if name.startswith("momentum_"):
+            try:
+                return int(name.split("_", 1)[1]) + 1
+            except Exception:
+                return 0
+        if name.startswith("historical_vol_"):
+            try:
+                return int(name.split("_", 2)[2]) + 1
+            except Exception:
+                return 0
+        if name.startswith("volume_sma_"):
+            try:
+                return int(name.split("_", 2)[2])
+            except Exception:
+                return 0
+        if name.startswith("ppo"):
+            try:
+                fast, slow = map(int, name[3:].split("_"))
+                return max(fast, slow)
+            except Exception:
+                return 0
+        return 0
+
+    def required_live_bars(self) -> int:
+        """
+        Return the M1 history budget needed for scientifically consistent live
+        inference with the current feature set.
+
+        The budget covers the longest feature lookback plus enough extra rows
+        to build a full inference window after indicator warm-up.
+        """
+        ws = max(1, int(getattr(self.cfg, "window_size", 20) or 20))
+        base_budget = max(ws + 200, 500)
+        feat_budget = max(
+            (self._feature_live_lookback_m1(feat) for feat in self.cfg.training_features),
+            default=0,
+        )
+        return max(base_budget, feat_budget + ws + 64)
+
     def _needs_macro_context(self) -> bool:
         feats = set(self.cfg.training_features)
         needed = {
@@ -1502,10 +1616,23 @@ def _calibrate_abs_threshold(
             if best_meeting is None:
                 best_meeting = candidate
             else:
+                bm_cov = float(best_meeting["coverage"])
                 bm_q = float(best_meeting["quantile"])
                 bm_acc = float(best_meeting["direction_accuracy"])
-                # Prefer stricter (higher-quantile) thresholds once target precision is met.
-                if float(q) > bm_q + 1e-12 or (abs(float(q) - bm_q) <= 1e-12 and acc > bm_acc + 1e-12):
+                # Preserve active coverage once the accuracy target is met.
+                # Choosing the strictest threshold here makes live trading brittle
+                # and can suppress valid signals even when a looser threshold
+                # already satisfies the directional-precision target.
+                if (
+                    cov > bm_cov + 1e-12
+                    or (
+                        abs(cov - bm_cov) <= 1e-12
+                        and (
+                            acc > bm_acc + 1e-12
+                            or (abs(acc - bm_acc) <= 1e-12 and float(q) < bm_q - 1e-12)
+                        )
+                    )
+                ):
                     best_meeting = candidate
             continue
         best_acc = float(best["direction_accuracy"])

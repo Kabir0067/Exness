@@ -31,6 +31,10 @@ class ExecutionManager:
         e = self._e
         now = time.time()
 
+        if bool(getattr(e, "_manual_stop", False)):
+            log_health.info("ENQUEUE_SKIP | asset=%s reason=manual_stop", cand.asset)
+            return False, None
+
         if cand.asset == "XAU":
             risk = e._xau.risk if e._xau else None
             cfg = e._xau_cfg
@@ -46,8 +50,9 @@ class ExecutionManager:
             pass
 
         try:
-            fn = getattr(risk, "requires_hard_stop", None)
-            if callable(fn) and bool(fn()):
+            hard_stop_attr = getattr(risk, "requires_hard_stop", False)
+            hard_stop_active = bool(hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr)
+            if hard_stop_active:
                 log_health.info("ENQUEUE_SKIP | asset=%s reason=hard_stop", cand.asset)
                 return False, None
         except Exception:
@@ -84,12 +89,12 @@ class ExecutionManager:
                         "tp": cand.tp,
                         "price": current_price,
                         "blocked": True,
-                        "reason": "Phase C - Daily Risk Limit Reached",
+                        "reason": "Phase C - лимити рӯзонаи риск пур шуд",
                         "message": (
-                            f"вљ пёЏ [PHASE C вЂ” Shadow Trade] РЎРёРіРЅР°Р»Рё С‚Р°СЃРґРёТ›С€СѓРґР°Рё {cand.signal} Р±Р°СЂРѕРё {cand.symbol}.\n"
-                            f"РќР°СЂС…: {current_price:.2f} | Р‘РѕРІР°СЂУЈ: {cand.confidence:.0f}%\n"
-                            f"(РЎР°РІРґРѕ Р±Рѕ Р»РёРјРёС‚Рё СЂРёСЃРє РјР°РЅСЉ С€СѓРґ)\n"
-                            f"ТІР°Т·РјРё СЌТіС‚РёРјРѕР»УЈ: {cand.lot:.2f} | SL: {cand.sl:.2f} | TP: {cand.tp:.2f}"
+                            f"⚠️ [PHASE C — Савдои соягӣ] Сигнали тасдиқшудаи {cand.signal} барои {cand.symbol}.\n"
+                            f"Нарх: {current_price:.2f} | Боварӣ: {cand.confidence:.0f}%\n"
+                            f"(Иҷрои савдо аз сабаби лимити риск манъ шуд)\n"
+                            f"Ҳаҷми эҳтимолӣ: {cand.lot:.2f} | SL: {cand.sl:.2f} | TP: {cand.tp:.2f}"
                         ),
                     }
                     e._signal_notifier(cand.asset, shadow_alert)
@@ -335,13 +340,15 @@ class ExecutionManager:
             phase_snapshot=str(phase),
         )
 
-        e._order_rm_by_id[str(order_id)] = risk
+        with e._order_state_lock:
+            e._order_rm_by_id[str(order_id)] = risk
         e._register_pending_order(intent)
 
         try:
             e._order_q.put(intent, timeout=0.15)
         except queue.Full:
-            e._order_rm_by_id.pop(str(order_id), None)
+            with e._order_state_lock:
+                e._order_rm_by_id.pop(str(order_id), None)
             e._clear_pending_order(str(order_id))
             if risk and hasattr(risk, "record_execution_failure"):
                 try:
@@ -474,8 +481,9 @@ class ExecutionManager:
             return 0
 
         try:
-            fn = getattr(pipe.risk, "requires_hard_stop", None)
-            if callable(fn) and bool(fn()):
+            hard_stop_attr = getattr(pipe.risk, "requires_hard_stop", False)
+            hard_stop_active = bool(hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr)
+            if hard_stop_active:
                 return 0
         except Exception:
             pass

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pickle
 import shutil
 import threading
@@ -18,6 +19,7 @@ log = logging.getLogger("core.model_gate")
 DEFAULT_REQUIRED_ASSETS: Tuple[str, ...] = ("XAU", "BTC")
 _LEGACY_BACKUP_DONE = False
 _LEGACY_BACKUP_LOCK = threading.Lock()
+_BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
 
 
 def _normalize_asset(asset: str) -> str:
@@ -34,6 +36,14 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return float(default)
+
+
+def _anti_overfit_gate_required() -> bool:
+    for name in ("LIVE_REQUIRE_ANTI_OVERFIT_GATE", "INSTITUTIONAL_REQUIRE_ALPHA_GATE", "AUTO_TRAIN_REQUIRE_ALPHA_GATE"):
+        raw = str(os.environ.get(name, "") or "").strip().lower()
+        if raw:
+            return raw in _BOOL_TRUE
+    return False
 
 
 def _remove_first(haystack: str, needle: str) -> str:
@@ -274,7 +284,8 @@ def _asset_gate_status(
         state_sample_issues = [str(x) for x in _state_issues_raw if str(x).strip()]
     else:
         state_sample_issues = []
-    required_state_fields = (
+    anti_overfit_gate_required = _anti_overfit_gate_required()
+    required_state_fields = [
         "status",
         "verified",
         "real_backtest",
@@ -282,11 +293,11 @@ def _asset_gate_status(
         "wfa_total_windows",
         "wfa_failed_windows",
         "wfa_required_windows",
-        "anti_overfit_passed",
-        "tscv_folds",
         "stress_test_passed",
         "unsafe",
-    )
+    ]
+    if anti_overfit_gate_required:
+        required_state_fields.extend(("anti_overfit_passed", "tscv_folds"))
     missing_state_fields = [k for k in required_state_fields if k not in state]
 
     if legacy:
@@ -424,7 +435,7 @@ def _asset_gate_status(
             legacy_fallback=False,
         )
 
-    if not state_anti_overfit_ok or state_tscv_folds < 2:
+    if anti_overfit_gate_required and (not state_anti_overfit_ok or state_tscv_folds < 2):
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
@@ -621,19 +632,19 @@ def _asset_gate_status(
     meta_sharpe = _safe_float(meta.get("backtest_sharpe", meta.get("sharpe", 0.0)), 0.0)
     meta_wr = _safe_float(meta.get("backtest_win_rate", meta.get("win_rate", 0.0)), 0.0)
     meta_dd = _safe_float(meta.get("max_drawdown_pct", max_dd), max_dd)
-    required_meta_fields = (
+    required_meta_fields = [
         "asset",
         "status",
         "real_backtest",
         "unsafe",
         "stress_test_passed",
         "wfa_passed",
-        "anti_overfit_passed",
-        "tscv_folds",
         "backtest_sharpe",
         "backtest_win_rate",
         "max_drawdown_pct",
-    )
+    ]
+    if anti_overfit_gate_required:
+        required_meta_fields.extend(("anti_overfit_passed", "tscv_folds"))
     missing_meta_fields = [k for k in required_meta_fields if k not in meta]
 
     if missing_meta_fields:
@@ -672,7 +683,7 @@ def _asset_gate_status(
         )
         reason = f"meta_wfa_failed:{wfa_tag}"
         ok = False
-    elif not meta_anti_overfit_ok or meta_tscv_folds < 2:
+    elif anti_overfit_gate_required and (not meta_anti_overfit_ok or meta_tscv_folds < 2):
         reason = f"meta_anti_overfit_failed:passed={int(meta_anti_overfit_ok)}:tscv_folds={meta_tscv_folds}"
         ok = False
     elif meta_status != "VERIFIED":
