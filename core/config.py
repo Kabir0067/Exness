@@ -108,7 +108,9 @@ def _allow_missing_tg() -> bool:
 
 
 def _auto_dry_run_on_missing_env() -> bool:
-    return _env_bool("AUTO_DRY_RUN_ON_MISSING_ENV", default=True)
+    if not _env_bool("AUTO_DRY_RUN_ON_MISSING_ENV", default=True):
+        return False
+    return bool(_missing_required_env_vars())
 
 
 def _is_dry_run() -> bool:
@@ -332,6 +334,7 @@ class BaseSymbolParams:
     lot_step: float = 0.01
     lot_min: float = 0.01
     lot_max: float = 100.0
+    hard_lot_cap: float = 1.0         # Risk-management hard cap (independent of broker max)
     contract_size: float = 100.0      # 1 lot = 100 oz (XAU), 1 lot = 1 BTC, etc.
     digits: int = 2                    # Price precision (XAU=2, BTC=2)
     point_value: float = 1.0           # $ value per point per lot
@@ -369,6 +372,7 @@ class BTCSymbolParams(BaseSymbolParams):
     spread_limit_pct: float = 0.0005
     # BTC contract/lot specifics
     contract_size: float = 1.0         # 1 lot = 1 BTC
+    hard_lot_cap: float = 0.50         # Risk hard cap: max 0.50 BTC per order
     digits: int = 2                    # BTC price to 2 decimals
     point_value: float = 1.0           # $1 per point per lot
 
@@ -422,6 +426,8 @@ class BaseEngineConfig:
     max_risk_per_trade: float = 0.015             # 1.5% — conservative institutional default
     analysis_cooldown_sec: float = 12.0
     max_orders_per_signal: int = 1
+    max_open_positions_per_asset: int = 5
+    max_concurrent_positions_total: int = 5
     signal_cooldown_sec_override: float = 0.0
 
     # ─── ATR-based SL/TP ─────────────────────────────────────────
@@ -460,8 +466,11 @@ class BaseEngineConfig:
     })
 
     # ─── Signal ──────────────────────────────────────────────────
-    min_confidence: int = 80         # QUANTUM SNIPER MODE: Only high-prob trades
+    min_confidence: int = 75         # Sniper floor: 75% balances quality with signal rate (hard min: 70)
     signal_min_score: float = 70.0   # Minimum internal score to even consider
+    ml_bridge_enabled: bool = True
+    ml_bridge_min_confidence: float = 0.80
+    ml_bridge_allow_neutral_pipeline: bool = False  # Indicator/pipeline veto is authoritative by default
     adx_min: float = 20.0
     adx_trend_min: float = 25.0
     high_accuracy_mode: bool = True

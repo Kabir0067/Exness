@@ -25,12 +25,12 @@ from mt5_client import MT5_LOCK, ensure_mt5
 LOG_DIR = LOG_ROOT
 
 log_feed = logging.getLogger("feed_btc")
-log_feed.setLevel(logging.ERROR)
+log_feed.setLevel(logging.WARNING)
 log_feed.propagate = False
 
 if not any(isinstance(h, logging.FileHandler) for h in log_feed.handlers):
     fh = logging.FileHandler(str(get_log_path("btc_feed.log")), encoding="utf-8", delay=True)
-    fh.setLevel(logging.ERROR)
+    fh.setLevel(logging.WARNING)
     fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
     log_feed.addHandler(fh)
 

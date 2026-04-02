@@ -1303,8 +1303,22 @@ def _safe_retrain_models(notifier: NotifierLike) -> bool:
         return False
 
 
+_RETRAIN_SESSION_COUNT: int = 0
+_RETRAIN_SESSION_MAX: int = int(os.environ.get("RETRAIN_SESSION_MAX", "3") or 3)
+
+
 def _run_retraining_cycle(notifier: NotifierLike, *, reason: str) -> bool:
-    log.warning("Retraining cycle started | reason=%s", reason)
+    global _RETRAIN_SESSION_COUNT
+    _RETRAIN_SESSION_COUNT += 1
+    if _RETRAIN_SESSION_COUNT > _RETRAIN_SESSION_MAX:
+        log.warning(
+            "RETRAIN_SESSION_LIMIT_REACHED | attempts=%d max=%d reason=%s | "
+            "Continuing with existing model to prevent infinite retrain loop.",
+            _RETRAIN_SESSION_COUNT, _RETRAIN_SESSION_MAX, reason,
+        )
+        return False
+    log.warning("Retraining cycle started | reason=%s attempt=%d/%d",
+                reason, _RETRAIN_SESSION_COUNT, _RETRAIN_SESSION_MAX)
     success = False
     try:
         try:

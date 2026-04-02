@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import html
 import re
+import time
 import traceback
+import threading
 from typing import Any, Callable, Dict
 
 import telebot
@@ -100,6 +102,25 @@ from .bot_utils import (
     tg_call,
     _summary_cache,
 )
+
+# =============================================================================
+# Handler debounce — rejects duplicate commands within 1.5s (button storm protection)
+# =============================================================================
+_HANDLER_LAST_TS: Dict[str, float] = {}
+_HANDLER_LOCK = threading.Lock()
+_HANDLER_DEBOUNCE_SEC = 1.5
+
+
+def _debounce_check(key: str) -> bool:
+    """Return True if command should proceed; False if it arrived too soon after the last one."""
+    now = time.time()
+    with _HANDLER_LOCK:
+        last = _HANDLER_LAST_TS.get(key, 0.0)
+        if now - last < _HANDLER_DEBOUNCE_SEC:
+            return False
+        _HANDLER_LAST_TS[key] = now
+    return True
+
 
 # =============================================================================
 # Bot instance
@@ -434,6 +455,9 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
 
     # Buy/Sell: first choose side, then count
     if data in ("buy_btc", "sell_btc", "buy_xau", "sell_xau"):
+        if not _debounce_check(f"helper:{call.message.chat.id}:{data}"):
+            bot.answer_callback_query(call.id, "⏳ Обрабатывается...", show_alert=False)
+            return
         try:
             st = engine.status()
             if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
@@ -1214,6 +1238,9 @@ def handle_balance(message: telebot.types.Message) -> None:
 
 
 def handle_trade_start(message: telebot.types.Message) -> None:
+    if not _debounce_check(f"start:{message.chat.id}"):
+        bot.send_message(message.chat.id, "⏳ Команда уже обрабатывается...", parse_mode="HTML")
+        return
     try:
         st = engine.status()
         if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
@@ -1259,6 +1286,9 @@ def handle_trade_start(message: telebot.types.Message) -> None:
 
 
 def handle_trade_stop(message: telebot.types.Message) -> None:
+    if not _debounce_check(f"stop:{message.chat.id}"):
+        bot.send_message(message.chat.id, "⏳ Команда уже обрабатывается...", parse_mode="HTML")
+        return
     try:
         st = engine.status()
         was_active = engine.request_manual_stop()

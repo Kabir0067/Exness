@@ -6,6 +6,7 @@ from typing import Any, Dict, Literal, Optional
 from zoneinfo import ZoneInfo
 
 import logging
+import sys
 import time
 from logging.handlers import RotatingFileHandler
 

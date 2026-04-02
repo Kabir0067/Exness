@@ -31,6 +31,21 @@ def safe_last(arr: np.ndarray, default: float = 0.0) -> float:
     return v if math.isfinite(v) else default
 
 
+def _shifted_last(arr: np.ndarray, shift: int, default: float = 0.0) -> float:
+    """
+    Extract shift-aware last value.
+    shift=0 → arr[-1]  (current bar)
+    shift=1 → arr[-2]  (previous bar, prevents lookahead)
+    """
+    if arr is None or len(arr) == 0:
+        return default
+    pos = 1 + shift  # 1-based distance from end
+    if pos > len(arr):
+        return default
+    v = float(arr[-pos])
+    return v if math.isfinite(v) else default
+
+
 @dataclass
 class AnomalyResult:
     score: float = 0.0
@@ -143,10 +158,12 @@ class FeatureEngine:
                 result[tf] = self._compute_tf(tf=tf, df=df, shift=shift)
             except Exception as exc:
                 log.error(
-                    "compute_indicators(%s) error: %s\n%s",
+                    "compute_indicators(tf=%s) failed: %s\n%s",
                     tf, exc, traceback.format_exc(),
                 )
-                result[tf] = {}
+                raise RuntimeError(
+                    f"feature computation failed for tf={tf}: {exc}"
+                ) from exc
 
         # MTF alignment
         if len(result) >= 2:
@@ -227,13 +244,15 @@ class FeatureEngine:
 
         # ── ATR (TA-Lib) ──
         atr = self._nan_to_num(talib.ATR(h, l, c, timeperiod=self._atr_period), 0.0)
-        atr_last = safe_last(atr)
-        close_last = float(c[-shift]) if shift < len(c) else float(c[-1])
+        atr_last = _shifted_last(atr, shift)
+        _cl_pos = 1 + shift  # 1-based offset from end
+        close_last = float(c[-_cl_pos]) if _cl_pos <= len(c) else float(c[-1])
         atr_pct = atr_last / close_last if close_last > 0 else 0.0
 
-        # ── Fractal efficiency & volatility ──
-        ker = kaufman_efficiency_ratio(c, period=self._ker_period)
-        rvi = relative_volatility_index(c, period=self._rvi_period)
+        # ── Fractal efficiency & volatility (shift-aware) ──
+        _c_for_ker = c[:len(c)-shift] if shift > 0 and shift < len(c) else c
+        ker = kaufman_efficiency_ratio(_c_for_ker, period=self._ker_period)
+        rvi = relative_volatility_index(_c_for_ker, period=self._rvi_period)
 
         # ── ADX (TA-Lib) ──
         adx = self._nan_to_num(talib.ADX(h, l, c, timeperiod=self._adx_period), 0.0)
@@ -249,10 +268,12 @@ class FeatureEngine:
         bb_upper = self._nan_to_num(bb_upper, c0)
         bb_middle = self._nan_to_num(bb_middle, c0)
         bb_lower = self._nan_to_num(bb_lower, c0)
-        bb_width = (safe_last(bb_upper) - safe_last(bb_lower)) / safe_last(bb_middle) \
-            if safe_last(bb_middle) > 0 else 0.0
-        bb_pctb = (close_last - safe_last(bb_lower)) / (safe_last(bb_upper) - safe_last(bb_lower)) \
-            if (safe_last(bb_upper) - safe_last(bb_lower)) > 0 else 0.5
+        _bb_u = _shifted_last(bb_upper, shift)
+        _bb_l = _shifted_last(bb_lower, shift)
+        _bb_m = _shifted_last(bb_middle, shift)
+        bb_width = (_bb_u - _bb_l) / _bb_m if _bb_m > 0 else 0.0
+        bb_pctb = (close_last - _bb_l) / (_bb_u - _bb_l) \
+            if (_bb_u - _bb_l) > 0 else 0.5
 
         # ── Momentum & Volatility (TA-Lib) ──
         cci = self._nan_to_num(talib.CCI(h, l, c, timeperiod=self._cci_period), 0.0)
@@ -270,45 +291,78 @@ class FeatureEngine:
         stoch_d = self._nan_to_num(stoch_d, 50.0)
         obv = self._nan_to_num(talib.OBV(c, v), 0.0)
 
-        # ── VWAP ──
-        vwap = self._vwap(df, window=20)
+        # ── Shift-aware arrays and DataFrame for pattern/helper functions ──
+        # When shift>0, trim arrays/df so [-1] refers to the shifted bar,
+        # preventing lookahead bias in backtest mode.  (forensic fix 2026-04-02)
+        if shift > 0 and shift < len(c):
+            _c_s = c[:-shift]
+            _h_s = h[:-shift]
+            _l_s = l[:-shift]
+            _o_s = o[:-shift]
+            _v_s = v[:-shift]
+            _atr_s = atr[:-shift]
+            _rsi_s = rsi[:-shift]
+            _df_s = df.iloc[:-shift]
+        else:
+            _c_s, _h_s, _l_s, _o_s, _v_s = c, h, l, o, v
+            _atr_s, _rsi_s = atr, rsi
+            _df_s = df
 
-        # ── Volume Z-Score ──
-        z_vol = self._z_score(v, period=50)
+        # Recompute atr_last and z_vol on shifted arrays for pattern functions
+        _atr_last_s = safe_last(_atr_s)
+
+        # ── VWAP (shift-aware) ──
+        vwap = self._vwap(_df_s, window=20)
+
+        # ── Volume Z-Score (shift-aware) ──
+        z_vol = self._z_score(_v_s, period=50)
         z_vol_series = self._z_score_series(v, period=50)
+        if shift > 0 and shift < len(z_vol_series):
+            _z_vol_s = z_vol_series[:-shift]
+        else:
+            _z_vol_s = z_vol_series
+        _z_vol_s_scalar = z_vol
 
-        # ── Trend ──
-        trend = self._determine_trend(c, ema_m, ema_l, ema_a, adx)
+        # ── Trend (shift-aware) ──
+        trend = self._determine_trend(
+            c, ema_m, ema_l, ema_a, adx, shift=shift,
+        )
 
-        # ── Linreg slope ──
-        linreg_slope = self.linreg_trend_slope(c, period=20)
+        # ── Linreg slope (shift-aware) ──
+        linreg_slope = self.linreg_trend_slope(_c_s, period=20)
 
-        # ── Volatility regime ──
-        vol_regime, atr_ratio = self.volatility_regime(atr, period=50)
+        # ── Volatility regime (shift-aware) ──
+        vol_regime, atr_ratio = self.volatility_regime(_atr_s, period=50)
 
-        # ── Divergence ──
-        div = self._detect_divergence_swings(ind=rsi, price=c)
+        # ── Divergence (shift-aware) ──
+        div = self._detect_divergence_swings(ind=_rsi_s, price=_c_s)
 
-        # ── Forecast ──
-        forecast = self.forecast_continuation(df, v)
+        # ── Forecast (shift-aware) ──
+        forecast = self.forecast_continuation(_df_s, _v_s)
 
-        # ── Smart money patterns ──
-        fvg = self._detect_fvg(df, atr)
-        sweep = self._liquidity_sweep(df, atr_last=atr_last, z_volume=z_vol, adx=adx)
-        ob = self._order_block(df, atr_last=atr_last, v=v, z_vol_series=z_vol_series)
+        # ── Smart money patterns (shift-aware) ──
+        fvg = self._detect_fvg(_df_s, _atr_s)
+        sweep = self._liquidity_sweep(
+            _df_s, atr_last=_atr_last_s, z_volume=_z_vol_s_scalar, adx=adx,
+        )
+        ob = self._order_block(
+            _df_s, atr_last=_atr_last_s, v=_v_s, z_vol_series=_z_vol_s,
+        )
         stop_hunt_side, stop_hunt_strength = self._stop_hunt_profile(
-            df=df,
-            atr_last=atr_last,
-            z_volume=z_vol,
+            df=_df_s,
+            atr_last=_atr_last_s,
+            z_volume=_z_vol_s_scalar,
             sweep=sweep,
         )
-        ob_touch_prox, ob_pretouch_bias = self._order_block_pretouch(df=df, atr_last=atr_last)
+        ob_touch_prox, ob_pretouch_bias = self._order_block_pretouch(
+            df=_df_s, atr_last=_atr_last_s,
+        )
         near_rn = self._near_round_number(price=close_last, atr=atr_last)
 
-        # ── Anomalies ──
+        # ── Anomalies (shift-aware) ──
         anomaly = self._detect_market_anomalies(
-            dfp=df, atr_series=atr, z_vol_series=z_vol_series,
-            adx=safe_last(adx),
+            dfp=_df_s, atr_series=_atr_s, z_vol_series=_z_vol_s,
+            adx=_shifted_last(adx, shift),
         )
 
         # ── Confluence ──
@@ -324,8 +378,8 @@ class FeatureEngine:
             vwap_dist_atr=abs(close_last - vwap) / atr_last if atr_last > 0 else 0.0,
         )
 
-        # Build output (shift-aware)
-        idx = -shift if shift < len(c) else -1
+        # Build output (shift-aware): shift=0 → idx=-1 (current), shift=1 → idx=-2 (prev)
+        idx = -(1 + shift) if (1 + shift) <= len(c) else -1
         out = {
             # EMAs
             "ema_short": float(ema_s[idx]),
@@ -345,11 +399,11 @@ class FeatureEngine:
             "ker": float(ker),
             "rvi": float(rvi),
             # ADX
-            "adx": safe_last(adx),
+            "adx": _shifted_last(adx, shift),
             # Bollinger
-            "bb_upper": safe_last(bb_upper),
-            "bb_lower": safe_last(bb_lower),
-            "bb_middle": safe_last(bb_middle),
+            "bb_upper": _bb_u,
+            "bb_lower": _bb_l,
+            "bb_middle": _bb_m,
             "bb_width": bb_width,
             "bb_pctb": bb_pctb,
             # Momentum / Volatility
@@ -490,15 +544,15 @@ class FeatureEngine:
 
     def _determine_trend(
         self, c: np.ndarray, ema21: np.ndarray, ema50: np.ndarray,
-        ema200: np.ndarray, adx: np.ndarray,
+        ema200: np.ndarray, adx: np.ndarray, *, shift: int = 0,
     ) -> str:
-        """Determine trend direction from EMA stack."""
-        s = safe_last(ema21)
-        m = safe_last(ema50)
-        l = safe_last(ema200)
-        if s > m > l > 0:
+        """Determine trend direction from EMA stack (shift-aware)."""
+        s = _shifted_last(ema21, shift)
+        m = _shifted_last(ema50, shift)
+        l_val = _shifted_last(ema200, shift)
+        if s > m > l_val > 0:
             return "bull"
-        if s < m < l and l > 0:
+        if s < m < l_val and l_val > 0:
             return "bear"
         return "flat"
 
@@ -812,7 +866,8 @@ class FeatureEngine:
     ) -> Tuple[str, float]:
         """
         Detect volatility regime based on ATR ratio.
-        Returns (regime, atr_ratio)
+        Returns (regime, atr_ratio).
+        Note: caller passes shift-trimmed atr_series so [-1] is the correct bar.
         """
         if period is None:
             period = 50

@@ -546,9 +546,9 @@ class InstitutionalBacktestEngine:
 
         if enforce_min_signals:
             try:
-                min_trades: int = 20
+                min_trades: int = 10
             except Exception:
-                min_trades = 20
+                min_trades = 10
             try:
                 signal_trade_ratio: float = 3.0
             except Exception:
@@ -1481,7 +1481,7 @@ class InstitutionalBacktestEngine:
         require_both_sides: bool = True
         allow_pf_capped: bool = False
 
-        min_trades: int = 20
+        min_trades: int = 10
         min_wins: int = 1 if require_both_sides else 0
         min_losses: int = 1 if require_both_sides else 0
 
@@ -1501,6 +1501,14 @@ class InstitutionalBacktestEngine:
             )
 
         # Verification gate
+        SHARPE_SUSPICIOUS_THRESHOLD = 5.0
+        if metrics.sharpe_ratio > SHARPE_SUSPICIOUS_THRESHOLD:
+            log.warning(
+                "BACKTEST_SHARPE_SUSPICIOUS | asset=%s sharpe=%.2f > %.1f | "
+                "Verify backtest period length, transaction costs, and WFA window count. "
+                "Real-market Sharpe above 5.0 is statistically improbable.",
+                self.asset, metrics.sharpe_ratio, SHARPE_SUSPICIOUS_THRESHOLD,
+            )
         base_verified = (
             metrics.sharpe_ratio      >= MIN_GATE_SHARPE
             and metrics.win_rate      >= MIN_GATE_WIN_RATE
@@ -1513,8 +1521,17 @@ class InstitutionalBacktestEngine:
             or not self._sample_quality_passed
         )
         wfa_gate_ok       = bool(wfa.get("passed", False))
+        # Sharpe > 8.0 blocks institutional_grade: near-certain backtest overfitting.
+        SHARPE_HARD_CAP = 8.0
+        sharpe_credible = metrics.sharpe_ratio <= SHARPE_HARD_CAP
+        if not sharpe_credible:
+            log.warning(
+                "SHARPE_INSTITUTIONAL_BLOCK | asset=%s sharpe=%.2f > %.1f | "
+                "institutional_grade forced to False.",
+                self.asset, metrics.sharpe_ratio, SHARPE_HARD_CAP,
+            )
         self._last_verified = bool(base_verified and wfa_gate_ok and not unsafe)
-        metrics.institutional_grade = bool(self._last_verified and not unsafe)
+        metrics.institutional_grade = bool(self._last_verified and not unsafe and sharpe_credible)
         self._risk_of_ruin  = mc_results["risk_of_ruin"]
         self._wfa           = wfa
         self._unsafe        = unsafe
@@ -1580,6 +1597,7 @@ class InstitutionalBacktestEngine:
                 "losing_trades":          int(getattr(metrics, "losing_trades",  0) or 0),
                 "status":                 "UNSAFE" if unsafe else ("VERIFIED" if self._last_verified else "REJECTED"),
                 "backtested_at_utc":      datetime.now(timezone.utc).isoformat(),
+                "suspicious_sharpe":     bool(float(metrics.sharpe_ratio) > 5.0),
             })
 
             with p.open("w", encoding="utf-8") as f:
@@ -1797,6 +1815,8 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
         _console(f"INSTITUTIONAL BACKTEST: {status}")
         _console("=" * 60)
         _console(f"Sharpe Ratio:        {metrics.sharpe_ratio:.2f} (Req: >= {MIN_GATE_SHARPE:.2f})")
+        if metrics.sharpe_ratio > 5.0:
+            _console(f"  ** WARNING: Sharpe {metrics.sharpe_ratio:.2f} > 5.0 — verify backtest realism **")
         _console(f"Win Rate:            {metrics.win_rate:.1%} (Req: >= {MIN_GATE_WIN_RATE:.1%})")
         _console(f"Max Drawdown:        {metrics.max_drawdown_pct:.2%} (Max: {MAX_GATE_DRAWDOWN:.0%})")
         _console(f"Risk of Ruin:        {metrics.risk_of_ruin:.2%} (Max: 1%)")

@@ -67,7 +67,7 @@ def _partial_gate_enabled(required_assets: Optional[tuple[str, ...]] = None) -> 
     assets = tuple(required_assets or _required_gate_assets())
     if not _env_truthy("PARTIAL_GATE_MODE", "0"):
         return False
-    if len(assets) > 1 and _env_truthy("STRICT_DUAL_ASSET_MODE", "1"):
+    if len(assets) > 1 and _env_truthy("STRICT_DUAL_ASSET_MODE", "0"):
         return False
     return True
 
@@ -108,6 +108,11 @@ MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 MIN_BACKTEST_SHARPE = MIN_GATE_SHARPE
 MIN_BACKTEST_WIN_RATE = MIN_GATE_WIN_RATE
 RECOVERABLE_HALT_REASONS = frozenset({"mt5_unhealthy", "mt5_disconnected"})
+MONITORING_ONLY_HALT_REASONS = frozenset({
+    "manual_stop",
+    "manual_stop_active",
+    "manual_stop_triggered",
+})
 
 
 class MultiAssetTradingEngine:
@@ -135,6 +140,8 @@ class MultiAssetTradingEngine:
         self._run = threading.Event()
         self._lock = threading.Lock()
         self._order_state_lock = threading.RLock()
+        self._build_pipelines_lock = threading.Lock()  # serializes _build_pipelines calls
+        self._starting = False  # guarded by _lock; prevents duplicate loop thread creation
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_started_ts: float = 0.0
         self._last_runtime_heartbeat_ts: float = 0.0
@@ -379,9 +386,24 @@ class MultiAssetTradingEngine:
 
         # Position tracking for detecting trade closures
         self._last_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
+        xau_max_positions = max(
+            1,
+            int(getattr(self._xau_cfg, "max_open_positions_per_asset", 5) or 5),
+        )
+        btc_max_positions = max(
+            1,
+            int(getattr(self._btc_cfg, "max_open_positions_per_asset", 5) or 5),
+        )
+        portfolio_max_positions = max(
+            1,
+            min(
+                int(getattr(self._xau_cfg, "max_concurrent_positions_total", 5) or 5),
+                int(getattr(self._btc_cfg, "max_concurrent_positions_total", 5) or 5),
+            ),
+        )
         self._max_open_positions: Dict[str, int] = {
-            "XAU": 1,
-            "BTC": 1,
+            "XAU": xau_max_positions,
+            "BTC": btc_max_positions,
         }
         self._max_lot_cap: Dict[str, float] = {
             "XAU": 1.00,
@@ -399,7 +421,7 @@ class MultiAssetTradingEngine:
             max_total_exposure_factor=3.0,     # Cap leverage at 3x
             correlation_reduction=0.50,        # Cut size 50% if correlated
             max_risk_per_trade_pct=self._xau_cfg.max_risk_per_trade,
-            max_concurrent_positions=6,
+            max_concurrent_positions=portfolio_max_positions,
         )
 
         # Decoupled deterministic runtime (FSM ports + runner).
@@ -421,7 +443,8 @@ class MultiAssetTradingEngine:
         print(f"Backtest Status: {bt_status} (Sharpe >= {MIN_BACKTEST_SHARPE:.1f})")
         if not self._backtest_passed:
             print(f"Gate Reason:     {self._gate_last_reason}")
-        print("Signals:         SNIPER MODE (Conf >= 75%)")
+        _display_floor = max(int(getattr(self._xau_cfg, "min_confidence", 75) or 75), 70)
+        print(f"Signals:         SNIPER MODE (Conf >= {_display_floor}%)")
         print("=" * 60 + "\n")
 
     def _load_model_state(self) -> Optional[Dict[str, Any]]:
@@ -935,6 +958,10 @@ class MultiAssetTradingEngine:
 
     # -------------------- pipelines --------------------
     def _build_pipelines(self) -> bool:
+        # Serialize concurrent calls — rapid start/stop/recover cannot overlap here.
+        if not self._build_pipelines_lock.acquire(blocking=False):
+            log_health.warning("BUILD_PIPELINES_SKIPPED | reason=already_building")
+            return False
         try:
             # XAU
             xau_feed = XauMarketFeed(self._xau_cfg, self._xau_cfg.symbol_params)
@@ -962,6 +989,8 @@ class MultiAssetTradingEngine:
         except Exception as exc:
             log_err.error("build pipelines error: %s | tb=%s", exc, traceback.format_exc())
             return False
+        finally:
+            self._build_pipelines_lock.release()
 
     def _restart_exec_worker(self) -> None:
         self._stop_exec_workers(timeout=4.0)
@@ -1166,9 +1195,11 @@ class MultiAssetTradingEngine:
 
     # -------------------- portfolio logic --------------------
     def _next_order_id(self, asset: str) -> str:
-        self._order_counter += 1
+        with self._lock:
+            self._order_counter += 1
+            counter = self._order_counter
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        return f"PORD_{asset}_{ts}_{self._order_counter}_{os.getpid()}"
+        return f"PORD_{asset}_{ts}_{counter}_{os.getpid()}"
 
     def _effective_min_conf(self, c: AssetCandidate) -> float:
         return self._execution_manager.effective_min_conf(c)
@@ -1349,14 +1380,16 @@ class MultiAssetTradingEngine:
     def _live_open_positions_total(self) -> int:
         total = 0
         pipes = (("XAU", getattr(self, "_xau", None)), ("BTC", getattr(self, "_btc", None)))
+        with self._lock:
+            open_pos_snap = dict(self._current_open_positions)
         for asset, pipe in pipes:
             if pipe is None:
-                total += max(0, int(self._current_open_positions.get(asset, 0) or 0))
+                total += max(0, int(open_pos_snap.get(asset, 0) or 0))
                 continue
             try:
                 total += max(0, int(pipe.open_positions()))
             except Exception:
-                total += max(0, int(self._current_open_positions.get(asset, 0) or 0))
+                total += max(0, int(open_pos_snap.get(asset, 0) or 0))
         return int(total)
 
     def _live_risk_halt_reason(self, snapshot: Optional[Dict[str, Any]] = None) -> str:
@@ -1433,7 +1466,9 @@ class MultiAssetTradingEngine:
         reasons: List[str] = []
         if account_reason:
             reasons.append(account_reason)
-        for asset, open_now in self._current_open_positions.items():
+        with self._lock:
+            open_positions_snap = dict(self._current_open_positions)
+        for asset, open_now in open_positions_snap.items():
             max_pos = int(self._max_open_positions.get(asset, 0) or 0)
             if max_pos > 0 and int(open_now) > max_pos:
                 reasons.append(f"open_positions:{asset}:{int(open_now)}>{max_pos}")
@@ -1453,6 +1488,17 @@ class MultiAssetTradingEngine:
             status = "MT5_OFFLINE"
 
         self._prune_signal_window(self._signal_emit_ts_global, now)
+        # Statistical credibility: Wilson score confidence interval for win rate.
+        import math as _math
+        _n = max(1, int(wr_samples))
+        _p = float(live_wr)
+        _z = 1.96  # 95% CI
+        _denom = 1 + (_z * _z / _n)
+        _centre = (_p + _z * _z / (2 * _n)) / _denom
+        _margin = (_z / _denom) * _math.sqrt((_p * (1 - _p) / _n) + (_z * _z / (4 * _n * _n)))
+        wr_ci_lo = max(0.0, _centre - _margin)
+        wr_ci_hi = min(1.0, _centre + _margin)
+
         snapshot = {
             "status": status,
             "reason": "|".join(reasons) if reasons else "ok",
@@ -1467,13 +1513,40 @@ class MultiAssetTradingEngine:
             "dd_pct": float(dd_pct),
             "balance": float(bal),
             "equity": float(eq),
+            # Statistical credibility fields
+            "wr_ci_95_lo": round(wr_ci_lo, 4),
+            "wr_ci_95_hi": round(wr_ci_hi, 4),
         }
         self._live_evidence_state = snapshot
+
+        # PATCH-2: Zero-signal alarm — if engine has been running > 4h with 0 signals,
+        # that means filters are too strict or data is stale. Flag as DEGRADED.
+        _ZERO_SIGNAL_ALARM_SEC = float(os.getenv("ZERO_SIGNAL_ALARM_SEC", "14400") or 14400)
+        if (
+            snapshot["signals_24h"] == 0
+            and self._loop_started_ts > 0
+            and (now - self._loop_started_ts) > _ZERO_SIGNAL_ALARM_SEC
+            and not self._manual_stop
+            and not self.dry_run
+        ):
+            reasons.append("zero_signals_extended")
+            if status == "HEALTHY":
+                status = "DEGRADED"
+                snapshot["status"] = status
+                snapshot["reason"] = "|".join(reasons) if reasons else "ok"
+
+        # PATCH-3: Low-sample confidence flag for win_rate_live.
+        _MIN_TRADES_RELIABLE = 100
+        if snapshot["closed_trade_samples"] < _MIN_TRADES_RELIABLE:
+            snapshot["win_rate_confidence"] = "LOW_SAMPLE"
+        else:
+            snapshot["win_rate_confidence"] = "RELIABLE"
 
         level = log_health.warning if reasons else log_health.info
         level(
             "LIVE_EVIDENCE | status=%s reason=%s latency_p95=%.1f slippage_p95=%.2f "
-            "win_rate_live=%.3f win_rate_ref=%.3f drift=%+.3f dd_pct=%.3f closed_trades=%d signals_24h=%d",
+            "win_rate_live=%.3f win_rate_ref=%.3f drift=%+.3f dd_pct=%.3f "
+            "closed_trades=%d signals_24h=%d wr_confidence=%s",
             snapshot["status"],
             snapshot["reason"],
             snapshot["latency_p95_ms"],
@@ -1484,6 +1557,7 @@ class MultiAssetTradingEngine:
             snapshot["dd_pct"],
             snapshot["closed_trade_samples"],
             snapshot["signals_24h"],
+            snapshot.get("win_rate_confidence", "UNKNOWN"),
         )
         return dict(snapshot)
 
@@ -1506,8 +1580,9 @@ class MultiAssetTradingEngine:
     def _heartbeat(self, open_xau: int, open_btc: int) -> None:
         try:
             self._mark_runtime_alive()
-            self._current_open_positions["XAU"] = int(open_xau)
-            self._current_open_positions["BTC"] = int(open_btc)
+            with self._lock:
+                self._current_open_positions["XAU"] = int(open_xau)
+                self._current_open_positions["BTC"] = int(open_btc)
             now = time.time()
             with MT5_LOCK:
                 acc = mt5.account_info()
@@ -2044,8 +2119,14 @@ class MultiAssetTradingEngine:
 
         t = threading.Thread(target=self._loop, name="portfolio.engine.loop", daemon=True)
         with self._lock:
+            if self._starting:
+                log_health.warning("ENGINE_START_SKIPPED | reason=already_starting")
+                return True
+            self._starting = True
             self._loop_thread = t
         t.start()
+        with self._lock:
+            self._starting = False
         return True
 
     def stop(self) -> bool:
@@ -2177,13 +2258,38 @@ class MultiAssetTradingEngine:
         log_health.info("FSM_TRANSITION | %s -> %s | reason=%s", current.value, nxt.value, reason)
         return nxt
 
-    def _halt_fsm(self, reason: str) -> None:
+    def _resolve_halt_reason(self, reason: str) -> str:
         reason_s = str(reason or "unspecified").strip() or "unspecified"
-        recoverable = reason_s.lower() in RECOVERABLE_HALT_REASONS
+        if reason_s != "live_risk_breach":
+            return reason_s
+        try:
+            snapshot = self._update_live_evidence(force=True)
+        except Exception:
+            snapshot = None
+        try:
+            resolved = str(self._live_risk_halt_reason(snapshot=snapshot) or "").strip()
+        except Exception:
+            resolved = ""
+        if resolved:
+            log_health.warning(
+                "FSM_HALT_REASON_RESOLVED | raw=%s resolved=%s",
+                reason_s,
+                resolved,
+            )
+            return resolved
+        return reason_s
 
-        log_err.critical("FSM_HALT | reason=%s", reason_s)
+    def _halt_fsm(self, reason: str) -> None:
+        reason_s = self._resolve_halt_reason(reason)
+        recoverable = reason_s.lower() in RECOVERABLE_HALT_REASONS
+        monitoring_only = reason_s.lower() in MONITORING_ONLY_HALT_REASONS
+
+        if monitoring_only:
+            log_health.warning("FSM_HALT | reason=%s | mode=monitoring_only", reason_s)
+        else:
+            log_err.critical("FSM_HALT | reason=%s", reason_s)
         with self._lock:
-            if not recoverable:
+            if not (recoverable or monitoring_only):
                 self._manual_stop = True
             self._run.clear()
         self._drain_queue(self._order_q)
@@ -2192,7 +2298,42 @@ class MultiAssetTradingEngine:
             self._order_rm_by_id.clear()
             self._pending_order_meta.clear()
         if recoverable:
-            log_health.warning("FSM_HALT_RECOVERABLE | reason=%s | auto_restart_allowed=True", reason_s)
+            log_health.warning("FSM_HALT_RECOVERABLE | reason=%s | attempting_auto_restart", reason_s)
+            # Schedule auto-restart in a daemon thread after brief cooldown.
+            # _recover_all() re-inits MT5, rebuilds pipelines, restarts workers.
+            def _auto_restart():
+                _MAX_RESTART_ATTEMPTS = 3
+                for attempt in range(1, _MAX_RESTART_ATTEMPTS + 1):
+                    delay = 10.0 * attempt  # 10s, 20s, 30s backoff
+                    log_health.info(
+                        "FSM_AUTO_RESTART_ATTEMPT | reason=%s attempt=%d/%d delay=%.0fs",
+                        reason_s, attempt, _MAX_RESTART_ATTEMPTS, delay,
+                    )
+                    time.sleep(delay)
+                    try:
+                        ok = self._recover_all()
+                        if ok:
+                            log_health.info("FSM_AUTO_RESTART_OK | reason=%s attempt=%d", reason_s, attempt)
+                            self.start()
+                            return
+                        log_err.error(
+                            "FSM_AUTO_RESTART_FAILED | reason=%s attempt=%d/%d | _recover_all=False",
+                            reason_s, attempt, _MAX_RESTART_ATTEMPTS,
+                        )
+                    except Exception as exc:
+                        log_err.error(
+                            "FSM_AUTO_RESTART_EXCEPTION | reason=%s attempt=%d/%d err=%s",
+                            reason_s, attempt, _MAX_RESTART_ATTEMPTS, exc,
+                        )
+                log_err.critical(
+                    "FSM_AUTO_RESTART_EXHAUSTED | reason=%s | all %d attempts failed — manual intervention required",
+                    reason_s, _MAX_RESTART_ATTEMPTS,
+                )
+            t = threading.Thread(target=_auto_restart, name="fsm.auto_restart", daemon=True)
+            t.start()
+            return
+        if monitoring_only:
+            log_health.info("FSM_HALT_MONITORING_ONLY | reason=%s | auto_restart_allowed=False", reason_s)
             return
 
         self._emergency_flatten(f"fsm_halt:{reason_s}")

@@ -455,10 +455,12 @@ class SignalEngine:
             # Cap confidence by strength
             conf = self._cap_conf_by_strength(conf, net_abs)
 
-            # ── QUANTUM SNIPER FILTER ──
-            # Strict 80% confidence floor as demanded by USER
-            sniper_floor = max(int(getattr(self.cfg, "min_confidence", 80) or 80), 80)
-            if conf < sniper_floor or (float(conf) / 100.0) < 0.80:
+            # ── SNIPER FILTER ──
+            # Configurable confidence floor. Hard minimum 70% prevents noise trades.
+            # Default 75% balances selectivity with signal rate.
+            _SNIPER_HARD_MIN = 70
+            sniper_floor = max(int(getattr(self.cfg, "min_confidence", 75) or 75), _SNIPER_HARD_MIN)
+            if conf < sniper_floor:
                 return self._neutral(
                     sym, reasons + [f"sniper_reject:{conf}<{sniper_floor}"], t0,
                     confidence=conf, spread_pct=spread_pct, bar_key=bar_key,
@@ -808,9 +810,13 @@ class SignalEngine:
         buy_score += max(0, mr_val) * weights["mean_reversion"]
         sell_score += max(0, -mr_val) * weights["mean_reversion"]
 
-        # Volatility (direction-neutral boost)
-        buy_score += vol_score * weights["volatility"] * 0.5
-        sell_score += vol_score * weights["volatility"] * 0.5
+        # Volatility — amplifies whichever side is already leading.
+        # Previous code added identical amounts to both sides, which cancelled
+        # in net = buy - sell (10% of weight budget was dead).
+        if buy_score >= sell_score:
+            buy_score += vol_score * weights["volatility"]
+        else:
+            sell_score += vol_score * weights["volatility"]
 
         # Flow (OFI-style combined edge)
         if micro_edge > 0.0:
@@ -1485,7 +1491,7 @@ class SignalEngine:
             if len(c) < 10:
                 return True
             # Check for extreme volatility that might indicate unreliable data
-            pct_changes = np.abs(np.diff(c[-10:])) / c[-11:-1]
+            pct_changes = np.abs(np.diff(c[-10:])) / c[-10:-1]
             median_pct = float(np.median(pct_changes))
             last_pct = float(pct_changes[-1]) if len(pct_changes) > 0 else 0.0
             return last_pct < median_pct * 5
@@ -1588,23 +1594,10 @@ class SignalEngine:
             if signal == "Neutral":
                 return signal, conf
 
-        # D1 conflict penalty (daily trend opposes signal)
-        if signal in ("Buy", "Sell") and dfd is not None:
-            try:
-                d1_result = self._d1_confluence_score(dfd)
-                d1_val = d1_result.get("value", 0.0)
-                if abs(d1_val) > 0.2:  # Only penalize on clear daily trend
-                    d1_conflict = (
-                        (signal == "Buy" and d1_val < -0.2) or
-                        (signal == "Sell" and d1_val > 0.2)
-                    )
-                    if d1_conflict:
-                        d1_pen = 0.15  # 15% confidence penalty for D1 conflict
-                        conf = int(conf * (1.0 - d1_pen))
-                        if reasons is not None:
-                            reasons.append(f"d1_conflict:{d1_val:+.2f}")
-            except Exception:
-                pass
+        # D1 conflict penalty — REMOVED (2026-04-02 forensic audit).
+        # D1 confluence is already applied in _ensemble_score (line ~861) where
+        # it adjusts the net score. Applying it a second time here as a 15%
+        # confidence multiplier caused double-penalization from the same data.
 
         return signal, conf
 

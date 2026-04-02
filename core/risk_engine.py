@@ -1345,7 +1345,8 @@ class RiskManager:
         self._ensure_ready()
         eq = float(self._acc.equity or 0.0)
         if eq <= 0:
-            return 0.01
+            log.warning("calculate_position_size: equity=%.2f <= 0, returning 0.0", eq)
+            return 0.0
 
         # Fractional Kelly risk percent (SAFE institutional sizing)
         conf_raw = float(confidence or 0.0)
@@ -1434,7 +1435,15 @@ class RiskManager:
 
         if not _is_finite(lot_raw):
             return lot_min
-        return max(lot_min, min(lot_max, round(lot_raw, 8)))
+        lot_clamped = max(lot_min, min(lot_max, round(lot_raw, 8)))
+        hard_cap = float(getattr(self.sp, "hard_lot_cap", 0) or 0)
+        if hard_cap > 0 and lot_clamped > hard_cap:
+            log.warning(
+                "HARD_LOT_CAP | symbol=%s lot_raw=%.4f clamped_to=%.4f hard_cap=%.4f",
+                self.sp.symbol, lot_clamped, hard_cap, hard_cap,
+            )
+            lot_clamped = hard_cap
+        return lot_clamped
 
     # ─── SL/TP calculation methods ───────────────────────────────────
 
@@ -1771,7 +1780,15 @@ class RiskManager:
             return result
 
         # ── Position size ──
-        lot = self.calculate_position_size(side_n, entry, sl, tp, confidence, adapt=adapt)
+        # When a structural SL is used, override the ATR-based stop distance
+        # in the sizing formula with the actual SL distance (forensic fix BUG-5).
+        _sizing_adapt = dict(adapt) if isinstance(adapt, dict) else {}
+        actual_sl_dist = abs(entry - sl)
+        if actual_sl_dist > 0 and struct_sl is not None:
+            sl_m = float(self.cfg.atr_sl_multiplier or 2.5)
+            if sl_m > 0:
+                _sizing_adapt["atr"] = actual_sl_dist / sl_m
+        lot = self.calculate_position_size(side_n, entry, sl, tp, confidence, adapt=_sizing_adapt)
         if lot <= 0:
             result["reason"] = "kelly_zero"
             result["entry"] = entry
@@ -1896,8 +1913,9 @@ class RiskManager:
                         p95_slip, self.sp.base,
                     )
 
-        # Periodic CSV flush
-        self._update_execution_analysis(metrics)
+        # Fill telemetry must be durable immediately so broker fills are not
+        # missing from CSV if the process stalls or restarts moments later.
+        self._flush_exec_csv(force=True)
 
     def record_execution_failure(
         self, order_id: str, enqueue_time: float, send_time: float, reason: str,

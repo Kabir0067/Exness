@@ -1,6 +1,6 @@
 {
   "gold::scalping": {
-    "saved_ts": 1774935610.424218,
+    "saved_ts": 1775121043.45504,
     "ttl_sec": 3600.0,
     "data": {
       "status": "live",
@@ -13,88 +13,6 @@
       "window_hours": 4,
       "headlines": [],
       "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=4 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only"
-    }
-  },
-  "gold::intraday": {
-    "saved_ts": 1774935826.867854,
-    "ttl_sec": 10800.0,
-    "data": {
-      "status": "live",
-      "asset": "gold",
-      "trade_style": "intraday",
-      "bias": "neutral",
-      "avg_sentiment": 0.0,
-      "headline_count": 0,
-      "high_impact_count": 0,
-      "window_hours": 18,
-      "headlines": [],
-      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=18 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=directional_overlay"
-    }
-  },
-  "btc::scalping": {
-    "saved_ts": 1774935882.1733558,
-    "ttl_sec": 3600.0,
-    "data": {
-      "status": "live",
-      "asset": "btc",
-      "trade_style": "scalping",
-      "bias": "neutral",
-      "avg_sentiment": -0.1412,
-      "headline_count": 1,
-      "high_impact_count": 0,
-      "window_hours": 4,
-      "headlines": [
-        {
-          "title": "Bitcoin, Ethereum Rally, While XRP, Dogecoin Flat Amid Trump's 'Serious' Iran Discussions: Analyst Says '",
-          "source": "benzinga.com",
-          "published_at": "2026-03-31T02:09:12.000000Z",
-          "url": "https://www.benzinga.com/crypto/cryptocurrency/26/03/51557756/crypto-flat-amid-iran-risks-analyst-sees-big-money-flow",
-          "score": -0.1412,
-          "high_impact": false
-        }
-      ],
-      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=4 | ARTICLES=1 | AVG_SENTIMENT=-0.14 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only\nTOP_HEADLINES:\n- 2026-03-31T02:09:12.000000Z | benzinga.com | score=-0.14 | Bitcoin, Ethereum Rally, While XRP, Dogecoin Flat Amid Trump's 'Serious' Iran Discussions: Analyst Says '"
-    }
-  },
-  "btc::intraday": {
-    "saved_ts": 1774937536.8138437,
-    "ttl_sec": 10800.0,
-    "data": {
-      "status": "live",
-      "asset": "btc",
-      "trade_style": "intraday",
-      "bias": "bullish",
-      "avg_sentiment": 0.2323,
-      "headline_count": 3,
-      "high_impact_count": 0,
-      "window_hours": 12,
-      "headlines": [
-        {
-          "title": "Bitcoin, Ethereum Rally, While XRP, Dogecoin Flat Amid Trump's 'Serious' Iran Discussions: Analyst Says '",
-          "source": "benzinga.com",
-          "published_at": "2026-03-31T02:09:12.000000Z",
-          "url": "https://www.benzinga.com/crypto/cryptocurrency/26/03/51557756/crypto-flat-amid-iran-risks-analyst-sees-big-money-flow",
-          "score": -0.1412,
-          "high_impact": false
-        },
-        {
-          "title": "Bull Run Cycle Approaching: Should You Buy Bitcoin and Solana now",
-          "source": "financefeeds.com",
-          "published_at": "2026-03-31T01:20:28.000000Z",
-          "url": "https://financefeeds.com/bull-run-cycle-approaching-should-you-buy-bitcoin-and-solana-now-or-there-is-a-better-choice/",
-          "score": 0.3018,
-          "high_impact": false
-        },
-        {
-          "title": "Best Crypto to Invest in as Same Pepe Cofounder Is Launching A new Meme Coin While DOGE BTC and Midas Build",
-          "source": "financefeeds.com",
-          "published_at": "2026-03-31T01:20:12.000000Z",
-          "url": "https://financefeeds.com/best-crypto-to-invest-in-as-same-pepe-cofounder-is-launching-a-new-meme-coin-while-doge-btc-and-midas-build/",
-          "score": 0.5364,
-          "high_impact": false
-        }
-      ],
-      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=12 | ARTICLES=3 | AVG_SENTIMENT=+0.23 | BIAS=BULLISH | HIGH_IMPACT=0 | RULE=directional_overlay\nTOP_HEADLINES:\n- 2026-03-31T02:09:12.000000Z | benzinga.com | score=-0.14 | Bitcoin, Ethereum Rally, While XRP, Dogecoin Flat Amid Trump's 'Serious' Iran Discussions: Analyst Says '\n- 2026-03-31T01:20:28.000000Z | financefeeds.com | score=+0.30 | Bull Run Cycle Approaching: Should You Buy Bitcoin and Solana now\n- 2026-03-31T01:20:12.000000Z | financefeeds.com | score=+0.54 | Best Crypto to Invest in as Same Pepe Cofounder Is Launching A new Meme Coin While DOGE BTC and Midas Build"
     }
   }
 }

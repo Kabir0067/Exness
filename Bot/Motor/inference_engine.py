@@ -322,6 +322,30 @@ class InferenceEngine:
                 else last_close * 0.001
             )
 
+            # Compute live indicator values for payload frames (replaces hardcoded neutrals).
+            live_rsi = 50.0
+            live_ema20 = last_close
+            live_ema50 = last_close
+            live_ema200 = last_close
+            try:
+                _c = np.asarray(df["Close"].values, dtype=np.float64)
+                if len(_c) >= 200:
+                    import talib as _talib
+                    _rsi_arr = _talib.RSI(_c, timeperiod=14)
+                    _ema20_arr = _talib.EMA(_c, timeperiod=20)
+                    _ema50_arr = _talib.EMA(_c, timeperiod=50)
+                    _ema200_arr = _talib.EMA(_c, timeperiod=200)
+                    if np.isfinite(_rsi_arr[-1]):
+                        live_rsi = float(_rsi_arr[-1])
+                    if np.isfinite(_ema20_arr[-1]):
+                        live_ema20 = float(_ema20_arr[-1])
+                    if np.isfinite(_ema50_arr[-1]):
+                        live_ema50 = float(_ema50_arr[-1])
+                    if np.isfinite(_ema200_arr[-1]):
+                        live_ema200 = float(_ema200_arr[-1])
+            except Exception:
+                pass
+
             flow_confirm = 0.0
             try:
                 feed = getattr(pipe, "feed", None)
@@ -360,10 +384,10 @@ class InferenceEngine:
                             "ts_bar": float(df.index[-1].timestamp()),
                             "last_close": last_close,
                             "atr_14": atr_val,
-                            "rsi_14": 50.0,
-                            "ema_20": last_close,
-                            "ema_50": last_close,
-                            "ema_200": last_close,
+                            "rsi_14": live_rsi,
+                            "ema_20": live_ema20,
+                            "ema_50": live_ema50,
+                            "ema_200": live_ema200,
                         }
                     },
                     intraday_payload=None,
@@ -388,10 +412,10 @@ class InferenceEngine:
                             "ts_bar": float(df.index[-1].timestamp()),
                             "last_close": last_close,
                             "atr_14": atr_val,
-                            "rsi_14": 50.0,
-                            "ema_20": last_close,
-                            "ema_50": last_close,
-                            "ema_200": last_close,
+                            "rsi_14": live_rsi,
+                            "ema_20": live_ema20,
+                            "ema_50": live_ema50,
+                            "ema_200": live_ema200,
                         }
                     },
                     intraday_payload=None,
@@ -416,10 +440,10 @@ class InferenceEngine:
                             "ts_bar": float(df.index[-1].timestamp()),
                             "last_close": last_close,
                             "atr_14": atr_val,
-                            "rsi_14": 50.0,
-                            "ema_20": last_close,
-                            "ema_50": last_close,
-                            "ema_200": last_close,
+                            "rsi_14": live_rsi,
+                            "ema_20": live_ema20,
+                            "ema_50": live_ema50,
+                            "ema_200": live_ema200,
                         }
                     },
                     intraday_payload=None,
@@ -479,10 +503,10 @@ class InferenceEngine:
                 "ts_bar": float(df.index[-1].timestamp()),
                 "last_close": last_close,
                 "atr_14": atr_val,
-                "rsi_14": 50.0,
-                "ema_20": last_close,
-                "ema_50": last_close,
-                "ema_200": last_close,
+                "rsi_14": live_rsi,
+                "ema_20": live_ema20,
+                "ema_50": live_ema50,
+                "ema_200": live_ema200,
             }
 
             out = MLSignal(
@@ -649,6 +673,162 @@ class InferenceEngine:
             tp = min(float(base_tp), entry - atr * (1.30 + c))
         return sl, tp
 
+    @staticmethod
+    def _frame_bar_key(frame: Dict[str, Any]) -> str:
+        raw = frame.get("ts_bar")
+        if raw is None:
+            raw = frame.get("t_close")
+        if isinstance(raw, (int, float)):
+            try:
+                return str(int(float(raw)))
+            except Exception:
+                return str(raw)
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s:
+                parsed = parse_bar_key(s)
+                if parsed is not None:
+                    return str(int(parsed.timestamp()))
+                return s.replace(" ", "_")
+        return str(int(time.time()))
+
+    def _build_ml_bridge_candidate(
+        self,
+        asset: str,
+        sig: MLSignal,
+        pipe: Any,
+        inst_candidate: AssetCandidate,
+    ) -> Optional[AssetCandidate]:
+        e = self._e
+        cfg = e._xau_cfg if asset == "XAU" else e._btc_cfg
+        if not bool(getattr(cfg, "ml_bridge_enabled", True)):
+            return None
+
+        pipeline_signal = str(getattr(inst_candidate, "signal", "") or "").strip()
+        allow_neutral_pipeline = bool(getattr(cfg, "ml_bridge_allow_neutral_pipeline", False))
+        if pipeline_signal not in ("Buy", "Sell") and not allow_neutral_pipeline:
+            log_health.info(
+                "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s pipeline_signal=%s reason=indicator_veto",
+                asset,
+                sig.signal,
+                pipeline_signal or "Neutral",
+            )
+            return None
+
+        sig_name = str(sig.signal or "").upper().strip()
+        if sig_name not in ("STRONG BUY", "STRONG SELL"):
+            return None
+
+        conf = max(0.0, min(1.0, float(sig.confidence or 0.0)))
+        min_conf = max(0.0, min(1.0, float(getattr(cfg, "ml_bridge_min_confidence", 0.80) or 0.80)))
+        if conf < min_conf:
+            return None
+
+        frame = self.extract_payload_frame(sig.scalp_payload)
+        if not frame:
+            frame = self.extract_payload_frame(sig.intraday_payload)
+
+        entry = float(sig.entry or frame.get("last_close", 0.0) or getattr(pipe, "last_market_close", 0.0) or 0.0)
+        if entry <= 0.0:
+            log_health.info(
+                "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s reason=no_entry_price",
+                asset,
+                sig.signal,
+            )
+            return None
+
+        try:
+            open_positions = int(e._asset_open_positions(asset))
+        except Exception:
+            open_positions = 0
+        try:
+            max_positions = int(e._asset_max_positions(asset))
+        except Exception:
+            max_positions = 0
+
+        adapt = {
+            "regime": "ml_router",
+            "confidence": conf,
+            "atr": float(frame.get("atr_14", 0.0) or 0.0),
+            "atr_pct": float(frame.get("atr_pct", 0.0) or 0.0),
+            "ker": float(frame.get("ker", 0.0) or 0.0),
+            "rvi": float(frame.get("rvi", 0.0) or 0.0),
+            "stop_hunt_strength": float(frame.get("stop_hunt_strength", 0.0) or 0.0),
+            "ob_touch_proximity": float(
+                frame.get("ob_touch_proximity", frame.get("ob_pretouch_bias", 0.0)) or 0.0
+            ),
+        }
+
+        try:
+            plan = pipe.risk.plan_order(
+                side=str(sig.side),
+                confidence=conf,
+                ind=dict(frame),
+                adapt=adapt,
+                entry=entry,
+                open_positions=open_positions,
+                max_positions=max_positions,
+            )
+        except Exception as exc:
+            log_err.error("FSM_ML_BRIDGE_ERROR | asset=%s err=%s", asset, exc)
+            return None
+
+        if bool(plan.get("blocked", True)):
+            log_health.info(
+                "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s reason=%s",
+                asset,
+                sig.signal,
+                plan.get("reason", "plan_blocked"),
+            )
+            return None
+
+        lot = e._apply_asset_lot_cap(asset, float(plan.get("lot", 0.0) or 0.0), "ml_bridge")
+        if lot <= 0.0:
+            return None
+
+        base_reasons = tuple(str(r) for r in (inst_candidate.reasons or ()))
+        bridge_reasons = (
+            "ml_bridge:neutral_pipeline",
+            f"ml_provider:{sig.provider}",
+            f"ml_model:{sig.model}",
+            f"ml_reason:{sig.reason}",
+            "sniper_fsm",
+        )
+        signal_id = f"MLBRIDGE_{asset}_{self._frame_bar_key(frame)}_{sig.side}"
+        latency_ms = max(float(getattr(inst_candidate, "latency_ms", 0.0) or 0.0), 0.0)
+
+        log_health.info(
+            "FSM_ML_BRIDGE | asset=%s signal=%s conf=%.3f lot=%.4f signal_id=%s",
+            asset,
+            sig.side,
+            conf,
+            lot,
+            signal_id,
+        )
+
+        return AssetCandidate(
+            asset=asset,
+            symbol=str(getattr(inst_candidate, "symbol", "") or pipe.symbol),
+            signal=str(sig.side),
+            confidence=conf,
+            lot=lot,
+            sl=float(plan.get("sl", 0.0) or 0.0),
+            tp=float(plan.get("tp", 0.0) or 0.0),
+            latency_ms=latency_ms,
+            blocked=False,
+            reasons=tuple(list(base_reasons[:12]) + list(bridge_reasons)),
+            signal_id=signal_id,
+            raw_result={
+                "institutional_candidate": inst_candidate.raw_result,
+                "ml_signal": sig.signal,
+                "provider": sig.provider,
+                "model": sig.model,
+                "reason": sig.reason,
+                "confidence": sig.confidence,
+                "bridge_plan": dict(plan),
+            },
+        )
+
     def build_ml_candidate(self, asset: str, sig: MLSignal) -> Optional[AssetCandidate]:
         e = self._e
         if e._is_asset_blocked(asset):
@@ -689,6 +869,12 @@ class InferenceEngine:
             return None
 
         if str(inst_candidate.signal) not in ("Buy", "Sell"):
+            cfg = e._xau_cfg if asset == "XAU" else e._btc_cfg
+            allow_neutral_pipeline = bool(getattr(cfg, "ml_bridge_allow_neutral_pipeline", False))
+            if allow_neutral_pipeline:
+                bridge_candidate = self._build_ml_bridge_candidate(asset, sig, pipe, inst_candidate)
+                if bridge_candidate is not None:
+                    return bridge_candidate
             log_health.info(
                 "FSM_PIPELINE_NEUTRAL | asset=%s ml_signal=%s pipeline_signal=%s reasons=%s",
                 asset,

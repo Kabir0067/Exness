@@ -8,7 +8,7 @@ from typing import Any, Optional, Tuple
 import MetaTrader5 as mt5
 
 from ExnessAPI.functions import market_is_open
-from mt5_client import MT5_LOCK, mt5_async_call
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_async_call
 
 from .logging_setup import log_err, log_health
 from .models import AssetCandidate
@@ -80,6 +80,13 @@ class _AssetPipeline:
 
         self._signal_log_every = 5.0
         self._last_signal_log_ts = 0.0
+
+        # PATCH-S2: Per-filter rejection counter for signal diagnostics.
+        self._rejection_counts: dict = {}  # reason → count
+        self._rejection_log_every = 300.0  # log summary every 5 minutes
+        self._rejection_last_log_ts = 0.0
+        self._total_cycles = 0
+        self._total_signals = 0
 
         # Market freshness thresholds
         self._max_bar_age_mult = float(getattr(cfg, "market_max_bar_age_mult", 2.0) or 2.0)
@@ -159,15 +166,42 @@ class _AssetPipeline:
         symbol = self.symbol
         if not symbol:
             raise RuntimeError(f"{self.asset}: empty symbol")
-        with MT5_LOCK:
-            info = mt5.symbol_info(symbol)
-            if info is None:
-                if not mt5.symbol_select(symbol, True):
-                    raise RuntimeError(f"{self.asset}: symbol_select failed: {symbol}")
-            else:
-                if hasattr(info, "visible") and (not bool(info.visible)):
-                    if not mt5.symbol_select(symbol, True):
-                        raise RuntimeError(f"{self.asset}: symbol_select failed (invisible): {symbol}")
+
+        # 1. Terminal check OUTSIDE MT5_LOCK — ensure_mt5 acquires MT5_LOCK internally.
+        # CRITICAL: never call ensure_mt5() while holding MT5_LOCK (threading.Lock is
+        # non-reentrant); doing so causes a 5-second timeout and MT5 reinit storm.
+        if mt5.terminal_info() is None:
+            log_health.warning(
+                "%s: terminal_info=None before ensure_symbol_selected, reconnecting...",
+                self.asset,
+            )
+            try:
+                ensure_mt5()
+            except Exception as exc:
+                raise RuntimeError(f"{self.asset}: ensure_mt5 failed: {exc}") from exc
+
+        last_err: Optional[str] = None
+        for attempt in range(1, 4):
+            with MT5_LOCK:
+                # 2. Symbol auto-add / make visible — no nested ensure_mt5 inside lock
+                info = mt5.symbol_info(symbol)
+                needs_select = info is None or (
+                    hasattr(info, "visible") and not bool(info.visible)
+                )
+                if not needs_select:
+                    return  # already selected and visible
+                if mt5.symbol_select(symbol, True):
+                    return  # successfully added/made visible
+                last_err = f"symbol_select failed: {symbol}"
+
+            if attempt < 3:
+                log_health.warning(
+                    "%s: ensure_symbol_selected attempt %d failed (%s), retrying in 2s...",
+                    self.asset, attempt, last_err,
+                )
+                time.sleep(2.0)
+
+        raise RuntimeError(f"{self.asset}: {last_err or f'symbol_select failed: {symbol}'}")
 
     def _fetch_df_for_validation(self):
         tf = getattr(self.cfg.symbol_params, "tf_primary", None)
@@ -417,7 +451,26 @@ class _AssetPipeline:
             reasons = tuple(str(r) for r in (getattr(res, "reasons", []) or [])[:10])
             signal_id = str(getattr(res, "signal_id", "") or f"{self.asset}_SIG_{int(time.time() * 1000)}")
 
+            # PATCH-S2: Track rejection reasons for diagnostics.
+            self._total_cycles += 1
+            if signal in ("Buy", "Sell", "Strong Buy", "Strong Sell"):
+                self._total_signals += 1
+            for r in reasons:
+                key = r.split(":")[0] if ":" in r else r
+                self._rejection_counts[key] = self._rejection_counts.get(key, 0) + 1
+
             now_ts = time.time()
+            if (now_ts - self._rejection_last_log_ts) >= self._rejection_log_every:
+                self._rejection_last_log_ts = now_ts
+                top_reasons = sorted(self._rejection_counts.items(), key=lambda x: -x[1])[:8]
+                top_str = " ".join(f"{k}={v}" for k, v in top_reasons) if top_reasons else "none"
+                log_health.info(
+                    "FILTER_REJECTION_STATS | asset=%s cycles=%d signals=%d signal_rate=%.3f top_rejections=[%s]",
+                    self.asset, self._total_cycles, self._total_signals,
+                    (self._total_signals / max(1, self._total_cycles)),
+                    top_str,
+                )
+
             if (now_ts - self._last_signal_log_ts) >= self._signal_log_every:
                 self._last_signal_log_ts = now_ts
                 log_health.info(

@@ -1,4 +1,4 @@
-﻿import math
+import math
 
 def run_capital_projection() -> None:
     x = 4

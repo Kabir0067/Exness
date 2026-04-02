@@ -515,38 +515,24 @@ def _effective_trading_context(context: Dict[str, Any]) -> Dict[str, Any]:
         return effective
 
     if status == "ai_fallback":
-        raw_bias = str(effective.get("bias") or "neutral").lower()
-        raw_sentiment = float(effective.get("avg_sentiment") or 0.0)
-        raw_high_impact = int(effective.get("high_impact_count") or 0)
-        trade_style = str(effective.get("trade_style") or "scalping").lower()
-
-        effective["raw_bias"] = raw_bias
-        effective["raw_avg_sentiment"] = raw_sentiment
-        effective["raw_high_impact_count"] = raw_high_impact
-
-        directional = raw_bias in ("bullish", "bearish") and (
-            abs(raw_sentiment) >= _AI_FALLBACK_DIRECTIONAL_SENTIMENT_MIN or raw_high_impact > 0
-        )
-        if directional:
-            impact_cap = 0 if trade_style == "scalping" else 1
-            effective["bias"] = raw_bias
-            effective["avg_sentiment"] = round(raw_sentiment * (0.70 if trade_style == "scalping" else 0.85), 4)
-            effective["high_impact_count"] = min(raw_high_impact, impact_cap)
-            effective["confidence_mode"] = "fallback_directional_limited"
-            summary = str(effective.get("summary_text") or "").rstrip()
-            if summary:
-                summary += "\nEFFECTIVE_RULE=AI_FALLBACK_SOFT_DIRECTIONAL | REASON=non_live_news_context"
-            effective["summary_text"] = summary
-            return effective
-
+        # Preserve raw AI output for logging/diagnostics only.
+        effective["raw_bias"] = str(effective.get("bias") or "neutral").lower()
+        effective["raw_avg_sentiment"] = float(effective.get("avg_sentiment") or 0.0)
+        effective["raw_high_impact_count"] = int(effective.get("high_impact_count") or 0)
+        # SAFETY: AI-generated sentiment is not market data — never let it
+        # modify live trade confidence.  Always neutralize for trading.
         effective["bias"] = "neutral"
         effective["avg_sentiment"] = 0.0
         effective["high_impact_count"] = 0
-        effective["confidence_mode"] = "fallback_soft_neutral"
+        effective["confidence_mode"] = "ai_fallback_neutralized"
         summary = str(effective.get("summary_text") or "").rstrip()
         if summary:
-            summary += "\nEFFECTIVE_RULE=AI_FALLBACK_SOFT_NEUTRAL | REASON=weak_non_live_news_context"
+            summary += "\nEFFECTIVE_RULE=AI_FALLBACK_NEUTRALIZED | REASON=synthetic_sentiment_blocked_from_trading"
         effective["summary_text"] = summary
+        log.info(
+            "ai_fallback_neutralized | raw_bias=%s raw_sentiment=%.4f raw_high_impact=%d",
+            effective["raw_bias"], effective["raw_avg_sentiment"], effective["raw_high_impact_count"],
+        )
         return effective
 
     # AI-generated news fallback is too weak to drive direction or high-impact blocking.

@@ -77,7 +77,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 halt_reason = ""
         if halt_reason:
             ctx.halt_reason = halt_reason
-            nxt = self._e._transition_state(state, EngineState.HALT, "live_risk_breach")
+            nxt = self._e._transition_state(state, EngineState.HALT, halt_reason)
             return StepDecision(next_state=nxt, ctx=ctx, skip_sleep=True)
 
         if self._e._live_trading_pause_reason(force=False):
@@ -130,34 +130,28 @@ class EngineFSMStageServices(IFSMEnginePorts):
             if has_catboost:
                 sig = self._e._infer_catboost(asset, payload)
                 if sig is None:
-                    if self._e._allow_llm_fallback:
-                        sig = infer_from_payloads(
-                            asset,
-                            scalp_payload=payload.get("scalp"),
-                            intraday_payload=payload.get("intraday"),
-                        )
-                    else:
-                        sig = MLSignal(
-                            asset=asset,
-                            signal="HOLD",
-                            side="Neutral",
-                            confidence=0.0,
-                            reason="catboost_inference_failed_no_fallback",
-                            provider="catboost",
-                            model="catboost_trained",
-                            entry=None,
-                            stop_loss=None,
-                            take_profit=None,
-                            scalp_payload=payload.get("scalp"),
-                            intraday_payload=payload.get("intraday"),
-                        )
-            elif self._e._allow_llm_fallback:
-                sig = infer_from_payloads(
-                    asset,
-                    scalp_payload=payload.get("scalp"),
-                    intraday_payload=payload.get("intraday"),
-                )
-            else:
+                    # PATCH-4: LLM fallback disabled in live path.
+                    # LLM inference adds 2-15s non-deterministic latency which causes
+                    # stale entries in fast markets.  Return HOLD instead.
+                    log_health.info(
+                        "CATBOOST_FAIL_HOLD | asset=%s reason=catboost_returned_none_llm_fallback_disabled",
+                        asset,
+                    )
+                    sig = MLSignal(
+                        asset=asset,
+                        signal="HOLD",
+                        side="Neutral",
+                        confidence=0.0,
+                        reason="catboost_inference_failed_llm_disabled",
+                        provider="catboost",
+                        model="catboost_trained",
+                        entry=None,
+                        stop_loss=None,
+                        take_profit=None,
+                        scalp_payload=payload.get("scalp"),
+                        intraday_payload=payload.get("intraday"),
+                    )
+            elif not has_catboost:
                 sig = MLSignal(
                     asset=asset,
                     signal="HOLD",
@@ -222,7 +216,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 halt_reason = ""
         if halt_reason:
             ctx.halt_reason = halt_reason
-            nxt = self._e._transition_state(state, EngineState.HALT, "live_risk_breach")
+            nxt = self._e._transition_state(state, EngineState.HALT, halt_reason)
             return StepDecision(next_state=nxt, ctx=ctx, skip_sleep=True)
 
         if self._e._live_trading_pause_reason(force=False):

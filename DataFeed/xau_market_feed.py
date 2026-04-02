@@ -25,7 +25,7 @@ from mt5_client import MT5_LOCK, ensure_mt5
 LOG_DIR = LOG_ROOT
 
 log_feed = logging.getLogger("feed_xau")
-log_feed.setLevel(logging.ERROR)
+log_feed.setLevel(logging.WARNING)
 log_feed.propagate = False
 
 if not any(isinstance(h, logging.FileHandler) for h in log_feed.handlers):
@@ -34,7 +34,7 @@ if not any(isinstance(h, logging.FileHandler) for h in log_feed.handlers):
         encoding="utf-8",
         delay=True,
     )
-    fh.setLevel(logging.ERROR)
+    fh.setLevel(logging.WARNING)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     fh.setFormatter(fmt)
     log_feed.addHandler(fh)
