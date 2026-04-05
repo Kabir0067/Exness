@@ -1248,6 +1248,14 @@ def handle_trade_start(message: telebot.types.Message) -> None:
             return
 
         engine.clear_manual_stop()
+        st_after_clear = engine.status()
+        if bool(getattr(st_after_clear, "manual_stop", False)):
+            bot.send_message(
+                message.chat.id,
+                "Monitoring-only mode active. Trading start is blocked.",
+                parse_mode="HTML",
+            )
+            return
         started = bool(engine.start())
         if started:
             bot.send_message(

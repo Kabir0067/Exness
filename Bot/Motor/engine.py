@@ -50,6 +50,10 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _monitoring_only_mode() -> bool:
+    return _env_truthy("MONITORING_ONLY", "0")
+
+
 def _required_gate_assets() -> tuple[str, ...]:
     raw = str(os.getenv("REQUIRED_GATE_ASSETS", "XAU,BTC") or "XAU,BTC")
     out: List[str] = []
@@ -155,7 +159,7 @@ class MultiAssetTradingEngine:
         )
 
 
-        self._manual_stop = False
+        self._manual_stop = _monitoring_only_mode()
         self._mt5_ready = False
         self._retraining_mode = False
         self._last_retraining_log_ts = 0.0
@@ -2109,6 +2113,12 @@ class MultiAssetTradingEngine:
 
         self._restart_exec_worker()
 
+        if _monitoring_only_mode():
+            log_health.warning(
+                "MONITORING_ONLY_PROFILE_ACTIVE | trading_disabled=True manual_stop=%s",
+                self._manual_stop,
+            )
+
         log_health.info(
             "PORTFOLIO_ENGINE_START | dry_run=%s xau=%s btc=%s manual_stop=%s",
             self.dry_run,
@@ -2170,6 +2180,10 @@ class MultiAssetTradingEngine:
     def clear_manual_stop(self) -> None:
         unsafe_reason = self._preflight_live_account_state()
         with self._lock:
+            if _monitoring_only_mode():
+                self._manual_stop = True
+                log_health.warning("MANUAL_STOP_CLEAR_BLOCKED_MONITORING_ONLY | trading_disabled=True")
+                return
             if unsafe_reason:
                 self._manual_stop = True
                 log_err.error(

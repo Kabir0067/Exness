@@ -250,6 +250,27 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _monitoring_only_mode() -> bool:
+    return _env_truthy("MONITORING_ONLY", "0")
+
+
+def _auto_retrain_enabled() -> bool:
+    if _monitoring_only_mode():
+        return False
+    return _env_truthy("AUTO_RETRAIN_ENABLED", "1")
+
+
+def _log_monitoring_only_profile() -> None:
+    models_dir = get_artifact_dir("models")
+    model_state = get_artifact_path("models", "model_state.pkl")
+    log.warning(
+        "MONITORING_ONLY_PROFILE | trading_disabled=True auto_train=False auto_retrain=False "
+        "| artifact_freeze_required=True | models_dir=%s | model_state=%s",
+        models_dir,
+        model_state,
+    )
+
+
 def sleep_interruptible(stop_event: Event, seconds: float) -> None:
     end = time.monotonic() + float(seconds)
     while not stop_event.is_set():
@@ -1388,6 +1409,8 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     GATE_RETRAIN_COOLDOWN_SEC = max(30.0, _env_float("GATE_RETRAIN_COOLDOWN_SEC", 300.0))
     retrain_assets = list(_required_gate_assets())
     last_retrain_check = 0.0
+    monitoring_only_mode = _monitoring_only_mode()
+    auto_retrain_enabled = _auto_retrain_enabled()
 
     dry_run_mode = bool(getattr(engine, "dry_run", False))
     if dry_run_mode:
@@ -1402,6 +1425,10 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     model_checker = ModelAgeChecker(get_artifact_path("models", "model_state.pkl"))
 
     notifier.notify("🧠 Нозири мотор оғоз шуд.")
+    if monitoring_only_mode:
+        log.warning("MONITORING_ONLY_SUPERVISOR | model retraining disabled by profile")
+    elif not auto_retrain_enabled:
+        log.warning("AUTO_RETRAIN_ENABLED=0 | supervisor retraining disabled")
     if not gate_ready_at_start:
         log.warning(
             "Engine gate initially blocked | reason=%s | delaying next retrain by %.0fs",
@@ -1437,7 +1464,7 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
         except Exception:
             pass
 
-        if not retraining_in_progress and not dry_run_mode:
+        if auto_retrain_enabled and not retraining_in_progress and not dry_run_mode:
             now = time.time()
             if (now - last_retrain_check) > RETRAIN_CHECK_INTERVAL:
                 last_retrain_check = now
@@ -1491,7 +1518,7 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
             sleep_interruptible(stop_event, 1.0)
             continue
 
-        if not ok_trading and not retraining_in_progress and not dry_run_mode:
+        if auto_retrain_enabled and not ok_trading and not retraining_in_progress and not dry_run_mode:
             gate_ok, gate_reason, _active_assets = _model_gate_ready_effective()
             if not gate_ok:
                 now = time.time()
@@ -1755,6 +1782,14 @@ def _main_inner(args: argparse.Namespace) -> int:
 
     shutdown = GracefulShutdown()
     effective_dry_run = _effective_dry_run(args)
+    monitoring_only_mode = _monitoring_only_mode()
+
+    if monitoring_only_mode:
+        try:
+            engine.request_manual_stop()
+        except Exception:
+            pass
+        _log_monitoring_only_profile()
 
     if effective_dry_run:
         try:
@@ -1766,7 +1801,9 @@ def _main_inner(args: argparse.Namespace) -> int:
         ready, reason = _models_ready()
         if not ready:
             log.warning("MODELS_MISSING | reason=%s", reason)
-            if _env_truthy("AUTO_TRAIN_ON_STARTUP", "1"):
+            if monitoring_only_mode:
+                log.warning("MONITORING_ONLY_PROFILE | skipping startup auto-training")
+            elif _env_truthy("AUTO_TRAIN_ON_STARTUP", "1"):
                 ok = _auto_train_models_strict()
                 if ok:
                     log.info("Auto-training completed")
