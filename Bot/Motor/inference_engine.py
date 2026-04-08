@@ -181,6 +181,7 @@ class InferenceEngine:
         ):
             return cached.get("signal")
         try:
+            e._touch_runtime_progress()
             import numpy as np
             import pandas as pd
 
@@ -217,6 +218,7 @@ class InferenceEngine:
                     len(rates) if rates is not None else 0,
                 )
                 return None
+            e._touch_runtime_progress()
             if len(rates) < n_bars:
                 log_health.warning(
                     "CATBOOST_HISTORY_SHORT | asset=%s bars=%s requested=%s",
@@ -246,10 +248,12 @@ class InferenceEngine:
             if X_series.empty:
                 log_health.warning("CATBOOST_SKIP | asset=%s reason=empty_features", asset)
                 return None
+            e._touch_runtime_progress()
 
             X_last = np.stack([X_series.iloc[-1]])
             pred = cb_model.predict(X_last)
             pred_val = float(pred[0])
+            e._touch_runtime_progress()
 
             static_threshold = max(float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 1e-12)
             model_threshold = 0.0
@@ -316,6 +320,7 @@ class InferenceEngine:
                 atr_arr = talib.ATR(h, l, c, timeperiod=14)
             except Exception:
                 pass
+            e._touch_runtime_progress()
             atr_val = (
                 float(atr_arr[-1])
                 if atr_arr is not None and len(atr_arr) > 0 and np.isfinite(atr_arr[-1])
@@ -366,6 +371,7 @@ class InferenceEngine:
                     flow_confirm = max(-1.0, min(1.0, 0.55 * t_imb + 0.45 * t_delta))
             except Exception:
                 flow_confirm = 0.0
+            e._touch_runtime_progress()
 
             if abs(pred_val) < threshold:
                 out = MLSignal(

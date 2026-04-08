@@ -1399,6 +1399,10 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
     restart_guard = RateLimiter(20.0)
     manual_stop_rl = RateLimiter(60.0)
     runtime_recover_after_sec = max(6.0, _env_float("ENGINE_RUNTIME_RECOVER_SEC", 12.0))
+    startup_connect_grace_sec = max(
+        3.0,
+        _env_float("ENGINE_CONNECT_GRACE_SEC", max(8.0, runtime_recover_after_sec)),
+    )
 
     started_once = False
     attempt = 0
@@ -1498,7 +1502,20 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
 
         runtime_thread_dead = bool(runtime_snapshot.get("thread_dead", False))
         runtime_stale = bool(runtime_snapshot.get("stale", False))
+        runtime_bootstrapping = bool(runtime_snapshot.get("bootstrapping", False))
         runtime_hb_age = float(runtime_snapshot.get("heartbeat_age_sec", 0.0) or 0.0)
+        runtime_starting = bool(runtime_snapshot.get("starting", False))
+        runtime_loop_started_ts = float(runtime_snapshot.get("loop_started_ts", 0.0) or 0.0)
+        runtime_start_age = (
+            max(0.0, time.time() - runtime_loop_started_ts)
+            if runtime_loop_started_ts > 0.0
+            else 0.0
+        )
+        in_connect_grace = bool(
+            runtime_starting
+            or runtime_bootstrapping
+            or (runtime_loop_started_ts > 0.0 and runtime_start_age < startup_connect_grace_sec)
+        )
         if (runtime_thread_dead or runtime_stale) and not manual_stop:
             if restart_guard.allow("engine_runtime_watchdog"):
                 log.error(
@@ -1579,6 +1596,31 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
                     started_once = True
                     notifier.notify("🟢 Мотори тиҷорат оғоз шуд.")
                 attempt = 0
+                try:
+                    st = engine.status()
+                    ok_connected = bool(getattr(st, "connected", True))
+                    ok_trading = bool(getattr(st, "trading", True))
+                    manual_stop = bool(getattr(st, "manual_stop", False))
+                    snap_fn = getattr(engine, "runtime_watchdog_snapshot", None)
+                    if callable(snap_fn):
+                        snap = snap_fn()
+                        if isinstance(snap, dict):
+                            runtime_snapshot = dict(snap)
+                    runtime_starting = bool(runtime_snapshot.get("starting", False))
+                    runtime_bootstrapping = bool(runtime_snapshot.get("bootstrapping", False))
+                    runtime_loop_started_ts = float(runtime_snapshot.get("loop_started_ts", 0.0) or 0.0)
+                    runtime_start_age = (
+                        max(0.0, time.time() - runtime_loop_started_ts)
+                        if runtime_loop_started_ts > 0.0
+                        else 0.0
+                    )
+                    in_connect_grace = bool(
+                        runtime_starting
+                        or runtime_bootstrapping
+                        or (runtime_loop_started_ts > 0.0 and runtime_start_age < startup_connect_grace_sec)
+                    )
+                except Exception:
+                    pass
 
             except Exception as exc:
                 delay = backoff.delay(attempt)
@@ -1589,6 +1631,9 @@ def run_engine_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
                 continue
 
         if not ok_connected:
+            if in_connect_grace:
+                sleep_interruptible(stop_event, 1.0)
+                continue
             if restart_guard.allow("engine_unhealthy"):
                 log.warning("Engine unhealthy (connected=%s trading=%s) -> waiting/recovering", ok_connected, ok_trading)
                 if TG_HEALTH_NOTIFY:
@@ -1750,7 +1795,12 @@ def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
 
 
 def _args_disable_telegram(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "headless", False) or getattr(args, "engine_only", False))
+    if bool(getattr(args, "headless", False) or getattr(args, "engine_only", False)):
+        return True
+    dry_run_requested = bool(getattr(args, "dry_run", False) or _env_truthy("DRY_RUN", "0"))
+    if dry_run_requested and not _env_truthy("ALLOW_TG_IN_DRY_RUN", "0"):
+        return True
+    return False
 
 
 def _effective_dry_run(args: argparse.Namespace) -> bool:
@@ -1821,12 +1871,17 @@ def _main_inner(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    notifier_wired = False
     if send_signal_notification is not None:
         try:
             engine.set_signal_notifier(send_signal_notification)
+            notifier_wired = True
         except Exception:
             pass
-    log.info("SIGNAL_NOTIFIER_WIRED | Engine -> Bot connected")
+    log.info(
+        "SIGNAL_NOTIFIER_WIRED | Engine -> %s",
+        "Bot connected" if notifier_wired else "disabled",
+    )
 
     if _tg_available:
         notifier: NotifierLike = Notifier(shutdown.stop_event, queue_max=200)

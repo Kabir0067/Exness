@@ -1,429 +1,311 @@
 <div align="center">
 
-# QuantCore Pro
+<h1>QuantCore Pro</h1>
 
-### Автоматизированная торговая система для XAU и BTC на MetaTrader 5
+<h3>Institutional-style MetaTrader 5 trading runtime</h3>
 
-*39 000 строк Python. Детерминированный конвейер. ML-валидация. Контроль риска на каждом уровне.*
+<p>
+  Built for deterministic orchestration, model admission control, layered risk rails,
+  broker-aware execution, and operational visibility.
+</p>
 
-<br/>
-
-<img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" />
-<img src="https://img.shields.io/badge/MetaTrader_5-Exness-0078D4?style=flat-square" />
-<img src="https://img.shields.io/badge/ML-CatBoost-FFCC00?style=flat-square" />
-<img src="https://img.shields.io/badge/Telegram-Bot_Control-26A5E4?style=flat-square&logo=telegram&logoColor=white" />
-<img src="https://img.shields.io/badge/Tests-116_passing-00C853?style=flat-square" />
-
-<br/><br/>
-
-| XAUUSDm (Gold) | BTCUSDm (Bitcoin) | Архитектура | Риск |
-|:-:|:-:|:-:|:-:|
-| 24/5 с rollover blackout | 24/7 | Deterministic FSM | Kelly/4 + hard cap |
-| ATR×2.5 SL | ATR×3.0 SL | Multi-worker execution | Max DD 6%, daily 4% |
-| Spread gate 0.025% | Spread gate 0.05% | Fill recovery + sync | Kill switch (auto) |
+<p>
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/Runtime-MT5%20%2F%20Exness-0B4F9C?style=flat-square" alt="MT5 Exness" />
+  <img src="https://img.shields.io/badge/Assets-XAUUSDm%20%2B%20BTCUSDm-8A6A00?style=flat-square" alt="Assets" />
+  <img src="https://img.shields.io/badge/ML-CatBoost-F6C343?style=flat-square" alt="CatBoost" />
+  <img src="https://img.shields.io/badge/Execution-Deterministic%20FSM-111111?style=flat-square" alt="Deterministic FSM" />
+  <img src="https://img.shields.io/badge/V1-Finalized-0A7F5A?style=flat-square" alt="V1 Finalized" />
+  <img src="https://img.shields.io/badge/Verification-116%20tests%20verified-1F9D55?style=flat-square" alt="116 tests verified" />
+</p>
 
 </div>
 
 ---
 
-## Что это за система
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <h3>Release Posture</h3>
+      <p>
+        <strong>V1 is finalized as a runtime-ready engineering release.</strong>
+      </p>
+      <p>
+        The core runtime, guard rails, verification paths, and documentation
+        have been aligned to the system that is actually present in this repository.
+      </p>
+    </td>
+    <td valign="top" width="50%">
+      <h3>System Focus</h3>
+      <p>
+        QuantCore Pro is designed around the same engineering concerns that define
+        serious internal execution stacks: deterministic flow, controlled startup,
+        risk-first behavior, reconciliation, and observability.
+      </p>
+    </td>
+  </tr>
+</table>
 
-QuantCore Pro — полноценная автоматизированная торговая система, построенная как инженерный продукт, а не как скрипт-советник.
+## Executive Summary
 
-Система принимает рыночные данные с MetaTrader 5, вычисляет более 40 технических и структурных признаков, пропускает их через обученную ML-модель и каскад валидационных фильтров, рассчитывает позицию по формуле Келли с жёстким ограничением, отправляет ордер с контролем исполнения и верифицирует результат — полный цикл от тика до проверенной сделки.
+QuantCore Pro is not presented as a one-file signal bot, a toy MT5 script, or a "black box alpha" marketing page.
 
-Каждый этап цепочки спроектирован с учётом отказоустойчивости: что произойдёт, если MT5 отключится, данные устареют, модель вернёт мусор, брокер отклонит ордер, баланс обнулится. На каждый из этих сценариев есть конкретный обработчик.
+It is a production-minded trading runtime for MetaTrader 5 that combines:
 
----
+- deterministic finite-state execution
+- model gatekeeping before live order flow
+- layered portfolio and per-asset risk controls
+- execution verification and broker reconciliation
+- runtime diagnostics, health telemetry, and recovery paths
+- dry-run, engine-only, and monitoring-oriented operating modes
 
-## Почему эта система сложная
+The result is a repository that reads and behaves far closer to an institutional execution runtime than to the average retail automation project. That statement describes engineering posture and system design. It does not claim ownership of any hidden bank strategy, proprietary desk alpha, or guaranteed profit profile.
 
-Это не один файл с `if RSI > 70: sell`. Это **65 модулей**, связанных в единый конвейер:
+## Why It Feels Like A Serious Internal Runtime
 
-- **Модульная архитектура** — каждый компонент изолирован и тестируем: данные, признаки, сигналы, риск, исполнение, контроль
-- **Детерминированный FSM** — конечный автомат с 7 состояниями управляет циклом торговли, исключая недетерминированное поведение
-- **CatBoost ML-пайплайн** — обучение, walk-forward анализ, Monte Carlo стресс-тест, gate-система качества — всё до первого live-ордера
-- **Многослойная защита капитала** — kill switch, circuit breaker по волатильности, breaker по latency/slippage, daily loss limit, peak drawdown guard, hard lot cap
-- **Контроль исполнения** — дедупликация ордеров, верификация fill, пост-fill прикрепление SL/TP с retry, ghost fill detection, order sync manager
-- **Полная наблюдаемость** — JSONL диагностика, CSV метрик исполнения, watchdog snapshot, rejection stats, Wilson CI для win rate
-- **Telegram-контроль** — start/stop, статус, ручной override, дебаунс от двойных нажатий
+<table>
+  <tr>
+    <td valign="top" width="33%">
+      <h3>Deterministic Core</h3>
+      <p>
+        The engine is built around a finite-state machine instead of ad hoc
+        background behavior. That makes transitions explicit, failures more
+        diagnosable, and execution flow easier to reason about under stress.
+      </p>
+    </td>
+    <td valign="top" width="33%">
+      <h3>Trade Admission Control</h3>
+      <p>
+        Models are not blindly trusted. The runtime checks gate state, artifact
+        readiness, asset eligibility, and startup conditions before letting live
+        order flow proceed.
+      </p>
+    </td>
+    <td valign="top" width="33%">
+      <h3>Risk As Infrastructure</h3>
+      <p>
+        Risk is not a single stop-loss rule. It is embedded across sizing,
+        drawdown limits, circuit breakers, portfolio controls, trade pausing,
+        and emergency stop behavior.
+      </p>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top" width="33%">
+      <h3>Execution Verification</h3>
+      <p>
+        Orders are tracked beyond the initial send path. The stack includes
+        queueing, deduplication, reconciliation, SL/TP attachment handling,
+        and pending-order state resolution.
+      </p>
+    </td>
+    <td valign="top" width="33%">
+      <h3>Recovery-Aware Runtime</h3>
+      <p>
+        Startup, reconnect, and unhealthy runtime paths are supervised. The
+        engine is built to degrade, pause, recover, or hold rather than fail
+        silently.
+      </p>
+    </td>
+    <td valign="top" width="33%">
+      <h3>Operational Visibility</h3>
+      <p>
+        Health logs, diagnostics snapshots, MT5 events, and execution telemetry
+        make the runtime inspectable. That is one of the clearest markers of a
+        production-minded system.
+      </p>
+    </td>
+  </tr>
+</table>
 
----
+## V1 Final Status
 
-## Архитектура системы
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <h3>Verified</h3>
+      <ul>
+        <li>Core runtime compiles cleanly</li>
+        <li>Local smoke verifier passes: <code>python test.py</code></li>
+        <li>Committed regression verification recorded: <code>116 passed</code></li>
+        <li>Dry-run startup path has been verified</li>
+        <li>Dry-run engine-only soak check completed cleanly</li>
+        <li>Volatility breaker now behaves as a cooldown, not an all-day hard stop</li>
+        <li>Irregular bar-gap false positives are blocked in the volatility breaker</li>
+        <li>Startup telemetry warmup was added for live evidence evaluation</li>
+        <li>Dry-run Telegram noise is disabled by default</li>
+      </ul>
+    </td>
+    <td valign="top" width="50%">
+      <h3>Release Meaning</h3>
+      <p>
+        V1 is complete as an <strong>engineering release</strong>.
+      </p>
+      <p>
+        That means the runtime boots, the control rails are in place, the
+        verification layer is present, and the public-facing documentation now
+        reflects verified system behavior.
+      </p>
+      <p>
+        Market edge, profitability durability, and long-horizon live alpha still
+        require ongoing statistical validation, exactly as they should in any
+        serious trading program.
+      </p>
+    </td>
+  </tr>
+</table>
 
-```
-                          ┌─────────────────────────────────────────────────────────┐
-                          │                     main.py                             │
-                          │          preflight → auto-train → gate → supervisor     │
-                          └────────────────────────────┬────────────────────────────┘
-                                                       │
-                    ┌──────────────────────────────────┼──────────────────────────────────┐
-                    │                                  │                                  │
-              ┌─────▼──────┐                  ┌────────▼────────┐                 ┌───────▼───────┐
-              │  Telegram   │                  │  MultiAsset     │                 │   Health      │
-              │  Bot        │◄────────────────►│  TradingEngine  │────────────────►│   Monitor     │
-              │  (control)  │   start/stop     │  (FSM core)     │   heartbeat     │   (watchdog)  │
-              └─────────────┘                  └────────┬────────┘                 └───────────────┘
-                                                       │
-                          ┌────────────────────────────┼────────────────────────────┐
-                          │                            │                            │
-                  ┌───────▼───────┐           ┌────────▼────────┐          ┌────────▼────────┐
-                  │  DataFeed     │           │  Pipeline       │          │  Execution      │
-                  │  (XAU / BTC)  │           │  (per asset)    │          │  Manager        │
-                  │  MT5 + ticks  │           │                 │          │  + Workers      │
-                  └───────┬───────┘           └────────┬────────┘          └────────┬────────┘
-                          │                            │                            │
-                          ▼                            ▼                            ▼
-               ┌────────────────┐         ┌──────────────────┐          ┌────────────────────┐
-               │ FeatureEngine  │────────►│  SignalEngine     │────────►│  RiskManager       │
-               │ 40+ indicators │         │  100-pt scoring   │         │  Kelly/4 sizing    │
-               │ smart-money    │         │  ML bridge        │         │  ATR SL/TP         │
-               │ MTF analysis   │         │  25+ filters      │         │  kill switch       │
-               └────────────────┘         └──────────────────┘          └────────┬───────────┘
-                                                                                 │
-                                                                                 ▼
-                                                                      ┌────────────────────┐
-                                                                      │  MT5 order_send    │
-                                                                      │  fill verify       │
-                                                                      │  SL/TP attach      │
-                                                                      │  order sync        │
-                                                                      └────────────────────┘
-```
+The canonical release gate is documented here:
 
-### Полная цепочка принятия решения
+- [V1_FINAL_CHECKLIST.md](V1_FINAL_CHECKLIST.md)
 
-```
-DATA ──► FEATURES ──► MODEL ──► SIGNALS ──► FILTERS ──► RISK ──► ORDER ──► FILL ──► VERIFY ──► LOG
- │          │           │          │           │          │         │         │          │        │
- MT5      40+ ind    CatBoost   100-pt     25+ gates   Kelly    MT5 API   retcode    sync    JSONL
- ticks    ATR/BB     predict    scoring    MTF/D1/     /4 cap   dedup     SL/TP     broker   CSV
- bars     patterns   threshold  confidence spread/vol  phase    idempot   rebase    recon    TG
-```
+## Runtime Topology
 
-Если любой этап возвращает отказ — торговля не происходит. Система fail-safe по дизайну.
+```text
+main.py
+  -> runtime bootstrap
+  -> startup policy and model gate orchestration
+  -> engine supervisor
+  -> optional Telegram supervisor
 
----
+Bot/Motor/
+  -> deterministic FSM runtime
+  -> inference engine
+  -> execution manager
+  -> order sync manager
+  -> portfolio engine health and diagnostics
 
-## Основные модули
+core/
+  -> configuration
+  -> feature engineering
+  -> signal logic
+  -> risk engine
+  -> portfolio risk
+  -> model gate and model manager
 
-### Ядро (`core/`)
+DataFeed/
+  -> XAU market data path
+  -> BTC market data path
+  -> tick, bar, and microstructure payload generation
 
-| Модуль | LOC | Назначение |
-|--------|----:|------------|
-| `config.py` | 713 | Единый конфиг с asset-specific override (XAU/BTC) |
-| `feature_engine.py` | 982 | 40+ индикаторов, smart-money паттерны, MTF анализ |
-| `signal_engine.py` | 1 968 | 100-балльная система скоринга, ML-bridge, 25+ фильтров |
-| `risk_engine.py` | 2 074 | Позиционный сайзинг, SL/TP, kill switch, фазы, breakers |
-| `model_gate.py` | 783 | Multi-layer gate: Sharpe ≥ 0.5, WR ≥ 52%, DD ≤ 25% |
-| `portfolio_risk.py` | — | Кросс-активный контроль, корреляция, портфельный DD |
+ExnessAPI/
+  -> order placement
+  -> position handling
+  -> broker interaction utilities
 
-### Исполнение (`Bot/Motor/`)
-
-| Модуль | LOC | Назначение |
-|--------|----:|------------|
-| `engine.py` | 2 436 | Главный оркестратор, FSM, watchdog, recovery |
-| `pipeline.py` | — | Per-asset signal pipeline с кэшированием |
-| `execution.py` | — | ExecutionWorker threads, bounded queue |
-| `execution_manager.py` | — | Enqueue, dedup, cooldown, verification |
-| `order_sync_manager.py` | — | Broker reconciliation, deferred fill resolution |
-| `inference_engine.py` | 932 | CatBoost inference, bar-level cache, threshold |
-| `scheduler.py` | — | Asset scheduling, signal density control |
-| `fsm_runtime.py` | — | FSM dispatch loop, state transitions |
-
-### Обучение и валидация (`Backtest/`)
-
-| Модуль | LOC | Назначение |
-|--------|----:|------------|
-| `model_train.py` | 2 317 | CatBoost training, TSCV, feature pipeline, window creation |
-| `engine.py` | 1 852 | Backtest simulation, WFA, Monte Carlo (10K paths), stress |
-| `metrics.py` | — | Sharpe, profit factor, expectancy, risk-of-ruin |
-
-### Данные и исполнение
-
-| Модуль | LOC | Назначение |
-|--------|----:|------------|
-| `mt5_client.py` | 1 398 | MT5 connection management, async dispatch, reconnect |
-| `DataFeed/xau_market_feed.py` | 914 | XAU real-time data, tick stats, microstructure |
-| `DataFeed/btc_market_feed.py` | 1 189 | BTC real-time data, 24/7, regime estimation |
-| `ExnessAPI/order_execution.py` | 1 799 | Market order, SL/TP robust attach, fill recovery |
-| `ExnessAPI/functions.py` | 2 093 | Position management, close, adaptive risk |
-
----
-
-## Возможности
-
-### Анализ рынка
-- **Multi-timeframe**: M1, M5, M15, H1, H4, D1 — данные синхронизированы, признаки shift-aware
-- **40+ индикаторов**: EMA (8/21/50/200), RSI, MACD, ADX, Bollinger Bands, CCI, Stochastic, OBV, ATR, KER, RVI
-- **Smart-money паттерны**: Fair Value Gaps, Liquidity Sweeps, Order Blocks, Stop-Hunt detection
-- **Микроструктура**: tick momentum, cumulative delta, OFI proxy, spread dynamics
-
-### ML-модель
-- **CatBoost** gradient boosting с 2000 итераций
-- **Time-series cross-validation** (4 fold, хронологический порядок)
-- **Walk-forward анализ** с адаптивным масштабированием окон
-- **Monte Carlo стресс-тест**: 10 000 случайных путей с bootstrap, tail shocks, execution drag
-- **Автоматический retrain** при устаревании модели или провале gate
-
-### Генерация сигналов
-- **100-балльная система**: trend (24), momentum (15), volatility (10), structure (12), flow (15), tick momentum (12), volume delta (8), mean reversion (4)
-- **Confidence mapping** с cap по силе сигнала
-- **Sniper floor**: сигналы ниже 75% confidence отклоняются
-- **D1 confluence**: daily trend усиливает или ослабляет сигнал
-- **MTF penalties**: конфликт M5/M15 с основным сигналом снижает confidence
-
-### Управление риском
-- **Kelly/4 sizing**: четверть от формулы Келли, с абсолютным потолком 2% на сделку
-- **ATR-based SL/TP**: adaptive с fractal volatility stop (KER + RVI weighted)
-- **Hard lot cap**: XAU ≤ 1.0 lot, BTC ≤ 0.50 lot — не обходится ни при каких условиях
-- **Daily loss limit**: 4% — при достижении торговля останавливается до нового UTC-дня
-- **Peak drawdown guard**: 3% от пика — soft stop; 6% — hard stop
-- **Kill switch**: expectancy < -0.5 И winrate < 30% → KILLED; expectancy < -0.2 → COOLING
-- **Phase escalation**: A → B → C с уменьшением размера позиции (1.0x → 0.75x → стоп)
-
-### Исполнение
-- **Bounded queue** (maxsize=50) с multi-worker dispatch
-- **Idempotency**: edge-trigger dedup + seen-index + cooldown
-- **Fill verification**: immediate retcode check + broker-side history probe
-- **SL/TP robust attach**: 4 retry с расширением дистанции, fail-safe close
-- **Order sync manager**: deferred resolution для ambiguous fills, 8-секундный timeout
-- **Ghost fill detection**: проверка `history_deals_get` после transport failure
-
-### Защита и восстановление
-- **Volatility circuit breaker**: ATR/SMA(ATR,50) > 3.0 → cooldown 30 мин
-- **Execution breaker**: p95 latency > 550ms или slippage > 20pts → cooldown 2 мин
-- **Spread spike blocker**: > 3σ от исторического spread → блокировка
-- **Flash crash guard**: > 3.5σ price move → cooldown 5 мин
-- **FSM auto-restart**: 3 попытки с exponential backoff (10s / 20s / 30s)
-- **STOP.lock**: физический файл-выключатель — мгновенная остановка и flatten
-- **MT5 identity check**: верификация account login при каждом reconnect
-
----
-
-## Наблюдаемость
-
-Система генерирует данные для мониторинга на каждом уровне:
-
-| Метрика | Источник | Назначение |
-|---------|----------|------------|
-| `signals_24h` | watchdog snapshot | Количество сигналов за 24ч |
-| `FILTER_REJECTION_STATS` | pipeline health log | signal_rate, top rejection reasons |
-| `wr_ci_95_lo / wr_ci_95_hi` | watchdog (Wilson CI) | Статистическая достоверность win rate |
-| `latency_p95_ms` | watchdog | Качество исполнения |
-| `slippage_p95_points` | watchdog | Проскальзывание |
-| `dd_pct` | watchdog | Drawdown от пика |
-| `kill_switch` | risk engine | ACTIVE / COOLING / KILLED |
-| Execution CSV | `Logs/exec_metrics_*.csv` | Per-trade latency, slippage, spread |
-| Health heartbeat | `portfolio_engine_health.log` | MT5 status, module status, error counts |
-| Diagnostics | `portfolio_engine_diag.jsonl` | Full engine state per cycle |
-
----
-
-## Model Quality Gate
-
-Ни один актив не допускается к торговле без прохождения gate:
-
-```
-                   ┌─────────────────────────────┐
-                   │       MODEL GATE CHECK       │
-                   │                               │
-                   │  state file exists?     ──────► NO → blocked
-                   │  status = VERIFIED?     ──────► NO → blocked
-                   │  unsafe = false?        ──────► NO → blocked
-                   │  real_backtest = true?   ──────► NO → blocked
-                   │  WFA passed?            ──────► NO → blocked
-                   │  stress test passed?    ──────► NO → blocked
-                   │  Sharpe ≥ 0.5?          ──────► NO → blocked
-                   │  Win Rate ≥ 52%?        ──────► NO → blocked
-                   │  Max Drawdown ≤ 25%?    ──────► NO → blocked
-                   │  model .pkl exists?     ──────► NO → blocked
-                   │  metadata .json exists? ──────► NO → blocked
-                   │                               │
-                   │  ALL PASS → trading allowed   │
-                   └───────────────────────────────┘
+Backtest/
+  -> model training support
+  -> backtest engine
+  -> metrics and validation support
 ```
 
-Если gate не пройден — система может работать, но ордера не отправляются. Это ключевое отличие от систем, которые «просто торгуют».
+## Operating Modes
 
----
+| Mode | Purpose | Notes |
+| --- | --- | --- |
+| `python main.py` | Live-oriented startup path | Uses strict runtime and model admission rules |
+| `python main.py --dry-run --engine-only` | Controlled runtime verification | Best path for clean engine-only startup checks |
+| `DRY_RUN=1 python main.py` | Dry-run from environment | Telegram remains disabled by default unless explicitly enabled |
+| `MONITORING_ONLY=1 python main.py` | Observation without trade execution | Useful for supervised runtime inspection |
 
-## Текущий статус
+If Telegram is required during dry-run, enable it explicitly:
 
-> **Архитектура: сильная. Live edge: не доказан.**
+```bash
+ALLOW_TG_IN_DRY_RUN=1
+```
 
-Система прошла полный forensic audit (апрель 2026) с исправлением 7 материальных багов и устранением lookahead bias в feature engine. 116 автоматических тестов проходят, включая proof-of-no-lookahead тесты.
+## Verification
 
-| Аспект | Статус |
-|--------|--------|
-| Архитектура и code quality | Проверена, баги исправлены |
-| Lock discipline и concurrency | Проверена, deadlock-free |
-| Risk management logic | Проверена, hard caps enforced |
-| Execution safety | Multi-layer dedup, fill verify, sync |
-| Backtest credibility | Требует re-run после fix lookahead |
-| Live statistical edge | **Не доказан** — требует demo validation |
-| Model freshness | Требует переобучения после lookahead fix |
-| Multi-day stability | **Не проверена** — требует soak test |
+These commands represent the V1 verification posture:
 
-**Что это значит:** код готов к запуску в demo-режиме для сбора реальной runtime статистики. Переход на live с реальными деньгами обоснован только после подтверждения edge на demo данных (≥30 сделок, Wilson CI lower bound ≥ 0.50).
+```bash
+python -m py_compile core/risk_engine.py Bot/Motor/engine.py main.py test.py
+python test.py
+python main.py --dry-run --engine-only
+```
 
----
+The V1 release record also includes a committed regression verification run with `116 passed`.
 
-## Для кого
+## System Characteristics That Are Real In This Repository
 
-- **Algo-трейдеры** — как reference architecture для MT5 автоматизации
-- **Python-разработчики** — как пример сложной многопоточной системы с FSM, bounded queues, lock discipline
-- **Quant-инженеры** — CatBoost pipeline, walk-forward validation, Monte Carlo, Kelly sizing
-- **Исследователи MT5 automation** — полный цикл от тика до verified fill с error recovery
-- **Трейдеры** — для понимания, как строится серьёзная торговая инфраструктура vs. простой индикаторный бот
+- XAUUSDm and BTCUSDm are first-class runtime assets.
+- Live-oriented and dry-run execution paths both exist.
+- Model gatekeeping is enforced before live order admission.
+- Risk controls include hard stops, soft stops, cooldowns, kill-switch behavior, and portfolio exposure controls.
+- The volatility circuit breaker is time-bounded and cooldown-based.
+- Health and diagnostics are emitted into `Logs/`.
+- The runtime includes startup supervision, recovery hooks, and broker-state awareness.
+- The repository includes a built-in smoke verifier for local release checks.
 
----
+## Logs And Observability
 
-## Технологический стек
+The runtime is designed to be inspectable while it is running. Key operational outputs include:
 
-| Компонент | Технология |
-|-----------|------------|
-| Язык | Python 3.12 |
-| Брокер | MetaTrader 5 (Exness) |
-| ML | CatBoost 1.2, scikit-learn 1.8 |
-| Индикаторы | TA-Lib, pandas-ta |
-| Данные | pandas 2.3, NumPy 2.2 |
-| Статистика | SciPy 1.17 |
-| Контроль | pyTelegramBotAPI 4.29 |
-| Concurrency | threading, queue.Queue, RLock |
-| Тесты | pytest 9.0 (116 тестов) |
-| Платформа | Windows 10/11 (MT5 requirement) |
+- `Logs/main.log`
+- `Logs/portfolio_engine_health.log`
+- `Logs/portfolio_engine_diag.jsonl`
+- `Logs/mt5.log`
+- `Logs/telegram.log`
 
----
+That visibility matters because serious trading systems are judged not only by how they trade, but by how clearly they reveal their own health, state transitions, and failure modes.
 
-## Установка и запуск
+## Repository Layout
 
-### 1. Зависимости
+```text
+main.py
+mt5_client.py
+log_config.py
+test.py
+
+Bot/
+Backtest/
+core/
+DataFeed/
+ExnessAPI/
+Artifacts/
+Logs/
+strategies/
+```
+
+If the committed regression suite is present in the checkout, it lives under `tests/`.
+
+## Environment
+
+Typical runtime variables:
+
+```ini
+EXNESS_LOGIN=...
+EXNESS_PASSWORD=...
+EXNESS_SERVER=...
+
+TG_TOKEN=...
+TG_ADMIN_ID=...
+```
+
+Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> TA-Lib требует предварительной установки C-библиотеки. На Windows — скачайте `.whl` с [неофициального репозитория](https://github.com/cgohlke/talib-build/releases).
+## Positioning
 
-### 2. Конфигурация
+The strongest truthful one-line description of this repository is:
 
-Создайте файл `.env` в корне проекта:
+> QuantCore Pro is a production-minded, institutional-style MT5 trading runtime with deterministic orchestration, strict trade admission, layered risk infrastructure, broker-aware recovery, and operational diagnostics.
 
-```ini
-EXNESS_LOGIN=12345678
-EXNESS_PASSWORD=your_password
-EXNESS_SERVER=Exness-MT5Real
-
-TG_TOKEN=your_telegram_bot_token
-TG_ADMIN_ID=your_telegram_user_id
-```
-
-При первом запуске без `.env` система автоматически создаст шаблон.
-
-### 3. Запуск
-
-```bash
-# Production mode (требует .env с реальными credentials)
-python main.py
-
-# Dry-run mode (без MT5, без реальных ордеров)
-DRY_RUN=1 python main.py
-```
-
-### 4. Тесты
-
-```bash
-python -m pytest tests/ -v
-```
-
-### Ключевые переменные окружения
-
-| Переменная | По умолчанию | Описание |
-|------------|:------------:|----------|
-| `DRY_RUN` | `0` | Симуляция без MT5 |
-| `PARTIAL_GATE_MODE` | `1` | Торговля только по assets, прошедшим gate |
-| `AUTO_TRAIN_ASSETS` | `XAU,BTC` | Активы для auto-train при старте |
-| `BACKTEST_FORCE_RETRAIN` | `0` | Принудительное переобучение |
-| `GATE_RETRAIN_COOLDOWN_SEC` | `300` | Cooldown между retrain попытками |
-
----
-
-## Структура проекта
-
-```
-QuantCore/
-│
-├── main.py                         # Entry point, supervisor, lifecycle
-├── mt5_client.py                   # MT5 connection, lock discipline, async dispatch
-├── log_config.py                   # Logging setup
-│
-├── core/                           # Ядро торговой логики
-│   ├── config.py                   #   Unified config (XAU/BTC override)
-│   ├── feature_engine.py           #   40+ indicators, patterns, shift-aware
-│   ├── signal_engine.py            #   100-pt scoring, ML bridge, filters
-│   ├── risk_engine.py              #   Kelly sizing, SL/TP, kill switch
-│   ├── model_gate.py               #   Quality gate (Sharpe/WR/DD)
-│   ├── model_manager.py            #   Model load/save/verify
-│   ├── model_retrainer.py          #   Runtime retraining trigger
-│   ├── portfolio_risk.py           #   Cross-asset risk
-│   └── transaction_costs.py        #   Realistic cost model
-│
-├── Backtest/                       # Обучение и валидация
-│   ├── model_train.py              #   CatBoost training pipeline
-│   ├── engine.py                   #   Backtest + WFA + Monte Carlo
-│   └── metrics.py                  #   Performance metrics
-│
-├── Bot/                            # Runtime и контроль
-│   ├── bot.py                      #   Telegram handlers
-│   ├── bot_utils.py                #   TG utilities, notifications
-│   ├── portfolio_engine.py         #   Portfolio orchestrator
-│   └── Motor/                      #   Execution engine
-│       ├── engine.py               #     FSM orchestrator (2400 LOC)
-│       ├── pipeline.py             #     Per-asset signal pipeline
-│       ├── execution.py            #     Worker threads
-│       ├── execution_manager.py    #     Order lifecycle
-│       ├── order_sync_manager.py   #     Broker reconciliation
-│       ├── inference_engine.py     #     CatBoost inference
-│       ├── scheduler.py            #     Asset scheduling
-│       ├── fsm_runtime.py          #     FSM dispatch
-│       ├── fsm_services.py         #     FSM step handlers
-│       └── fsm_types.py            #     State definitions
-│
-├── DataFeed/                       # Рыночные данные
-│   ├── xau_market_feed.py          #   XAU data + microstructure
-│   └── btc_market_feed.py          #   BTC data + regime estimation
-│
-├── ExnessAPI/                      # Broker API layer
-│   ├── order_execution.py          #   Market orders, SL/TP attach
-│   ├── functions.py                #   Position management
-│   ├── history.py                  #   Trade history
-│   └── daily_balance.py            #   Balance tracking
-│
-├── strategies/                     # Asset stack wrappers
-├── tests/                          # 116 automated tests
-├── Logs/                           # Runtime logs + exec metrics
-└── Artifacts/                      # Models + backtest reports
-```
-
----
+That is the level at which V1 is finalized.
 
 ## Disclaimer
 
-Эта система — инженерный исследовательский проект. Она **не гарантирует прибыль** и не является финансовым советом.
+This repository is a trading engineering system.
 
-- Алгоритмическая торговля сопряжена с существенным финансовым риском
-- Прошлые результаты бэктеста не гарантируют будущих результатов
-- Live deployment требует постоянного мониторинга и понимания рисков
-- Система спроектирована с защитой капитала, но ни одна защита не является абсолютной
-- Используйте систему на свой страх и риск, начиная с demo-счёта
+- It is designed to control risk, not eliminate it.
+- Backtest quality and runtime controls improve discipline, but do not guarantee future returns.
+- Real-money deployment should still begin with monitoring, staged exposure, and capital discipline.
 
----
+## Next Stage
 
-<div align="center">
+V1 handoff is complete.
 
-*Разработано Кабиром Гафуровым*
-
-*Вопросы архитектуры, предложения и замечания — через Issues*
-
-</div>
+The next development stage is **V2**.

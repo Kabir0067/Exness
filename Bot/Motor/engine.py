@@ -157,6 +157,20 @@ class MultiAssetTradingEngine:
             6.0,
             float(os.getenv("ENGINE_RUNTIME_STALL_SEC", "20.0") or 20.0),
         )
+        runtime_first_cycle_grace_default = max(
+            35.0,
+            self._runtime_stall_timeout_sec * 1.75,
+        )
+        self._runtime_first_cycle_grace_sec: float = max(
+            self._runtime_stall_timeout_sec,
+            float(
+                os.getenv(
+                    "ENGINE_FIRST_CYCLE_GRACE_SEC",
+                    str(runtime_first_cycle_grace_default),
+                )
+                or runtime_first_cycle_grace_default
+            ),
+        )
 
 
         self._manual_stop = _monitoring_only_mode()
@@ -301,6 +315,25 @@ class MultiAssetTradingEngine:
         self._live_max_winrate_drift: float = max(
             0.01,
             float(os.getenv("LIVE_MAX_WINRATE_DRIFT", "0.15") or 0.15),
+        )
+        live_evidence_grace_default = max(30.0, self._runtime_start_grace_sec * 2.0)
+        self._live_evidence_grace_sec: float = max(
+            self._live_monitor_interval_sec,
+            float(
+                os.getenv(
+                    "LIVE_EVIDENCE_GRACE_SEC",
+                    str(live_evidence_grace_default),
+                )
+                or live_evidence_grace_default
+            ),
+        )
+        self._live_evidence_min_latency_samples: int = max(
+            5,
+            int(
+                float(
+                    os.getenv("LIVE_EVIDENCE_MIN_LATENCY_SAMPLES", "8") or 8
+                )
+            ),
         )
         self._live_evidence_state: Dict[str, Any] = {
             "status": "BOOT",
@@ -901,6 +934,7 @@ class MultiAssetTradingEngine:
         if self.dry_run:
             return True
         try:
+            self._touch_runtime_progress()
             session_ok, session_reason = self._mt5_session_status()
             if session_ok:
                 self._mt5_ready = True
@@ -928,6 +962,7 @@ class MultiAssetTradingEngine:
             )
 
             ensure_mt5()
+            self._touch_runtime_progress()
             recovered, recovered_reason = self._mt5_session_status()
             self._mt5_ready = bool(recovered)
             if not recovered:
@@ -1424,6 +1459,29 @@ class MultiAssetTradingEngine:
             return dict(self._live_evidence_state)
         self._last_live_monitor_ts = now
 
+        runtime_age_sec = (
+            max(0.0, now - float(self._loop_started_ts or 0.0))
+            if self._loop_started_ts > 0
+            else 0.0
+        )
+        latency_samples = max(
+            len(self._exec_latency_ms_hist),
+            len(self._fsm_cycle_ms_hist),
+        )
+        slippage_samples = len(self._exec_slippage_hist)
+        telemetry_runtime_ready = (
+            self._loop_started_ts > 0
+            and runtime_age_sec >= self._live_evidence_grace_sec
+        )
+        latency_gate_ready = (
+            telemetry_runtime_ready
+            and latency_samples >= self._live_evidence_min_latency_samples
+        )
+        slippage_gate_ready = (
+            telemetry_runtime_ready
+            and slippage_samples >= self._live_evidence_min_latency_samples
+        )
+
         lat_p95 = max(
             self._p95(self._exec_latency_ms_hist),
             self._p95(self._fsm_cycle_ms_hist),
@@ -1476,9 +1534,9 @@ class MultiAssetTradingEngine:
             max_pos = int(self._max_open_positions.get(asset, 0) or 0)
             if max_pos > 0 and int(open_now) > max_pos:
                 reasons.append(f"open_positions:{asset}:{int(open_now)}>{max_pos}")
-        if lat_p95 > self._live_max_p95_latency_ms:
+        if latency_gate_ready and lat_p95 > self._live_max_p95_latency_ms:
             reasons.append(f"latency_p95:{lat_p95:.1f}>{self._live_max_p95_latency_ms:.1f}")
-        if slip_p95 > self._live_max_p95_slippage_points:
+        if slippage_gate_ready and slip_p95 > self._live_max_p95_slippage_points:
             reasons.append(f"slippage_p95:{slip_p95:.2f}>{self._live_max_p95_slippage_points:.2f}")
         if wr_samples >= 8 and ref_wr > 0.0 and drift < -self._live_max_winrate_drift:
             reasons.append(f"winrate_drift:{drift:+.3f}")
@@ -1517,6 +1575,10 @@ class MultiAssetTradingEngine:
             "dd_pct": float(dd_pct),
             "balance": float(bal),
             "equity": float(eq),
+            "runtime_age_sec": round(runtime_age_sec, 1),
+            "latency_samples": int(latency_samples),
+            "slippage_samples": int(slippage_samples),
+            "telemetry_warmup": bool(not (latency_gate_ready and slippage_gate_ready)),
             # Statistical credibility fields
             "wr_ci_95_lo": round(wr_ci_lo, 4),
             "wr_ci_95_hi": round(wr_ci_hi, 4),
@@ -1665,22 +1727,33 @@ class MultiAssetTradingEngine:
 
     # -------------------- status API --------------------
     def status(self) -> PortfolioStatus:
-        try:
-            with MT5_LOCK:
-                term = mt5.terminal_info()
-                acc = mt5.account_info()
-        except Exception:
-            term = None
-            acc = None
-
-        identity_ok, _identity_reason = self._mt5_identity_ok(acc)
-        connected = bool(self._mt5_ready and term and getattr(term, "connected", False) and identity_ok)
         runtime_snapshot = self.runtime_watchdog_snapshot()
         trading = bool(runtime_snapshot.get("trading_ok", False))
+        if self.dry_run:
+            connected = True
+            with self._lock:
+                bal = float(self._last_account_snapshot.get("balance", 0.0) or 0.0)
+                eq = float(self._last_account_snapshot.get("equity", 0.0) or 0.0)
+            if bal <= 0.0:
+                bal = 10000.0
+            if eq <= 0.0:
+                eq = bal
+            pnl = 0.0
+            dd = max(0.0, (bal - eq) / bal) if bal > 0 else 0.0
+        else:
+            try:
+                with MT5_LOCK:
+                    term = mt5.terminal_info()
+                    acc = mt5.account_info()
+            except Exception:
+                term = None
+                acc = None
 
-        bal, eq, _ = self._stable_account_snapshot(acc, time.time())
-        pnl = float(getattr(acc, "profit", 0.0) or 0.0) if acc else 0.0
-        dd = max(0.0, (bal - eq) / bal) if bal > 0 else 0.0
+            identity_ok, _identity_reason = self._mt5_identity_ok(acc)
+            connected = bool(self._mt5_ready and term and getattr(term, "connected", False) and identity_ok)
+            bal, eq, _ = self._stable_account_snapshot(acc, time.time())
+            pnl = float(getattr(acc, "profit", 0.0) or 0.0) if acc else 0.0
+            dd = max(0.0, (bal - eq) / bal) if bal > 0 else 0.0
 
         open_xau = self._xau.open_positions() if self._xau else 0
         open_btc = self._btc.open_positions() if self._btc else 0
@@ -1843,6 +1916,11 @@ class MultiAssetTradingEngine:
         with self._lock:
             self._last_runtime_heartbeat_ts = now
 
+    def _touch_runtime_progress(self) -> None:
+        # Long MT5/model stages can legitimately take seconds. Keep the watchdog
+        # fed while real forward progress is happening to avoid false stale alarms.
+        self._mark_runtime_alive()
+
     def runtime_watchdog_snapshot(self) -> Dict[str, Any]:
         with self._lock:
             running = bool(self._run.is_set())
@@ -1850,6 +1928,7 @@ class MultiAssetTradingEngine:
             loop_thread = self._loop_thread
             loop_started_ts = float(self._loop_started_ts or 0.0)
             last_heartbeat_ts = float(self._last_runtime_heartbeat_ts or 0.0)
+            completed_cycles = int(len(self._fsm_cycle_ms_hist))
 
         loop_alive = bool(loop_thread and loop_thread.is_alive())
         now = time.time()
@@ -1863,10 +1942,18 @@ class MultiAssetTradingEngine:
             and loop_started_ts > 0.0
             and (now - loop_started_ts) <= self._runtime_start_grace_sec
         )
+        bootstrapping = bool(
+            running
+            and loop_alive
+            and completed_cycles <= 0
+            and loop_started_ts > 0.0
+            and (now - loop_started_ts) <= self._runtime_first_cycle_grace_sec
+        )
         stale = bool(
             running
             and loop_alive
             and not starting
+            and not bootstrapping
             and last_activity_ts > 0.0
             and heartbeat_age_sec > self._runtime_stall_timeout_sec
         )
@@ -1877,6 +1964,7 @@ class MultiAssetTradingEngine:
             "running": running,
             "loop_alive": loop_alive,
             "starting": starting,
+            "bootstrapping": bootstrapping,
             "stale": stale,
             "thread_dead": thread_dead,
             "heartbeat_age_sec": float(heartbeat_age_sec),

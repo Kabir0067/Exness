@@ -372,6 +372,22 @@ class RiskManager:
     def requires_hard_stop(self) -> bool:
         today = self._utc_date()
         with self._lock:
+            compat_reason = str(self._hard_stop_reason or "")
+            compat_release = (
+                self._hard_stop
+                and compat_reason.startswith("vol_circuit_breaker:")
+                and time.time() >= self._vol_breaker_until
+            )
+            if compat_release:
+                self._hard_stop = False
+                self._hard_stop_reason = ""
+                if self.phase == "C" and str(self._phase_reason or "") == compat_reason:
+                    self.phase = "A"
+                    self._phase_reason = "vol_circuit_breaker_cleared"
+                log.info(
+                    "VOL_CIRCUIT_BREAKER_CLEARED | %s | legacy hard-stop released",
+                    self.sp.base,
+                )
             if self._exec_breaker_active and time.time() < self._exec_breaker_until:
                 return True
             need_reset = today != self._last_date
@@ -385,6 +401,18 @@ class RiskManager:
     def hard_stop_reason(self) -> str:
         with self._lock:
             return str(self._hard_stop_reason or "unspecified")
+
+    def _vol_breaker_state(self) -> Tuple[bool, str]:
+        now = time.time()
+        with self._lock:
+            active = self._vol_breaker_active and now < self._vol_breaker_until
+            if active:
+                return True, str(self._vol_breaker_reason or "")
+            if self._vol_breaker_active:
+                self._vol_breaker_active = False
+                self._vol_breaker_until = 0.0
+                self._vol_breaker_reason = ""
+        return False, ""
 
     def _refresh_today_pnl_snapshot(self) -> None:
         if self._refresh_symbol_daily_pnl():
@@ -936,9 +964,9 @@ class RiskManager:
 
         Returns True if circuit breaker was triggered.
         """
-        with self._lock:
-            if self._vol_breaker_active and time.time() < self._vol_breaker_until:
-                return True  # already tripped
+        vol_active, _ = self._vol_breaker_state()
+        if vol_active:
+            return True  # already tripped
         if dfp is None or len(dfp) < 60:
             return False
         try:
@@ -969,6 +997,35 @@ class RiskManager:
                 gap = abs(float(c[-1]) - float(c[-2]))
                 gap_mult = float(getattr(self.cfg, 'circuit_breaker_gap_atr_mult', 2.0) or 2.0)
                 if gap > gap_mult * atr_last:
+                    gap_check_ok = True
+                    bar_delta_sec = 0.0
+                    max_bar_delta_sec = 0.0
+                    try:
+                        t_col = cols.get("time", "time")
+                        if t_col in dfp.columns:
+                            t_prev = pd.Timestamp(dfp[t_col].iat[-2])
+                            t_last = pd.Timestamp(dfp[t_col].iat[-1])
+                            bar_delta_sec = max(0.0, float((t_last - t_prev).total_seconds()))
+                            tf_sec = float(
+                                tf_seconds(str(getattr(self.sp, "tf_primary", "M1") or "M1")) or 60
+                            )
+                            max_bar_delta_sec = max(tf_sec * 1.5, tf_sec + 5.0)
+                            if bar_delta_sec > max_bar_delta_sec:
+                                gap_check_ok = False
+                    except Exception:
+                        gap_check_ok = True
+
+                    if not gap_check_ok:
+                        log.warning(
+                            "VOL_CIRCUIT_BREAKER_GAP_IGNORED | %s | gap=%.2f atr=%.2f "
+                            "bar_delta=%.1fs max_delta=%.1fs",
+                            self.sp.base,
+                            gap,
+                            atr_last,
+                            bar_delta_sec,
+                            max_bar_delta_sec,
+                        )
+                        return False
                     reason = f"PRICE_GAP:{gap:.2f}>{gap_mult:.1f}xATR({atr_last:.2f})"
                     self._trigger_vol_breaker(reason)
                     return True
@@ -978,7 +1035,7 @@ class RiskManager:
         return False
 
     def _trigger_vol_breaker(self, reason: str) -> None:
-        """Activate the volatility circuit breaker."""
+        """Activate the volatility circuit breaker cooldown without all-day hard-stop."""
         with self._lock:
             cooldown = float(getattr(self.cfg, 'circuit_breaker_cooldown_sec', 1800.0) or 1800.0)
             self._vol_breaker_active = True
@@ -988,7 +1045,6 @@ class RiskManager:
                 "VOL_CIRCUIT_BREAKER_TRIGGERED | %s | %s | cooldown=%.0fs",
                 self.sp.base, reason, cooldown,
             )
-            self._enter_hard_stop(f"vol_circuit_breaker:{reason}")
 
     def update_phase(self) -> None:
         self.evaluate_account_state()
@@ -1124,9 +1180,7 @@ class RiskManager:
                     self._spread_pct_hist = self._spread_pct_hist[-200:]
 
         # Volatility circuit breaker (Black Swan)
-        with self._lock:
-            vol_active = self._vol_breaker_active and time.time() < self._vol_breaker_until
-            vol_reason = self._vol_breaker_reason
+        vol_active, vol_reason = self._vol_breaker_state()
         if vol_active:
             reasons.append(f"VOL_CIRCUIT_BREAKER:{vol_reason}")
             return False, reasons
@@ -2052,6 +2106,7 @@ class RiskManager:
     # ─── Summary for health logging ──────────────────────────────────
 
     def summary(self) -> Dict[str, Any]:
+        vol_active, _ = self._vol_breaker_state()
         with self._lock:
             return {
                 "asset": self.sp.base,
@@ -2068,7 +2123,7 @@ class RiskManager:
                 "trades_today": len(self._trades_today),
                 "exec_p95_lat": round(self.exec_p95_latency(), 1),
                 "exec_p95_slip": round(self.exec_p95_slippage(), 2),
-                "vol_breaker": self._vol_breaker_active,
+                "vol_breaker": vol_active,
                 "daily_target_locked": self._daily_target_locked,
                 "daily_target_lock_reason": self._daily_target_lock_reason,
             }

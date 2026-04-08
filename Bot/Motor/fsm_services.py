@@ -38,6 +38,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
         self._e._report_cycle_latency_ms(float(latency_ms))
 
     def step_boot(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         if self._e.manual_stop_active():
             ctx.halt_reason = "manual_stop_active"
             nxt = self._e._transition_state(state, EngineState.HALT, "manual_stop")
@@ -57,6 +58,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
         return StepDecision(next_state=nxt, ctx=ctx)
 
     def step_data_sync(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         if not self._e._check_mt5_health():
             ctx.halt_reason = "mt5_disconnected"
             nxt = self._e._transition_state(state, EngineState.HALT, "mt5_disconnected")
@@ -88,11 +90,13 @@ class EngineFSMStageServices(IFSMEnginePorts):
         data_sync_ok = True
         data_sync_reason = ""
         for asset in active_assets:
+            self._e._touch_runtime_progress()
             if self._e._is_asset_blocked(asset):
                 self._e._log_blocked_asset_skip(asset, "data_sync")
                 continue
 
             asset_payloads = fetch_ml_payloads(asset)
+            self._e._touch_runtime_progress()
             ok, reason = self._e._validate_data_sync_payloads(asset, asset_payloads)
             if not ok:
                 data_sync_ok = False
@@ -119,8 +123,10 @@ class EngineFSMStageServices(IFSMEnginePorts):
         return StepDecision(next_state=state, ctx=ctx)
 
     def step_ml_inference(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         signals: Dict[str, MLSignal] = {}
         for asset, payload in ctx.payloads.items():
+            self._e._touch_runtime_progress()
             if self._e._is_asset_blocked(asset):
                 self._e._log_blocked_asset_skip(asset, "ml_inference")
                 continue
@@ -129,6 +135,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
             has_catboost = asset in self._e._catboost_payloads
             if has_catboost:
                 sig = self._e._infer_catboost(asset, payload)
+                self._e._touch_runtime_progress()
                 if sig is None:
                     # PATCH-4: LLM fallback disabled in live path.
                     # LLM inference adds 2-15s non-deterministic latency which causes
@@ -183,8 +190,10 @@ class EngineFSMStageServices(IFSMEnginePorts):
         return StepDecision(next_state=nxt, ctx=ctx)
 
     def step_risk_calc(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         candidates: List[AssetCandidate] = []
         for asset in ("XAU", "BTC"):
+            self._e._touch_runtime_progress()
             sig = ctx.ml_signals.get(asset)
             if sig is None:
                 continue
@@ -199,6 +208,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
         return StepDecision(next_state=nxt, ctx=ctx)
 
     def step_execution_queue(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         if self._e._retraining_mode:
             now = time.time()
             if now - self._e._last_retraining_log_ts > 10.0:
@@ -224,11 +234,14 @@ class EngineFSMStageServices(IFSMEnginePorts):
             return StepDecision(next_state=nxt, ctx=ctx)
 
         self._e._execute_candidates(ctx.candidates)
+        self._e._touch_runtime_progress()
         nxt = self._e._transition_state(state, EngineState.VERIFICATION, "queue_complete")
         return StepDecision(next_state=nxt, ctx=ctx)
 
     def step_verification(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
+        self._e._touch_runtime_progress()
         self._e._verification_step()
+        self._e._touch_runtime_progress()
         nxt = self._e._transition_state(state, EngineState.DATA_SYNC, "verification_complete")
         return StepDecision(next_state=nxt, ctx=ctx)
 
