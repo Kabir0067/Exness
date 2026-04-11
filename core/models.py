@@ -118,6 +118,8 @@ class SignalResult:
     tp: float = 0.0
     lot: float = 0.0
     timeframe: str = ""
+    data_state: str = "data valid"
+    feature_state: str = "features valid"
 
 
 @dataclass

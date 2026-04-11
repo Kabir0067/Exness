@@ -48,7 +48,16 @@ import MetaTrader5 as mt5
 
 from core.model_manager import ModelMetadata, model_manager
 from log_config import LOG_DIR, get_artifact_dir, get_artifact_path, get_log_path
-from mt5_client import MT5_LOCK, ensure_mt5
+
+try:
+    from mt5_client import MT5_LOCK, ensure_mt5
+except Exception:
+    import threading
+
+    MT5_LOCK = threading.RLock()
+
+    def ensure_mt5() -> bool:
+        return False
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger("backtest.model_train_institutional")
@@ -1994,6 +2003,223 @@ def _run_walk_forward_validation(
     }
 
 
+def _split_is_chronological(splits: Dict[str, Dict[str, pd.Series]]) -> bool:
+    """Verify strict chronological train/validation/test/holdout ordering."""
+    ordered_parts = ("train", "val", "test", "holdout")
+    last_ts: Optional[pd.Timestamp] = None
+    for part in ordered_parts:
+        idx = splits.get(part, {}).get("X", pd.Series(dtype=object)).index
+        if len(idx) <= 0:
+            continue
+        cur_min = pd.Timestamp(idx.min())
+        cur_max = pd.Timestamp(idx.max())
+        if last_ts is not None and cur_min <= last_ts:
+            return False
+        last_ts = cur_max
+    return True
+
+
+def _direction_balance(y: np.ndarray) -> Dict[str, Any]:
+    """Measure sign imbalance for directional stability diagnostics."""
+    arr = np.asarray(y, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return {"positive": 0, "negative": 0, "flat": 0, "dominant_ratio": 1.0, "imbalanced": True}
+    signs = np.sign(arr)
+    positive = int(np.sum(signs > 0.0))
+    negative = int(np.sum(signs < 0.0))
+    flat = int(np.sum(signs == 0.0))
+    dominant = max(positive, negative, flat)
+    dominant_ratio = float(dominant / max(1, arr.size))
+    return {
+        "positive": positive,
+        "negative": negative,
+        "flat": flat,
+        "dominant_ratio": dominant_ratio,
+        "imbalanced": bool(dominant_ratio > 0.85),
+    }
+
+
+def _regime_dependency_profile(pred: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    """Estimate whether accuracy collapses under a different realized-volatility regime."""
+    pred_arr = np.asarray(pred, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(pred_arr) & np.isfinite(y_arr)
+    pred_arr = pred_arr[mask]
+    y_arr = y_arr[mask]
+    if pred_arr.size < 20 or y_arr.size != pred_arr.size:
+        return {"dependency_delta": 0.0, "dependent": False}
+
+    realized_vol = np.abs(y_arr)
+    q1 = float(np.quantile(realized_vol, 0.25))
+    q3 = float(np.quantile(realized_vol, 0.75))
+    low_mask = realized_vol <= q1
+    high_mask = realized_vol >= q3
+    if int(np.sum(low_mask)) < 5 or int(np.sum(high_mask)) < 5:
+        return {"dependency_delta": 0.0, "dependent": False}
+
+    low_acc = float(np.mean(np.sign(pred_arr[low_mask]) == np.sign(y_arr[low_mask])))
+    high_acc = float(np.mean(np.sign(pred_arr[high_mask]) == np.sign(y_arr[high_mask])))
+    dependency_delta = abs(high_acc - low_acc)
+    return {
+        "low_vol_accuracy": low_acc,
+        "high_vol_accuracy": high_acc,
+        "dependency_delta": dependency_delta,
+        "dependent": bool(dependency_delta > 0.20),
+    }
+
+
+def _build_training_audit_report(
+    *,
+    cfg: InstitutionalTrainConfig,
+    splits: Dict[str, Dict[str, pd.Series]],
+    results: Dict[str, Dict[str, Any]],
+    preds_by_split: Dict[str, np.ndarray],
+    alpha_calibration: Dict[str, Any],
+    anti_overfit: Dict[str, Any],
+    source_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Build the Phase 7 training audit for leakage, overfit, and model staleness."""
+    training_features = list(getattr(cfg, "training_features", []) or [])
+    suspicious_name_tokens = ("target", "label", "future", "lead", "lookahead", "leak")
+    suspicious_feature_names = [
+        feat for feat in training_features
+        if any(tok in str(feat).lower() for tok in suspicious_name_tokens)
+    ]
+
+    train_y = np.asarray(splits.get("train", {}).get("y", pd.Series(dtype=np.float64)).values, dtype=np.float64)
+    hold_y = np.asarray(splits.get("holdout", {}).get("y", pd.Series(dtype=np.float64)).values, dtype=np.float64)
+    train_pred = np.asarray(preds_by_split.get("train", np.array([], dtype=np.float64)), dtype=np.float64)
+    hold_pred = np.asarray(preds_by_split.get("holdout", np.array([], dtype=np.float64)), dtype=np.float64)
+
+    feature_target_corr_max = 0.0
+    try:
+        if source_df is not None and not source_df.empty and "target" in source_df.columns:
+            corr_series = source_df[training_features + ["target"]].corr(numeric_only=True)["target"].drop(labels=["target"], errors="ignore")
+            corr_vals = np.abs(corr_series.to_numpy(dtype=np.float64, copy=False))
+            corr_vals = corr_vals[np.isfinite(corr_vals)]
+            if corr_vals.size > 0:
+                feature_target_corr_max = float(np.max(corr_vals))
+    except Exception:
+        feature_target_corr_max = 0.0
+
+    chronology_ok = _split_is_chronological(splits)
+    balance = _direction_balance(hold_y)
+    regime_dependency = _regime_dependency_profile(hold_pred, hold_y)
+
+    train_dir_acc = float(results.get("train", {}).get("direction_accuracy", 0.0) or 0.0)
+    hold_dir_acc = float(results.get("holdout", {}).get("direction_accuracy", 0.0) or 0.0)
+    val_active_acc = float(alpha_calibration.get("val_direction_accuracy_active", 0.0) or 0.0)
+    hold_active_acc = float(alpha_calibration.get("holdout_direction_accuracy_active", 0.0) or 0.0)
+    hold_active_cov = float(alpha_calibration.get("holdout_coverage_active", 0.0) or 0.0)
+    min_cov = float(alpha_calibration.get("target_active_min_coverage", 0.0) or 0.0)
+    calibration_gap = abs(val_active_acc - hold_active_acc)
+
+    val_thr = float(alpha_calibration.get("pred_abs_threshold", 0.0) or 0.0)
+    hold_thr = float(alpha_calibration.get("holdout_abs_threshold_from_quantile", 0.0) or 0.0)
+    threshold_ratio = (
+        float(hold_thr / max(val_thr, 1e-12))
+        if val_thr > 0.0 and hold_thr > 0.0
+        else 1.0
+    )
+
+    asset_target = 0.56 if "BTC" in str(cfg.symbol).upper() else 0.55
+    cadence_hours = 24.0 * (7.0 if "BTC" in str(cfg.symbol).upper() else 14.0)
+    stale_age_hours = 0.0
+    try:
+        latest_ts = pd.Timestamp(source_df.index.max())
+        if latest_ts.tzinfo is None:
+            latest_ts = latest_ts.tz_localize("UTC")
+        else:
+            latest_ts = latest_ts.tz_convert("UTC")
+        now_ts = pd.Timestamp.now(tz="UTC")
+        stale_age_hours = max(
+            0.0,
+            (now_ts - latest_ts).total_seconds() / 3600.0,
+        )
+    except Exception:
+        stale_age_hours = cadence_hours * 2.0
+
+    feature_leakage_detected = bool(suspicious_feature_names)
+    target_leakage_detected = bool((not chronology_ok) or feature_target_corr_max >= 0.995)
+    overfitting_detected = bool(
+        (train_dir_acc - hold_dir_acc) > 0.12
+        or not bool(anti_overfit.get("passed", False))
+    )
+    asset_specific_quality = bool(
+        hold_active_acc >= asset_target
+        and hold_active_cov >= max(0.005, min_cov * 0.80)
+    )
+    calibration_ok = bool(calibration_gap <= 0.10 and val_thr > 0.0)
+    threshold_stable = bool(0.60 <= threshold_ratio <= 1.60)
+    stale_model_detected = bool(stale_age_hours > cadence_hours)
+    oos_degradation = float(max(0.0, train_dir_acc - hold_dir_acc))
+
+    passed = bool(
+        not feature_leakage_detected
+        and not target_leakage_detected
+        and not balance["imbalanced"]
+        and not overfitting_detected
+        and not regime_dependency.get("dependent", False)
+        and asset_specific_quality
+        and calibration_ok
+        and threshold_stable
+        and not stale_model_detected
+    )
+
+    return {
+        "passed": passed,
+        "feature_leakage": {
+            "detected": feature_leakage_detected,
+            "suspicious_features": suspicious_feature_names,
+        },
+        "target_leakage": {
+            "detected": target_leakage_detected,
+            "chronology_ok": chronology_ok,
+            "feature_target_corr_max": feature_target_corr_max,
+        },
+        "class_imbalance": balance,
+        "overfitting": {
+            "detected": overfitting_detected,
+            "train_direction_accuracy": train_dir_acc,
+            "holdout_direction_accuracy": hold_dir_acc,
+            "gap": train_dir_acc - hold_dir_acc,
+        },
+        "regime_dependency": regime_dependency,
+        "asset_specific_quality": {
+            "passed": asset_specific_quality,
+            "target_active_accuracy": asset_target,
+            "holdout_active_accuracy": hold_active_acc,
+            "holdout_active_coverage": hold_active_cov,
+        },
+        "calibration_quality": {
+            "passed": calibration_ok,
+            "val_active_accuracy": val_active_acc,
+            "holdout_active_accuracy": hold_active_acc,
+            "gap": calibration_gap,
+        },
+        "threshold_stability": {
+            "passed": threshold_stable,
+            "validation_threshold": val_thr,
+            "holdout_threshold": hold_thr,
+            "ratio": threshold_ratio,
+        },
+        "retraining_cadence": {
+            "recommended_hours": cadence_hours,
+            "stale_age_hours": stale_age_hours,
+        },
+        "stale_model_detection": {
+            "detected": stale_model_detected,
+            "stale_age_hours": stale_age_hours,
+            "limit_hours": cadence_hours,
+        },
+        "out_of_sample_degradation": {
+            "detected": oos_degradation > 0.10,
+            "gap": oos_degradation,
+        },
+    }
+
+
 def train(
     cfg: Optional[InstitutionalTrainConfig] = None,
     log_dir: Optional[Path] = None,
@@ -2157,11 +2383,29 @@ def train(
         f"({int(wfa_report.get('failed', 0))}/{int(wfa_report.get('total', 0))} failed)"
     )
 
+    training_audit = _build_training_audit_report(
+        cfg=cfg_effective,
+        splits=splits,
+        results=results,
+        preds_by_split=preds_by_split,
+        alpha_calibration=alpha_calibration,
+        anti_overfit=anti_overfit,
+        source_df=raw_df,
+    )
+    _console(
+        "   Training Audit: "
+        f"{'PASS' if training_audit.get('passed', False) else 'FAIL'} | "
+        f"stale={int(bool(training_audit.get('stale_model_detection', {}).get('detected', False)))} "
+        f"overfit={int(bool(training_audit.get('overfitting', {}).get('detected', False)))} "
+        f"regime_dep={int(bool(training_audit.get('regime_dependency', {}).get('dependent', False)))}"
+    )
+
     institutional_ok = (
         model.backend == "catboost"
         and hold_acc_active >= target_acc
         and hold_cov_active >= min_cov
         and anti_overfit_ok
+        and bool(training_audit.get("passed", False))
     )
     alpha_gate_required = str(os.getenv("INSTITUTIONAL_REQUIRE_ALPHA_GATE", "1") or "1").strip().lower() in {
         "1", "true", "yes", "y", "on"
@@ -2198,6 +2442,8 @@ def train(
             f":wfa_passed={int(wfa_passed)}"
             f":wfa_failed={wfa_failed}/{wfa_total}"
         )
+    if not bool(training_audit.get("passed", False)):
+        alpha_gate_fail_reasons.append("training_audit_failed")
     if alpha_gate_required and alpha_gate_fail_reasons:
         raise RuntimeError(
             "institutional_training_blocked:alpha_gate_failed:"
@@ -2217,6 +2463,7 @@ def train(
         "alpha_calibration": alpha_calibration,
         "anti_overfit": anti_overfit,
         "anti_overfit_passed": anti_overfit_ok,
+        "training_audit": training_audit,
         "institutional_grade": institutional_ok,
     }
 
@@ -2238,6 +2485,7 @@ def train(
         wfa_passed=bool(wfa_report.get("passed", False)),
         wfa_total_windows=int(wfa_report.get("total", 0) or 0),
         wfa_failed_windows=int(wfa_report.get("failed", 0) or 0),
+        training_audit=training_audit,
     )
     registry_base = model_manager.save_model(payload, metadata)
 
@@ -2280,6 +2528,7 @@ def train(
         "results": results,
         "alpha_calibration": alpha_calibration,
         "anti_overfit": anti_overfit,
+        "training_audit": training_audit,
         "training_features": list(cfg_effective.training_features),
         "feature_importance": feature_importance,
         "institutional_grade": institutional_ok,

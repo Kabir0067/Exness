@@ -17,6 +17,15 @@ except ImportError:
     mt5 = None
 
 from .config import BaseEngineConfig, BaseSymbolParams
+from .data_integrity import (
+    DATA_INCOMPLETE,
+    DATA_VALID,
+    Validator,
+)
+from .feature_engine import (
+    FEATURES_VALID,
+    FeatureIntegrityError,
+)
 from .models import SignalResult
 from .risk_engine import RiskManager
 from .utils import _is_finite, _side_norm, clamp01
@@ -79,6 +88,9 @@ class SignalEngine:
         self._macro_symbol_cache: Dict[str, Optional[str]] = {}
         self._macro_ctx_cache_ts: float = 0.0
         self._macro_ctx_cache: Dict[str, float] = {}
+        self._validator = Validator(cfg, sp)
+        self._data_audits: Dict[Tuple[str, str], Any] = {}
+        self._last_market_audit: Optional[Any] = None
 
         log.info(
             "SignalEngine(%s) initialized | tf=%s/%s/%s",
@@ -106,13 +118,14 @@ class SignalEngine:
 
     def _sanitize_rates(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         """
-        Ensure DataFrame is usable:
-          - columns: open/high/low/close
-          - sorted by time (if time column exists)
-          - numeric close
+        Normalize OHLCV column names and numeric dtypes without mutating
+        chronology. The strict integrity audit decides whether ordering, gaps,
+        timezone handling, or schema issues are acceptable.
         """
         if df is None or len(df) == 0:
             return None
+
+        df = df.copy()
 
         # Normalize column names
         renames = {}
@@ -136,13 +149,9 @@ class SignalEngine:
         if "close" not in df.columns:
             return None
 
-        # Sort by time if available
-        if "time" in df.columns:
-            df = df.sort_values("time")
-
-        # Ensure numeric
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df.dropna(subset=["close"], inplace=True)
+        for col in ("open", "high", "low", "close", "tick_volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
         if len(df) < 10:
             return None
@@ -166,10 +175,118 @@ class SignalEngine:
             df = self._unwrap_rates_df(ret)
             if df is not None and bars is not None and len(df) > bars:
                 df = df.iloc[-bars:].copy()
-            return self._sanitize_rates(df)
+            df = self._sanitize_rates(df)
+            audit = self._validator.validate_ohlcv(df, tf, symbol=sym)
+            self._data_audits[(sym, tf)] = audit
+            if not audit.tradable:
+                return None
+            return audit.normalized_df
         except Exception as exc:
             log.error("_get_rates_df(%s, %s): %s", sym, tf, exc)
+            self._data_audits[(sym, tf)] = self._validator.validate_ohlcv(
+                None,
+                tf,
+                symbol=sym,
+            )
             return None
+
+    def _audit_for(self, sym: str, tf: str) -> Optional[Any]:
+        return self._data_audits.get((sym, tf))
+
+    def _audit_failure_result(
+        self,
+        sym: str,
+        tf: str,
+        t0: float,
+        fallback_reason: str,
+    ) -> SignalResult:
+        audit = self._audit_for(sym, tf)
+        reasons = [fallback_reason]
+        data_state = DATA_INCOMPLETE
+        if audit is not None:
+            reasons = audit.reason_codes()[:10]
+            data_state = str(getattr(audit, "state", DATA_INCOMPLETE) or DATA_INCOMPLETE)
+            if fallback_reason not in reasons:
+                reasons.append(fallback_reason)
+        return self._neutral(
+            sym,
+            reasons,
+            t0,
+            trade_blocked=True,
+            data_state=data_state,
+        )
+
+    def _quote_snapshot(self, sym: str) -> Tuple[float, float, Optional[Any]]:
+        bid = ask = 0.0
+        tick_timestamp: Optional[Any] = None
+
+        try:
+            snap_fn = getattr(self._feed, "last_quote_snapshot", None)
+            if callable(snap_fn):
+                snap = snap_fn()
+                if isinstance(snap, (tuple, list)) and len(snap) >= 3:
+                    bid = float(snap[0] or 0.0)
+                    ask = float(snap[1] or 0.0)
+                    tick_timestamp = snap[2]
+                    return bid, ask, tick_timestamp
+        except Exception:
+            pass
+
+        try:
+            snap_fn = getattr(self._feed, "_last_quote_snapshot", None)
+            if callable(snap_fn):
+                snap = snap_fn()
+                if isinstance(snap, (tuple, list)) and len(snap) >= 3:
+                    bid = float(snap[0] or 0.0)
+                    ask = float(snap[1] or 0.0)
+                    tick_timestamp = snap[2]
+                    return bid, ask, tick_timestamp
+        except Exception:
+            pass
+
+        try:
+            quote_fn = getattr(self._feed, "quote", None)
+            if callable(quote_fn):
+                snap = quote_fn()
+                if isinstance(snap, (tuple, list)) and len(snap) >= 2:
+                    bid = float(snap[0] or 0.0)
+                    ask = float(snap[1] or 0.0)
+        except Exception:
+            bid = ask = 0.0
+
+        try:
+            if mt5 is not None:
+                with _mt5_lock():
+                    tick = mt5.symbol_info_tick(sym)
+                if tick is not None:
+                    bid = float(getattr(tick, "bid", bid) or bid)
+                    ask = float(getattr(tick, "ask", ask) or ask)
+                    tick_timestamp = (
+                        getattr(tick, "time_msc", None)
+                        or getattr(tick, "time", None)
+                    )
+        except Exception:
+            pass
+
+        return bid, ask, tick_timestamp
+
+    def _symbol_info_snapshot(self, sym: str) -> Optional[Any]:
+        try:
+            info_fn = getattr(self._feed, "symbol_info", None)
+            if callable(info_fn):
+                info = info_fn(sym)
+                if info is not None:
+                    return info
+        except Exception:
+            pass
+
+        try:
+            if mt5 is not None:
+                with _mt5_lock():
+                    return mt5.symbol_info(sym)
+        except Exception:
+            pass
+        return None
 
     # ─── Main compute ────────────────────────────────────────────────
 
@@ -195,10 +312,30 @@ class SignalEngine:
             # ── 1. Fetch rates ──
             dfp = self._get_rates_df(sym, self.sp.tf_primary)
             if dfp is None or len(dfp) < 30:
-                return self._neutral(sym, ["no_primary_data"], t0)
+                return self._audit_failure_result(
+                    sym,
+                    self.sp.tf_primary,
+                    t0,
+                    "no_primary_data",
+                )
 
             dfc = self._get_rates_df(sym, self.sp.tf_confirm)
+            if dfc is None or len(dfc) < 30:
+                return self._audit_failure_result(
+                    sym,
+                    self.sp.tf_confirm,
+                    t0,
+                    "no_confirm_data",
+                )
+
             dfl = self._get_rates_df(sym, self.sp.tf_long)
+            if dfl is None or len(dfl) < 30:
+                return self._audit_failure_result(
+                    sym,
+                    self.sp.tf_long,
+                    t0,
+                    "no_long_data",
+                )
 
             # D1 timeframe for daily trend confluence
             tf_daily = getattr(self.sp, "tf_daily", "D1")
@@ -207,29 +344,73 @@ class SignalEngine:
                 sym, tf_daily,
                 bars=d1_bars,
             )
+            if dfd is None or len(dfd) < 30:
+                return self._audit_failure_result(
+                    sym,
+                    tf_daily,
+                    t0,
+                    "no_daily_data",
+                )
             # Dedicated H1 stream for vector alignment math (M1/M15/H1/D1)
             if str(self.sp.tf_long).upper() == "H1":
                 dfh = dfl
             else:
                 dfh = self._get_rates_df(sym, "H1", bars=120)
+                if dfh is None or len(dfh) < 30:
+                    return self._audit_failure_result(
+                        sym,
+                        "H1",
+                        t0,
+                        "no_h1_data",
+                    )
             # Dedicated H4 stream for institutional flow confluence gate.
             if str(self.sp.tf_long).upper() == "H4":
                 dfh4 = dfl
             else:
                 dfh4 = self._get_rates_df(sym, "H4", bars=120)
+                if dfh4 is None or len(dfh4) < 30:
+                    return self._audit_failure_result(
+                        sym,
+                        "H4",
+                        t0,
+                        "no_h4_data",
+                    )
+
+            bid, ask, tick_timestamp = self._quote_snapshot(sym)
+            symbol_info = self._symbol_info_snapshot(sym)
+            market_audit = self._validator.validate_market_context(
+                df=dfp,
+                timeframe=self.sp.tf_primary,
+                symbol=sym,
+                bid=bid,
+                ask=ask,
+                tick_timestamp=tick_timestamp,
+                symbol_info=symbol_info,
+                now=time.time(),
+            )
+            self._last_market_audit = market_audit
+            if not market_audit.tradable:
+                return self._neutral(
+                    sym,
+                    market_audit.reason_codes()[:10],
+                    t0,
+                    trade_blocked=True,
+                    data_state=market_audit.state,
+                )
 
             # ── 1b. Volatility circuit breaker (Black Swan) ──
             if self._rm.check_volatility_circuit_breaker(dfp):
                 return self._neutral(
                     sym, ["vol_circuit_breaker"], t0,
                     trade_blocked=True,
+                    data_state=DATA_VALID,
                 )
 
             # ── 2. Compute indicators ──
             df_dict = {
                 self.sp.tf_primary: dfp,
-                self.sp.tf_confirm: dfc if dfc is not None else dfp,
-                self.sp.tf_long: dfl if dfl is not None else dfp,
+                self.sp.tf_confirm: dfc,
+                self.sp.tf_long: dfl,
             }
             if dfh is not None and len(dfh) > 0:
                 df_dict["H1"] = dfh
@@ -238,25 +419,67 @@ class SignalEngine:
 
             try:
                 indicators = self._fe.compute_indicators(df_dict, shift=1)
+            except FeatureIntegrityError as exc:
+                audit = exc.audit
+                return self._neutral(
+                    sym,
+                    audit.reason_codes()[:10],
+                    t0,
+                    trade_blocked=True,
+                    data_state=DATA_VALID,
+                    feature_state=audit.state,
+                )
             except Exception as exc:
-                return self._neutral(sym, [f"indicator_error:{exc}"], t0)
+                return self._neutral(
+                    sym,
+                    [f"indicator_error:{exc}"],
+                    t0,
+                    feature_state=FEATURES_VALID,
+                )
 
             if not indicators:
-                return self._neutral(sym, ["no_indicators"], t0)
+                return self._neutral(
+                    sym,
+                    ["no_indicators"],
+                    t0,
+                    feature_state=FEATURES_VALID,
+                )
 
             indp = indicators.get(self.sp.tf_primary, {})
             indc = indicators.get(self.sp.tf_confirm, {})
             indl = indicators.get(self.sp.tf_long, {})
             ind_h1 = indicators.get("H1", {})
             ind_h4 = indicators.get("H4", {})
+            regime_timestamp: Optional[Any] = None
+            market_regime = "normal"
 
             if not indp:
-                return self._neutral(sym, ["no_primary_indicators"], t0)
+                return self._neutral(
+                    sym,
+                    ["no_primary_indicators"],
+                    t0,
+                    feature_state=FEATURES_VALID,
+                )
+
+            try:
+                if "time" in dfp.columns and len(dfp) >= 2:
+                    regime_timestamp = dfp["time"].iloc[-2]
+                elif len(dfp.index) >= 2:
+                    regime_timestamp = dfp.index[-2]
+            except Exception:
+                regime_timestamp = None
+
+            market_regime = self._fe.classify_market_regime(
+                indicators,
+                asset=self.sp.base,
+                now=regime_timestamp,
+                primary_tf=self.sp.tf_primary,
+            )
 
             # ── 3. Market state ──
             bid, ask = self._tick_bid_ask(sym)
             if bid <= 0 or ask <= 0:
-                return self._neutral(sym, ["no_tick"], t0)
+                return self._neutral(sym, ["no_tick"], t0, regime=market_regime)
 
             spread_pct = (ask - bid) / bid if bid > 0 else 0.0
             bar_key = self._bar_key(dfp)
@@ -265,6 +488,7 @@ class SignalEngine:
                     return self._neutral(
                         sym, ["same_bar_dedup"], t0,
                         spread_pct=spread_pct, bar_key=bar_key,
+                        regime=market_regime,
                     )
                 self._last_bar_key = bar_key
 
@@ -275,6 +499,7 @@ class SignalEngine:
                     sym, reasons + [flash_reason], t0,
                     spread_pct=spread_pct, bar_key=bar_key,
                     trade_blocked=True,
+                    regime=market_regime,
                 )
 
             # ATR for regime detection
@@ -319,6 +544,7 @@ class SignalEngine:
                     sym, guard_reasons, t0,
                     spread_pct=spread_pct, bar_key=bar_key,
                     trade_blocked=True,
+                    regime=market_regime,
                 )
 
             # ── 5. Ensemble scoring ──
@@ -358,6 +584,7 @@ class SignalEngine:
                 return self._neutral(
                     sym, reasons + [f"weak_score:{net_abs:.1f}<{score_floor:.1f}"], t0,
                     spread_pct=spread_pct, bar_key=bar_key,
+                    regime=market_regime,
                 )
 
             # Confidence
@@ -381,6 +608,7 @@ class SignalEngine:
                         spread_pct=spread_pct,
                         bar_key=bar_key,
                         trade_blocked=True,
+                        regime=market_regime,
                     )
                 conf = max(0, conf - 12)
                 reasons.append(f"late_chase_penalty:{ext_atr:.2f}atr")
@@ -414,6 +642,7 @@ class SignalEngine:
                                 spread_pct=spread_pct,
                                 bar_key=bar_key,
                                 trade_blocked=True,
+                                regime=market_regime,
                             )
                         pen = int(max(0, int(getattr(self.cfg, "stop_hunt_conflict_penalty", 16) or 16)))
                         conf = max(0, conf - pen)
@@ -465,6 +694,7 @@ class SignalEngine:
                     sym, reasons + [f"sniper_reject:{conf}<{sniper_floor}"], t0,
                     confidence=conf, spread_pct=spread_pct, bar_key=bar_key,
                     trade_blocked=True,
+                    regime=market_regime,
                 )
 
             # Can emit?
@@ -474,6 +704,7 @@ class SignalEngine:
                     sym, reasons + [f"emit_blocked:{emit_reason}"], t0,
                     confidence=conf, spread_pct=spread_pct, bar_key=bar_key,
                     trade_blocked=True,
+                    regime=market_regime,
                 )
 
             adapt["confidence"] = clamp01(conf / 100.0)
@@ -494,6 +725,7 @@ class SignalEngine:
                 reasons=reasons,
                 dfp=dfp,
                 structure_frames=(dfp, dfc, dfl, dfh),
+                market_regime=market_regime,
             )
 
         except Exception as exc:
@@ -538,18 +770,43 @@ class SignalEngine:
             idx = -2 if len(df) >= 2 else -1
             last = df.iloc[idx]
             t = last.get("time", 0)
-            return str(int(float(t) or 0))
+            ts = self._epoch_seconds(t)
+            if ts is None:
+                return "no_bar"
+            return str(int(ts))
         except Exception:
             return "no_bar"
 
     def _last_bar_age(self, df: pd.DataFrame) -> float:
         try:
             if "time" in df.columns:
-                last_ts = float(df.iloc[-1]["time"])
-                return time.time() - last_ts
+                last_ts = self._epoch_seconds(df.iloc[-1]["time"])
+                if last_ts is not None:
+                    return max(0.0, time.time() - last_ts)
         except Exception:
             pass
         return 0.0
+
+    @staticmethod
+    def _epoch_seconds(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            if value.tzinfo is None:
+                return float(value.tz_localize("UTC").timestamp())
+            return float(value.tz_convert("UTC").timestamp())
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except Exception:
+                pass
+        try:
+            raw = float(value)
+            if raw > 10**12:
+                raw /= 1000.0
+            return raw
+        except Exception:
+            return None
 
     def _flash_crash_guard(self, dfp: pd.DataFrame) -> Tuple[bool, str]:
         """BTC flash-crash guard via return z-score (sigma event)."""
@@ -598,6 +855,8 @@ class SignalEngine:
         regime: Optional[str] = None,
         bar_key: str = "no_bar",
         trade_blocked: bool = False,
+        data_state: str = DATA_VALID,
+        feature_state: str = FEATURES_VALID,
     ) -> SignalResult:
         return SignalResult(
             signal="Neutral",
@@ -610,6 +869,8 @@ class SignalEngine:
             reasons=reasons,
             latency_ms=(time.time() - t0) * 1000,
             trade_blocked=trade_blocked,
+            data_state=data_state,
+            feature_state=feature_state,
         )
 
     # ─── Session checks ──────────────────────────────────────────────
@@ -1908,6 +2169,7 @@ class SignalEngine:
         reasons: List[str],
         dfp: Optional[pd.DataFrame] = None,
         structure_frames: Tuple[Optional[pd.DataFrame], ...] = (),
+        market_regime: Optional[str] = None,
     ) -> SignalResult:
         """Build final SignalResult, optionally with execution plan."""
         sig_id = self._signal_id(sym, self.sp.tf_primary, bar_key, signal)
@@ -1918,12 +2180,14 @@ class SignalEngine:
             symbol=sym,
             confidence=conf,
             spread_pct=spread_pct,
-            regime=adapt.get("regime", "normal"),
+            regime=market_regime or adapt.get("regime", "normal"),
             signal_id=sig_id,
             bar_key=bar_key,
             reasons=reasons,
             latency_ms=latency,
             timeframe=self.sp.tf_primary,
+            data_state=DATA_VALID,
+            feature_state=FEATURES_VALID,
         )
 
         if execute and signal != "Neutral" and conf >= self.cfg.min_confidence:

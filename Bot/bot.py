@@ -1330,6 +1330,10 @@ def handle_engine_check(message: telebot.types.Message) -> None:
             f"📂 Позицияҳо: XAU <b>{status.open_trades_xau}</b> | BTC <b>{status.open_trades_btc}</b>\n"
             f"🛎 Сигналҳо: XAU <b>{html.escape(str(status.last_signal_xau))}</b> | BTC <b>{html.escape(str(status.last_signal_btc))}</b>\n"
             f"📥 Queue: <b>{status.exec_queue_size}</b>\n"
+            f"🧭 Controller: <b>{html.escape(str(getattr(status, 'controller_state', 'unknown')))}</b>\n"
+            f"🧪 Chaos: <b>{html.escape(str(getattr(status, 'chaos_state', 'unknown')))}</b>\n"
+            f"🚫 Gate: <code>{html.escape(str(getattr(status, 'gate_reason', '') or '-'))}</code>\n"
+            f"🛑 Halt: <code>{html.escape(str(getattr(status, 'risk_halt_reason', '') or '-'))}</code>\n"
         ),
         parse_mode="HTML",
     )

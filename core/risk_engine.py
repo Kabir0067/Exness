@@ -1268,6 +1268,48 @@ class RiskManager:
 
         return True, ""
 
+    def execution_barrier_snapshot(
+        self,
+        *,
+        side: str,
+        confidence: float,
+        lot: float,
+        entry_price: float,
+        sl: float,
+        tp: float,
+        signal_id: str = "",
+        stage: str = "dispatch",
+        base_lot: Optional[float] = None,
+        phase_snapshot: str = "",
+    ) -> Dict[str, Any]:
+        """Return a deterministic snapshot of the dispatch gate state."""
+        allowed, adjusted_lot, reason = self.pre_order_gate(
+            side=side,
+            confidence=confidence,
+            lot=lot,
+            entry_price=entry_price,
+            sl=sl,
+            tp=tp,
+            signal_id=signal_id,
+            stage=stage,
+            base_lot=base_lot,
+            phase_snapshot=phase_snapshot,
+        )
+        with self._lock:
+            phase_now = str(self.phase or "A").upper()
+            daily_locked = bool(self._daily_target_locked)
+            hard_stop = bool(self._hard_stop)
+            hard_stop_reason = str(self._hard_stop_reason or "")
+        return {
+            "allowed": bool(allowed),
+            "adjusted_lot": float(adjusted_lot or 0.0),
+            "reason": str(reason or ""),
+            "phase": phase_now,
+            "daily_locked": daily_locked,
+            "hard_stop": hard_stop,
+            "hard_stop_reason": hard_stop_reason,
+        }
+
     def pre_order_gate(
         self,
         *,
@@ -1299,10 +1341,36 @@ class RiskManager:
             return False, 0.0, "gate_bad_side"
         if not _is_finite(lot_val, entry, sl_val, tp_val) or lot_val <= 0.0:
             return False, 0.0, "gate_bad_values"
+        hard_cap = float(getattr(self.sp, "hard_lot_cap", 0.0) or 0.0)
+        if hard_cap > 0.0:
+            tol = max(1e-8, hard_cap * 1e-6)
+            if lot_val > (hard_cap + tol):
+                return False, 0.0, f"hard_lot_cap:{lot_val:.8f}>{hard_cap:.8f}"
         if side_n == "Buy" and not (sl_val < entry < tp_val):
             return False, 0.0, "gate_bad_sl_tp_buy"
         if side_n == "Sell" and not (tp_val < entry < sl_val):
             return False, 0.0, "gate_bad_sl_tp_sell"
+
+        min_stop_distance = 0.0
+        point = 0.0
+        try:
+            if mt5 is not None:
+                with _mt5_lock():
+                    info = mt5.symbol_info(self.sp.symbol)
+                if info is not None:
+                    point = float(getattr(info, "point", 0.0) or 0.0)
+                    stops_level = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
+                    min_stop_distance = max(min_stop_distance, stops_level * max(point, 0.0))
+        except Exception:
+            pass
+        if point <= 0.0:
+            digits = max(0, int(getattr(self.sp, "digits", 0) or 0))
+            point = 10.0 ** (-digits) if digits > 0 else 0.0
+        price_tol = max(point, abs(entry) * 1e-8, 1e-10)
+        if abs(entry - sl_val) <= max(price_tol, min_stop_distance - price_tol):
+            return False, 0.0, f"gate_stop_distance_sl:{abs(entry - sl_val):.8f}"
+        if abs(tp_val - entry) <= max(price_tol, min_stop_distance - price_tol):
+            return False, 0.0, f"gate_stop_distance_tp:{abs(tp_val - entry):.8f}"
 
         # Cheap refresh for deterministic gating under high-frequency flow.
         now = time.time()

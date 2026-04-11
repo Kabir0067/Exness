@@ -1046,6 +1046,29 @@ def _bootstrap_runtime(*, allow_telegram: bool = True) -> bool:
     return True
 
 
+def _controller_boot_report() -> dict[str, Any]:
+    """Return a single production snapshot for startup and supervision logs."""
+    if engine is None:
+        return {}
+    snap_fn = getattr(engine, "controller_snapshot", None)
+    if callable(snap_fn):
+        try:
+            snap = snap_fn()
+            if isinstance(snap, dict):
+                return snap
+        except Exception:
+            return {}
+    runtime_fn = getattr(engine, "runtime_watchdog_snapshot", None)
+    if callable(runtime_fn):
+        try:
+            snap = runtime_fn()
+            if isinstance(snap, dict):
+                return {"runtime": snap}
+        except Exception:
+            return {}
+    return {}
+
+
 # =============================================================================
 # Shutdown
 # =============================================================================
@@ -1883,6 +1906,16 @@ def _main_inner(args: argparse.Namespace) -> int:
         "Bot connected" if notifier_wired else "disabled",
     )
 
+    boot_report = _controller_boot_report()
+    if boot_report:
+        log.info(
+            "PRODUCTION_BOOT | controller=%s gate_reason=%s blocked=%s chaos=%s",
+            str(boot_report.get("controller_state", "-") or "-"),
+            str(boot_report.get("gate_reason", "") or ""),
+            ",".join(boot_report.get("blocked_assets", ())) if boot_report.get("blocked_assets") else "-",
+            str(boot_report.get("chaos_state", "-") or "-"),
+        )
+
     if _tg_available:
         notifier: NotifierLike = Notifier(shutdown.stop_event, queue_max=200)
         try:
@@ -1926,6 +1959,8 @@ def _main_inner(args: argparse.Namespace) -> int:
     thread_restart_cooldown_sec = 2.0
     last_engine_thread_restart_ts = 0.0
     last_bot_thread_restart_ts = 0.0
+    last_controller_probe_ts = 0.0
+    controller_probe_sec = 30.0
 
     try:
         engine_thread.start()
@@ -1938,6 +1973,28 @@ def _main_inner(args: argparse.Namespace) -> int:
 
         while not shutdown.stop_event.is_set():
             now = time.time()
+            if (now - last_controller_probe_ts) >= controller_probe_sec:
+                last_controller_probe_ts = now
+                try:
+                    housekeep_fn = getattr(engine, "manage_runtime_housekeeping", None)
+                    if callable(housekeep_fn):
+                        housekeep_fn()
+                except Exception:
+                    pass
+                try:
+                    chaos_fn = getattr(engine, "run_chaos_audit", None)
+                    if callable(chaos_fn):
+                        chaos = chaos_fn()
+                        if isinstance(chaos, dict) and not bool(chaos.get("overall_passed", True)):
+                            failed = [
+                                str(name)
+                                for name, payload in dict(chaos.get("scenarios", {})).items()
+                                if isinstance(payload, dict) and not bool(payload.get("passed", False))
+                            ]
+                            if failed:
+                                log.warning("CHAOS_AUDIT_WARN | failed=%s", ",".join(failed[:6]))
+                except Exception:
+                    pass
             if not engine_thread.is_alive() and (now - last_engine_thread_restart_ts) >= thread_restart_cooldown_sec:
                 last_engine_thread_restart_ts = now
                 log.error("ENGINE_SUPERVISOR_THREAD_EXITED | restarting")

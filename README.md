@@ -1,253 +1,470 @@
-<div align="center">
+# QuantCore Pro
 
-<h1>QuantCore Pro</h1>
+Institutional-style MetaTrader 5 trading runtime for `XAUUSDm` and `BTCUSDm`, built around audit-first execution, deterministic control, portfolio risk firewalls, pessimistic backtesting, model training audits, and a Telegram control center.
 
-<h3>Institutional-style MetaTrader 5 trading runtime</h3>
+## What This Repository Actually Is
 
-<p>
-  Built for deterministic orchestration, model admission control, layered risk rails,
-  broker-aware execution, and operational visibility.
-</p>
+This repository is not a single-file MT5 bot and it is not a bare signal script.
 
-<p>
-  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12" />
-  <img src="https://img.shields.io/badge/Runtime-MT5%20%2F%20Exness-0B4F9C?style=flat-square" alt="MT5 Exness" />
-  <img src="https://img.shields.io/badge/Assets-XAUUSDm%20%2B%20BTCUSDm-8A6A00?style=flat-square" alt="Assets" />
-  <img src="https://img.shields.io/badge/ML-CatBoost-F6C343?style=flat-square" alt="CatBoost" />
-  <img src="https://img.shields.io/badge/Execution-Deterministic%20FSM-111111?style=flat-square" alt="Deterministic FSM" />
-  <img src="https://img.shields.io/badge/V1-Finalized-0A7F5A?style=flat-square" alt="V1 Finalized" />
-  <img src="https://img.shields.io/badge/Verification-116%20tests%20verified-1F9D55?style=flat-square" alt="116 tests verified" />
-</p>
+Running `python main.py` boots a full production-style runtime with:
 
-</div>
+- runtime bootstrap and environment preflight
+- optional startup model training / model readiness checks
+- deterministic multi-asset trading engine
+- Phase 1 market-data integrity audit
+- Phase 2 feature integrity audit
+- live market regime classification
+- signal generation with hard pre-trade barriers
+- risk engine, portfolio risk manager, and execution integrity gates
+- broker send, reconciliation, and runtime health supervision
+- Telegram bot control and monitoring without blocking the engine loop
+- chaos-audit and recovery-oriented controller snapshots
 
----
+The current first-class assets in the live runtime are:
 
-<table>
-  <tr>
-    <td valign="top" width="50%">
-      <h3>Release Posture</h3>
-      <p>
-        <strong>V1 is finalized as a runtime-ready engineering release.</strong>
-      </p>
-      <p>
-        The core runtime, guard rails, verification paths, and documentation
-        have been aligned to the system that is actually present in this repository.
-      </p>
-    </td>
-    <td valign="top" width="50%">
-      <h3>System Focus</h3>
-      <p>
-        QuantCore Pro is designed around the same engineering concerns that define
-        serious internal execution stacks: deterministic flow, controlled startup,
-        risk-first behavior, reconciliation, and observability.
-      </p>
-    </td>
-  </tr>
-</table>
+- `XAUUSDm`
+- `BTCUSDm`
 
-## Executive Summary
-
-QuantCore Pro is not presented as a one-file signal bot, a toy MT5 script, or a "black box alpha" marketing page.
-
-It is a production-minded trading runtime for MetaTrader 5 that combines:
-
-- deterministic finite-state execution
-- model gatekeeping before live order flow
-- layered portfolio and per-asset risk controls
-- execution verification and broker reconciliation
-- runtime diagnostics, health telemetry, and recovery paths
-- dry-run, engine-only, and monitoring-oriented operating modes
-
-The result is a repository that reads and behaves far closer to an institutional execution runtime than to the average retail automation project. That statement describes engineering posture and system design. It does not claim ownership of any hidden bank strategy, proprietary desk alpha, or guaranteed profit profile.
-
-## Why It Feels Like A Serious Internal Runtime
-
-<table>
-  <tr>
-    <td valign="top" width="33%">
-      <h3>Deterministic Core</h3>
-      <p>
-        The engine is built around a finite-state machine instead of ad hoc
-        background behavior. That makes transitions explicit, failures more
-        diagnosable, and execution flow easier to reason about under stress.
-      </p>
-    </td>
-    <td valign="top" width="33%">
-      <h3>Trade Admission Control</h3>
-      <p>
-        Models are not blindly trusted. The runtime checks gate state, artifact
-        readiness, asset eligibility, and startup conditions before letting live
-        order flow proceed.
-      </p>
-    </td>
-    <td valign="top" width="33%">
-      <h3>Risk As Infrastructure</h3>
-      <p>
-        Risk is not a single stop-loss rule. It is embedded across sizing,
-        drawdown limits, circuit breakers, portfolio controls, trade pausing,
-        and emergency stop behavior.
-      </p>
-    </td>
-  </tr>
-  <tr>
-    <td valign="top" width="33%">
-      <h3>Execution Verification</h3>
-      <p>
-        Orders are tracked beyond the initial send path. The stack includes
-        queueing, deduplication, reconciliation, SL/TP attachment handling,
-        and pending-order state resolution.
-      </p>
-    </td>
-    <td valign="top" width="33%">
-      <h3>Recovery-Aware Runtime</h3>
-      <p>
-        Startup, reconnect, and unhealthy runtime paths are supervised. The
-        engine is built to degrade, pause, recover, or hold rather than fail
-        silently.
-      </p>
-    </td>
-    <td valign="top" width="33%">
-      <h3>Operational Visibility</h3>
-      <p>
-        Health logs, diagnostics snapshots, MT5 events, and execution telemetry
-        make the runtime inspectable. That is one of the clearest markers of a
-        production-minded system.
-      </p>
-    </td>
-  </tr>
-</table>
-
-## V1 Final Status
-
-<table>
-  <tr>
-    <td valign="top" width="50%">
-      <h3>Verified</h3>
-      <ul>
-        <li>Core runtime compiles cleanly</li>
-        <li>Local smoke verifier passes: <code>python test.py</code></li>
-        <li>Committed regression verification recorded: <code>116 passed</code></li>
-        <li>Dry-run startup path has been verified</li>
-        <li>Dry-run engine-only soak check completed cleanly</li>
-        <li>Volatility breaker now behaves as a cooldown, not an all-day hard stop</li>
-        <li>Irregular bar-gap false positives are blocked in the volatility breaker</li>
-        <li>Startup telemetry warmup was added for live evidence evaluation</li>
-        <li>Dry-run Telegram noise is disabled by default</li>
-      </ul>
-    </td>
-    <td valign="top" width="50%">
-      <h3>Release Meaning</h3>
-      <p>
-        V1 is complete as an <strong>engineering release</strong>.
-      </p>
-      <p>
-        That means the runtime boots, the control rails are in place, the
-        verification layer is present, and the public-facing documentation now
-        reflects verified system behavior.
-      </p>
-      <p>
-        Market edge, profitability durability, and long-horizon live alpha still
-        require ongoing statistical validation, exactly as they should in any
-        serious trading program.
-      </p>
-    </td>
-  </tr>
-</table>
-
-The canonical release gate is documented here:
-
-- [V1_FINAL_CHECKLIST.md](V1_FINAL_CHECKLIST.md)
-
-## Runtime Topology
+## End-to-End Runtime Flow
 
 ```text
-main.py
-  -> runtime bootstrap
-  -> startup policy and model gate orchestration
-  -> engine supervisor
-  -> optional Telegram supervisor
-
-Bot/Motor/
-  -> deterministic FSM runtime
-  -> inference engine
-  -> execution manager
-  -> order sync manager
-  -> portfolio engine health and diagnostics
-
-core/
-  -> configuration
-  -> feature engineering
-  -> signal logic
-  -> risk engine
-  -> portfolio risk
-  -> model gate and model manager
-
-DataFeed/
-  -> XAU market data path
-  -> BTC market data path
-  -> tick, bar, and microstructure payload generation
-
-ExnessAPI/
-  -> order placement
-  -> position handling
-  -> broker interaction utilities
-
-Backtest/
-  -> model training support
-  -> backtest engine
-  -> metrics and validation support
+python main.py
+  -> startup preflight
+  -> MT5 / Telegram availability checks
+  -> model readiness gate (+ optional auto-train on startup)
+  -> MultiAssetTradingEngine
+      -> XAU + BTC data feeds
+      -> Phase 1 Data Integrity Audit
+      -> feature engineering
+      -> Phase 2 Feature Integrity Audit
+      -> market regime classification
+      -> signal engine
+      -> risk engine + portfolio firewall
+      -> execution manager
+      -> MT5 order send + reconciliation
+  -> Telegram supervisor (optional)
+  -> controller snapshot, chaos audit, and housekeeping loop
 ```
 
-## Operating Modes
+## Production Entry Point
 
-| Mode | Purpose | Notes |
-| --- | --- | --- |
-| `python main.py` | Live-oriented startup path | Uses strict runtime and model admission rules |
-| `python main.py --dry-run --engine-only` | Controlled runtime verification | Best path for clean engine-only startup checks |
-| `DRY_RUN=1 python main.py` | Dry-run from environment | Telegram remains disabled by default unless explicitly enabled |
-| `MONITORING_ONLY=1 python main.py` | Observation without trade execution | Useful for supervised runtime inspection |
-
-If Telegram is required during dry-run, enable it explicitly:
+The system is designed to be started from:
 
 ```bash
-ALLOW_TG_IN_DRY_RUN=1
+python main.py
 ```
 
-## Verification
+Supported CLI flags:
 
-These commands represent the V1 verification posture:
+- `python main.py --headless`
+- `python main.py --engine-only`
+- `python main.py --dry-run`
+- `python main.py --dry-run --engine-only`
 
-```bash
-python -m py_compile core/risk_engine.py Bot/Motor/engine.py main.py test.py
-python test.py
-python main.py --dry-run --engine-only
-```
+Environment toggles used by the real runtime:
 
-The V1 release record also includes a committed regression verification run with `116 passed`.
+| Variable | Effect |
+| --- | --- |
+| `DRY_RUN=1` | Forces simulation mode. |
+| `MONITORING_ONLY=1` | Keeps the system in observation mode with trading disabled. |
+| `ALLOW_TG_IN_DRY_RUN=1` | Allows Telegram to stay enabled in dry-run mode. |
+| `AUTO_TRAIN_ON_STARTUP=1` | Trains/retrains models automatically when startup policy requires it. |
+| `AUTO_TRAIN_ON_STARTUP=0` | Skips startup retraining. |
+| `ALLOW_MISSING_TG=1` | If Telegram credentials are missing, the system falls back to engine-only startup instead of hard failing. |
+| `AUTO_DRY_RUN_ON_MISSING_ENV=1` | If live broker credentials are missing, startup can auto-fall back to dry-run. |
 
-## System Characteristics That Are Real In This Repository
+Operational behavior in `main.py`:
 
-- XAUUSDm and BTCUSDm are first-class runtime assets.
-- Live-oriented and dry-run execution paths both exist.
-- Model gatekeeping is enforced before live order admission.
-- Risk controls include hard stops, soft stops, cooldowns, kill-switch behavior, and portfolio exposure controls.
-- The volatility circuit breaker is time-bounded and cooldown-based.
-- Health and diagnostics are emitted into `Logs/`.
-- The runtime includes startup supervision, recovery hooks, and broker-state awareness.
-- The repository includes a built-in smoke verifier for local release checks.
+- enforces singleton boot
+- performs environment preflight
+- wires engine notifiers to Telegram when available
+- starts engine supervision thread
+- starts Telegram supervision thread when allowed
+- exposes a boot-time controller report via `_controller_boot_report()`
+- periodically calls `manage_runtime_housekeeping()` and `run_chaos_audit()`
+- keeps Telegram and engine separated so the bot does not block the trading loop
 
-## Logs And Observability
+## Core Architecture
 
-The runtime is designed to be inspectable while it is running. Key operational outputs include:
+These are the main existing files that carry the system:
 
-- `Logs/main.log`
-- `Logs/portfolio_engine_health.log`
-- `Logs/portfolio_engine_diag.jsonl`
-- `Logs/mt5.log`
-- `Logs/telegram.log`
+- `main.py`: master orchestrator, startup policy, engine and Telegram supervision, controller boot reporting
+- `Bot/Motor/engine.py`: `MultiAssetTradingEngine`, live engine state machine, runtime health, controller snapshot, chaos audit, housekeeping
+- `Bot/Motor/execution_manager.py`: order dispatch preparation, portfolio pre-checks, proposed risk computation
+- `Bot/Motor/models.py`: portfolio status model used by engine and Telegram
+- `Bot/bot.py`: Telegram control center, admin-only command layer, notifications, menus, actions
+- `Bot/bot_utils.py`: Telegram keyboards, formatting, summaries, helper limits
+- `core/data_integrity.py`: Phase 1 market-data validator and detector set
+- `core/feature_engine.py`: feature computation, Phase 2 feature validator, MTF integrity checks, regime classifier
+- `core/signal_engine.py`: data and feature firewalls before any live signal result is allowed through
+- `core/risk_engine.py`: strategy phase logic, kill-switch, execution barrier, SL/TP geometry checks, lot caps
+- `core/portfolio_risk.py`: daily-loss hard stop, drawdown hard stop, exposure and open-risk caps
+- `core/model_manager.py`: model metadata persistence, including training audit metadata
+- `Backtest/engine.py`: pessimistic backtest engine and backtest audit
+- `Backtest/model_train.py`: model training pipeline and training-audit report
+- `tests/test_data_integrity_audit.py`: regression suite covering the integrated audit layers
 
-That visibility matters because serious trading systems are judged not only by how they trade, but by how clearly they reveal their own health, state transitions, and failure modes.
+## Audit And Safety Layers
+
+### Phase 1: Data Integrity Audit
+
+Implemented in `core/data_integrity.py` and enforced in `core/signal_engine.py`.
+
+The validator covers:
+
+- missing bars
+- duplicate bars
+- wrong timezone handling and strict UTC normalization
+- future leakage in timestamps
+- candle order correctness
+- stale ticks / tick freshness
+- spread anomalies
+- weekend and session-hole detection
+- symbol digits / point / contract-size consistency
+- broker feed inconsistencies
+- gap anomalies
+- impossible spikes
+- strict OHLC integrity assertions
+
+Exact data states before signal generation:
+
+- `data valid`
+- `data stale`
+- `data incomplete`
+- `abnormal spread`
+- `market unusable`
+
+If Phase 1 fails, the signal path is blocked before any trade decision is generated.
+
+### Phase 2: Feature Integrity Audit
+
+Implemented in `core/feature_engine.py` and enforced in `core/signal_engine.py`.
+
+The feature firewall validates:
+
+- EMA reference behavior against observed price envelopes
+- RSI mathematical bounds
+- MACD line / signal / histogram identity
+- ATR non-negativity and true-range consistency
+- zero NaN / Inf leakage into the decision layer
+- warmup sufficiency before features are considered valid
+- scaling / normalization boundaries
+- strict no-lookahead behavior for `shift()` and rolling calculations
+- MTF alignment from fully closed higher-timeframe candles only
+- feature lag alignment
+
+Exact feature states before the decision layer:
+
+- `features valid`
+- `nan detected`
+- `insufficient warmup`
+- `lookahead bias detected`
+- `mtf alignment error`
+- `scaling error`
+
+If Phase 2 fails, `SignalResult` is returned in a blocked neutral state and does not reach live execution.
+
+### Phase 4 And 5: Risk And Execution Audit
+
+Implemented across `core/risk_engine.py`, `core/portfolio_risk.py`, `Bot/Motor/execution_manager.py`, and `Bot/Motor/engine.py`.
+
+Hard protections include:
+
+- max daily loss hard stop
+- max drawdown from peak hard stop
+- persistent no-trade-after-hard-stop behavior
+- separate risk tracking per asset
+- total exposure caps
+- per-asset exposure caps
+- per-asset open-risk caps
+- strategy `A / B / C` phase switching
+- cooldown enforcement
+- kill-switch enforcement
+- portfolio exposure checked before order send
+- hard lot-size cap
+- SL / TP geometry validation
+- minimum stop-distance validation
+- execution barrier snapshots for diagnostics
+
+Live open-risk is reconciled from real positions by the engine and proposed risk is computed before order admission by the execution manager.
+
+### Phase 6: Backtest Audit
+
+Implemented in `Backtest/engine.py`.
+
+The backtest engine is intentionally pessimistic and now enforces:
+
+- commission included
+- spread included
+- slippage included
+- realistic fill rules
+- session restrictions
+- minimum stop-distance rules
+- no future-data usage
+- no bar-close cheating
+- walk-forward split
+- strict train / test separation
+- out-of-sample validation
+- next-bar entry logic through `entry_delay_bars`
+
+Backtest metadata includes `backtest_audit`.
+
+### Phase 7: Model Training Audit
+
+Implemented in `Backtest/model_train.py` and persisted through `core/model_manager.py`.
+
+The training audit reports and gates on:
+
+- feature leakage
+- target leakage
+- class imbalance
+- overfitting
+- regime dependency
+- asset-specific model quality
+- calibration quality
+- threshold stability
+- retraining cadence
+- stale model detection
+- out-of-sample degradation
+
+Model metadata includes `training_audit`, and the institutional gate now requires the audit to pass.
+
+### Phase 8: Regime Audit
+
+Implemented in `core/feature_engine.py` and consumed by `core/signal_engine.py`.
+
+Live regime labels currently include:
+
+- `trend strong`
+- `trend weak`
+- `range`
+- `breakout`
+- `fake breakout`
+- `high volatility`
+- `low volatility`
+- `session open`
+- `session dead hours`
+- `news hours`
+- `weekend BTC regime`
+
+Higher-timeframe signals are derived from closed candles only to prevent repainting.
+
+### Phase 10: Stress Test Audit
+
+Implemented through the controller and chaos hooks in `Bot/Motor/engine.py` and surfaced through `main.py`.
+
+The runtime includes resilience checks and recovery paths for:
+
+- MT5 disconnect
+- internet or processing delay
+- stale feed conditions
+- missing bars
+- spread spikes
+- sudden gaps
+- slow model response
+- duplicate signal storms
+- simultaneous multi-asset trigger pressure
+- corrupted configuration conditions
+- invalid symbol information
+- process restart while positions are open
+- terminal restart during an open trade
+- log growth and housekeeping pressure
+
+The engine exposes:
+
+- `status()`
+- `runtime_watchdog_snapshot()`
+- `manage_runtime_housekeeping()`
+- `run_chaos_audit()`
+- `controller_snapshot()`
+
+### Phase 11: Main Orchestration And Bot Control
+
+`main.py` is the production entry point and now boots the realistic system end to end.
+
+The bot is not a side gadget. It is the control center for:
+
+- start / stop behavior
+- kill-style trading halt
+- monitoring and reporting
+- order-management actions
+- AI menu access
+- helper actions
+- operational notifications
+
+## Telegram Bot: Full Feature Map
+
+The Telegram control plane is implemented in `Bot/bot.py` and `Bot/bot_utils.py`.
+
+### Access Model
+
+- admin-only control surface
+- unauthorized access attempts trigger an alert back to the admin
+- Telegram network calls are wrapped with safe handlers
+- typing / UI actions are handled without blocking the engine
+
+### Main Telegram Commands
+
+These are the main commands exposed through `bot_commands()`:
+
+| Command | Real behavior |
+| --- | --- |
+| `/start` | Opens the base control entry and directs the admin to the control panel. |
+| `/buttons` | Opens the main reply-keyboard control panel. |
+| `/status` | Shows live system state, including controller and chaos fields. |
+| `/ai` | Opens the AI market-analysis menu for XAU and BTC modes. |
+| `/balance` | Shows balance / equity account state. |
+| `/history` | Shows full trading history and account reporting. |
+| `/helpers` | Opens the helper panel for TP/SL mass actions and manual helper orders. |
+
+Additional admin helper commands that exist in the bot:
+
+- `/tek_prof`
+- `/stop_ls`
+
+These are quick-action command paths for bulk TP / SL management in USD across open positions.
+
+### Main Reply Keyboard Buttons
+
+The main control keyboard includes these exact buttons:
+
+- `🚀 Оғози Тиҷорат`
+- `🛑 Қатъи Тиҷорат`
+- `❌ Бастани ҳама ордерҳо`
+- `💰 Бастани фоидадорҳо`
+- `📋 Дидани Ордерҳои Кушода`
+- `📈 Фоидаи Имрӯза`
+- `📊 Фоидаи Ҳафтаина`
+- `💹 Фоидаи Моҳона`
+- `💳 Баланс`
+- `📊 Хулосаи Позицияҳо`
+- `🔍 Санҷиши Муҳаррик`
+- `🛠 Санҷиши Пурраи мотор`
+
+### AI Inline Menu
+
+The AI menu contains these exact options:
+
+- `🥇 AI XAU`
+- `₿ AI BTC`
+- `📈 XAU рӯзона`
+- `📉 BTC рӯзона`
+
+These route into the bot's analysis views for scalp and intraday variants of XAU and BTC.
+
+### Helpers Inline Menu
+
+The helper menu contains these actions:
+
+- `TP`
+- `SL`
+- `BTC Buy`
+- `BTC Sell`
+- `XAU Buy`
+- `XAU Sell`
+
+Important operational rule:
+
+- manual helper orders are restricted to a single safe order only
+- `HELPER_ORDER_COUNTS = (1,)`
+- bulk helper stacking is intentionally blocked
+
+USD range limits for the mass TP / SL actions:
+
+- TP range: `1..10` USD
+- SL range: `1..10` USD
+
+### Order-Management Features Exposed By The Bot
+
+The bot can:
+
+- start trading
+- stop trading
+- close all open orders
+- close profitable positions only
+- view open orders
+- navigate open orders one by one
+- close an individual order from the order viewer
+- close the order-view panel
+- show daily, weekly, and monthly profit summaries
+- show balance and position summaries
+- run engine status checks
+- run full engine checks
+
+### Notifications The Engine Sends To Telegram
+
+The engine is wired to Telegram for these non-blocking notifications:
+
+- signal notifications
+- order updates
+- skipped-order notifications
+- phase-change notifications
+- engine-stop notifications
+- daily-start notifications
+
+### What `/status` Surfaces
+
+The status output is meant to be operational, not cosmetic. It includes current trading and engine context such as:
+
+- controller state
+- chaos state
+- gate reason
+- risk halt reason
+- balance
+- equity
+- drawdown
+- daily PnL
+- open-position counts
+- last-signal context
+- queue / engine runtime health
+
+## Controller, Runtime Supervision, And Recovery
+
+The live engine in `Bot/Motor/engine.py` maintains a unified controller snapshot consumed by both `main.py` and Telegram.
+
+Key controller outputs include:
+
+- `controller_state`
+- `gate_reason`
+- `blocked_assets`
+- `risk_halt_reason`
+- `chaos_state`
+- `uptime_sec`
+
+This controller surface is used for:
+
+- startup boot reports
+- periodic supervision probes
+- Telegram status reporting
+- runtime diagnostics
+- graceful restart / recovery-aware behavior
+
+## Risk And Execution Details That Matter
+
+This repository now treats risk as infrastructure rather than a single stop-loss rule.
+
+Important protections already present in code:
+
+- no order is allowed through if SL / TP geometry is mathematically invalid
+- no order is allowed through if the minimum stop distance is violated
+- no order is allowed through if the lot size breaches the hard cap
+- no order is allowed through if portfolio or per-asset risk is already above limits
+- no new trade is allowed after a portfolio hard stop trips
+- phase logic and drawdown protections remain active while sizing adapts
+- data-state and feature-state audits block trade creation before execution
+
+## Backtest And Training Reality
+
+This repository does not assume optimistic fills or lenient model approval.
+
+What is actually enforced:
+
+- transaction costs are included in backtests
+- entries are delayed to avoid same-bar cheating
+- walk-forward and out-of-sample logic are part of the evaluation flow
+- training audit failure can block institutional approval
+- stale or overfit models are explicitly flagged
+- regime dependency and asset-specific weakness are measured
 
 ## Repository Layout
 
@@ -255,57 +472,68 @@ That visibility matters because serious trading systems are judged not only by h
 main.py
 mt5_client.py
 log_config.py
+README.md
+requirements.txt
 test.py
 
-Bot/
-Backtest/
 core/
+  config.py
+  data_integrity.py
+  feature_engine.py
+  signal_engine.py
+  risk_engine.py
+  portfolio_risk.py
+  model_manager.py
+
+Bot/
+  bot.py
+  bot_utils.py
+  Motor/
+    engine.py
+    execution_manager.py
+    models.py
+
+Backtest/
+  engine.py
+  model_train.py
+
 DataFeed/
 ExnessAPI/
 Artifacts/
 Logs/
-strategies/
+tests/
+  test_data_integrity_audit.py
 ```
 
-If the committed regression suite is present in the checkout, it lives under `tests/`.
+## Verification
 
-## Environment
-
-Typical runtime variables:
-
-```ini
-EXNESS_LOGIN=...
-EXNESS_PASSWORD=...
-EXNESS_SERVER=...
-
-TG_TOKEN=...
-TG_ADMIN_ID=...
-```
-
-Install dependencies with:
+The current integrated regression commands for this repository are:
 
 ```bash
-pip install -r requirements.txt
+python -m py_compile core\data_integrity.py core\feature_engine.py core\portfolio_risk.py core\risk_engine.py core\signal_engine.py core\model_manager.py Bot\Motor\models.py Bot\Motor\execution_manager.py Bot\Motor\engine.py Backtest\engine.py Backtest\model_train.py main.py Bot\bot.py tests\test_data_integrity_audit.py
+python -m unittest tests.test_data_integrity_audit -v
 ```
 
-## Positioning
+Latest verified integrated suite on this branch:
 
-The strongest truthful one-line description of this repository is:
+- `29` tests passed
 
-> QuantCore Pro is a production-minded, institutional-style MT5 trading runtime with deterministic orchestration, strict trade admission, layered risk infrastructure, broker-aware recovery, and operational diagnostics.
+Important note:
 
-That is the level at which V1 is finalized.
+- `test.py` is not the production regression gate for the trading runtime; the audit-focused test suite is `tests/test_data_integrity_audit.py`
 
-## Disclaimer
+## Summary
 
-This repository is a trading engineering system.
+This repository now reflects a realistic trading stack with:
 
-- It is designed to control risk, not eliminate it.
-- Backtest quality and runtime controls improve discipline, but do not guarantee future returns.
-- Real-money deployment should still begin with monitoring, staged exposure, and capital discipline.
+- audit-first data admission
+- audit-first feature admission
+- regime-aware signal generation
+- risk-first execution gating
+- portfolio hard-stop enforcement
+- pessimistic backtest validation
+- model training audit gates
+- resilience and chaos supervision
+- a Telegram control surface that exposes the real runtime rather than hiding it
 
-## Next Stage
-
-V1 handoff is complete.
-
-The next development stage is **V2**.
+That is the actual shape of the system currently present in this codebase.

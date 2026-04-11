@@ -144,12 +144,48 @@ class ExecutionManager:
             p = tick_info.ask if tick_info else 0.0
             proposed_margin = (p * float(cand.lot) * c_size) / float(leverage or 1)
 
+        pre_tick = mt5_async_call(
+            "symbol_info_tick",
+            cand.symbol,
+            timeout=0.35,
+            default=None,
+        )
+        pre_info = mt5_async_call(
+            "symbol_info",
+            cand.symbol,
+            timeout=0.5,
+            default=None,
+        )
+        pre_price = float(
+            pre_tick.ask if (pre_tick is not None and cand.signal == "Buy")
+            else (pre_tick.bid if pre_tick is not None else 0.0)
+        )
+        live_contract_size = float(getattr(pre_info, "trade_contract_size", 0.0) or 0.0)
+        if live_contract_size <= 0.0:
+            live_contract_size = float(getattr(cfg.symbol_params, "contract_size", 1.0) or 1.0)
+        proposed_risk_amount = max(
+            0.0,
+            abs(pre_price - float(cand.sl or 0.0)) * float(cand.lot) * live_contract_size,
+        )
+
         allowed, adj_lot, block_reason = e._portfolio_risk.check_before_order(
             asset=cand.asset,
             side=cand.signal,
             equity=equity,
             proposed_lot=float(cand.lot),
             proposed_margin=proposed_margin,
+            proposed_risk_amount=proposed_risk_amount,
+            asset_exposure_factor=float(
+                getattr(cfg, "max_asset_exposure_factor", 0.0) or 0.0
+            ),
+            asset_risk_factor=float(
+                getattr(
+                    cfg,
+                    "max_asset_risk_per_asset_pct",
+                    max(0.0, float(getattr(cfg, "max_risk_per_trade", 0.0) or 0.0)) * 2.0,
+                )
+                or 0.0
+            ),
         )
         if not allowed:
             log_health.warning("PORTFOLIO_BLOCK | asset=%s reason=%s", cand.asset, block_reason)
@@ -184,13 +220,13 @@ class ExecutionManager:
                 e._last_log_id[cand.asset] = str(cand.signal_id)
             return False, None
 
-        tick = mt5_async_call(
+        tick = pre_tick if pre_tick is not None else mt5_async_call(
             "symbol_info_tick",
             cand.symbol,
             timeout=0.35,
             default=None,
         )
-        info = mt5_async_call(
+        info = pre_info if pre_info is not None else mt5_async_call(
             "symbol_info",
             cand.symbol,
             timeout=0.5,

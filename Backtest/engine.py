@@ -35,7 +35,6 @@ import pandas as pd
 import talib
 
 from log_config import get_artifact_dir, get_artifact_path, get_log_path
-from mt5_client import MT5_LOCK, ensure_mt5
 from core.model_manager import model_manager
 from core.transaction_costs import TransactionCostModel
 from core.config import (
@@ -45,6 +44,16 @@ from core.config import (
     WFA_MIN_PASS_RATE,
     WFA_MIN_WINDOWS,
 )
+
+try:
+    from mt5_client import MT5_LOCK, ensure_mt5
+except Exception:
+    import threading
+
+    MT5_LOCK = threading.RLock()
+
+    def ensure_mt5() -> bool:
+        return False
 
 try:
     from .metrics import BacktestMetrics, compute_metrics, save_metrics
@@ -133,6 +142,10 @@ class InstitutionalBacktestConfig:
     commission_bps:       float = 0.5
     funding_rate_annual:  float = 0.05
     backtest_risk_free_rate: float = 0.0
+    enforce_session_restrictions: bool = True
+    allow_dead_hours_entries: bool = False
+    min_stop_distance_atr: float = 0.25
+    entry_delay_bars: int = 1
 
     # Walk-Forward Analysis
     wfa_train_days:   int   = 90
@@ -426,6 +439,7 @@ class InstitutionalBacktestEngine:
         self._anti_overfit_passed:   bool            = False
         self._tscv_folds:            int             = 0
         self._tscv_mean_active_acc:  float           = 0.0
+        self._backtest_audit:        Dict[str, Any]  = {}
 
         self.regime_detector = RegimeDetector(
             lookback=run_cfg.regime_lookback,
@@ -436,6 +450,65 @@ class InstitutionalBacktestEngine:
             fraction=run_cfg.kelly_fraction,
             max_size=run_cfg.max_position_size_pct,
         )
+
+    def _session_allows_trade(self, ts: Any) -> bool:
+        """Return True when the entry timestamp is tradable under live-session rules."""
+        if not bool(self.run_cfg.enforce_session_restrictions):
+            return True
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        else:
+            stamp = stamp.tz_convert("UTC")
+        if self.asset in ("BTC", "BTCUSD", "BTCUSDM"):
+            return True
+        if int(stamp.weekday()) >= 5:
+            return False
+        minute = int(stamp.hour * 60 + stamp.minute)
+        if minute >= 1435 or minute < 65:
+            return False
+        if not bool(self.run_cfg.allow_dead_hours_entries) and (minute < 360 or minute >= 1320):
+            return False
+        return True
+
+    def _build_backtest_audit(
+        self,
+        *,
+        df: pd.DataFrame,
+        trades: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build a pessimistic realism audit for the backtest pipeline."""
+        chronological = bool(df.index.is_monotonic_increasing and not bool(df.index.has_duplicates))
+        next_bar_only = all(
+            int(t.get("entry_idx", -1)) > int(t.get("signal_idx", -1))
+            for t in trades
+        ) if trades else True
+        split_ordering = False
+        try:
+            pipe_cfg = getattr(payload.get("pipeline"), "cfg", None)
+            if pipe_cfg is not None:
+                train_split = float(getattr(pipe_cfg, "train_split", 0.0) or 0.0)
+                val_split = float(getattr(pipe_cfg, "val_split", 0.0) or 0.0)
+                test_split = float(getattr(pipe_cfg, "test_split", 0.0) or 0.0)
+                split_ordering = bool(0.0 < train_split < val_split < test_split < 1.0)
+        except Exception:
+            split_ordering = False
+
+        audit = {
+            "commission_included": bool(float(self.run_cfg.commission_bps or 0.0) > 0.0),
+            "spread_included": bool(any(float(v or 0.0) > 0.0 for v in (self.run_cfg.spread_bps or {}).values())),
+            "slippage_included": bool(any(float(v or 0.0) > 0.0 for v in (self.run_cfg.slippage_bps or {}).values())),
+            "session_restrictions_enabled": bool(self.run_cfg.enforce_session_restrictions),
+            "stop_distance_rules_enabled": bool(float(self.run_cfg.min_stop_distance_atr or 0.0) > 0.0),
+            "chronological_data": chronological,
+            "next_bar_execution_only": next_bar_only,
+            "walk_forward_enabled": bool(int(self.run_cfg.wfa_required_windows or 0) > 0),
+            "train_test_separation": split_ordering,
+        }
+        audit["passed"] = bool(all(audit.values()))
+        self._backtest_audit = audit
+        return audit
 
     # ------------------------------------------------------------------ #
     # Model registry paths                                                  #
@@ -745,7 +818,8 @@ class InstitutionalBacktestEngine:
                     i += 1
                     continue
 
-            entry_idx = i + 1
+            entry_delay_bars = max(1, int(self.run_cfg.entry_delay_bars or 1))
+            entry_idx = i + entry_delay_bars
             if entry_idx >= n_obs:
                 break
             direction = 1.0 if p > 0.0 else -1.0
@@ -755,9 +829,20 @@ class InstitutionalBacktestEngine:
                 i += 1
                 continue
 
+            if not self._session_allows_trade(df.index[entry_idx]):
+                i += 1
+                continue
+
             atr_value = atr[entry_idx] if entry_idx < len(atr) and np.isfinite(atr[entry_idx]) else entry_price * 0.01
             stop_distance = float(atr_value * self.run_cfg.atr_stop_multiplier)
             target_distance = float(atr_value * self.run_cfg.atr_target_multiplier)
+            min_stop_distance = max(
+                abs(entry_price) * 1e-6,
+                float(self.run_cfg.min_stop_distance_atr or 0.0) * max(float(atr_value), 0.0),
+            )
+            if stop_distance < min_stop_distance or target_distance < min_stop_distance:
+                i += 1
+                continue
             stop_loss = float(entry_price - (direction * stop_distance))
             take_profit = float(entry_price + (direction * target_distance))
 
@@ -902,6 +987,7 @@ class InstitutionalBacktestEngine:
                 "pnl": float(net_pnl),
                 "gross_pnl": float(gross_pnl),
                 "direction": direction,
+                "signal_idx": int(i),
                 "entry_idx": int(entry_idx),
                 "exit_idx": int(exit_idx),
                 "entry_time": str(df.index[entry_idx]),
@@ -1476,6 +1562,11 @@ class InstitutionalBacktestEngine:
         self._stress_results      = stress
         metrics.stress_test_passed = bool(stress.get("passed", False))
         metrics.stress_scenarios   = list(stress.get("scenarios", []))
+        backtest_audit = self._build_backtest_audit(
+            df=df,
+            trades=trades,
+            payload=payload,
+        )
 
         # Sample quality gate
         require_both_sides: bool = True
@@ -1491,6 +1582,8 @@ class InstitutionalBacktestEngine:
         if int(metrics.losing_trades)   < min_losses: sample_issues.append(f"insufficient_losses:{metrics.losing_trades}<{min_losses}")
         if getattr(metrics, "profit_factor_capped", False) and not allow_pf_capped:
             sample_issues.append("profit_factor_capped")
+        if not bool(backtest_audit.get("passed", False)):
+            sample_issues.append("backtest_audit_failed")
 
         self._sample_quality_issues  = sample_issues
         self._sample_quality_passed  = len(sample_issues) == 0
@@ -1587,6 +1680,7 @@ class InstitutionalBacktestEngine:
                 "tscv_mean_active_direction_accuracy": float(self._tscv_mean_active_acc),
                 "stress_test_passed":     stress["passed"],
                 "stress_scenarios":       stress["scenarios"],
+                "backtest_audit":         dict(self._backtest_audit),
                 "institutional_grade":    bool(self._last_verified and not unsafe),
                 "real_backtest":          True,
                 "unsafe":                 unsafe,

@@ -32,6 +32,7 @@ class ModelMetadata:
     wfa_passed: bool = False
     wfa_total_windows: int = 0
     wfa_failed_windows: int = 0
+    training_audit: Optional[dict] = None
 
 class ModelManager:
     """

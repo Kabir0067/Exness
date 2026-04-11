@@ -8,6 +8,7 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
@@ -134,6 +135,17 @@ class MultiAssetTradingEngine:
         self._model_win_rate: float = 0.0
         self._backtest_linkage_verified: bool = False
         self._boot_report_printed: bool = False
+        self._boot_ts: float = time.time()
+        self._last_chaos_audit: Dict[str, Any] = {}
+        self._last_housekeeping_ts: float = 0.0
+        self._housekeeping_interval_sec: float = max(
+            15.0,
+            float(os.getenv("ENGINE_HOUSEKEEPING_SEC", "60.0") or 60.0),
+        )
+        self._log_growth_limit_bytes: int = max(
+            8 * 1024 * 1024,
+            int(float(os.getenv("ENGINE_LOG_GROWTH_LIMIT_BYTES", str(32 * 1024 * 1024))) or (32 * 1024 * 1024)),
+        )
 
         # ------------------------------------------------------------
         # QUANTUM ARCHITECTURE: SYSTEM MATRIX
@@ -459,6 +471,16 @@ class MultiAssetTradingEngine:
             correlation_reduction=0.50,        # Cut size 50% if correlated
             max_risk_per_trade_pct=self._xau_cfg.max_risk_per_trade,
             max_concurrent_positions=portfolio_max_positions,
+            max_total_drawdown_pct=float(getattr(self._xau_cfg, "max_drawdown", 0.12) or 0.12),
+            max_asset_exposure_factor=float(getattr(self._xau_cfg, "max_asset_exposure_factor", 1.5) or 1.5),
+            max_asset_risk_pct=float(
+                getattr(
+                    self._xau_cfg,
+                    "max_asset_risk_per_asset_pct",
+                    max(0.0, float(getattr(self._xau_cfg, "max_risk_per_trade", 0.0) or 0.0)) * 2.0,
+                )
+                or 0.03
+            ),
         )
 
         # Decoupled deterministic runtime (FSM ports + runner).
@@ -1728,6 +1750,7 @@ class MultiAssetTradingEngine:
     # -------------------- status API --------------------
     def status(self) -> PortfolioStatus:
         runtime_snapshot = self.runtime_watchdog_snapshot()
+        controller = self.controller_snapshot()
         trading = bool(runtime_snapshot.get("trading_ok", False))
         if self.dry_run:
             connected = True
@@ -1775,6 +1798,11 @@ class MultiAssetTradingEngine:
             last_selected_asset=str(self._last_selected_asset),
             exec_queue_size=int(self._total_exec_queue_size()),
             last_reconcile_ts=float(self._last_reconcile_ts),
+            controller_state=str(controller.get("controller_state", "stopped") or "stopped"),
+            risk_halt_reason=str(controller.get("risk_halt_reason", "") or ""),
+            gate_reason=str(controller.get("gate_reason", "") or ""),
+            chaos_state=str(controller.get("chaos_state", "unknown") or "unknown"),
+            blocked_assets=tuple(controller.get("blocked_assets", ())),
         )
 
     # -------------------- external API --------------------
@@ -1851,6 +1879,17 @@ class MultiAssetTradingEngine:
                                 margin_used = (price_ref * float(vol) * contract_size) / max(lev, 1.0)
                         exp.margin_used += max(0.0, float(margin_used))
                         exp.unrealized_pnl += p.profit
+                        sl_price = float(getattr(p, "sl", 0.0) or 0.0)
+                        price_ref = float(getattr(p, "price_current", 0.0) or getattr(p, "price_open", 0.0) or 0.0)
+                        if sl_price > 0.0 and price_ref > 0.0:
+                            cfg = self._xau_cfg if asset == "XAU" else self._btc_cfg
+                            contract_size = float(
+                                getattr(getattr(cfg, "symbol_params", None), "contract_size", 1.0) or 1.0
+                            )
+                            exp.open_risk += max(
+                                0.0,
+                                abs(price_ref - sl_price) * float(vol) * contract_size,
+                            )
                         
                         # Signed volume for net direction
                         signed_vol = vol if p_type == 0 else -vol
@@ -1977,6 +2016,231 @@ class MultiAssetTradingEngine:
     def unsafe_account_state_snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._unsafe_account_snapshot)
+
+    def _log_growth_snapshot(self) -> Dict[str, Any]:
+        roots = [Path("logs"), Path("Logs")]
+        total_bytes = 0
+        oversized_files: List[str] = []
+        tracked_files = 0
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*.log"):
+                try:
+                    size = int(path.stat().st_size)
+                except Exception:
+                    continue
+                tracked_files += 1
+                total_bytes += size
+                if size > self._log_growth_limit_bytes:
+                    oversized_files.append(f"{path}:{size}")
+        return {
+            "tracked_files": tracked_files,
+            "total_bytes": total_bytes,
+            "oversized_files": tuple(sorted(oversized_files)),
+            "limit_bytes": int(self._log_growth_limit_bytes),
+        }
+
+    def manage_runtime_housekeeping(self, *, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and (now - self._last_housekeeping_ts) < self._housekeeping_interval_sec:
+            return {}
+        self._last_housekeeping_ts = now
+        snapshot = self._log_growth_snapshot()
+        oversized = tuple(snapshot.get("oversized_files", ()))
+        if oversized:
+            log_health.warning(
+                "LOG_GROWTH_PRESSURE | count=%d limit=%d",
+                len(oversized),
+                int(snapshot.get("limit_bytes", 0) or 0),
+            )
+        return snapshot
+
+    def run_chaos_audit(self, *, force: bool = False) -> Dict[str, Any]:
+        """Evaluate runtime resilience against the supported chaos scenarios."""
+        now = time.time()
+        cached_ts = float(self._last_chaos_audit.get("timestamp", 0.0) or 0.0)
+        if self._last_chaos_audit and not force and (now - cached_ts) < 5.0:
+            return dict(self._last_chaos_audit)
+
+        runtime = self.runtime_watchdog_snapshot()
+        unsafe = self.unsafe_account_state_snapshot()
+        housekeeping = self.manage_runtime_housekeeping(force=force)
+
+        def _p95(values: Deque[float]) -> float:
+            arr = sorted(float(v) for v in values if float(v) >= 0.0)
+            if not arr:
+                return 0.0
+            idx = min(len(arr) - 1, max(0, int(round(0.95 * (len(arr) - 1)))))
+            return float(arr[idx])
+
+        def _pipe_metrics(pipe: Any, default_symbol: str) -> Dict[str, Any]:
+            if pipe is None:
+                return {
+                    "market_ok": False,
+                    "reason": "pipeline_missing",
+                    "rows": 0,
+                    "tick_age": float("inf"),
+                    "symbol": default_symbol,
+                    "last_signal": "Neutral",
+                    "signal_ts": 0.0,
+                }
+            return {
+                "market_ok": bool(getattr(pipe, "last_market_ok", False)),
+                "reason": str(getattr(pipe, "last_market_reason", "") or ""),
+                "rows": int(getattr(pipe, "last_market_rows", 0) or 0),
+                "tick_age": float(
+                    getattr(pipe, "last_tick_age_sec", 0.0) or getattr(pipe, "last_bar_age_sec", 0.0) or 0.0
+                ),
+                "symbol": str(getattr(pipe, "symbol", default_symbol) or default_symbol),
+                "last_signal": str(getattr(pipe, "last_signal", "Neutral") or "Neutral"),
+                "signal_ts": float(getattr(pipe, "last_signal_ts", 0.0) or 0.0),
+            }
+
+        xau_metrics = _pipe_metrics(self._xau, "XAUUSDm")
+        btc_metrics = _pipe_metrics(self._btc, "BTCUSDm")
+        recent_signal_ts = [float(ts) for ts in self._signal_emit_ts_global if (now - float(ts)) <= 60.0]
+        simultaneous_dual_trigger = bool(
+            xau_metrics["last_signal"] != "Neutral"
+            and btc_metrics["last_signal"] != "Neutral"
+            and abs(float(xau_metrics["signal_ts"]) - float(btc_metrics["signal_ts"])) <= 2.0
+        )
+
+        scenarios: Dict[str, Dict[str, Any]] = {}
+
+        def _record(name: str, passed: bool, detail: str, *, recoverable: bool = True) -> None:
+            scenarios[name] = {
+                "passed": bool(passed),
+                "recoverable": bool(recoverable),
+                "detail": str(detail or ""),
+            }
+
+        _record(
+            "MT5 disconnect",
+            bool(self.dry_run or self._mt5_ready),
+            "ready" if (self.dry_run or self._mt5_ready) else "mt5_not_ready",
+        )
+        _record(
+            "internet delay",
+            _p95(self._exec_latency_ms_hist) <= float(self._live_max_p95_latency_ms or 0.0),
+            f"p95_ms={_p95(self._exec_latency_ms_hist):.1f}/{self._live_max_p95_latency_ms:.1f}",
+        )
+        _record(
+            "stale feed",
+            bool(xau_metrics["market_ok"] and btc_metrics["market_ok"]),
+            f"xau={xau_metrics['reason']} btc={btc_metrics['reason']}",
+        )
+        _record(
+            "missing bars",
+            bool(xau_metrics["rows"] >= 30 and btc_metrics["rows"] >= 30),
+            f"xau_rows={xau_metrics['rows']} btc_rows={btc_metrics['rows']}",
+        )
+        _record(
+            "spread spike",
+            _p95(self._exec_slippage_hist) <= float(self._live_max_p95_slippage_points or 0.0),
+            f"p95_slippage={_p95(self._exec_slippage_hist):.2f}/{self._live_max_p95_slippage_points:.2f}",
+        )
+        gap_reason = f"{getattr(self._xau, 'risk', None).hard_stop_reason if self._xau else ''}|{getattr(self._btc, 'risk', None).hard_stop_reason if self._btc else ''}"
+        _record(
+            "sudden gap",
+            "gap" not in gap_reason.lower(),
+            gap_reason or "clear",
+        )
+        _record(
+            "slow model response",
+            _p95(self._fsm_cycle_ms_hist) <= max(2.0 * self._live_max_p95_latency_ms, 2500.0),
+            f"p95_cycle_ms={_p95(self._fsm_cycle_ms_hist):.1f}",
+        )
+        _record(
+            "duplicate signal storm",
+            len(recent_signal_ts) <= max(20, int(self._target_signals_per_24h_max * 2)),
+            f"signals_last_min={len(recent_signal_ts)}",
+        )
+        _record(
+            "simultaneous XAU + BTC triggers",
+            not simultaneous_dual_trigger,
+            "dual_trigger_detected" if simultaneous_dual_trigger else "clear",
+        )
+        cfg_valid = bool(
+            getattr(getattr(self._xau_cfg, "symbol_params", None), "contract_size", 0.0)
+            and getattr(getattr(self._btc_cfg, "symbol_params", None), "contract_size", 0.0)
+        )
+        _record(
+            "corrupted config",
+            cfg_valid,
+            "config_ok" if cfg_valid else "invalid_contract_size",
+            recoverable=False,
+        )
+        symbol_info_valid = bool(
+            xau_metrics["symbol"]
+            and btc_metrics["symbol"]
+            and int(getattr(getattr(self._xau_cfg, "symbol_params", None), "digits", 0) or 0) > 0
+            and int(getattr(getattr(self._btc_cfg, "symbol_params", None), "digits", 0) or 0) > 0
+        )
+        _record(
+            "invalid symbol info",
+            symbol_info_valid,
+            "symbol_info_ok" if symbol_info_valid else "symbol_info_invalid",
+            recoverable=False,
+        )
+        restart_ready = bool(callable(getattr(self, "_recover_all", None)) and callable(getattr(self, "_restart_exec_worker", None)))
+        _record(
+            "process restart mid-position",
+            restart_ready,
+            "restart_hooks_ready" if restart_ready else "restart_hooks_missing",
+        )
+        log_growth_ok = not bool(tuple(housekeeping.get("oversized_files", ())))
+        _record(
+            "log file growth",
+            log_growth_ok,
+            "within_limit" if log_growth_ok else "oversized_logs_detected",
+        )
+        terminal_restart_ready = bool(callable(getattr(self, "_emergency_flatten", None)) and restart_ready)
+        _record(
+            "terminal restart during open trade",
+            terminal_restart_ready,
+            "recovery_ready" if terminal_restart_ready else "recovery_missing",
+        )
+        if unsafe.get("reason"):
+            _record(
+                "invalid live account state",
+                False,
+                str(unsafe.get("reason") or ""),
+                recoverable=False,
+            )
+
+        overall_passed = bool(all(item.get("passed", False) for item in scenarios.values()))
+        snapshot = {
+            "timestamp": now,
+            "overall_passed": overall_passed,
+            "scenarios": scenarios,
+        }
+        self._last_chaos_audit = dict(snapshot)
+        return snapshot
+
+    def controller_snapshot(self) -> Dict[str, Any]:
+        """Return the unified controller state for main.py and Telegram."""
+        runtime = self.runtime_watchdog_snapshot()
+        chaos = self.run_chaos_audit(force=False)
+        risk_halt_reason = str(self._portfolio_stop_reason or self._unsafe_account_reason or "")
+        if bool(runtime.get("trading_ok", False)) and not bool(self._manual_stop):
+            controller_state = "running"
+        elif bool(self._manual_stop):
+            controller_state = "monitoring"
+        elif bool(runtime.get("starting", False)):
+            controller_state = "starting"
+        else:
+            controller_state = "stopped"
+        return {
+            "controller_state": controller_state,
+            "runtime": runtime,
+            "risk_halt_reason": risk_halt_reason,
+            "gate_reason": str(self._gate_last_reason or ""),
+            "blocked_assets": tuple(sorted(set(self._blocked_assets or []))),
+            "chaos_state": "pass" if bool(chaos.get("overall_passed", False)) else "warn",
+            "chaos_audit": chaos,
+            "uptime_sec": max(0.0, time.time() - float(self._boot_ts or time.time())),
+        }
 
     def _preflight_live_account_state(self) -> str:
         if self.dry_run:

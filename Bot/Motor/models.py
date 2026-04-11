@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Tuple
 
 
@@ -38,6 +38,11 @@ class PortfolioStatus:
     last_selected_asset: str
     exec_queue_size: int
     last_reconcile_ts: float
+    controller_state: str = "stopped"
+    risk_halt_reason: str = ""
+    gate_reason: str = ""
+    chaos_state: str = "unknown"
+    blocked_assets: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

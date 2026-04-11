@@ -18,9 +18,26 @@ from .config import BaseEngineConfig
 from .utils import (
     kaufman_efficiency_ratio,
     relative_volatility_index,
+    tf_seconds,
 )
 
 log = logging.getLogger("core.feature_engine")
+
+FEATURES_VALID = "features valid"
+NAN_DETECTED = "nan detected"
+INSUFFICIENT_WARMUP = "insufficient warmup"
+LOOKAHEAD_BIAS_DETECTED = "lookahead bias detected"
+MTF_ALIGNMENT_ERROR = "mtf alignment error"
+SCALING_ERROR = "scaling error"
+
+_FEATURE_STATE_PRIORITY = {
+    FEATURES_VALID: 0,
+    INSUFFICIENT_WARMUP: 1,
+    NAN_DETECTED: 2,
+    SCALING_ERROR: 3,
+    LOOKAHEAD_BIAS_DETECTED: 4,
+    MTF_ALIGNMENT_ERROR: 5,
+}
 
 
 def safe_last(arr: np.ndarray, default: float = 0.0) -> float:
@@ -56,6 +73,63 @@ class AnomalyResult:
     def __post_init__(self):
         if self.reasons is None:
             self.reasons = []
+
+
+@dataclass(frozen=True)
+class FeatureAuditIssue:
+    code: str
+    message: str
+    state: str
+
+
+@dataclass
+class FeatureAuditResult:
+    state: str = FEATURES_VALID
+    valid: bool = True
+    issues: List[FeatureAuditIssue] = None
+    metadata: Dict[str, Any] = None
+
+    def __post_init__(self) -> None:
+        if self.issues is None:
+            self.issues = []
+        if self.metadata is None:
+            self.metadata = {}
+
+    def add_issue(
+        self,
+        code: str,
+        message: str,
+        state: str,
+        **details: Any,
+    ) -> None:
+        issue = FeatureAuditIssue(code=code, message=message, state=state)
+        if issue not in self.issues:
+            self.issues.append(issue)
+        if _FEATURE_STATE_PRIORITY[state] > _FEATURE_STATE_PRIORITY[self.state]:
+            self.state = state
+        self.valid = self.state == FEATURES_VALID
+        if details:
+            self.metadata[code] = details
+
+    def merge(self, other: "FeatureAuditResult") -> "FeatureAuditResult":
+        if other is None:
+            return self
+        self.metadata.update(other.metadata)
+        for issue in other.issues:
+            self.add_issue(issue.code, issue.message, issue.state)
+        return self
+
+    def reason_codes(self) -> List[str]:
+        reasons = [f"feature_state:{self.state}"]
+        for issue in self.issues:
+            reasons.append(issue.code)
+        return reasons
+
+
+class FeatureIntegrityError(RuntimeError):
+    def __init__(self, audit: FeatureAuditResult) -> None:
+        self.audit = audit
+        super().__init__(audit.state)
 
 
 class FeatureEngine:
@@ -122,6 +196,8 @@ class FeatureEngine:
         self._anomaly_atr_spike_mult = 3.0
         self._anomaly_spread_z_thresh = 5.0
 
+        self._last_feature_audit: FeatureAuditResult = FeatureAuditResult()
+
         self._validate_cfg()
         log.info("FeatureEngine initialized for %s", symbol)
 
@@ -148,14 +224,30 @@ class FeatureEngine:
         Returns:
             {timeframe_str: {indicator_name: value}} for each TF
         """
+        shift_i = int(shift)
+        audit = FeatureAuditResult(metadata={"shift": shift_i})
+        self._last_feature_audit = audit
+        if shift_i < 1:
+            audit.add_issue(
+                "shift_not_closed_bar",
+                "Live feature computation must use closed bars only",
+                LOOKAHEAD_BIAS_DETECTED,
+                shift=shift_i,
+            )
+            raise FeatureIntegrityError(audit)
+
         result: Dict[str, Dict[str, Any]] = {}
+        frame_meta: Dict[str, Dict[str, Any]] = {}
 
         for tf, df in df_dict.items():
-            if df is None or len(df) < 10:
+            input_audit = self._audit_input_frame(tf=tf, df=df, shift=shift_i)
+            audit.merge(input_audit)
+            if not input_audit.valid:
                 result[tf] = {}
+                frame_meta[tf] = self._frame_meta(tf=tf, df=df, shift=shift_i)
                 continue
             try:
-                result[tf] = self._compute_tf(tf=tf, df=df, shift=shift)
+                indicators = self._compute_tf(tf=tf, df=df, shift=shift_i)
             except Exception as exc:
                 log.error(
                     "compute_indicators(tf=%s) failed: %s\n%s",
@@ -164,12 +256,512 @@ class FeatureEngine:
                 raise RuntimeError(
                     f"feature computation failed for tf={tf}: {exc}"
                 ) from exc
+            meta = self._frame_meta(tf=tf, df=df, shift=shift_i)
+            frame_meta[tf] = meta
+            indicators["feature_lag_bars"] = shift_i
+            indicators["feature_valid"] = True
+            if meta.get("used_time") is not None:
+                indicators["feature_source_time"] = meta["used_time"].isoformat()
+            result[tf] = indicators
+            audit.merge(
+                self._audit_feature_output(
+                    tf=tf,
+                    df=df,
+                    out=indicators,
+                    shift=shift_i,
+                    meta=meta,
+                )
+            )
 
         # MTF alignment
         if len(result) >= 2:
-            self._check_mtf_alignment(result)
+            self._check_mtf_alignment(result, frame_meta, audit)
+
+        self._last_feature_audit = audit
+        if not audit.valid:
+            raise FeatureIntegrityError(audit)
 
         return result
+
+    def last_feature_audit(self) -> FeatureAuditResult:
+        return self._last_feature_audit
+
+    def classify_market_regime(
+        self,
+        indicators: Dict[str, Dict[str, Any]],
+        *,
+        asset: str = "",
+        now: Optional[Any] = None,
+        primary_tf: Optional[str] = None,
+    ) -> str:
+        """Classify the live market state from closed-bar features only."""
+        if not indicators:
+            return "range"
+
+        tf = str(primary_tf or getattr(self.cfg.symbol_params, "tf_primary", "M1") or "M1")
+        primary = indicators.get(tf) or indicators.get("M1") or next(iter(indicators.values()), {})
+        if not isinstance(primary, dict) or not primary:
+            return "range"
+
+        asset_u = str(asset or getattr(self.cfg.symbol_params, "base", "") or "").upper()
+        ts = self._coerce_timestamp(now)
+        if ts is None:
+            ts = pd.Timestamp.utcnow()
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+
+        trend = str(primary.get("trend", "flat") or "flat").lower()
+        forecast = str(primary.get("forecast", "none") or "none").lower()
+        volatility = str(primary.get("volatility_regime", primary.get("regime", "normal")) or "normal").lower()
+        adx = float(primary.get("adx", 0.0) or 0.0)
+        atr_ratio = float(primary.get("atr_ratio", 1.0) or 1.0)
+        linreg_slope = float(primary.get("linreg_slope", 0.0) or 0.0)
+        confluence = float(primary.get("confluence", 0.0) or 0.0)
+        stop_hunt_strength = abs(float(primary.get("stop_hunt_strength", 0.0) or 0.0))
+        divergence = str(primary.get("divergence", "") or "").lower()
+        anomaly = primary.get("anomaly")
+        anomaly_level = str(getattr(anomaly, "level", "normal") or "normal").lower()
+
+        tags: List[str] = []
+        minute_utc = int(ts.hour * 60 + ts.minute)
+        weekday = int(ts.weekday())
+
+        if "BTC" in asset_u and weekday >= 5:
+            tags.append("weekend BTC regime")
+
+        if minute_utc in range(420, 481) or minute_utc in range(750, 811):
+            tags.append("session open")
+        elif minute_utc < 360 or minute_utc >= 1320:
+            tags.append("session dead hours")
+
+        if minute_utc in range(745, 851) or minute_utc in range(360, 391):
+            tags.append("news hours")
+
+        breakout = forecast in {"bull_continuation", "bear_continuation"}
+        fake_breakout = bool(
+            breakout
+            and (
+                stop_hunt_strength >= 0.60
+                or divergence in {"bullish", "bearish"}
+                or anomaly_level in {"warning", "critical"}
+            )
+        )
+
+        if fake_breakout:
+            tags.append("fake breakout")
+        elif breakout:
+            tags.append("breakout")
+
+        if volatility == "explosive" or atr_ratio >= 1.50:
+            tags.append("high volatility")
+        elif volatility == "dead" or atr_ratio <= 0.70:
+            tags.append("low volatility")
+
+        strong_trend = bool(
+            trend in {"bull", "bear"}
+            and (
+                adx >= 25.0
+                or abs(linreg_slope) >= max(
+                    1e-4,
+                    abs(float(primary.get("close", 0.0) or 0.0)) * 1e-6,
+                )
+                or confluence >= 0.70
+            )
+        )
+
+        if strong_trend:
+            tags.append("trend strong")
+        elif trend in {"bull", "bear"}:
+            tags.append("trend weak")
+        elif not breakout and volatility != "explosive":
+            tags.append("range")
+
+        if not tags:
+            tags.append("range")
+
+        unique_tags: List[str] = []
+        for tag in tags:
+            if tag not in unique_tags:
+                unique_tags.append(tag)
+        return "|".join(unique_tags[:4])
+
+    def _required_warmup_bars(self, timeframe: str, shift: int) -> int:
+        del timeframe
+        return int(
+            max(
+                self._ema_anchor + shift + 5,
+                self._macd_slow + self._macd_signal + shift + 5,
+                self._bb_period + shift + 5,
+                self._atr_period + shift + 5,
+                self._stoch_k_period + self._stoch_slowd_period + shift + 5,
+                50,
+            )
+        )
+
+    def _audit_input_frame(
+        self,
+        *,
+        tf: str,
+        df: Optional[pd.DataFrame],
+        shift: int,
+    ) -> FeatureAuditResult:
+        audit = FeatureAuditResult(metadata={"tf": tf})
+        if df is None or len(df) == 0:
+            audit.add_issue(
+                f"{tf.lower()}_frame_missing",
+                f"{tf} frame is missing",
+                INSUFFICIENT_WARMUP,
+            )
+            return audit
+
+        warmup_bars = self._required_warmup_bars(tf, shift)
+        if len(df) < warmup_bars:
+            audit.add_issue(
+                f"{tf.lower()}_insufficient_warmup",
+                f"{tf} requires {warmup_bars} bars, got {len(df)}",
+                INSUFFICIENT_WARMUP,
+                required=warmup_bars,
+                actual=len(df),
+            )
+
+        cols = {c.lower(): c for c in df.columns}
+        required_cols = {"open", "high", "low", "close"}
+        if not required_cols.issubset(set(cols)):
+            audit.add_issue(
+                f"{tf.lower()}_schema_error",
+                f"{tf} frame is missing required OHLC columns",
+                SCALING_ERROR,
+            )
+        return audit
+
+    def _frame_meta(
+        self,
+        *,
+        tf: str,
+        df: Optional[pd.DataFrame],
+        shift: int,
+    ) -> Dict[str, Any]:
+        tf_sec = int(tf_seconds(tf))
+        meta: Dict[str, Any] = {
+            "tf": tf,
+            "tf_seconds": tf_sec,
+            "shift": int(shift),
+            "used_time": None,
+            "latest_time": None,
+            "used_close_time": None,
+        }
+        if df is None or len(df) <= shift:
+            return meta
+
+        time_col = None
+        cols = {c.lower(): c for c in df.columns}
+        if "time" in cols:
+            time_col = cols["time"]
+
+        used_idx = len(df) - 1 - shift
+        latest_idx = len(df) - 1
+        if time_col is not None:
+            used_time = self._coerce_timestamp(df.iloc[used_idx][time_col])
+            latest_time = self._coerce_timestamp(df.iloc[latest_idx][time_col])
+        else:
+            used_time = self._coerce_timestamp(df.index[used_idx])
+            latest_time = self._coerce_timestamp(df.index[latest_idx])
+
+        meta["used_time"] = used_time
+        meta["latest_time"] = latest_time
+        if used_time is not None:
+            meta["used_close_time"] = used_time + pd.Timedelta(seconds=tf_sec)
+        return meta
+
+    def _audit_feature_output(
+        self,
+        *,
+        tf: str,
+        df: pd.DataFrame,
+        out: Dict[str, Any],
+        shift: int,
+        meta: Dict[str, Any],
+    ) -> FeatureAuditResult:
+        audit = FeatureAuditResult(metadata={"tf": tf})
+        if not isinstance(out, dict) or not out:
+            audit.add_issue(
+                f"{tf.lower()}_empty_features",
+                f"{tf} features are empty after computation",
+                INSUFFICIENT_WARMUP,
+            )
+            return audit
+
+        for key, value in out.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                if not math.isfinite(float(value)):
+                    audit.add_issue(
+                        f"{tf.lower()}_{key}_nan",
+                        f"{tf}:{key} is non-finite",
+                        NAN_DETECTED,
+                    )
+            elif isinstance(value, AnomalyResult):
+                if not math.isfinite(float(value.score)):
+                    audit.add_issue(
+                        f"{tf.lower()}_anomaly_score_nan",
+                        f"{tf}: anomaly score is non-finite",
+                        NAN_DETECTED,
+                    )
+
+        if out.get("feature_lag_bars") != shift:
+            audit.add_issue(
+                f"{tf.lower()}_feature_lag_mismatch",
+                f"{tf} feature lag does not match requested shift",
+                LOOKAHEAD_BIAS_DETECTED,
+            )
+
+        df = self._ensure_volume(df)
+        cols = {c.lower(): c for c in df.columns}
+        c = self._as_1d_float(df[cols.get("close", "Close")].to_numpy())
+        h = self._as_1d_float(df[cols.get("high", "High")].to_numpy())
+        l = self._as_1d_float(df[cols.get("low", "Low")].to_numpy())
+        used_len = len(c) - shift
+        if used_len <= 0:
+            audit.add_issue(
+                f"{tf.lower()}_lookahead_underflow",
+                f"{tf} used length is invalid for shift={shift}",
+                LOOKAHEAD_BIAS_DETECTED,
+            )
+            return audit
+
+        c_seen = c[:used_len]
+        h_seen = h[:used_len]
+        l_seen = l[:used_len]
+        price_min = float(np.min(c_seen))
+        price_max = float(np.max(c_seen))
+
+        self._check_bounded_feature(
+            audit, tf=tf, key="rsi", value=out.get("rsi"), lower=0.0, upper=100.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="adx", value=out.get("adx"), lower=0.0, upper=100.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="stoch_k", value=out.get("stoch_k"), lower=0.0, upper=100.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="stoch_d", value=out.get("stoch_d"), lower=0.0, upper=100.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="ker", value=out.get("ker"), lower=0.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="rvi", value=out.get("rvi"), lower=0.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="confluence", value=out.get("confluence"), lower=0.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="ob_touch_proximity", value=out.get("ob_touch_proximity"), lower=0.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="linreg_slope", value=out.get("linreg_slope"), lower=-1.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="ob_pretouch_bias", value=out.get("ob_pretouch_bias"), lower=-1.0, upper=1.0,
+        )
+        self._check_bounded_feature(
+            audit, tf=tf, key="stop_hunt_strength", value=out.get("stop_hunt_strength"), lower=-1.0, upper=1.0,
+        )
+
+        for ema_key in ("ema_short", "ema_medium", "ema_slow", "ema_anchor"):
+            ema_val = float(out.get(ema_key, 0.0) or 0.0)
+            tol = self._feature_tol(max(abs(price_max), abs(price_min), abs(ema_val), 1.0))
+            if ema_val < (price_min - tol) or ema_val > (price_max + tol):
+                audit.add_issue(
+                    f"{tf.lower()}_{ema_key}_range_error",
+                    f"{tf}:{ema_key} fell outside the observed price envelope",
+                    SCALING_ERROR,
+                )
+
+        atr_val = float(out.get("atr", 0.0) or 0.0)
+        if atr_val < 0.0:
+            audit.add_issue(
+                f"{tf.lower()}_atr_negative",
+                f"{tf}: ATR must be non-negative",
+                SCALING_ERROR,
+            )
+        prev_close = c_seen[:-1]
+        if len(prev_close) > 0:
+            tr_seen = np.maximum(
+                h_seen[1:] - l_seen[1:],
+                np.maximum(
+                    np.abs(h_seen[1:] - prev_close),
+                    np.abs(l_seen[1:] - prev_close),
+                ),
+            )
+            if tr_seen.size > 0:
+                atr_tol = self._feature_tol(max(float(np.max(tr_seen)), atr_val, 1.0))
+                if atr_val > float(np.max(tr_seen)) + atr_tol:
+                    audit.add_issue(
+                        f"{tf.lower()}_atr_reference_error",
+                        f"{tf}: ATR exceeded the observed true-range envelope",
+                        SCALING_ERROR,
+                    )
+
+        macd_val = float(out.get("macd", 0.0) or 0.0)
+        macd_signal_val = float(out.get("macd_signal", 0.0) or 0.0)
+        macd_hist_val = float(out.get("macd_hist", 0.0) or 0.0)
+        macd_tol = self._feature_tol(
+            max(abs(macd_val), abs(macd_signal_val), abs(macd_hist_val), 1.0)
+        )
+        if abs((macd_val - macd_signal_val) - macd_hist_val) > macd_tol:
+            audit.add_issue(
+                f"{tf.lower()}_macd_identity_error",
+                f"{tf}: MACD histogram violated line-signal identity",
+                SCALING_ERROR,
+            )
+
+        if float(out.get("bb_width", 0.0) or 0.0) < 0.0:
+            audit.add_issue(
+                f"{tf.lower()}_bb_width_negative",
+                f"{tf}: Bollinger width must be non-negative",
+                SCALING_ERROR,
+            )
+        if float(out.get("atr_pct", 0.0) or 0.0) < 0.0:
+            audit.add_issue(
+                f"{tf.lower()}_atr_pct_negative",
+                f"{tf}: ATR percent must be non-negative",
+                SCALING_ERROR,
+            )
+        if float(out.get("atr_ratio", 0.0) or 0.0) < 0.0:
+            audit.add_issue(
+                f"{tf.lower()}_atr_ratio_negative",
+                f"{tf}: ATR ratio must be non-negative",
+                SCALING_ERROR,
+            )
+
+        audit.merge(
+            self._verify_reference_alignment(
+                tf=tf,
+                df=df,
+                out=out,
+                shift=shift,
+                meta=meta,
+            )
+        )
+        return audit
+
+    def _verify_reference_alignment(
+        self,
+        *,
+        tf: str,
+        df: pd.DataFrame,
+        out: Dict[str, Any],
+        shift: int,
+        meta: Dict[str, Any],
+    ) -> FeatureAuditResult:
+        audit = FeatureAuditResult(metadata={"tf": tf})
+        del meta
+        cols = {c.lower(): c for c in df.columns}
+        c = self._as_1d_float(df[cols.get("close", "Close")].to_numpy())
+        h = self._as_1d_float(df[cols.get("high", "High")].to_numpy())
+        l = self._as_1d_float(df[cols.get("low", "Low")].to_numpy())
+        used_len = len(c) - shift
+        if used_len <= 1:
+            audit.add_issue(
+                f"{tf.lower()}_reference_underflow",
+                f"{tf}: reference validation length is insufficient",
+                INSUFFICIENT_WARMUP,
+            )
+            return audit
+
+        c_cut = c[:used_len]
+        h_cut = h[:used_len]
+        l_cut = l[:used_len]
+        c0 = float(c_cut[0]) if len(c_cut) > 0 else 0.0
+
+        ema_ref = safe_last(self._nan_to_num(talib.EMA(c_cut, timeperiod=self._ema_medium), c0))
+        rsi_ref = safe_last(self._nan_to_num(talib.RSI(c_cut, timeperiod=self._rsi_period), 50.0))
+        macd_line_ref, macd_signal_ref, _ = talib.MACD(
+            c_cut,
+            fastperiod=self._macd_fast,
+            slowperiod=self._macd_slow,
+            signalperiod=self._macd_signal,
+        )
+        macd_line_ref = safe_last(self._nan_to_num(macd_line_ref, 0.0))
+        macd_signal_ref = safe_last(self._nan_to_num(macd_signal_ref, 0.0))
+        atr_ref = safe_last(
+            self._nan_to_num(
+                talib.ATR(h_cut, l_cut, c_cut, timeperiod=self._atr_period),
+                0.0,
+            )
+        )
+
+        checks = (
+            ("ema_medium", float(out.get("ema_medium", 0.0) or 0.0), float(ema_ref)),
+            ("rsi", float(out.get("rsi", 0.0) or 0.0), float(rsi_ref)),
+            ("macd", float(out.get("macd", 0.0) or 0.0), float(macd_line_ref)),
+            ("macd_signal", float(out.get("macd_signal", 0.0) or 0.0), float(macd_signal_ref)),
+            ("atr", float(out.get("atr", 0.0) or 0.0), float(atr_ref)),
+        )
+        for key, live_val, ref_val in checks:
+            tol = self._feature_tol(max(abs(live_val), abs(ref_val), 1.0))
+            if abs(live_val - ref_val) > tol:
+                audit.add_issue(
+                    f"{tf.lower()}_{key}_lookahead",
+                    f"{tf}:{key} diverged from closed-bar reference",
+                    LOOKAHEAD_BIAS_DETECTED,
+                    live=live_val,
+                    reference=ref_val,
+                )
+        return audit
+
+    def _check_bounded_feature(
+        self,
+        audit: FeatureAuditResult,
+        *,
+        tf: str,
+        key: str,
+        value: Any,
+        lower: float,
+        upper: float,
+    ) -> None:
+        if value is None:
+            return
+        val = float(value)
+        if not math.isfinite(val):
+            audit.add_issue(
+                f"{tf.lower()}_{key}_nan",
+                f"{tf}:{key} is non-finite",
+                NAN_DETECTED,
+            )
+            return
+        tol = self._feature_tol(max(abs(lower), abs(upper), abs(val), 1.0))
+        if val < (lower - tol) or val > (upper + tol):
+            audit.add_issue(
+                f"{tf.lower()}_{key}_scale_error",
+                f"{tf}:{key} breached expected bounds [{lower}, {upper}]",
+                SCALING_ERROR,
+            )
+
+    @staticmethod
+    def _feature_tol(scale: float) -> float:
+        return max(1e-8, float(scale) * 1e-8)
+
+    @staticmethod
+    def _coerce_timestamp(value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            if value.tzinfo is None:
+                return value.tz_localize("UTC")
+            return value.tz_convert("UTC")
+        try:
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is None:
+                return ts.tz_localize("UTC")
+            return ts.tz_convert("UTC")
+        except Exception:
+            return None
 
     # ═════════════════════════════════════════════════════════════════
     # TIMEFRAME COMPUTATION
@@ -450,14 +1042,25 @@ class FeatureEngine:
 
     @staticmethod
     def _ffill_finite(a: np.ndarray, default: float = 0.0) -> np.ndarray:
-        """Forward-fill non-finite values."""
-        out = a.copy()
-        last_good = default
-        for i in range(len(out)):
-            if math.isfinite(out[i]):
-                last_good = out[i]
-            else:
-                out[i] = last_good
+        """Vectorized forward-fill for non-finite values."""
+        out = np.asarray(a, dtype=np.float64).copy()
+        if out.size == 0:
+            return out
+        finite = np.isfinite(out)
+        if finite.all():
+            return out
+        if not finite.any():
+            out.fill(float(default))
+            return out
+
+        idx = np.where(finite, np.arange(out.size, dtype=np.int64), -1)
+        np.maximum.accumulate(idx, out=idx)
+        leading = idx < 0
+        if np.any(leading):
+            out[leading] = float(default)
+        missing = ~finite & ~leading
+        if np.any(missing):
+            out[missing] = out[idx[missing]]
         return out
 
     @staticmethod
@@ -962,8 +1565,42 @@ class FeatureEngine:
             return "weak"
         return "none"
 
-    def _check_mtf_alignment(self, out: Dict[str, Any]) -> None:
-        """Check multi-timeframe trend alignment."""
+    def _check_mtf_alignment(
+        self,
+        out: Dict[str, Any],
+        frame_meta: Dict[str, Dict[str, Any]],
+        audit: Optional[FeatureAuditResult] = None,
+    ) -> None:
+        """Check multi-timeframe trend alignment and closed-candle safety."""
+        primary_tf = str(
+            getattr(getattr(self.cfg, "symbol_params", None), "tf_primary", "") or ""
+        )
+        if primary_tf not in frame_meta and frame_meta:
+            primary_tf = min(frame_meta, key=lambda x: int(tf_seconds(x)))
+        primary_meta = frame_meta.get(primary_tf, {})
+        primary_sec = int(primary_meta.get("tf_seconds", 0) or 0)
+        primary_close_time = primary_meta.get("used_close_time")
+
+        if primary_close_time is not None:
+            for tf, meta in frame_meta.items():
+                tf_sec = int(meta.get("tf_seconds", 0) or 0)
+                used_close_time = meta.get("used_close_time")
+                if tf_sec <= primary_sec or used_close_time is None:
+                    continue
+                if used_close_time > primary_close_time:
+                    if audit is not None:
+                        audit.add_issue(
+                            f"{tf.lower()}_mtf_open_candle",
+                            f"{tf} features were derived from a candle not yet closed",
+                            MTF_ALIGNMENT_ERROR,
+                            used_close_time=str(used_close_time),
+                            primary_close_time=str(primary_close_time),
+                        )
+                    if isinstance(out.get(tf), dict):
+                        out[tf]["mtf_closed"] = False
+                elif isinstance(out.get(tf), dict):
+                    out[tf]["mtf_closed"] = True
+
         trends = [v.get("trend", "flat") for v in out.values() if isinstance(v, dict)]
         if all(t == "bull" for t in trends):
             for v in out.values():
