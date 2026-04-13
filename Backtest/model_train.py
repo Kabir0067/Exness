@@ -46,7 +46,7 @@ except Exception:
 
 import MetaTrader5 as mt5
 
-from core.model_manager import ModelMetadata, model_manager
+from core.model_engine import ModelMetadata, model_manager
 from log_config import LOG_DIR, get_artifact_dir, get_artifact_path, get_log_path
 
 try:

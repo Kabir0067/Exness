@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
 import MetaTrader5 as mt5
@@ -28,11 +28,6 @@ import MetaTrader5 as mt5
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 from log_config import get_log_path
-
-# =============================================================================
-# Types / constants
-# =============================================================================
-SLTPUnits = Literal["points", "usd", "price"]
 
 DEFAULT_DEVIATION = 50
 # IMPORTANT: Must match bot engine magic to correctly count/filter positions.
@@ -1010,17 +1005,7 @@ def manual_open_capacity(symbol: str) -> Tuple[int, str]:
 
 
 def _clamp01(x: float) -> float:
-    try:
-        v = float(x)
-    except Exception:
-        return 0.0
-    if not math.isfinite(v):
-        return 0.0
-    if v < 0.0:
-        return 0.0
-    if v > 1.0:
-        return 1.0
-    return v
+    return clamp01(x)
 
 
 def _tp_mult_from_conf(confidence: float) -> float:
@@ -1913,6 +1898,15 @@ _SYMBOL_BTC = "BTCUSDm"
 _SYMBOL_XAU = "XAUUSDm"
 
 
+def _open_manual_orders(symbol: str, side: str, count: int) -> int:
+    n = 0
+    allowed, _reason = manual_open_capacity(symbol)
+    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
+        if _place_market_order_fixed_sltp(symbol, side):
+            n += 1
+    return n
+
+
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
     """Manual market order with live-price execution and ATR-protected SL/TP."""
     try:
@@ -2026,42 +2020,22 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
 
 def open_buy_order_btc(count: int) -> int:
     """Open `count` market BUY on BTCUSDm with fixed manual settings."""
-    n = 0
-    allowed, _reason = manual_open_capacity(_SYMBOL_BTC)
-    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
-        if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Buy"):
-            n += 1
-    return n
+    return _open_manual_orders(_SYMBOL_BTC, "Buy", count)
 
 
 def open_buy_order_xau(count: int) -> int:
     """Open `count` market BUY on XAUUSDm with fixed manual settings."""
-    n = 0
-    allowed, _reason = manual_open_capacity(_SYMBOL_XAU)
-    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
-        if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Buy"):
-            n += 1
-    return n
+    return _open_manual_orders(_SYMBOL_XAU, "Buy", count)
 
 
 def open_sell_order_btc(count: int) -> int:
     """Open `count` market SELL on BTCUSDm with fixed manual settings."""
-    n = 0
-    allowed, _reason = manual_open_capacity(_SYMBOL_BTC)
-    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
-        if _place_market_order_fixed_sltp(_SYMBOL_BTC, "Sell"):
-            n += 1
-    return n
+    return _open_manual_orders(_SYMBOL_BTC, "Sell", count)
 
 
 def open_sell_order_xau(count: int) -> int:
     """Open `count` market SELL on XAUUSDm with fixed manual settings."""
-    n = 0
-    allowed, _reason = manual_open_capacity(_SYMBOL_XAU)
-    for _ in range(min(max(0, int(count)), max(0, int(allowed)))):
-        if _place_market_order_fixed_sltp(_SYMBOL_XAU, "Sell"):
-            n += 1
-    return n
+    return _open_manual_orders(_SYMBOL_XAU, "Sell", count)
 
 
 
@@ -2074,8 +2048,10 @@ __all__ = [
     "get_order_by_index",
     "get_all_open_positions",
     "has_open_positions",
+    "market_is_open",
     "close_order",
     "close_all_position",
+    "close_all_position_by_profit",
     "set_takeprofit_all_positions_usd",
     "set_stoploss_all_positions_usd",
     "get_full_report_day",

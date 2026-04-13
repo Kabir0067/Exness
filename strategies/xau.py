@@ -4,8 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from core.config import XAUEngineConfig, XAUSymbolParams
-from core.feature_engine import FeatureEngine
+from core.core_config import XAUEngineConfig, XAUSymbolParams
+from core.data_engine import FeatureEngine
 from core.risk_engine import RiskManager
 from core.signal_engine import SignalEngine
 

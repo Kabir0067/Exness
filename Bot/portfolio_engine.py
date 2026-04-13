@@ -9,7 +9,7 @@ Public imports remain valid:
 
 from .Motor.engine import MultiAssetTradingEngine, engine  # noqa: F401
 from .Motor.models import AssetCandidate, ExecutionResult, OrderIntent, PortfolioStatus  # noqa: F401
-from .Motor.scheduler import UTCScheduler  # noqa: F401
+from .Motor.pipeline import UTCScheduler  # noqa: F401
 
 __all__ = [
     "UTCScheduler",
@@ -20,3 +20,4 @@ __all__ = [
     "MultiAssetTradingEngine",
     "engine",
 ]
+

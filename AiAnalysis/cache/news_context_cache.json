@@ -1,6 +1,6 @@
 {
   "gold::scalping": {
-    "saved_ts": 1775654774.5061805,
+    "saved_ts": 1776083561.4529734,
     "ttl_sec": 3600.0,
     "data": {
       "status": "live",
@@ -15,33 +15,8 @@
       "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=4 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only"
     }
   },
-  "btc::scalping": {
-    "saved_ts": 1775654781.6711977,
-    "ttl_sec": 3600.0,
-    "data": {
-      "status": "live",
-      "asset": "btc",
-      "trade_style": "scalping",
-      "bias": "bullish",
-      "avg_sentiment": 0.8284,
-      "headline_count": 1,
-      "high_impact_count": 0,
-      "window_hours": 4,
-      "headlines": [
-        {
-          "title": "Bitcoin Casino No Deposit Bonus 2026: BitStarz Introduces 50 Free Spins No Deposit Bonus With Fast Withdrawals",
-          "source": "manilatimes.net",
-          "published_at": "2026-04-08T10:08:45.000000Z",
-          "url": "https://www.manilatimes.net/2026/04/08/tmt-newswire/globenewswire/bitcoin-casino-no-deposit-bonus-2026-bitstarz-introduces-50-free-spins-no-deposit-bonus-with-fast-withdrawals/2316174",
-          "score": 0.8284,
-          "high_impact": false
-        }
-      ],
-      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=4 | ARTICLES=1 | AVG_SENTIMENT=+0.83 | BIAS=BULLISH | HIGH_IMPACT=0 | RULE=risk_filter_only\nTOP_HEADLINES:\n- 2026-04-08T10:08:45.000000Z | manilatimes.net | score=+0.83 | Bitcoin Casino No Deposit Bonus 2026: BitStarz Introduces 50 Free Spins No Deposit Bonus With Fast Withdrawals"
-    }
-  },
   "gold::intraday": {
-    "saved_ts": 1775654790.031983,
+    "saved_ts": 1776083582.6339762,
     "ttl_sec": 10800.0,
     "data": {
       "status": "live",
@@ -56,45 +31,86 @@
       "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=18 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=directional_overlay"
     }
   },
+  "btc::scalping": {
+    "saved_ts": 1776083687.905833,
+    "ttl_sec": 3600.0,
+    "data": {
+      "status": "live",
+      "asset": "btc",
+      "trade_style": "scalping",
+      "bias": "neutral",
+      "avg_sentiment": -0.0484,
+      "headline_count": 3,
+      "high_impact_count": 0,
+      "window_hours": 4,
+      "headlines": [
+        {
+          "title": "Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How",
+          "source": "finance.yahoo.com",
+          "published_at": "2026-04-13T10:28:00.000000Z",
+          "url": "https://finance.yahoo.com/markets/crypto/articles/holding-bitcoin-just-helped-sleep-102800677.html",
+          "score": -0.0824,
+          "high_impact": false
+        },
+        {
+          "title": "Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal",
+          "source": "benzinga.com",
+          "published_at": "2026-04-13T09:28:07.000000Z",
+          "url": "https://www.benzinga.com/markets/equities/26/04/51773375/stock-market-today-dow-futures-fall-as-trump-announces-strait-of-hormuz-blockade-goldman-sachs-f",
+          "score": -0.4404,
+          "high_impact": false
+        },
+        {
+          "title": "Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?",
+          "source": "finance.yahoo.com",
+          "published_at": "2026-04-13T09:17:00.000000Z",
+          "url": "https://finance.yahoo.com/markets/crypto/articles/strategys-michael-saylor-says-bitcoin-091700270.html",
+          "score": 0.3776,
+          "high_impact": false
+        }
+      ],
+      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=4 | ARTICLES=3 | AVG_SENTIMENT=-0.05 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only\nTOP_HEADLINES:\n- 2026-04-13T10:28:00.000000Z | finance.yahoo.com | score=-0.08 | Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How\n- 2026-04-13T09:28:07.000000Z | benzinga.com | score=-0.44 | Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal\n- 2026-04-13T09:17:00.000000Z | finance.yahoo.com | score=+0.38 | Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?"
+    }
+  },
   "btc::intraday": {
-    "saved_ts": 1775654805.2343528,
+    "saved_ts": 1776083720.4684577,
     "ttl_sec": 10800.0,
     "data": {
       "status": "live",
       "asset": "btc",
       "trade_style": "intraday",
-      "bias": "bullish",
-      "avg_sentiment": 0.5524,
+      "bias": "neutral",
+      "avg_sentiment": -0.0484,
       "headline_count": 3,
       "high_impact_count": 0,
       "window_hours": 12,
       "headlines": [
         {
-          "title": "Bitcoin Casino No Deposit Bonus 2026: BitStarz Introduces 50 Free Spins No Deposit Bonus With Fast Withdrawals",
-          "source": "manilatimes.net",
-          "published_at": "2026-04-08T10:08:45.000000Z",
-          "url": "https://www.manilatimes.net/2026/04/08/tmt-newswire/globenewswire/bitcoin-casino-no-deposit-bonus-2026-bitstarz-introduces-50-free-spins-no-deposit-bonus-with-fast-withdrawals/2316174",
-          "score": 0.8284,
+          "title": "Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How",
+          "source": "finance.yahoo.com",
+          "published_at": "2026-04-13T10:28:00.000000Z",
+          "url": "https://finance.yahoo.com/markets/crypto/articles/holding-bitcoin-just-helped-sleep-102800677.html",
+          "score": -0.0824,
           "high_impact": false
         },
         {
-          "title": "Stock Market Today: S&P 500, Dow Futures Surge As Trump Declares Ceasefire On Iran Strikes—SoFi Technolog",
+          "title": "Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal",
           "source": "benzinga.com",
-          "published_at": "2026-04-08T09:14:24.000000Z",
-          "url": "https://www.benzinga.com/markets/equities/26/04/51697591/stock-market-today-sp-500-dow-futures-surge-as-trump-declares-ceasefire-on-iran-strikes-sofi-tec",
-          "score": 0.4019,
+          "published_at": "2026-04-13T09:28:07.000000Z",
+          "url": "https://www.benzinga.com/markets/equities/26/04/51773375/stock-market-today-dow-futures-fall-as-trump-announces-strait-of-hormuz-blockade-goldman-sachs-f",
+          "score": -0.4404,
           "high_impact": false
         },
         {
-          "title": "Bitcoin Is The Ultimate 'Hard Money' Backed By Energy, Says Top Analyst: 'Very Few Economists Understand.",
-          "source": "benzinga.com",
-          "published_at": "2026-04-08T08:51:11.000000Z",
-          "url": "https://www.benzinga.com/crypto/cryptocurrency/26/04/51697356/bitcoin-is-the-ultimate-hard-money-backed-by-energy-says-top-analyst-very-few-economists-un",
-          "score": 0.427,
+          "title": "Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?",
+          "source": "finance.yahoo.com",
+          "published_at": "2026-04-13T09:17:00.000000Z",
+          "url": "https://finance.yahoo.com/markets/crypto/articles/strategys-michael-saylor-says-bitcoin-091700270.html",
+          "score": 0.3776,
           "high_impact": false
         }
       ],
-      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=12 | ARTICLES=3 | AVG_SENTIMENT=+0.55 | BIAS=BULLISH | HIGH_IMPACT=0 | RULE=directional_overlay\nTOP_HEADLINES:\n- 2026-04-08T10:08:45.000000Z | manilatimes.net | score=+0.83 | Bitcoin Casino No Deposit Bonus 2026: BitStarz Introduces 50 Free Spins No Deposit Bonus With Fast Withdrawals\n- 2026-04-08T09:14:24.000000Z | benzinga.com | score=+0.40 | Stock Market Today: S&P 500, Dow Futures Surge As Trump Declares Ceasefire On Iran Strikes—SoFi Technolog\n- 2026-04-08T08:51:11.000000Z | benzinga.com | score=+0.43 | Bitcoin Is The Ultimate 'Hard Money' Backed By Energy, Says Top Analyst: 'Very Few Economists Understand."
+      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=12 | ARTICLES=3 | AVG_SENTIMENT=-0.05 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=directional_overlay\nTOP_HEADLINES:\n- 2026-04-13T10:28:00.000000Z | finance.yahoo.com | score=-0.08 | Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How\n- 2026-04-13T09:28:07.000000Z | benzinga.com | score=-0.44 | Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal\n- 2026-04-13T09:17:00.000000Z | finance.yahoo.com | score=+0.38 | Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?"
     }
   }
 }

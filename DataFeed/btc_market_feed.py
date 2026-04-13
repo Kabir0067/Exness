@@ -15,7 +15,7 @@ import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 
-from core.config import BTCEngineConfig as EngineConfig, BTCSymbolParams as SymbolParams, TF_MAP
+from core.core_config import BTCEngineConfig as EngineConfig, BTCSymbolParams as SymbolParams, TF_MAP
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 

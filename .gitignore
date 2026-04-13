@@ -15,9 +15,7 @@ env/
 .env
 
 # ...existing code...
-# игнорировать папку артефактов
-Artifacts/
-
-/Artifacts/
+# игнорировать папку 
+test/
 
 .claude/

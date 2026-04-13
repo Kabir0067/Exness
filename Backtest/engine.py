@@ -35,9 +35,9 @@ import pandas as pd
 import talib
 
 from log_config import get_artifact_dir, get_artifact_path, get_log_path
-from core.model_manager import model_manager
-from core.transaction_costs import TransactionCostModel
-from core.config import (
+from core.model_engine import model_manager
+from core.risk_engine import TransactionCostModel
+from core.core_config import (
     MAX_GATE_DRAWDOWN,
     MIN_GATE_SHARPE,
     MIN_GATE_WIN_RATE,

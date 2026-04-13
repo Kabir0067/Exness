@@ -503,6 +503,12 @@ def _release_single_instance_lock() -> None:
                 _lock_fp.close()
             except Exception:
                 pass
+            try:
+                p = _lock_file_path()
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
             _lock_fp = None
             _lock_acquired = False
 
@@ -1088,7 +1094,7 @@ def safe_order_send(
 # =============================================================================
 def _default_config_from_env() -> MT5ClientConfig:
     try:
-        from core.config import get_config_from_env as _get_cfg  # type: ignore
+        from core.core_config import get_config_from_env as _get_cfg  # type: ignore
     except Exception:
         try:
             from config import get_config_from_env as _get_cfg  # type: ignore

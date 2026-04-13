@@ -1,0 +1,107 @@
+================================================================================
+  🏛️  INSTITUTIONAL BACKTEST REPORT — BTC (M1)
+  Period: 2026-02-24 17:57:00+00:00 → 2026-04-07 08:03:00+00:00
+================================================================================
+
+  ══════════════════════════════════════════════════════════════════════════
+  RETURNS & PERFORMANCE
+  ──────────────────────────────────────────────────────────────────────────
+    Initial Capital:        $100,000.00
+    Final Capital:          $104,186.43
+    Total Return:           +4.19%
+    Annualized Return:      +27.76%
+    CAGR:                   +43.36%
+
+  ══════════════════════════════════════════════════════════════════════════
+  RISK-ADJUSTED METRICS (Institutional Standard)
+  ──────────────────────────────────────────────────────────────────────────
+    Sharpe Ratio:           7.570  ✅ (Target: >= 2.0)
+    Sortino Ratio:          47.685
+    Calmar Ratio:           129.100
+    Omega Ratio:            12.224
+    Information Ratio:      -4.253
+
+  ══════════════════════════════════════════════════════════════════════════
+  RISK MEASURES
+  ──────────────────────────────────────────────────────────────────────────
+    Max Drawdown:           0.22%  ✅ (Max: 20%)
+    Average Drawdown:       0.06%
+    DD Duration (bars):     24
+    Recovery Factor:        19.47
+    Annualized Vol:         3.67%
+    Downside Deviation:     0.04%
+    Value at Risk (95%):    $-55.53
+    CVaR/ES (95%):          $-71.52
+
+  ══════════════════════════════════════════════════════════════════════════
+  ROBUSTNESS & STRESS TESTS
+  ──────────────────────────────────────────────────────────────────────────
+    Risk of Ruin:           0.00%  ✅ (Max: 1.0%)
+    MC Runs:                10,000
+    MC 95% Confidence:      $102,803.22
+    MC Worst Case:          $101,450.17
+    MC Best Case:           $106,836.03
+
+    Walk-Forward:           ✅ PASS (0/5 windows failed)
+    WFA Avg Sharpe:         8.19
+    WFA Min Sharpe:         4.76
+
+    Stress Test:            ✅ PASS
+    Scenarios:
+      ✅ flash_crash: Impact=-4131.86
+      ✅ volatility_spike: Impact=-51.27
+
+  ══════════════════════════════════════════════════════════════════════════
+  TRADE STATISTICS
+  ──────────────────────────────────────────────────────────────────────────
+    Total Trades:           172
+    Win Rate:               69.2%  ✅ (Target: >= 58%)
+    Profit Factor:          3.58
+    Expectancy:             $24.34
+    Expectancy Ratio:       0.79
+
+    Avg Win:                $48.84
+    Avg Loss:               $-30.67
+    Win/Loss Ratio:         1.59
+    Largest Win:            $174.29
+    Largest Loss:           $-94.85
+
+    Max Consecutive Wins:   4
+    Max Consecutive Losses: 25
+    Avg Consecutive Wins:   1.4
+    Avg Consecutive Losses: 3.2
+
+    Avg Duration (min):     40.9
+    Median Duration (min):  30.0
+
+  ══════════════════════════════════════════════════════════════════════════
+  TIME-BASED ANALYSIS
+  ──────────────────────────────────────────────────────────────────────────
+    Total Calendar Days:    42
+    Est. Trading Days:      42
+    Avg Trades / Day:       4.13
+    Best Day Return:        +1.2190%
+    Worst Day Return:       -0.1050%
+
+  ══════════════════════════════════════════════════════════════════════════
+  TRANSACTION COSTS (Reality Check)
+  ──────────────────────────────────────────────────────────────────────────
+    Spread Cost:            $948.62  ($5.52/trade)
+    Slippage Cost:          $587.88  ($3.42/trade)
+    Commission:             $158.10
+    Swap/Funding:           $5.69
+    Total Fees:             $1700.29
+    Fee Impact:             1.70%
+
+  ══════════════════════════════════════════════════════════════════════════
+  POSITION MANAGEMENT
+  ──────────────────────────────────────────────────────────────────────────
+    Avg Position Size:      9.0%
+    Max Position Size:      20.0%
+    Kelly Optimal:          49.8%
+
+================================================================================
+
+  🏛️  INSTITUTIONAL GRADE VERIFIED ✅
+
+================================================================================

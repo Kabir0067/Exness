@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytz
 
-from core.config import XAUEngineConfig as EngineConfig, XAUSymbolParams as SymbolParams, TF_MAP
+from core.core_config import XAUEngineConfig as EngineConfig, XAUSymbolParams as SymbolParams, TF_MAP
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 

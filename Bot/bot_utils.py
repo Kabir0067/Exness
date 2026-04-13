@@ -25,7 +25,7 @@ from telebot.apihelper import ApiException, ApiTelegramException
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 from telebot import types
 
-from core.config import get_config_from_env
+from core.core_config import get_config_from_env
 from ExnessAPI.functions import market_is_open
 from Bot.portfolio_engine import engine
 from log_config import LOG_DIR as LOG_ROOT, get_log_path
@@ -717,6 +717,9 @@ def _build_signal_message(asset: str, result: Any) -> str:
     time_str = _format_time_only()
     phase = str(_field("phase", "") or "").strip().upper()
     blocked = bool(_field("blocked", False))
+    event_type = str(_field("type", "") or "").strip().upper()
+    analysis_only = bool(_field("analysis_only", False)) or event_type == "ML_SIGNAL"
+    blocked_reason = str(_field("blocked_reason", "") or "").strip()
     lot = float(_field("lot", 0.0) or 0.0)
     order_id = str(_field("order_id", "") or "").strip()
 
@@ -725,13 +728,18 @@ def _build_signal_message(asset: str, result: Any) -> str:
         extra_lines.append(f"📦 Ҳаҷм: <b>{lot:.4f}</b>")
     if order_id:
         extra_lines.append(f"🧷 ID-и навбат: <code>{html.escape(order_id)}</code>")
+    if blocked_reason:
+        extra_lines.append(f"🚫 Манъ шуд: <b>{html.escape(blocked_reason)}</b>")
     extra_block = "".join(f"{line}\n" for line in extra_lines)
 
     title = "📡 <b>СИГНАЛ БА НАВБАТ ГУЗОШТА ШУД</b>"
     footer = "<i>Дар навбати иҷрои broker/MT5...</i>"
     if blocked or phase == "C":
-        title = "⚠️ <b>СИГНАЛИ PHASE C</b>"
-        footer = "<i>Сигнал маҳдуд шуд ва иҷро намегардад.</i>"
+        title = "⚠️ <b>СИГНАЛ ОМАД, ИҶРО МАНЪ ШУД</b>"
+        footer = "<i>Сигнал зинда аст; иҷро аз тарафи риск/мониторинг манъ шуд.</i>"
+    elif analysis_only:
+        title = "📡 <b>СИГНАЛИ ЗИНДА</b>"
+        footer = "<i>Таҳлил сигнал дод; иҷро баъд аз risk gate санҷида мешавад.</i>"
 
     signal_label = _tajik_signal_label(sig)
     reasons_block = _format_reason_block(_field("reasons", []))
@@ -1045,8 +1053,14 @@ def _format_status_message(status: Any) -> str:
     if active_label == "NONE" and getattr(status, "trading", False):
         active_label = "✅ Дар ҷустуҷӯ (XAU + BTC)"
 
-    active_icon = "🟢" if getattr(status, "trading", False) else "🔴"
-    trading_status = "ФАЪОЛ" if getattr(status, "trading", False) else "ХОМӮШ"
+    runtime_alive = bool(getattr(status, "trading", False))
+    manual_stop = bool(getattr(status, "manual_stop", False))
+    active_icon = "🟡" if (runtime_alive and manual_stop) else ("🟢" if runtime_alive else "🔴")
+    trading_status = (
+        "МОНИТОРИНГ (савдо манъ)"
+        if (runtime_alive and manual_stop)
+        else ("ФАЪОЛ" if runtime_alive else "ХОМӮШ")
+    )
     mt5_state = "ПАЙВАСТ" if getattr(status, "connected", False) else "ҶУДО"
     balance = float(getattr(status, "balance", 0.0))
     equity = float(getattr(status, "equity", 0.0))
@@ -1434,4 +1448,3 @@ def check_full_program() -> tuple[bool, str]:
 
     ok_note = "✅ <b>Санҷиш анҷом ёфт</b>\nҲамаи модулҳо (XAU + BTC) дуруст фаъоланд."
     return True, ok_note + ("\n" + telemetry if telemetry else "")
-
