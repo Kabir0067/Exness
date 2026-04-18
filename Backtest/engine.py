@@ -24,7 +24,7 @@ import pickle
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,16 +34,16 @@ import numpy as np
 import pandas as pd
 import talib
 
-from log_config import get_artifact_dir, get_artifact_path, get_log_path
-from core.model_engine import model_manager
-from core.risk_engine import TransactionCostModel
-from core.core_config import (
+from core.config import (
     MAX_GATE_DRAWDOWN,
     MIN_GATE_SHARPE,
     MIN_GATE_WIN_RATE,
     WFA_MIN_PASS_RATE,
     WFA_MIN_WINDOWS,
 )
+from core.model_engine import model_manager
+from core.portfolio_risk import TransactionCostModel
+from log_config import get_artifact_dir, get_artifact_path, get_log_path
 
 try:
     from mt5_client import MT5_LOCK, ensure_mt5
@@ -55,17 +55,26 @@ except Exception:
     def ensure_mt5() -> bool:
         return False
 
+
 try:
     from .metrics import BacktestMetrics, compute_metrics, save_metrics
     from .model_train import (
-        BTC_TRAIN_CONFIG, XAU_TRAIN_CONFIG,
-        Pipeline, RegressionModel, train_and_register, load_training_dataframe_for_asset,
+        BTC_TRAIN_CONFIG,
+        XAU_TRAIN_CONFIG,
+        Pipeline,
+        RegressionModel,
+        load_training_dataframe_for_asset,
+        train_and_register,
     )
 except ImportError:
     from Backtest.metrics import BacktestMetrics, compute_metrics, save_metrics
     from Backtest.model_train import (
-        BTC_TRAIN_CONFIG, XAU_TRAIN_CONFIG,
-        Pipeline, RegressionModel, train_and_register, load_training_dataframe_for_asset,
+        BTC_TRAIN_CONFIG,
+        XAU_TRAIN_CONFIG,
+        Pipeline,
+        RegressionModel,
+        load_training_dataframe_for_asset,
+        train_and_register,
     )
 
 log = logging.getLogger("backtest.engine_institutional")
@@ -73,7 +82,7 @@ log.setLevel(logging.INFO)
 log.propagate = False
 if not log.handlers:
     _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    _fh  = RotatingFileHandler(
+    _fh = RotatingFileHandler(
         str(get_log_path("backtest_engine.log")),
         maxBytes=8 * 1024 * 1024,
         backupCount=5,
@@ -110,37 +119,38 @@ def _console(msg: str) -> None:
 # Configuration dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class InstitutionalBacktestConfig:
     """Institutional-grade backtest configuration."""
 
     strategy_name: str
     model_version: str
-    start_date:    str
-    end_date:      str
+    start_date: str
+    end_date: str
 
     # Capital & Position Management
-    initial_capital:      float = 100_000.0
-    max_position_size_pct: float = 0.20     # Max 20% per position
-    kelly_fraction:        float = 0.25     # Conservative Kelly
+    initial_capital: float = 100_000.0
+    max_position_size_pct: float = 0.20  # Max 20% per position
+    kelly_fraction: float = 0.25  # Conservative Kelly
 
     # Risk Limits
-    max_drawdown_limit:        float = 0.15  # Halt at 15% drawdown
-    daily_loss_limit:          float = 0.03  # Halt if day loses 3%
-    max_correlation_exposure:  float = 0.60  # Max 60% in correlated assets
+    max_drawdown_limit: float = 0.15  # Halt at 15% drawdown
+    daily_loss_limit: float = 0.03  # Halt if day loses 3%
+    max_correlation_exposure: float = 0.60  # Max 60% in correlated assets
 
     # Stops
-    use_stops:               bool  = True
-    atr_stop_multiplier:     float = 2.5
-    atr_target_multiplier:   float = 4.0
+    use_stops: bool = True
+    atr_stop_multiplier: float = 2.5
+    atr_target_multiplier: float = 4.0
     trailing_stop_activation: float = 0.015
-    trailing_stop_distance:   float = 0.008
+    trailing_stop_distance: float = 0.008
 
     # Transaction Costs (realistic)
-    spread_bps:           Dict[str, float] = None
-    slippage_bps:         Dict[str, float] = None
-    commission_bps:       float = 0.5
-    funding_rate_annual:  float = 0.05
+    spread_bps: Dict[str, float] = None
+    slippage_bps: Dict[str, float] = None
+    commission_bps: float = 0.5
+    funding_rate_annual: float = 0.05
     backtest_risk_free_rate: float = 0.0
     enforce_session_restrictions: bool = True
     allow_dead_hours_entries: bool = False
@@ -148,9 +158,9 @@ class InstitutionalBacktestConfig:
     entry_delay_bars: int = 1
 
     # Walk-Forward Analysis
-    wfa_train_days:   int   = 90
-    wfa_test_days:    int   = 30
-    wfa_min_sharpe:   float = MIN_GATE_SHARPE
+    wfa_train_days: int = 90
+    wfa_test_days: int = 30
+    wfa_min_sharpe: float = MIN_GATE_SHARPE
     wfa_min_win_rate: float = MIN_GATE_WIN_RATE
     verification_max_drawdown_pct: float = MAX_GATE_DRAWDOWN
     # STRICT institutional rule: insufficient WFA coverage is a hard failure.
@@ -159,19 +169,19 @@ class InstitutionalBacktestConfig:
     wfa_required_windows: int = WFA_MIN_WINDOWS
 
     # Monte Carlo Robustness
-    monte_carlo_runs:        int   = 10_000
-    ruin_drawdown_pct:       float = 0.25
-    monte_carlo_confidence:  float = 0.95
-    monte_carlo_seed:        int   = 42
+    monte_carlo_runs: int = 10_000
+    ruin_drawdown_pct: float = 0.25
+    monte_carlo_confidence: float = 0.95
+    monte_carlo_seed: int = 42
 
     # Regime Detection
-    regime_lookback:     int   = 120
-    trend_threshold:     float = 0.0015
+    regime_lookback: int = 120
+    trend_threshold: float = 0.0015
     volatility_threshold: float = 1.5
 
     # Stress Testing
-    stress_test_scenarios:       bool  = True
-    crash_scenario_pct:          float = -0.20
+    stress_test_scenarios: bool = True
+    crash_scenario_pct: float = -0.20
     volatility_spike_multiplier: float = 3.0
 
     def __post_init__(self) -> None:
@@ -202,6 +212,7 @@ BTC_INSTITUTIONAL_CONFIG = InstitutionalBacktestConfig(
 # Symbol resolution helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _base_symbol(asset: str) -> str:
     asset_u = str(asset).upper().strip()
     if asset_u in ("BTC", "BTCUSD", "BTCUSDM"):
@@ -210,14 +221,14 @@ def _base_symbol(asset: str) -> str:
 
 
 def _resolve_symbol(asset: str) -> str:
-    base   = _base_symbol(asset)
+    base = _base_symbol(asset)
     suffix: str = ""
     candidates: List[str] = []
     if suffix:
         candidates.append(f"{base}{suffix}")
     candidates.extend([f"{base}m", base])
 
-    seen:  set[str]  = set()
+    seen: set[str] = set()
     uniq: List[str] = []
     for sym in candidates:
         if sym in seen:
@@ -238,8 +249,8 @@ def _resolve_symbol(asset: str) -> str:
         symbols = None
     if symbols:
         base_u = base.upper()
-        names  = [s.name for s in symbols if hasattr(s, "name")]
-        exact  = [n for n in names if n.upper() == base_u]
+        names = [s.name for s in symbols if hasattr(s, "name")]
+        exact = [n for n in names if n.upper() == base_u]
         if exact:
             return exact[0]
         starts = [n for n in names if n.upper().startswith(base_u)]
@@ -267,6 +278,7 @@ def _parse_utc_date(s: str) -> datetime:
 # Regime Detector
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class RegimeDetector:
     """
     Market regime classification: TREND_UP, TREND_DOWN, RANGE, HIGH_VOL.
@@ -277,26 +289,26 @@ class RegimeDetector:
 
     def __init__(
         self,
-        lookback:          int   = 120,
-        trend_threshold:   float = 0.0015,
-        vol_multiplier:    float = 1.5,
+        lookback: int = 120,
+        trend_threshold: float = 0.0015,
+        vol_multiplier: float = 1.5,
     ) -> None:
-        self.lookback         = lookback
-        self.trend_threshold  = trend_threshold
-        self.vol_multiplier   = vol_multiplier
+        self.lookback = lookback
+        self.trend_threshold = trend_threshold
+        self.vol_multiplier = vol_multiplier
 
     def detect(self, prices: np.ndarray) -> str:
         """Single-bar regime detection (original API — kept for compatibility)."""
         if len(prices) < self.lookback:
             return "UNKNOWN"
-        recent  = prices[-self.lookback:]
+        recent = prices[-self.lookback :]
         returns = np.diff(recent) / recent[:-1]
-        cumret  = (recent[-1] - recent[0]) / recent[0]
+        cumret = (recent[-1] - recent[0]) / recent[0]
         if cumret > self.trend_threshold:
             return "TREND_UP"
         elif cumret < -self.trend_threshold:
             return "TREND_DOWN"
-        vol     = float(np.std(returns))
+        vol = float(np.std(returns))
         avg_vol = float(np.std(np.diff(prices) / prices[:-1]))
         if vol > self.vol_multiplier * avg_vol:
             return "HIGH_VOL"
@@ -313,40 +325,42 @@ class RegimeDetector:
         inside the trade simulation loop which was O(n × lookback).
         The vectorised implementation is O(n) with pandas rolling operations.
         """
-        n  = len(prices)
+        n = len(prices)
         lb = self.lookback
         out = np.full(n, "UNKNOWN", dtype=object)
         if n < lb:
             return out
 
-        s   = pd.Series(prices, dtype=np.float64)
+        s = pd.Series(prices, dtype=np.float64)
         # Rolling cumulative return over the lookback window
         cumret = (s - s.shift(lb - 1)) / s.shift(lb - 1)
 
         # Rolling std of 1-bar returns (proxy for local volatility)
         ret_series = s.pct_change()
-        roll_vol   = ret_series.rolling(lb - 1).std()
+        roll_vol = ret_series.rolling(lb - 1).std()
         # Global avg volatility (denominator for HIGH_VOL test)
-        avg_vol    = float(ret_series.std())
+        avg_vol = float(ret_series.std())
         if not np.isfinite(avg_vol) or avg_vol <= 1e-15:
             avg_vol = 1e-15
 
         # Numpy arrays for fast conditional assignment
-        cr_arr  = cumret.to_numpy(dtype=np.float64)
+        cr_arr = cumret.to_numpy(dtype=np.float64)
         vol_arr = roll_vol.to_numpy(dtype=np.float64)
 
         valid = np.isfinite(cr_arr)
-        out[valid & (cr_arr > self.trend_threshold)]  = "TREND_UP"
+        out[valid & (cr_arr > self.trend_threshold)] = "TREND_UP"
         out[valid & (cr_arr < -self.trend_threshold)] = "TREND_DOWN"
 
         # For bars not yet labelled (UNKNOWN after trend checks), test volatility
         still_unknown = (out == "UNKNOWN") & valid
-        high_vol_mask = still_unknown & np.isfinite(vol_arr) & (
-            vol_arr > self.vol_multiplier * avg_vol
+        high_vol_mask = (
+            still_unknown
+            & np.isfinite(vol_arr)
+            & (vol_arr > self.vol_multiplier * avg_vol)
         )
         range_mask = still_unknown & ~high_vol_mask
         out[high_vol_mask] = "HIGH_VOL"
-        out[range_mask]    = "RANGE"
+        out[range_mask] = "RANGE"
 
         return out
 
@@ -354,6 +368,7 @@ class RegimeDetector:
 # ─────────────────────────────────────────────────────────────────────────────
 # Kelly Position Sizer
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class KellyPositionSizer:
     """Kelly Criterion position sizing with institutional safeguards."""
@@ -364,16 +379,16 @@ class KellyPositionSizer:
 
     def calculate(
         self,
-        win_rate:   float,
-        avg_win:    float,
-        avg_loss:   float,
+        win_rate: float,
+        avg_win: float,
+        avg_loss: float,
         confidence: float = 1.0,
     ) -> float:
         """Calculate Kelly-optimal position size, capped at max_size."""
         try:
-            wr   = float(win_rate)
-            aw   = abs(float(avg_win))
-            al   = abs(float(avg_loss))
+            wr = float(win_rate)
+            aw = abs(float(avg_win))
+            al = abs(float(avg_loss))
             conf = float(confidence)
         except Exception:
             return 0.0
@@ -398,7 +413,7 @@ class KellyPositionSizer:
             return 0.0
         kelly = max(0.0, kelly)
 
-        conf  = min(max(conf, 0.0), 2.0)
+        conf = min(max(conf, 0.0), 2.0)
         kelly *= self.fraction * conf
         return min(float(kelly), self.max_size)
 
@@ -406,6 +421,7 @@ class KellyPositionSizer:
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Engine
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class InstitutionalBacktestEngine:
     """
@@ -420,26 +436,26 @@ class InstitutionalBacktestEngine:
 
     def __init__(
         self,
-        asset:         str,
+        asset: str,
         model_version: str,
-        run_cfg:       InstitutionalBacktestConfig,
+        run_cfg: InstitutionalBacktestConfig,
     ) -> None:
-        self.asset         = str(asset).upper().strip()
+        self.asset = str(asset).upper().strip()
         self.model_version = str(model_version).strip()
-        self.run_cfg       = run_cfg
+        self.run_cfg = run_cfg
 
         # Internal state
-        self._last_verified:         bool            = False
-        self._risk_of_ruin:          float           = 0.0
-        self._wfa:                   Dict[str, Any]  = {}
-        self._unsafe:                bool            = False
-        self._stress_results:        Dict[str, Any]  = {}
-        self._sample_quality_passed: bool            = True
-        self._sample_quality_issues: List[str]       = []
-        self._anti_overfit_passed:   bool            = False
-        self._tscv_folds:            int             = 0
-        self._tscv_mean_active_acc:  float           = 0.0
-        self._backtest_audit:        Dict[str, Any]  = {}
+        self._last_verified: bool = False
+        self._risk_of_ruin: float = 0.0
+        self._wfa: Dict[str, Any] = {}
+        self._unsafe: bool = False
+        self._stress_results: Dict[str, Any] = {}
+        self._sample_quality_passed: bool = True
+        self._sample_quality_issues: List[str] = []
+        self._anti_overfit_passed: bool = False
+        self._tscv_folds: int = 0
+        self._tscv_mean_active_acc: float = 0.0
+        self._backtest_audit: Dict[str, Any] = {}
 
         self.regime_detector = RegimeDetector(
             lookback=run_cfg.regime_lookback,
@@ -467,7 +483,9 @@ class InstitutionalBacktestEngine:
         minute = int(stamp.hour * 60 + stamp.minute)
         if minute >= 1435 or minute < 65:
             return False
-        if not bool(self.run_cfg.allow_dead_hours_entries) and (minute < 360 or minute >= 1320):
+        if not bool(self.run_cfg.allow_dead_hours_entries) and (
+            minute < 360 or minute >= 1320
+        ):
             return False
         return True
 
@@ -479,11 +497,17 @@ class InstitutionalBacktestEngine:
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Build a pessimistic realism audit for the backtest pipeline."""
-        chronological = bool(df.index.is_monotonic_increasing and not bool(df.index.has_duplicates))
-        next_bar_only = all(
-            int(t.get("entry_idx", -1)) > int(t.get("signal_idx", -1))
-            for t in trades
-        ) if trades else True
+        chronological = bool(
+            df.index.is_monotonic_increasing and not bool(df.index.has_duplicates)
+        )
+        next_bar_only = (
+            all(
+                int(t.get("entry_idx", -1)) > int(t.get("signal_idx", -1))
+                for t in trades
+            )
+            if trades
+            else True
+        )
         split_ordering = False
         try:
             pipe_cfg = getattr(payload.get("pipeline"), "cfg", None)
@@ -496,14 +520,32 @@ class InstitutionalBacktestEngine:
             split_ordering = False
 
         audit = {
-            "commission_included": bool(float(self.run_cfg.commission_bps or 0.0) > 0.0),
-            "spread_included": bool(any(float(v or 0.0) > 0.0 for v in (self.run_cfg.spread_bps or {}).values())),
-            "slippage_included": bool(any(float(v or 0.0) > 0.0 for v in (self.run_cfg.slippage_bps or {}).values())),
-            "session_restrictions_enabled": bool(self.run_cfg.enforce_session_restrictions),
-            "stop_distance_rules_enabled": bool(float(self.run_cfg.min_stop_distance_atr or 0.0) > 0.0),
+            "commission_included": bool(
+                float(self.run_cfg.commission_bps or 0.0) > 0.0
+            ),
+            "spread_included": bool(
+                any(
+                    float(v or 0.0) > 0.0
+                    for v in (self.run_cfg.spread_bps or {}).values()
+                )
+            ),
+            "slippage_included": bool(
+                any(
+                    float(v or 0.0) > 0.0
+                    for v in (self.run_cfg.slippage_bps or {}).values()
+                )
+            ),
+            "session_restrictions_enabled": bool(
+                self.run_cfg.enforce_session_restrictions
+            ),
+            "stop_distance_rules_enabled": bool(
+                float(self.run_cfg.min_stop_distance_atr or 0.0) > 0.0
+            ),
             "chronological_data": chronological,
             "next_bar_execution_only": next_bar_only,
-            "walk_forward_enabled": bool(int(self.run_cfg.wfa_required_windows or 0) > 0),
+            "walk_forward_enabled": bool(
+                int(self.run_cfg.wfa_required_windows or 0) > 0
+            ),
             "train_test_separation": split_ordering,
         }
         audit["passed"] = bool(all(audit.values()))
@@ -515,14 +557,14 @@ class InstitutionalBacktestEngine:
     # ------------------------------------------------------------------ #
 
     def _registry_model_path(self) -> Path:
-        suffix  = "_institutional"
+        suffix = "_institutional"
         version = self.model_version
         if not version.endswith(suffix):
             version = f"{version}{suffix}"
         return get_artifact_path("models", f"v{version}.pkl")
 
     def _registry_meta_path(self) -> Path:
-        suffix  = "_institutional"
+        suffix = "_institutional"
         version = self.model_version
         if not version.endswith(suffix):
             version = f"{version}{suffix}"
@@ -530,34 +572,42 @@ class InstitutionalBacktestEngine:
 
     def _legacy_shared_version(self) -> str:
         version = str(self.model_version or "").strip()
-        low     = version.lower()
-        token   = "_xau" if self.asset in ("XAU", "XAUUSD", "XAUUSDM") else "_btc"
-        idx     = low.find(token)
+        low = version.lower()
+        token = "_xau" if self.asset in ("XAU", "XAUUSD", "XAUUSDM") else "_btc"
+        idx = low.find(token)
         if idx >= 0:
-            version = version[:idx] + version[idx + len(token):]
+            version = version[:idx] + version[idx + len(token) :]
         return version
 
     def _registry_model_candidates(self) -> List[Path]:
-        p             = self._registry_model_path()
-        legacy        = self._legacy_shared_version()
-        candidates    = [p]
+        p = self._registry_model_path()
+        legacy = self._legacy_shared_version()
+        candidates = [p]
         if legacy and legacy != self.model_version:
             candidates.append(get_artifact_path("models", f"v{legacy}.pkl"))
         seen: set[str] = set()
-        return [c for c in candidates if not (str(c.resolve()) in seen or seen.add(str(c.resolve())))]
+        return [
+            c
+            for c in candidates
+            if not (str(c.resolve()) in seen or seen.add(str(c.resolve())))
+        ]
 
     def _registry_meta_candidates(self) -> List[Path]:
-        p             = self._registry_meta_path()
-        legacy        = self._legacy_shared_version()
-        candidates    = [p]
+        p = self._registry_meta_path()
+        legacy = self._legacy_shared_version()
+        candidates = [p]
         if legacy and legacy != self.model_version:
             candidates.append(get_artifact_path("models", f"v{legacy}.json"))
         seen: set[str] = set()
-        return [c for c in candidates if not (str(c.resolve()) in seen or seen.add(str(c.resolve())))]
+        return [
+            c
+            for c in candidates
+            if not (str(c.resolve()) in seen or seen.add(str(c.resolve())))
+        ]
 
     def _load_model_payload(self) -> Dict[str, Any]:
-        candidates    = self._registry_model_candidates()
-        payload       = None
+        candidates = self._registry_model_candidates()
+        payload = None
         payload_path: Optional[Path] = None
         for p in candidates:
             if not p.exists():
@@ -568,7 +618,9 @@ class InstitutionalBacktestEngine:
             if p != candidates[0]:
                 log.warning(
                     "MODEL_PAYLOAD_LEGACY_FALLBACK | asset=%s version=%s path=%s",
-                    self.asset, self.model_version, p,
+                    self.asset,
+                    self.model_version,
+                    p,
                 )
             break
         if payload_path is None:
@@ -586,10 +638,10 @@ class InstitutionalBacktestEngine:
 
     def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calculate ATR for stop-loss sizing using TA-Lib."""
-        high  = np.asarray(df["High"].values,  dtype=np.float64)
-        low   = np.asarray(df["Low"].values,   dtype=np.float64)
+        high = np.asarray(df["High"].values, dtype=np.float64)
+        low = np.asarray(df["Low"].values, dtype=np.float64)
         close = np.asarray(df["Close"].values, dtype=np.float64)
-        atr   = talib.ATR(high, low, close, timeperiod=int(period))
+        atr = talib.ATR(high, low, close, timeperiod=int(period))
         return pd.Series(atr, index=df.index)
 
     # ------------------------------------------------------------------ #
@@ -599,15 +651,15 @@ class InstitutionalBacktestEngine:
     def _resolve_signal_threshold(
         self,
         configured_threshold: float,
-        pred:                 np.ndarray,
+        pred: np.ndarray,
         *,
-        enforce_min_signals:  bool = True,
+        enforce_min_signals: bool = True,
     ) -> float:
         """
         Use configured threshold when feasible; adapt downward when the model's
         prediction scale is too small to generate enough signals for evaluation.
         """
-        base     = max(float(configured_threshold or 0.0), 1e-12)
+        base = max(float(configured_threshold or 0.0), 1e-12)
         abs_pred = np.abs(np.asarray(pred, dtype=np.float64))
         abs_pred = abs_pred[np.isfinite(abs_pred)]
         if abs_pred.size == 0:
@@ -626,20 +678,28 @@ class InstitutionalBacktestEngine:
                 signal_trade_ratio: float = 3.0
             except Exception:
                 signal_trade_ratio = 3.0
-            min_trades         = max(1, min_trades)
+            min_trades = max(1, min_trades)
             signal_trade_ratio = max(1.0, signal_trade_ratio)
-            target_signals     = max(1, min(int(np.ceil(min_trades * signal_trade_ratio)), abs_pred.size))
-            base_signal_count  = int(np.sum(abs_pred >= base))
+            target_signals = max(
+                1, min(int(np.ceil(min_trades * signal_trade_ratio)), abs_pred.size)
+            )
+            base_signal_count = int(np.sum(abs_pred >= base))
 
             if base_signal_count < target_signals and abs_pred.size > 1:
-                quantile = min(max(1.0 - (float(target_signals) / float(abs_pred.size)), 0.0), 0.99)
+                quantile = min(
+                    max(1.0 - (float(target_signals) / float(abs_pred.size)), 0.0), 0.99
+                )
                 adaptive = float(np.quantile(abs_pred, quantile))
                 adaptive = max(1e-12, min(adaptive, max_pred * 0.999999))
                 if adaptive < base:
                     log.warning(
                         "BACKTEST_THRESHOLD_RELAX | asset=%s configured=%.8f adaptive=%.8f "
                         "base_signals=%s target_signals=%s",
-                        self.asset, base, adaptive, base_signal_count, target_signals,
+                        self.asset,
+                        base,
+                        adaptive,
+                        base_signal_count,
+                        target_signals,
                     )
                     base = adaptive
 
@@ -647,20 +707,25 @@ class InstitutionalBacktestEngine:
             return base
 
         # Prediction scale too small — adapt via configurable quantile
-        asset_key   = "BTC" if self.asset in ("BTC", "BTCUSD", "BTCUSDM") else "XAU"
-        q_raw       = os.getenv(f"BACKTEST_ADAPTIVE_THRESHOLD_QUANTILE_{asset_key}")
+        asset_key = "BTC" if self.asset in ("BTC", "BTCUSD", "BTCUSDM") else "XAU"
+        q_raw = os.getenv(f"BACKTEST_ADAPTIVE_THRESHOLD_QUANTILE_{asset_key}")
         if q_raw is None:
-            q_raw   = os.getenv("BACKTEST_ADAPTIVE_THRESHOLD_QUANTILE", "0.60")
-        quantile    = min(max(float(q_raw or "0.60"), 0.05), 0.95)
-        qv          = float(np.quantile(abs_pred, quantile))
-        adaptive    = max(qv, max_pred * 0.35, 1e-12)
+            q_raw = os.getenv("BACKTEST_ADAPTIVE_THRESHOLD_QUANTILE", "0.60")
+        quantile = min(max(float(q_raw or "0.60"), 0.05), 0.95)
+        qv = float(np.quantile(abs_pred, quantile))
+        adaptive = max(qv, max_pred * 0.35, 1e-12)
         if adaptive >= max_pred:
             adaptive = max(max_pred * 0.999999, 1e-12)
         signal_count = int(np.sum(abs_pred >= adaptive))
         log.warning(
             "BACKTEST_THRESHOLD_ADAPT | asset=%s configured=%.8f max_pred=%.8f "
             "adaptive=%.8f q=%.2f signals=%s",
-            self.asset, base, max_pred, adaptive, quantile, signal_count,
+            self.asset,
+            base,
+            max_pred,
+            adaptive,
+            quantile,
+            signal_count,
         )
         return adaptive
 
@@ -680,18 +745,26 @@ class InstitutionalBacktestEngine:
         model_quantile = 0.0
         if isinstance(alpha_calibration, dict):
             try:
-                model_threshold = float(alpha_calibration.get("pred_abs_threshold", 0.0) or 0.0)
+                model_threshold = float(
+                    alpha_calibration.get("pred_abs_threshold", 0.0) or 0.0
+                )
             except Exception:
                 model_threshold = 0.0
             try:
-                model_quantile = float(alpha_calibration.get("pred_quantile", 0.0) or 0.0)
+                model_quantile = float(
+                    alpha_calibration.get("pred_quantile", 0.0) or 0.0
+                )
             except Exception:
                 model_quantile = 0.0
 
         if np.isfinite(model_threshold) and model_threshold > 0.0:
             base = max(base, model_threshold)
 
-        if abs_pred.size > 0 and np.isfinite(model_quantile) and 0.0 < model_quantile <= 99.9:
+        if (
+            abs_pred.size > 0
+            and np.isfinite(model_quantile)
+            and 0.0 < model_quantile <= 99.9
+        ):
             try:
                 quant_thr = float(np.percentile(abs_pred, model_quantile))
             except Exception:
@@ -711,14 +784,14 @@ class InstitutionalBacktestEngine:
 
     def _simulate_trades_institutional(
         self,
-        df:              pd.DataFrame,
-        pred:            np.ndarray,
-        y:               np.ndarray,
+        df: pd.DataFrame,
+        pred: np.ndarray,
+        y: np.ndarray,
         *,
-        threshold:       float,
+        threshold: float,
         initial_capital: float,
-        rng:             Optional[np.random.Generator],
-        pre_regimes:     Optional[np.ndarray] = None,
+        rng: Optional[np.random.Generator],
+        pre_regimes: Optional[np.ndarray] = None,
     ) -> Tuple[List[float], List[Dict[str, Any]], Dict[str, float]]:
         """
         Institutional trade simulation with step-by-step exits.
@@ -764,7 +837,11 @@ class InstitutionalBacktestEngine:
 
         n_obs = min(len(pred), len(df))
         if n_obs < 3:
-            return [], [], {"spread": 0.0, "slippage": 0.0, "commission": 0.0, "funding": 0.0}
+            return (
+                [],
+                [],
+                {"spread": 0.0, "slippage": 0.0, "commission": 0.0, "funding": 0.0},
+            )
 
         i = 0
         while i < (n_obs - 1):
@@ -795,7 +872,7 @@ class InstitutionalBacktestEngine:
             if pre_regimes is not None:
                 regime = str(pre_regimes[i])
             else:
-                regime = self.regime_detector.detect(close_px[:i + 1])
+                regime = self.regime_detector.detect(close_px[: i + 1])
             if regime == "HIGH_VOL" and abs(p) < threshold * 1.5:
                 i += 1
                 continue
@@ -833,12 +910,17 @@ class InstitutionalBacktestEngine:
                 i += 1
                 continue
 
-            atr_value = atr[entry_idx] if entry_idx < len(atr) and np.isfinite(atr[entry_idx]) else entry_price * 0.01
+            atr_value = (
+                atr[entry_idx]
+                if entry_idx < len(atr) and np.isfinite(atr[entry_idx])
+                else entry_price * 0.01
+            )
             stop_distance = float(atr_value * self.run_cfg.atr_stop_multiplier)
             target_distance = float(atr_value * self.run_cfg.atr_target_multiplier)
             min_stop_distance = max(
                 abs(entry_price) * 1e-6,
-                float(self.run_cfg.min_stop_distance_atr or 0.0) * max(float(atr_value), 0.0),
+                float(self.run_cfg.min_stop_distance_atr or 0.0)
+                * max(float(atr_value), 0.0),
             )
             if stop_distance < min_stop_distance or target_distance < min_stop_distance:
                 i += 1
@@ -928,7 +1010,11 @@ class InstitutionalBacktestEngine:
                         pred_j = float(pred[j])
                     except Exception:
                         pred_j = 0.0
-                    if np.isfinite(pred_j) and abs(pred_j) >= threshold and (pred_j * direction) < 0.0:
+                    if (
+                        np.isfinite(pred_j)
+                        and abs(pred_j) >= threshold
+                        and (pred_j * direction) < 0.0
+                    ):
                         exit_idx = j
                         exit_price = cl
                         exit_reason = "signal_flip"
@@ -944,7 +1030,7 @@ class InstitutionalBacktestEngine:
             except Exception:
                 hold_minutes = float(max(0, exit_idx - entry_idx))
 
-            segment = close_px[max(0, entry_idx - 20): entry_idx + 1]
+            segment = close_px[max(0, entry_idx - 20) : entry_idx + 1]
             volatility = 0.0
             if len(segment) > 1:
                 denom = segment[:-1]
@@ -980,34 +1066,38 @@ class InstitutionalBacktestEngine:
 
             recent_pnls = [t["pnl"] for t in trades[-100:]]
             if len(recent_pnls) > 10:
-                win_rate_rolling = sum(1 for x in recent_pnls if x > 0) / len(recent_pnls)
+                win_rate_rolling = sum(1 for x in recent_pnls if x > 0) / len(
+                    recent_pnls
+                )
 
             realized_ret = direction * (exit_price - entry_price) / entry_price
-            trades.append({
-                "pnl": float(net_pnl),
-                "gross_pnl": float(gross_pnl),
-                "direction": direction,
-                "signal_idx": int(i),
-                "entry_idx": int(entry_idx),
-                "exit_idx": int(exit_idx),
-                "entry_time": str(df.index[entry_idx]),
-                "exit_time": str(df.index[exit_idx]),
-                "entry_price": float(entry_price),
-                "exit_price": float(exit_price),
-                "position_size_pct": float(position_size_pct),
-                "notional": float(notional),
-                "spread_cost": float(costs.spread),
-                "slippage_cost": float(costs.slippage),
-                "commission": float(costs.commission),
-                "funding_cost": float(costs.funding),
-                "regime": regime,
-                "hit_stop": hit_stop,
-                "hit_target": hit_target,
-                "exit_reason": exit_reason,
-                "hold_minutes": float(hold_minutes),
-                "prediction": float(p),
-                "actual_return": float(realized_ret),
-            })
+            trades.append(
+                {
+                    "pnl": float(net_pnl),
+                    "gross_pnl": float(gross_pnl),
+                    "direction": direction,
+                    "signal_idx": int(i),
+                    "entry_idx": int(entry_idx),
+                    "exit_idx": int(exit_idx),
+                    "entry_time": str(df.index[entry_idx]),
+                    "exit_time": str(df.index[exit_idx]),
+                    "entry_price": float(entry_price),
+                    "exit_price": float(exit_price),
+                    "position_size_pct": float(position_size_pct),
+                    "notional": float(notional),
+                    "spread_cost": float(costs.spread),
+                    "slippage_cost": float(costs.slippage),
+                    "commission": float(costs.commission),
+                    "funding_cost": float(costs.funding),
+                    "regime": regime,
+                    "hit_stop": hit_stop,
+                    "hit_target": hit_target,
+                    "exit_reason": exit_reason,
+                    "hold_minutes": float(hold_minutes),
+                    "prediction": float(p),
+                    "actual_return": float(realized_ret),
+                }
+            )
 
             i = max(i + 1, exit_idx + 1)
 
@@ -1022,7 +1112,10 @@ class InstitutionalBacktestEngine:
         if floor_used_count > 0:
             log.info(
                 "BACKTEST_POS_SIZE_FLOOR_USED | asset=%s count=%s floor=%.4f conf_min=%.2f",
-                self.asset, floor_used_count, min_pos_floor, min_pos_conf,
+                self.asset,
+                floor_used_count,
+                min_pos_floor,
+                min_pos_conf,
             )
 
         return pnl_series, trades, total_costs
@@ -1052,17 +1145,19 @@ class InstitutionalBacktestEngine:
         """
         runs = int(self.run_cfg.monte_carlo_runs)
         empty_result: Dict[str, float] = {
-            "risk_of_ruin":                0.0,
-            "confidence_95_percentile":    0.0,
-            "median_final":                0.0,
-            "worst_case":                  0.0,
-            "best_case":                   0.0,
+            "risk_of_ruin": 0.0,
+            "confidence_95_percentile": 0.0,
+            "median_final": 0.0,
+            "worst_case": 0.0,
+            "best_case": 0.0,
         }
         if not pnl_series or runs <= 0:
             return empty_result
 
-        ruin_threshold = self.run_cfg.initial_capital * (1.0 - self.run_cfg.ruin_drawdown_pct)
-        rng  = np.random.default_rng(self.run_cfg.monte_carlo_seed)
+        ruin_threshold = self.run_cfg.initial_capital * (
+            1.0 - self.run_cfg.ruin_drawdown_pct
+        )
+        rng = np.random.default_rng(self.run_cfg.monte_carlo_seed)
         pnls = np.asarray(pnl_series, dtype=np.float64)
         pnls = pnls[np.isfinite(pnls)]
         if pnls.size == 0:
@@ -1071,56 +1166,62 @@ class InstitutionalBacktestEngine:
         n = int(pnls.size)
 
         # Noise / shock parameters
-        abs_pnls   = np.abs(pnls)
-        median_abs = float(np.median(abs_pnls[abs_pnls > 0.0])) if np.any(abs_pnls > 0.0) else 0.0
+        abs_pnls = np.abs(pnls)
+        median_abs = (
+            float(np.median(abs_pnls[abs_pnls > 0.0]))
+            if np.any(abs_pnls > 0.0)
+            else 0.0
+        )
 
         exec_jitter_frac: float = 0.05
         tail_prob: float = 0.01
         tail_scale: float = 1.5
 
         exec_jitter_frac = max(0.0, min(exec_jitter_frac, 1.0))
-        tail_prob        = max(0.0, min(tail_prob, 0.5))
-        tail_scale       = max(0.5, tail_scale)
-        jitter_sigma     = max(median_abs * exec_jitter_frac, 1e-9)
+        tail_prob = max(0.0, min(tail_prob, 0.5))
+        tail_scale = max(0.5, tail_scale)
+        jitter_sigma = max(median_abs * exec_jitter_frac, 1e-9)
 
         # ── Step 1: bootstrap sampling — (runs, n) ──────────────────────
-        boot_idx = rng.integers(0, n, size=(runs, n))          # (runs, n)
-        paths    = pnls[boot_idx].astype(np.float64, copy=True) # (runs, n)
+        boot_idx = rng.integers(0, n, size=(runs, n))  # (runs, n)
+        paths = pnls[boot_idx].astype(np.float64, copy=True)  # (runs, n)
 
         # ── Step 2: execution noise drag (always adverse, ≥ 0) ──────────
-        drag  = np.abs(rng.normal(0.0, jitter_sigma, size=(runs, n)))
+        drag = np.abs(rng.normal(0.0, jitter_sigma, size=(runs, n)))
         paths -= drag
 
         # ── Step 3: tail (black-swan) shocks ───────────────────────────
         if tail_prob > 0.0:
-            shock_mask    = rng.random((runs, n)) < tail_prob
-            shock_scale   = rng.uniform(0.5, tail_scale, size=(runs, n))
+            shock_mask = rng.random((runs, n)) < tail_prob
+            shock_scale = rng.uniform(0.5, tail_scale, size=(runs, n))
             shock_penalty = np.abs(paths) * shock_scale * shock_mask
-            paths        -= shock_penalty
+            paths -= shock_penalty
 
         # ── Step 4: per-path permutation using vectorised advanced indexing
-        perm_idx = rng.permuted(                                # (runs, n)
+        perm_idx = rng.permuted(  # (runs, n)
             np.broadcast_to(np.arange(n), (runs, n)).copy(),
             axis=1,
         )
         # Advanced indexing to reorder each row
-        row_idx  = np.arange(runs)[:, np.newaxis]              # (runs, 1)
-        paths    = paths[row_idx, perm_idx]
+        row_idx = np.arange(runs)[:, np.newaxis]  # (runs, 1)
+        paths = paths[row_idx, perm_idx]
 
         # ── Step 5: cumulative equity curves ───────────────────────────
-        equity_matrix = np.cumsum(paths, axis=1) + self.run_cfg.initial_capital  # (runs, n)
+        equity_matrix = (
+            np.cumsum(paths, axis=1) + self.run_cfg.initial_capital
+        )  # (runs, n)
 
         # ── Step 6: risk statistics ─────────────────────────────────────
-        min_equity    = equity_matrix.min(axis=1)              # (runs,)
-        ruin_count    = int(np.sum(min_equity <= ruin_threshold))
-        final_eq      = equity_matrix[:, -1]                   # (runs,)
+        min_equity = equity_matrix.min(axis=1)  # (runs,)
+        ruin_count = int(np.sum(min_equity <= ruin_threshold))
+        final_eq = equity_matrix[:, -1]  # (runs,)
 
         return {
-            "risk_of_ruin":             float(ruin_count / runs),
+            "risk_of_ruin": float(ruin_count / runs),
             "confidence_95_percentile": float(np.percentile(final_eq, 5)),
-            "median_final":             float(np.median(final_eq)),
-            "worst_case":               float(np.min(final_eq)),
-            "best_case":                float(np.max(final_eq)),
+            "median_final": float(np.median(final_eq)),
+            "worst_case": float(np.min(final_eq)),
+            "best_case": float(np.max(final_eq)),
         }
 
     # ------------------------------------------------------------------ #
@@ -1129,7 +1230,7 @@ class InstitutionalBacktestEngine:
 
     def _stress_test(
         self,
-        df:     pd.DataFrame,
+        df: pd.DataFrame,
         trades: List[Dict],
     ) -> Dict[str, Any]:
         """
@@ -1142,36 +1243,56 @@ class InstitutionalBacktestEngine:
         crash_move = float(self.run_cfg.crash_scenario_pct)
 
         # Scenario 1: Flash crash — peak single-direction notional exposure
-        long_peak  = max((float(t.get("notional", 0.0) or 0.0) for t in trades if float(t.get("direction", 0.0) or 0.0) > 0.0), default=0.0)
-        short_peak = max((float(t.get("notional", 0.0) or 0.0) for t in trades if float(t.get("direction", 0.0) or 0.0) < 0.0), default=0.0)
+        long_peak = max(
+            (
+                float(t.get("notional", 0.0) or 0.0)
+                for t in trades
+                if float(t.get("direction", 0.0) or 0.0) > 0.0
+            ),
+            default=0.0,
+        )
+        short_peak = max(
+            (
+                float(t.get("notional", 0.0) or 0.0)
+                for t in trades
+                if float(t.get("direction", 0.0) or 0.0) < 0.0
+            ),
+            default=0.0,
+        )
         adverse_notional = long_peak if crash_move < 0.0 else short_peak
-        crash_loss       = adverse_notional * abs(crash_move)
-        crash_drawdown   = crash_loss / float(self.run_cfg.initial_capital or 1.0)
+        crash_loss = adverse_notional * abs(crash_move)
+        crash_drawdown = crash_loss / float(self.run_cfg.initial_capital or 1.0)
 
-        scenarios.append({
-            "name":           "flash_crash",
-            "impact":         float(-crash_loss),
-            "drawdown":       float(crash_drawdown),
-            "peak_notional":  float(adverse_notional),
-            "passed":         crash_drawdown < 0.30,
-        })
+        scenarios.append(
+            {
+                "name": "flash_crash",
+                "impact": float(-crash_loss),
+                "drawdown": float(crash_drawdown),
+                "peak_notional": float(adverse_notional),
+                "passed": crash_drawdown < 0.30,
+            }
+        )
 
         # Scenario 2: Volatility spike — 3× average slippage over a short execution cluster (3-5 trades)
-        mean_slip       = sum(t["slippage_cost"] for t in trades) / len(trades)
-        affected_trades = min(len(trades), max(3, min(5, int(np.ceil(len(trades) * 0.10)))))
-        vol_spike_cost  = mean_slip * 3.0 * affected_trades
+        mean_slip = sum(t["slippage_cost"] for t in trades) / len(trades)
+        affected_trades = min(
+            len(trades), max(3, min(5, int(np.ceil(len(trades) * 0.10))))
+        )
+        vol_spike_cost = mean_slip * 3.0 * affected_trades
         vol_spike_impact = vol_spike_cost / self.run_cfg.initial_capital
 
-        scenarios.append({
-            "name":     "volatility_spike",
-            "impact":   float(-vol_spike_cost),
-            "cost_pct": float(vol_spike_impact),
-            "affected_trades": int(affected_trades),
-            "passed":   vol_spike_impact < 0.05,
-        })
+        scenarios.append(
+            {
+                "name": "volatility_spike",
+                "impact": float(-vol_spike_cost),
+                "cost_pct": float(vol_spike_impact),
+                "affected_trades": int(affected_trades),
+                "passed": vol_spike_impact < 0.05,
+            }
+        )
 
         return {
-            "passed":    all(s["passed"] for s in scenarios),
+            "passed": all(s["passed"] for s in scenarios),
             "scenarios": scenarios,
         }
 
@@ -1182,15 +1303,15 @@ class InstitutionalBacktestEngine:
     def _walk_forward_institutional(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Walk-forward with institutional thresholds — adaptive window sizing."""
         train_days = self.run_cfg.wfa_train_days
-        test_days  = self.run_cfg.wfa_test_days
+        test_days = self.run_cfg.wfa_test_days
 
         if train_days <= 0 or test_days <= 0:
             return {"passed": False, "total": 0, "failed": 0, "windows": []}
 
         start = df.index.min()
-        end   = df.index.max()
+        end = df.index.max()
         total_data_days = (end - start).total_seconds() / 86_400.0
-        min_window      = train_days + test_days
+        min_window = train_days + test_days
         # FIXED (v2): read required_windows from the config field (no getattr fallback needed)
         required_windows = max(int(self.run_cfg.wfa_required_windows), 0)
 
@@ -1202,19 +1323,30 @@ class InstitutionalBacktestEngine:
             min_adaptive_scale = 0.05
             if scale >= min_adaptive_scale:
                 train_days = max(3, int(round(train_days * scale)))
-                test_days  = max(1, int(round(test_days * scale)))
+                test_days = max(1, int(round(test_days * scale)))
                 log.info(
                     "WFA_ADAPTIVE_WINDOWS | data_days=%.0f scale=%.3f new_train=%d new_test=%d required=%d",
-                    total_data_days, scale, train_days, test_days, required_windows,
+                    total_data_days,
+                    scale,
+                    train_days,
+                    test_days,
+                    required_windows,
                 )
             else:
                 log.warning(
                     "WFA_DATA_TOO_SHORT | data_days=%.0f scale=%.3f min_needed=%d required=%d — skipping WFA",
-                    total_data_days, scale, min_window, required_windows,
+                    total_data_days,
+                    scale,
+                    min_window,
+                    required_windows,
                 )
                 return {
-                    "passed": False, "total": 0, "failed": 0, "pass_rate": 0.0,
-                    "windows": [], "skipped": True,
+                    "passed": False,
+                    "total": 0,
+                    "failed": 0,
+                    "pass_rate": 0.0,
+                    "windows": [],
+                    "skipped": True,
                     "reason": (
                         f"data_days={total_data_days:.0f}<{min_window};"
                         f"scale={scale:.3f};required={required_windows}"
@@ -1223,8 +1355,8 @@ class InstitutionalBacktestEngine:
                 }
 
         train_delta = timedelta(days=train_days)
-        test_delta  = timedelta(days=test_days)
-        t0          = start
+        test_delta = timedelta(days=test_days)
+        t0 = start
         windows: List[Dict[str, Any]] = []
         failed = 0
         # Keep WFA runtime bounded during startup while still producing enough
@@ -1233,38 +1365,48 @@ class InstitutionalBacktestEngine:
 
         while t0 + train_delta + test_delta <= end and len(windows) < max_windows:
             train_end = t0 + train_delta
-            test_end  = train_end + test_delta
+            test_end = train_end + test_delta
 
             df_train = df[(df.index >= t0) & (df.index < train_end)]
-            df_test  = df[(df.index >= train_end) & (df.index < test_end)]
+            df_test = df[(df.index >= train_end) & (df.index < test_end)]
 
             if df_train.empty or df_test.empty:
                 break
 
-            cfg      = self._wfa_train_cfg()
+            cfg = self._wfa_train_cfg()
             pipeline = Pipeline(cfg)
-            splits   = pipeline.fit(df_train.copy())
-            model    = RegressionModel(cfg)
+            splits = pipeline.fit(df_train.copy())
+            model = RegressionModel(cfg)
             model.train(splits, announce=False)
 
             xy = pipeline.transform(df_test.copy())
             if xy["X"].empty:
                 failed += 1
-                windows.append({
-                    "train_start": str(df_train.index.min()),
-                    "test_start":  str(df_test.index.min()),
-                    "sharpe": 0.0, "win_rate": 0.0, "passed": False,
-                    "reason": "wfa_empty_features",
-                })
+                windows.append(
+                    {
+                        "train_start": str(df_train.index.min()),
+                        "test_start": str(df_test.index.min()),
+                        "sharpe": 0.0,
+                        "win_rate": 0.0,
+                        "passed": False,
+                        "reason": "wfa_empty_features",
+                    }
+                )
                 t0 += test_delta
                 continue
 
             sim_df = df_test.loc[xy["X"].index]
-            X      = np.stack(xy["X"].values)
-            y      = np.asarray(xy["ret"].values) if "ret" in xy else np.asarray(xy["y"].values)
-            pred   = model.model.predict(X)
+            X = np.stack(xy["X"].values)
+            y = (
+                np.asarray(xy["ret"].values)
+                if "ret" in xy
+                else np.asarray(xy["y"].values)
+            )
+            pred = model.model.predict(X)
 
-            configured_threshold = max(float(getattr(cfg, "percent_increase", 0.0) or 0.0), 1e-12)
+            configured_threshold = max(
+                float(getattr(cfg, "percent_increase", 0.0) or 0.0), 1e-12
+            )
             threshold = self._effective_signal_threshold(
                 configured_threshold,
                 pred,
@@ -1273,7 +1415,9 @@ class InstitutionalBacktestEngine:
             rng_wfa = np.random.default_rng(self.run_cfg.monte_carlo_seed)
 
             pnls, _, costs = self._simulate_trades_institutional(
-                sim_df, pred, y,
+                sim_df,
+                pred,
+                y,
                 threshold=threshold,
                 initial_capital=self.run_cfg.initial_capital,
                 rng=rng_wfa,
@@ -1281,11 +1425,15 @@ class InstitutionalBacktestEngine:
 
             if not pnls:
                 failed += 1
-                windows.append({
-                    "train_start": str(df_train.index.min()),
-                    "test_start":  str(df_test.index.min()),
-                    "sharpe": 0.0, "win_rate": 0.0, "passed": False,
-                })
+                windows.append(
+                    {
+                        "train_start": str(df_train.index.min()),
+                        "test_start": str(df_test.index.min()),
+                        "sharpe": 0.0,
+                        "win_rate": 0.0,
+                        "passed": False,
+                    }
+                )
                 t0 += test_delta
                 continue
 
@@ -1304,28 +1452,34 @@ class InstitutionalBacktestEngine:
             )
 
             passed = (
-                metrics.sharpe_ratio  >= self.run_cfg.wfa_min_sharpe
-                and metrics.win_rate  >= self.run_cfg.wfa_min_win_rate
-                and metrics.max_drawdown_pct <= self.run_cfg.verification_max_drawdown_pct
+                metrics.sharpe_ratio >= self.run_cfg.wfa_min_sharpe
+                and metrics.win_rate >= self.run_cfg.wfa_min_win_rate
+                and metrics.max_drawdown_pct
+                <= self.run_cfg.verification_max_drawdown_pct
             )
             if not passed:
                 failed += 1
 
-            windows.append({
-                "train_start": str(df_train.index.min()),
-                "test_start":  str(df_test.index.min()),
-                "sharpe":      float(metrics.sharpe_ratio),
-                "win_rate":    float(metrics.win_rate),
-                "max_dd":      float(metrics.max_drawdown_pct),
-                "passed":      bool(passed),
-            })
+            windows.append(
+                {
+                    "train_start": str(df_train.index.min()),
+                    "test_start": str(df_test.index.min()),
+                    "sharpe": float(metrics.sharpe_ratio),
+                    "win_rate": float(metrics.win_rate),
+                    "max_dd": float(metrics.max_drawdown_pct),
+                    "passed": bool(passed),
+                }
+            )
             t0 += test_delta
 
-        total     = len(windows)
+        total = len(windows)
         if total >= max_windows:
             log.info(
                 "WFA_WINDOW_CAP_REACHED | asset=%s total=%s cap=%s required=%s",
-                self.asset, total, max_windows, required_windows,
+                self.asset,
+                total,
+                max_windows,
+                required_windows,
             )
         pass_rate = (float(total - failed) / float(total)) if total > 0 else 0.0
         has_required = total >= required_windows
@@ -1333,33 +1487,43 @@ class InstitutionalBacktestEngine:
         if required_windows > 0 and not has_required:
             log.warning(
                 "WFA_INSUFFICIENT_WINDOWS | asset=%s total=%s required=%s pass_rate=%.3f skip=%s",
-                self.asset, total, required_windows, pass_rate, skipped,
+                self.asset,
+                total,
+                required_windows,
+                pass_rate,
+                skipped,
             )
 
         # Strict institutional gate: zero/insufficient WFA windows cannot pass.
-        passed_overall = bool(has_required and total > 0 and pass_rate >= WFA_MIN_PASS_RATE)
+        passed_overall = bool(
+            has_required and total > 0 and pass_rate >= WFA_MIN_PASS_RATE
+        )
         return {
-            "passed":           passed_overall,
-            "pass_rate":        pass_rate,
-            "total":            total,
-            "failed":           failed,
+            "passed": passed_overall,
+            "pass_rate": pass_rate,
+            "total": total,
+            "failed": failed,
             "required_windows": required_windows,
-            "skipped":          skipped,
-            "windows":          windows,
+            "skipped": skipped,
+            "windows": windows,
         }
 
     def _wfa_train_cfg(self):
         """Fast config for WFA mini-trains (reduced iterations, no verbose)."""
-        base_cfg = BTC_TRAIN_CONFIG if self.asset in ("BTC", "BTCUSD", "BTCUSDM") else XAU_TRAIN_CONFIG
-        params   = dict(getattr(base_cfg, "regressor_params", {}) or {})
+        base_cfg = (
+            BTC_TRAIN_CONFIG
+            if self.asset in ("BTC", "BTCUSD", "BTCUSDM")
+            else XAU_TRAIN_CONFIG
+        )
+        params = dict(getattr(base_cfg, "regressor_params", {}) or {})
 
         wfa_iters: int = 80
         wfa_verbose: int = 0
         wfa_early: int = 0
 
         params["iterations"] = max(20, min(2000, wfa_iters))
-        params["verbose"]    = max(0, wfa_verbose)
-        params["task_type"]  = "CPU"
+        params["verbose"] = max(0, wfa_verbose)
+        params["task_type"] = "CPU"
         params.setdefault("random_seed", 42)
 
         return replace(
@@ -1375,11 +1539,11 @@ class InstitutionalBacktestEngine:
     def load_history(self) -> pd.DataFrame:
         """Load historical data from MT5 with robust multi-fallback."""
         ensure_mt5()
-        symbol   = _mt5_symbol(self.asset)
+        symbol = _mt5_symbol(self.asset)
         start_dt = _parse_utc_date(self.run_cfg.start_date)
-        end_dt   = datetime.now(timezone.utc).replace(tzinfo=None)
-        tf       = mt5.TIMEFRAME_M1
-        rates    = None
+        end_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        tf = mt5.TIMEFRAME_M1
+        rates = None
         last_err = (0, "")
 
         with MT5_LOCK:
@@ -1389,18 +1553,20 @@ class InstitutionalBacktestEngine:
             if info is None:
                 raise RuntimeError(f"backtest_symbol_not_found:{symbol}")
 
-            rates    = mt5.copy_rates_range(symbol, tf, start_dt, end_dt)
+            rates = mt5.copy_rates_range(symbol, tf, start_dt, end_dt)
             last_err = mt5.last_error()
 
             if rates is None or len(rates) == 0:
-                default_bars = 120_000 if self.asset in ("XAU", "XAUUSD", "XAUUSDM") else 60_000
-                candidates   = [default_bars, 50_000, 30_000, 10_000, 5_000]
-                env_bars     : int = 0
+                default_bars = (
+                    120_000 if self.asset in ("XAU", "XAUUSD", "XAUUSDM") else 60_000
+                )
+                candidates = [default_bars, 50_000, 30_000, 10_000, 5_000]
+                env_bars: int = 0
                 if env_bars > 0:
                     candidates.insert(0, env_bars)
                 for bars in candidates:
                     try:
-                        rates    = mt5.copy_rates_from_pos(symbol, tf, 0, int(bars))
+                        rates = mt5.copy_rates_from_pos(symbol, tf, 0, int(bars))
                         last_err = mt5.last_error()
                         if rates is not None and len(rates) > 0:
                             break
@@ -1412,14 +1578,21 @@ class InstitutionalBacktestEngine:
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"backtest_history_empty:{symbol}:{last_err}")
         if len(rates) < 1_000:
-            raise RuntimeError(f"backtest_history_insufficient:{symbol}:only_{len(rates)}_bars")
+            raise RuntimeError(
+                f"backtest_history_insufficient:{symbol}:only_{len(rates)}_bars"
+            )
 
         df = pd.DataFrame(rates)
         df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        df = df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "close": "Close", "tick_volume": "Volume",
-        })
+        df = df.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "tick_volume": "Volume",
+            }
+        )
         return df.set_index("datetime")[["Open", "High", "Low", "Close", "Volume"]]
 
     # ------------------------------------------------------------------ #
@@ -1431,8 +1604,8 @@ class InstitutionalBacktestEngine:
         if df is None or df.empty:
             raise RuntimeError("backtest_empty_df")
 
-        payload  = self._load_model_payload()
-        model    = payload["model"]
+        payload = self._load_model_payload()
+        model = payload["model"]
         pipeline = payload["pipeline"]
         anti = payload.get("anti_overfit", {}) if isinstance(payload, dict) else {}
         tscv = anti.get("time_series_cv", {}) if isinstance(anti, dict) else {}
@@ -1440,53 +1613,76 @@ class InstitutionalBacktestEngine:
             payload.get("anti_overfit_passed", False)
             or (anti.get("passed", False) if isinstance(anti, dict) else False)
         )
-        self._tscv_folds = int(tscv.get("folds_evaluated", 0) or 0) if isinstance(tscv, dict) else 0
-        self._tscv_mean_active_acc = float(tscv.get("mean_active_direction_accuracy", 0.0) or 0.0) if isinstance(tscv, dict) else 0.0
+        self._tscv_folds = (
+            int(tscv.get("folds_evaluated", 0) or 0) if isinstance(tscv, dict) else 0
+        )
+        self._tscv_mean_active_acc = (
+            float(tscv.get("mean_active_direction_accuracy", 0.0) or 0.0)
+            if isinstance(tscv, dict)
+            else 0.0
+        )
 
         xy = pipeline.transform(df.copy())
         if xy["X"].empty:
             raise RuntimeError("backtest_windows_empty")
 
         sim_df = df.loc[xy["X"].index]
-        X      = np.stack(xy["X"].values)
-        y      = np.asarray(xy["ret"].values) if "ret" in xy else np.asarray(xy["y"].values)
-        pred   = model.predict(X)
+        X = np.stack(xy["X"].values)
+        y = np.asarray(xy["ret"].values) if "ret" in xy else np.asarray(xy["y"].values)
+        pred = model.predict(X)
 
-        configured_threshold = max(float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 1e-12)
+        configured_threshold = max(
+            float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 1e-12
+        )
         threshold = self._effective_signal_threshold(
             configured_threshold,
             pred,
-            alpha_calibration=payload.get("alpha_calibration", {}) if isinstance(payload, dict) else None,
+            alpha_calibration=(
+                payload.get("alpha_calibration", {})
+                if isinstance(payload, dict)
+                else None
+            ),
             enforce_min_signals=True,
         )
 
         try:
-            pred_arr    = np.asarray(pred, dtype=np.float64)
-            abs_pred    = np.abs(pred_arr)
-            abs_pred_f  = abs_pred[np.isfinite(abs_pred)]
+            pred_arr = np.asarray(pred, dtype=np.float64)
+            abs_pred = np.abs(pred_arr)
+            abs_pred_f = abs_pred[np.isfinite(abs_pred)]
             if abs_pred_f.size > 0:
                 log.info(
                     "BACKTEST_PRED_STATS | asset=%s n=%s mean_abs=%.8f std_abs=%.8f "
                     "max_abs=%.8f threshold=%.8f signals=%s",
-                    self.asset, int(abs_pred_f.size),
-                    float(np.mean(abs_pred_f)), float(np.std(abs_pred_f)),
-                    float(np.max(abs_pred_f)), float(threshold),
-                    int(np.sum(np.isfinite(pred_arr) & (np.abs(pred_arr) >= threshold))),
+                    self.asset,
+                    int(abs_pred_f.size),
+                    float(np.mean(abs_pred_f)),
+                    float(np.std(abs_pred_f)),
+                    float(np.max(abs_pred_f)),
+                    float(threshold),
+                    int(
+                        np.sum(np.isfinite(pred_arr) & (np.abs(pred_arr) >= threshold))
+                    ),
                 )
         except Exception:
             pass
 
         # PRE-COMPUTE regimes once for the entire sim_df (v2 improvement)
         prices_for_regime = df["Close"].to_numpy(dtype=np.float64)
-        pre_regimes       = self.regime_detector.detect_all(prices_for_regime)
+        pre_regimes = self.regime_detector.detect_all(prices_for_regime)
         # Align to sim_df index positions
         sim_positions = df.index.get_indexer(sim_df.index)
-        sim_regimes   = np.where(sim_positions >= 0, pre_regimes[np.clip(sim_positions, 0, len(pre_regimes) - 1)], "UNKNOWN")
+        sim_regimes = np.where(
+            sim_positions >= 0,
+            pre_regimes[np.clip(sim_positions, 0, len(pre_regimes) - 1)],
+            "UNKNOWN",
+        )
 
         rng = np.random.default_rng(self.run_cfg.monte_carlo_seed)
 
         pnl_series, trades, costs = self._simulate_trades_institutional(
-            sim_df, pred, y,
+            sim_df,
+            pred,
+            y,
             threshold=threshold,
             initial_capital=self.run_cfg.initial_capital,
             rng=rng,
@@ -1495,20 +1691,27 @@ class InstitutionalBacktestEngine:
 
         if not pnl_series:
             try:
-                pred_arr     = np.asarray(pred, dtype=np.float64)
-                signal_count = int(np.sum(np.isfinite(pred_arr) & (np.abs(pred_arr) >= threshold)))
+                pred_arr = np.asarray(pred, dtype=np.float64)
+                signal_count = int(
+                    np.sum(np.isfinite(pred_arr) & (np.abs(pred_arr) >= threshold))
+                )
             except Exception:
                 signal_count = 0
             log.warning(
                 "BACKTEST_NO_TRADES | asset=%s threshold=%.8f configured=%.8f "
                 "n_obs=%s signals=%s",
-                self.asset, float(threshold), float(configured_threshold),
-                int(min(len(pred), len(y), len(sim_df))), signal_count,
+                self.asset,
+                float(threshold),
+                float(configured_threshold),
+                int(min(len(pred), len(y), len(sim_df))),
+                signal_count,
             )
 
         # Derive actual trades_per_year from data span (prevent Sharpe inflation)
         try:
-            data_span_days = (sim_df.index.max() - sim_df.index.min()).total_seconds() / 86_400.0
+            data_span_days = (
+                sim_df.index.max() - sim_df.index.min()
+            ).total_seconds() / 86_400.0
             if data_span_days > 0 and len(pnl_series) > 0:
                 trades_per_year = len(pnl_series) / (data_span_days / 365.25)
             else:
@@ -1531,23 +1734,27 @@ class InstitutionalBacktestEngine:
             slippage_costs=costs["slippage"],
             swap_costs=costs.get("funding", 0.0),
             commission_costs=costs.get("commission", 0.0),
-            trade_durations_min=[float(t.get("hold_minutes", 0.0) or 0.0) for t in trades],
-            trade_details=trades,          # ← FIXED
+            trade_durations_min=[
+                float(t.get("hold_minutes", 0.0) or 0.0) for t in trades
+            ],
+            trade_details=trades,  # ← FIXED
         )
 
         # Monte Carlo (vectorised)
         mc_results = self._monte_carlo_institutional(pnl_series)
-        metrics.risk_of_ruin               = mc_results["risk_of_ruin"]
-        metrics.monte_carlo_runs           = self.run_cfg.monte_carlo_runs
-        metrics.mc_confidence_95_percentile = mc_results.get("confidence_95_percentile", 0.0)
-        metrics.mc_worst_case              = mc_results.get("worst_case", 0.0)
-        metrics.mc_best_case               = mc_results.get("best_case", 0.0)
+        metrics.risk_of_ruin = mc_results["risk_of_ruin"]
+        metrics.monte_carlo_runs = self.run_cfg.monte_carlo_runs
+        metrics.mc_confidence_95_percentile = mc_results.get(
+            "confidence_95_percentile", 0.0
+        )
+        metrics.mc_worst_case = mc_results.get("worst_case", 0.0)
+        metrics.mc_best_case = mc_results.get("best_case", 0.0)
 
         # Walk-forward analysis
         wfa = self._walk_forward_institutional(df)
-        metrics.wfa_passed          = wfa["passed"]
-        metrics.wfa_total_windows   = wfa["total"]
-        metrics.wfa_failed_windows  = wfa["failed"]
+        metrics.wfa_passed = wfa["passed"]
+        metrics.wfa_total_windows = wfa["total"]
+        metrics.wfa_failed_windows = wfa["failed"]
         wfa_windows = list(wfa.get("windows", []))
         wfa_sharpes = [
             float(w.get("sharpe", 0.0))
@@ -1559,9 +1766,9 @@ class InstitutionalBacktestEngine:
 
         # Stress testing
         stress = self._stress_test(df, trades)
-        self._stress_results      = stress
+        self._stress_results = stress
         metrics.stress_test_passed = bool(stress.get("passed", False))
-        metrics.stress_scenarios   = list(stress.get("scenarios", []))
+        metrics.stress_scenarios = list(stress.get("scenarios", []))
         backtest_audit = self._build_backtest_audit(
             df=df,
             trades=trades,
@@ -1577,20 +1784,30 @@ class InstitutionalBacktestEngine:
         min_losses: int = 1 if require_both_sides else 0
 
         sample_issues: List[str] = []
-        if int(metrics.total_trades)    < min_trades: sample_issues.append(f"insufficient_trades:{metrics.total_trades}<{min_trades}")
-        if int(metrics.winning_trades)  < min_wins:   sample_issues.append(f"insufficient_wins:{metrics.winning_trades}<{min_wins}")
-        if int(metrics.losing_trades)   < min_losses: sample_issues.append(f"insufficient_losses:{metrics.losing_trades}<{min_losses}")
+        if int(metrics.total_trades) < min_trades:
+            sample_issues.append(
+                f"insufficient_trades:{metrics.total_trades}<{min_trades}"
+            )
+        if int(metrics.winning_trades) < min_wins:
+            sample_issues.append(
+                f"insufficient_wins:{metrics.winning_trades}<{min_wins}"
+            )
+        if int(metrics.losing_trades) < min_losses:
+            sample_issues.append(
+                f"insufficient_losses:{metrics.losing_trades}<{min_losses}"
+            )
         if getattr(metrics, "profit_factor_capped", False) and not allow_pf_capped:
             sample_issues.append("profit_factor_capped")
         if not bool(backtest_audit.get("passed", False)):
             sample_issues.append("backtest_audit_failed")
 
-        self._sample_quality_issues  = sample_issues
-        self._sample_quality_passed  = len(sample_issues) == 0
+        self._sample_quality_issues = sample_issues
+        self._sample_quality_passed = len(sample_issues) == 0
         if sample_issues:
             log.warning(
                 "BACKTEST_SAMPLE_QUALITY_FAIL | asset=%s issues=%s",
-                self.asset, ",".join(sample_issues),
+                self.asset,
+                ",".join(sample_issues),
             )
 
         # Verification gate
@@ -1600,11 +1817,13 @@ class InstitutionalBacktestEngine:
                 "BACKTEST_SHARPE_SUSPICIOUS | asset=%s sharpe=%.2f > %.1f | "
                 "Verify backtest period length, transaction costs, and WFA window count. "
                 "Real-market Sharpe above 5.0 is statistically improbable.",
-                self.asset, metrics.sharpe_ratio, SHARPE_SUSPICIOUS_THRESHOLD,
+                self.asset,
+                metrics.sharpe_ratio,
+                SHARPE_SUSPICIOUS_THRESHOLD,
             )
         base_verified = (
-            metrics.sharpe_ratio      >= MIN_GATE_SHARPE
-            and metrics.win_rate      >= MIN_GATE_WIN_RATE
+            metrics.sharpe_ratio >= MIN_GATE_SHARPE
+            and metrics.win_rate >= MIN_GATE_WIN_RATE
             and metrics.max_drawdown_pct <= MAX_GATE_DRAWDOWN
             and self._sample_quality_passed
         )
@@ -1613,7 +1832,7 @@ class InstitutionalBacktestEngine:
             or not stress["passed"]
             or not self._sample_quality_passed
         )
-        wfa_gate_ok       = bool(wfa.get("passed", False))
+        wfa_gate_ok = bool(wfa.get("passed", False))
         # Sharpe > 8.0 blocks institutional_grade: near-certain backtest overfitting.
         SHARPE_HARD_CAP = 8.0
         sharpe_credible = metrics.sharpe_ratio <= SHARPE_HARD_CAP
@@ -1621,13 +1840,17 @@ class InstitutionalBacktestEngine:
             log.warning(
                 "SHARPE_INSTITUTIONAL_BLOCK | asset=%s sharpe=%.2f > %.1f | "
                 "institutional_grade forced to False.",
-                self.asset, metrics.sharpe_ratio, SHARPE_HARD_CAP,
+                self.asset,
+                metrics.sharpe_ratio,
+                SHARPE_HARD_CAP,
             )
         self._last_verified = bool(base_verified and wfa_gate_ok and not unsafe)
-        metrics.institutional_grade = bool(self._last_verified and not unsafe and sharpe_credible)
-        self._risk_of_ruin  = mc_results["risk_of_ruin"]
-        self._wfa           = wfa
-        self._unsafe        = unsafe
+        metrics.institutional_grade = bool(
+            self._last_verified and not unsafe and sharpe_credible
+        )
+        self._risk_of_ruin = mc_results["risk_of_ruin"]
+        self._wfa = wfa
+        self._unsafe = unsafe
 
         self._update_model_meta(metrics, mc_results, wfa, stress, unsafe)
         return metrics
@@ -1638,11 +1861,11 @@ class InstitutionalBacktestEngine:
 
     def _update_model_meta(
         self,
-        metrics:    BacktestMetrics,
+        metrics: BacktestMetrics,
         mc_results: Dict,
-        wfa:        Dict,
-        stress:     Dict,
-        unsafe:     bool,
+        wfa: Dict,
+        stress: Dict,
+        unsafe: bool,
     ) -> None:
         p = self._registry_meta_path()
         if not p.exists():
@@ -1660,39 +1883,47 @@ class InstitutionalBacktestEngine:
                 and (wfa_required <= 0 or wfa_total >= wfa_required)
             )
 
-            meta.update({
-                "backtest_sharpe":        float(metrics.sharpe_ratio),
-                "backtest_win_rate":      float(metrics.win_rate),
-                "max_drawdown_pct":       float(metrics.max_drawdown_pct),
-                "asset":                  self.asset,
-                "risk_of_ruin":           float(mc_results["risk_of_ruin"]),
-                "monte_carlo_runs":       self.run_cfg.monte_carlo_runs,
-                "mc_confidence_95":       float(mc_results["confidence_95_percentile"]),
-                "mc_worst_case":          float(mc_results["worst_case"]),
-                "wfa_passed":             wfa_passed_effective,
-                "wfa_pass_rate":          float(wfa.get("pass_rate", 0.0)),
-                "wfa_total_windows":      wfa_total,
-                "wfa_failed_windows":     wfa_failed,
-                "wfa_required_windows":   wfa_required,
-                "wfa_skipped":            bool(wfa.get("skipped", False)),
-                "anti_overfit_passed":    bool(self._anti_overfit_passed),
-                "tscv_folds":             int(self._tscv_folds),
-                "tscv_mean_active_direction_accuracy": float(self._tscv_mean_active_acc),
-                "stress_test_passed":     stress["passed"],
-                "stress_scenarios":       stress["scenarios"],
-                "backtest_audit":         dict(self._backtest_audit),
-                "institutional_grade":    bool(self._last_verified and not unsafe),
-                "real_backtest":          True,
-                "unsafe":                 unsafe,
-                "sample_quality_passed":  bool(self._sample_quality_passed),
-                "sample_quality_issues":  list(self._sample_quality_issues),
-                "total_trades":           int(getattr(metrics, "total_trades",   0) or 0),
-                "winning_trades":         int(getattr(metrics, "winning_trades", 0) or 0),
-                "losing_trades":          int(getattr(metrics, "losing_trades",  0) or 0),
-                "status":                 "UNSAFE" if unsafe else ("VERIFIED" if self._last_verified else "REJECTED"),
-                "backtested_at_utc":      datetime.now(timezone.utc).isoformat(),
-                "suspicious_sharpe":     bool(float(metrics.sharpe_ratio) > 5.0),
-            })
+            meta.update(
+                {
+                    "backtest_sharpe": float(metrics.sharpe_ratio),
+                    "backtest_win_rate": float(metrics.win_rate),
+                    "max_drawdown_pct": float(metrics.max_drawdown_pct),
+                    "asset": self.asset,
+                    "risk_of_ruin": float(mc_results["risk_of_ruin"]),
+                    "monte_carlo_runs": self.run_cfg.monte_carlo_runs,
+                    "mc_confidence_95": float(mc_results["confidence_95_percentile"]),
+                    "mc_worst_case": float(mc_results["worst_case"]),
+                    "wfa_passed": wfa_passed_effective,
+                    "wfa_pass_rate": float(wfa.get("pass_rate", 0.0)),
+                    "wfa_total_windows": wfa_total,
+                    "wfa_failed_windows": wfa_failed,
+                    "wfa_required_windows": wfa_required,
+                    "wfa_skipped": bool(wfa.get("skipped", False)),
+                    "anti_overfit_passed": bool(self._anti_overfit_passed),
+                    "tscv_folds": int(self._tscv_folds),
+                    "tscv_mean_active_direction_accuracy": float(
+                        self._tscv_mean_active_acc
+                    ),
+                    "stress_test_passed": stress["passed"],
+                    "stress_scenarios": stress["scenarios"],
+                    "backtest_audit": dict(self._backtest_audit),
+                    "institutional_grade": bool(self._last_verified and not unsafe),
+                    "real_backtest": True,
+                    "unsafe": unsafe,
+                    "sample_quality_passed": bool(self._sample_quality_passed),
+                    "sample_quality_issues": list(self._sample_quality_issues),
+                    "total_trades": int(getattr(metrics, "total_trades", 0) or 0),
+                    "winning_trades": int(getattr(metrics, "winning_trades", 0) or 0),
+                    "losing_trades": int(getattr(metrics, "losing_trades", 0) or 0),
+                    "status": (
+                        "UNSAFE"
+                        if unsafe
+                        else ("VERIFIED" if self._last_verified else "REJECTED")
+                    ),
+                    "backtested_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "suspicious_sharpe": bool(float(metrics.sharpe_ratio) > 5.0),
+                }
+            )
 
             with p.open("w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=4)
@@ -1701,7 +1932,11 @@ class InstitutionalBacktestEngine:
 
     def save_model_state(self, metrics: BacktestMetrics) -> Dict[str, Any]:
         """Save institutional model state to disk, protecting verified states."""
-        status = "UNSAFE" if self._unsafe else ("VERIFIED" if self._last_verified else "REJECTED")
+        status = (
+            "UNSAFE"
+            if self._unsafe
+            else ("VERIFIED" if self._last_verified else "REJECTED")
+        )
         wfa_total = int(self._wfa.get("total", 0) or 0)
         wfa_failed = int(self._wfa.get("failed", 0) or 0)
         wfa_required = int(self._wfa.get("required_windows", 0) or 0)
@@ -1710,35 +1945,35 @@ class InstitutionalBacktestEngine:
             and wfa_total > 0
             and (wfa_required <= 0 or wfa_total >= wfa_required)
         )
-        state  = {
-            "model_version":           self.model_version,
-            "asset":                   self.asset,
-            "generated_at_utc":        datetime.now(timezone.utc).isoformat(),
-            "status":                  status,
-            "verified":                self._last_verified,
-            "institutional_grade":     bool(self._last_verified and not self._unsafe),
-            "real_backtest":           True,
-            "sharpe_ratio":            float(metrics.sharpe_ratio),
-            "win_rate":                float(metrics.win_rate),
-            "max_drawdown_pct":        float(metrics.max_drawdown_pct),
-            "risk_of_ruin":            float(self._risk_of_ruin),
-            "wfa_passed":              wfa_passed_effective,
-            "wfa_pass_rate":           float(self._wfa.get("pass_rate", 0.0)),
-            "wfa_total_windows":       wfa_total,
-            "wfa_failed_windows":      wfa_failed,
-            "wfa_required_windows":    wfa_required,
-            "wfa_skipped":             bool(self._wfa.get("skipped", False)),
-            "anti_overfit_passed":     bool(self._anti_overfit_passed),
-            "tscv_folds":              int(self._tscv_folds),
+        state = {
+            "model_version": self.model_version,
+            "asset": self.asset,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "verified": self._last_verified,
+            "institutional_grade": bool(self._last_verified and not self._unsafe),
+            "real_backtest": True,
+            "sharpe_ratio": float(metrics.sharpe_ratio),
+            "win_rate": float(metrics.win_rate),
+            "max_drawdown_pct": float(metrics.max_drawdown_pct),
+            "risk_of_ruin": float(self._risk_of_ruin),
+            "wfa_passed": wfa_passed_effective,
+            "wfa_pass_rate": float(self._wfa.get("pass_rate", 0.0)),
+            "wfa_total_windows": wfa_total,
+            "wfa_failed_windows": wfa_failed,
+            "wfa_required_windows": wfa_required,
+            "wfa_skipped": bool(self._wfa.get("skipped", False)),
+            "anti_overfit_passed": bool(self._anti_overfit_passed),
+            "tscv_folds": int(self._tscv_folds),
             "tscv_mean_active_direction_accuracy": float(self._tscv_mean_active_acc),
-            "stress_test_passed":      bool(self._stress_results.get("passed")),
-            "unsafe":                  self._unsafe,
-            "sample_quality_passed":   bool(self._sample_quality_passed),
-            "sample_quality_issues":   list(self._sample_quality_issues),
-            "total_trades":            int(getattr(metrics, "total_trades",   0) or 0),
-            "winning_trades":          int(getattr(metrics, "winning_trades", 0) or 0),
-            "losing_trades":           int(getattr(metrics, "losing_trades",  0) or 0),
-            "source":                  "Backtest.engine_institutional",
+            "stress_test_passed": bool(self._stress_results.get("passed")),
+            "unsafe": self._unsafe,
+            "sample_quality_passed": bool(self._sample_quality_passed),
+            "sample_quality_issues": list(self._sample_quality_issues),
+            "total_trades": int(getattr(metrics, "total_trades", 0) or 0),
+            "winning_trades": int(getattr(metrics, "winning_trades", 0) or 0),
+            "losing_trades": int(getattr(metrics, "losing_trades", 0) or 0),
+            "source": "Backtest.engine_institutional",
         }
 
         MODEL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1763,7 +1998,8 @@ class InstitutionalBacktestEngine:
                         "new_asset=%s new_status=%s",
                         str(prev.get("model_version", "unknown")),
                         str(prev.get("asset", "unknown")),
-                        self.asset, status,
+                        self.asset,
+                        status,
                     )
             except Exception:
                 should_write_global = True
@@ -1774,8 +2010,10 @@ class InstitutionalBacktestEngine:
 
         log.info(
             "INSTITUTIONAL_MODEL_STATE | version=%s status=%s sharpe=%.3f win_rate=%.3f",
-            state["model_version"], state["status"],
-            state["sharpe_ratio"],  state["win_rate"],
+            state["model_version"],
+            state["status"],
+            state["sharpe_ratio"],
+            state["win_rate"],
         )
         return state
 
@@ -1783,6 +2021,7 @@ class InstitutionalBacktestEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 # Top-level entry point
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
     """Run the complete institutional backtest pipeline (train → backtest → verify)."""
@@ -1793,31 +2032,42 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
         else XAU_INSTITUTIONAL_CONFIG
     )
 
-    force_retrain = str(os.getenv("BACKTEST_FORCE_RETRAIN", "0") or "0").strip().lower() in {
-        "1", "true", "yes", "y", "on"
-    }
+    force_retrain = str(
+        os.getenv("BACKTEST_FORCE_RETRAIN", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
     model_version = run_cfg.model_version
     if force_retrain:
         log.info("Phase 1: Institutional Model Training (forced)")
         train_info = train_and_register(asset_u)
-        model_version = str(train_info.get("model_version", run_cfg.model_version) or run_cfg.model_version)
+        model_version = str(
+            train_info.get("model_version", run_cfg.model_version)
+            or run_cfg.model_version
+        )
     else:
         existing = model_manager.load_model(model_version)
         if existing is None:
             log.warning(
                 "BACKTEST_MODEL_MISSING | asset=%s version=%s -> training fallback",
-                asset_u, model_version,
+                asset_u,
+                model_version,
             )
             train_info = train_and_register(asset_u)
-            model_version = str(train_info.get("model_version", run_cfg.model_version) or run_cfg.model_version)
+            model_version = str(
+                train_info.get("model_version", run_cfg.model_version)
+                or run_cfg.model_version
+            )
         else:
-            log.info("Phase 1: Using existing model | asset=%s version=%s", asset_u, model_version)
+            log.info(
+                "Phase 1: Using existing model | asset=%s version=%s",
+                asset_u,
+                model_version,
+            )
 
     log.info("Phase 2: Institutional Backtest & Verification")
     engine = InstitutionalBacktestEngine(asset_u, model_version, run_cfg)
-    df     = pd.DataFrame()
+    df = pd.DataFrame()
     metrics: Optional[BacktestMetrics] = None
-    run_exc: Optional[Exception]       = None
+    run_exc: Optional[Exception] = None
 
     try:
         try:
@@ -1825,7 +2075,9 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
         except Exception as history_exc:
             log.warning(
                 "BACKTEST_HISTORY_FALLBACK | asset=%s version=%s err=%s",
-                asset_u, model_version, history_exc,
+                asset_u,
+                model_version,
+                history_exc,
             )
             df = load_training_dataframe_for_asset(asset_u)
             if df is None or len(df) < 1_000:
@@ -1839,37 +2091,52 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
         run_exc = exc
         log.error(
             "INSTITUTIONAL_BACKTEST_FAILED | asset=%s version=%s err=%s",
-            asset_u, model_version, exc, exc_info=True,
+            asset_u,
+            model_version,
+            exc,
+            exc_info=True,
         )
         engine._last_verified = False
-        engine._unsafe        = True
-        engine._risk_of_ruin  = 1.0
-        engine._wfa           = {"passed": False, "pass_rate": 0.0, "total": 0, "failed": 0, "windows": []}
+        engine._unsafe = True
+        engine._risk_of_ruin = 1.0
+        engine._wfa = {
+            "passed": False,
+            "pass_rate": 0.0,
+            "total": 0,
+            "failed": 0,
+            "windows": [],
+        }
         engine._stress_results = {"passed": False, "scenarios": []}
 
         start_date = run_cfg.start_date
-        end_date   = run_cfg.end_date
+        end_date = run_cfg.end_date
         try:
             if not df.empty:
                 start_date = str(df.index.min())
-                end_date   = str(df.index.max())
+                end_date = str(df.index.max())
         except Exception:
             pass
 
         metrics = BacktestMetrics(
-            symbol=asset_u, timeframe="M1",
-            start_date=str(start_date), end_date=str(end_date),
+            symbol=asset_u,
+            timeframe="M1",
+            start_date=str(start_date),
+            end_date=str(end_date),
             initial_capital=float(run_cfg.initial_capital),
             final_capital=float(run_cfg.initial_capital),
-            risk_of_ruin=1.0, wfa_passed=False, stress_test_passed=False,
+            risk_of_ruin=1.0,
+            wfa_passed=False,
+            stress_test_passed=False,
         )
 
     out_dir = get_artifact_dir("backtest_institutional")
-    prefix  = f"{asset_u.lower()}_{model_version.replace('.', '_')}_institutional"
+    prefix = f"{asset_u.lower()}_{model_version.replace('.', '_')}_institutional"
     if metrics is None:
         metrics = BacktestMetrics(
-            symbol=asset_u, timeframe="M1",
-            start_date=str(run_cfg.start_date), end_date=str(run_cfg.end_date),
+            symbol=asset_u,
+            timeframe="M1",
+            start_date=str(run_cfg.start_date),
+            end_date=str(run_cfg.end_date),
             initial_capital=float(run_cfg.initial_capital),
             final_capital=float(run_cfg.initial_capital),
         )
@@ -1908,14 +2175,24 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
         _console("\n" + "=" * 60)
         _console(f"INSTITUTIONAL BACKTEST: {status}")
         _console("=" * 60)
-        _console(f"Sharpe Ratio:        {metrics.sharpe_ratio:.2f} (Req: >= {MIN_GATE_SHARPE:.2f})")
+        _console(
+            f"Sharpe Ratio:        {metrics.sharpe_ratio:.2f} (Req: >= {MIN_GATE_SHARPE:.2f})"
+        )
         if metrics.sharpe_ratio > 5.0:
-            _console(f"  ** WARNING: Sharpe {metrics.sharpe_ratio:.2f} > 5.0 — verify backtest realism **")
-        _console(f"Win Rate:            {metrics.win_rate:.1%} (Req: >= {MIN_GATE_WIN_RATE:.1%})")
-        _console(f"Max Drawdown:        {metrics.max_drawdown_pct:.2%} (Max: {MAX_GATE_DRAWDOWN:.0%})")
+            _console(
+                f"  ** WARNING: Sharpe {metrics.sharpe_ratio:.2f} > 5.0 — verify backtest realism **"
+            )
+        _console(
+            f"Win Rate:            {metrics.win_rate:.1%} (Req: >= {MIN_GATE_WIN_RATE:.1%})"
+        )
+        _console(
+            f"Max Drawdown:        {metrics.max_drawdown_pct:.2%} (Max: {MAX_GATE_DRAWDOWN:.0%})"
+        )
         _console(f"Risk of Ruin:        {metrics.risk_of_ruin:.2%} (Max: 1%)")
         _console(f"WFA:                 {'PASS' if metrics.wfa_passed else 'FAIL'}")
-        _console(f"Stress Test:         {'PASS' if state['stress_test_passed'] else 'FAIL'}")
+        _console(
+            f"Stress Test:         {'PASS' if state['stress_test_passed'] else 'FAIL'}"
+        )
         _console(f"Version:             {model_version}")
         _console("=" * 60 + "\n")
     except Exception as exc:
@@ -1935,10 +2212,10 @@ def run_institutional_backtest(asset: str = "XAU") -> BacktestMetrics:
 # ─────────────────────────────────────────────────────────────────────────────
 # Compatibility aliases for legacy imports
 # ─────────────────────────────────────────────────────────────────────────────
-BacktestEngine      = InstitutionalBacktestEngine
+BacktestEngine = InstitutionalBacktestEngine
 XAU_BACKTEST_CONFIG = XAU_INSTITUTIONAL_CONFIG
 BTC_BACKTEST_CONFIG = BTC_INSTITUTIONAL_CONFIG
-run_backtest        = run_institutional_backtest
+run_backtest = run_institutional_backtest
 
 
 if __name__ == "__main__":

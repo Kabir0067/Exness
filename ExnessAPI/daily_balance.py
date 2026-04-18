@@ -1,20 +1,14 @@
+"""
+ExnessAPI/daily_balance.py — Daily balance anchoring for Phase A/B/C (per-asset).
+
+Provides thread-safe CSV-backed storage for daily start balance and peak
+equity tracking, enabling phase-based risk management decisions.
+"""
+
 from __future__ import annotations
 
-"""
-Daily balance anchoring for Phase A/B/C (per-asset).
-
-Goal:
-- At the start of each new UTC day, capture the account balance using balance_provider()
-  (fallback: provided current_balance), and persist it to a small CSV file.
-- RiskManager reads this anchor as daily_start_balance and applies phase rules based on daily return.
-
-Design:
-- dependency-light (safe if MT5 / APIs unavailable)
-- single-process thread-safe
-- atomic-ish writes on updates to avoid partial/corrupt CSV
-"""
-
 import csv
+import logging
 import math
 import threading
 from dataclasses import dataclass
@@ -22,123 +16,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-__all__ = [
-    "DailyRow",
-    "initialize_daily_balance",
-    "get_peak_balance",
-    "update_peak_equity",
-]
-
+# =============================================================================
+# Global Constants
+# =============================================================================
 _LOCK = threading.Lock()
+_FIELDS = ("date_utc", "start_balance", "peak_equity")
+
+logger = logging.getLogger(__name__)
 
 
-def _utc_date() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-def _safe_float(x: object) -> float:
-    try:
-        v = float(x)  # type: ignore[arg-type]
-        return v if math.isfinite(v) else 0.0
-    except Exception:
-        return 0.0
-
-
-def _normalize_asset(asset: str) -> str:
-    a = (asset or "GEN").strip().upper()
-    return a if a else "GEN"
-
-
-def _default_path(asset: str) -> Path:
-    name = f"daily_balance_{_normalize_asset(asset).lower()}.csv"
-    try:
-        from log_config import get_log_path  # type: ignore
-
-        return Path(get_log_path(name))
-    except Exception:
-        return Path(name)
-
-
+# =============================================================================
+# Data Structures
+# =============================================================================
 @dataclass(frozen=True)
 class DailyRow:
+    """Immutable representation of a single daily balance record."""
+
     date_utc: str
     start_balance: float
     peak_equity: float
 
 
-_FIELDS = ("date_utc", "start_balance", "peak_equity")
-
-
-def _parse_row(r: dict) -> Optional[DailyRow]:
-    try:
-        d = str(r.get("date_utc") or "").strip()
-        if not d:
-            return None
-        sb = _safe_float(r.get("start_balance"))
-        pk = _safe_float(r.get("peak_equity"))
-        if sb <= 0.0:
-            return DailyRow(d, 0.0, 0.0)
-        if pk <= 0.0:
-            pk = sb
-        return DailyRow(d, float(sb), float(pk))
-    except Exception:
-        return None
-
-
-def _read_last_row(path: Path) -> Optional[DailyRow]:
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            rows = list(csv.DictReader(f))
-        if not rows:
-            return None
-        return _parse_row(rows[-1])
-    except Exception:
-        return None
-
-
-def _atomic_write(path: Path, rows: list[dict]) -> None:
-    """
-    Best-effort atomic-ish rewrite:
-    write tmp -> replace.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(_FIELDS))
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    tmp.replace(path)
-
-
-def _append_row(path: Path, row: DailyRow) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = path.exists()
-    with path.open("a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(_FIELDS))
-        if not file_exists:
-            w.writeheader()
-        w.writerow(
-            {
-                "date_utc": str(row.date_utc).strip(),
-                "start_balance": f"{float(row.start_balance):.2f}",
-                "peak_equity": f"{float(row.peak_equity):.2f}",
-            }
-        )
-
-
+# =============================================================================
+# Public API
+# =============================================================================
 def initialize_daily_balance(
     current_balance: float,
     asset: str = "GEN",
     balance_provider: Optional[Callable[[], float]] = None,
 ) -> Tuple[float, str]:
     """
-    Returns (daily_start_balance, saved_mode).
+    Initialize or retrieve today's daily balance anchor.
 
-    saved_mode is kept for backward compatibility with older RiskManager code;
-    this module always returns "A" and the RiskManager should compute actual phase.
+    Returns (start_balance, phase) where phase is always 'A' at init time.
     """
     asset_u = _normalize_asset(asset)
     today = _utc_date()
@@ -147,24 +57,25 @@ def initialize_daily_balance(
     with _LOCK:
         last = _read_last_row(path)
 
-        # Already initialized for today
         if last and last.date_utc == today and last.start_balance > 0:
             return float(last.start_balance), "A"
 
-        # Build new start anchor
-        start = 0.0
+        start_balance = 0.0
+
         if balance_provider is not None:
             try:
-                start = _safe_float(balance_provider())
-            except Exception:
-                start = 0.0
+                start_balance = _safe_float(balance_provider())
+            except Exception as exc:
+                logger.warning("balance_provider failed: %s", exc)
+                start_balance = 0.0
 
-        if start <= 0.0:
-            start = _safe_float(current_balance)
+        if start_balance <= 0.0:
+            start_balance = _safe_float(current_balance)
 
-        row = DailyRow(today, float(start), float(start))
+        row = DailyRow(today, float(start_balance), float(start_balance))
         _append_row(path, row)
-        return float(start), "A"
+
+        return float(start_balance), "A"
 
 
 def get_peak_balance(
@@ -172,12 +83,7 @@ def get_peak_balance(
     previous_peak: Optional[float] = None,
     asset: str = "GEN",
 ) -> float:
-    """
-    Returns peak equity.
-
-    - If current_equity or previous_peak provided: returns max(previous_peak, current_equity).
-    - Else: returns today's stored peak_equity from CSV (or 0.0).
-    """
+    """Return the highest equity seen today, optionally computing from arguments."""
     if current_equity is not None or previous_peak is not None:
         ce = _safe_float(current_equity)
         pp = _safe_float(previous_peak)
@@ -185,73 +91,216 @@ def get_peak_balance(
 
     asset_u = _normalize_asset(asset)
     path = _default_path(asset_u)
+
     with _LOCK:
         last = _read_last_row(path)
+
         if not last or last.date_utc != _utc_date():
             return 0.0
+
         return float(last.peak_equity)
 
 
 def update_peak_equity(asset: str, current_equity: float) -> float:
-    """
-    Updates today's peak_equity in the CSV (best-effort). Returns updated peak.
-
-    Critical properties:
-    - Never raises (best-effort), always returns a float.
-    - Avoids duplicate-day bug by trimming whitespace on date_utc.
-    - Uses atomic-ish rewrite for the update path to prevent partial CSV corruption.
-    """
+    """Update today's peak equity if current_equity exceeds the stored value."""
     asset_u = _normalize_asset(asset)
     today = _utc_date()
     path = _default_path(asset_u)
-    ce = _safe_float(current_equity)
+    current_equity_safe = _safe_float(current_equity)
 
     with _LOCK:
         if not path.exists():
-            row = DailyRow(today, ce, ce)
+            row = DailyRow(today, current_equity_safe, current_equity_safe)
             _append_row(path, row)
-            return float(ce)
+            return float(current_equity_safe)
 
         try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                rows = list(csv.DictReader(f))
-        except Exception:
+            with path.open("r", encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+        except Exception as exc:
+            logger.error("Read failed, resetting file: %s", exc)
             rows = []
 
         if not rows:
-            # Rewrite clean file
             _atomic_write(
                 path,
-                [{"date_utc": today, "start_balance": f"{ce:.2f}", "peak_equity": f"{ce:.2f}"}],
+                [
+                    {
+                        "date_utc": today,
+                        "start_balance": f"{current_equity_safe:.2f}",
+                        "peak_equity": f"{current_equity_safe:.2f}",
+                    }
+                ],
             )
-            return float(ce)
+            return float(current_equity_safe)
 
-        last = rows[-1]
-        last_date = str(last.get("date_utc") or "").strip()
+        last_row = rows[-1]
+        last_date = str(last_row.get("date_utc") or "").strip()
 
         if last_date != today:
-            row = DailyRow(today, ce, ce)
+            row = DailyRow(today, current_equity_safe, current_equity_safe)
             _append_row(path, row)
-            return float(ce)
+            return float(current_equity_safe)
 
-        start = _safe_float(last.get("start_balance"))
-        peak = _safe_float(last.get("peak_equity"))
-        new_peak = float(max(peak, ce, start))
+        start_balance = _safe_float(last_row.get("start_balance"))
+        peak_equity = _safe_float(last_row.get("peak_equity"))
 
-        # Rewrite only with normalized values for last row
-        out_rows = rows[:-1]
-        out_rows.append(
+        new_peak = float(max(peak_equity, current_equity_safe, start_balance))
+
+        # Avoid unnecessary disk write if value is unchanged
+        if new_peak == peak_equity:
+            return float(new_peak)
+
+        updated_rows = rows[:-1]
+        updated_rows.append(
             {
                 "date_utc": today,
-                "start_balance": f"{start:.2f}",
+                "start_balance": f"{start_balance:.2f}",
                 "peak_equity": f"{new_peak:.2f}",
             }
         )
 
         try:
-            _atomic_write(path, out_rows)
-        except Exception:
-            # best effort: ignore filesystem errors
-            pass
+            _atomic_write(path, updated_rows)
+        except Exception as exc:
+            logger.error("Atomic update failed: %s", exc)
 
         return float(new_peak)
+
+
+# =============================================================================
+# Private Helpers
+# =============================================================================
+def _utc_date() -> str:
+    """Return today's date in ISO format (UTC)."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _safe_float(value: object) -> float:
+    """Convert to float with strict validation; fallback to 0.0 on failure."""
+    try:
+        result = float(value)  # type: ignore[arg-type]
+        return result if math.isfinite(result) else 0.0
+    except Exception as exc:
+        logger.debug("safe_float conversion failed: %s", exc)
+        return 0.0
+
+
+def _normalize_asset(asset: str) -> str:
+    """Normalize asset identifier to stable uppercase form."""
+    normalized = (asset or "GEN").strip().upper()
+    return normalized if normalized else "GEN"
+
+
+def _default_path(asset: str) -> Path:
+    """Resolve storage path via centralized logging config when available."""
+    filename = f"daily_balance_{_normalize_asset(asset).lower()}.csv"
+
+    try:
+        from log_config import get_log_path  # type: ignore
+
+        return Path(get_log_path(filename))
+    except Exception as exc:
+        logger.warning("get_log_path failed, fallback to local path: %s", exc)
+        return Path(filename)
+
+
+def _parse_row(row: dict) -> Optional[DailyRow]:
+    """Parse CSV row into typed structure with strict validation."""
+    try:
+        date = str(row.get("date_utc") or "").strip()
+        if not date:
+            return None
+
+        start_balance = _safe_float(row.get("start_balance"))
+        peak_equity = _safe_float(row.get("peak_equity"))
+
+        # Enforce non-negative invariants for financial data integrity
+        if start_balance <= 0.0:
+            return DailyRow(date, 0.0, 0.0)
+
+        if peak_equity <= 0.0:
+            peak_equity = start_balance
+
+        return DailyRow(date, float(start_balance), float(peak_equity))
+
+    except Exception as exc:
+        logger.error("Failed to parse row: %s", exc)
+        return None
+
+
+def _read_last_row(path: Path) -> Optional[DailyRow]:
+    """Retrieve the last row without loading the entire file into memory."""
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+
+            last_row = None
+            for row in reader:
+                last_row = row
+
+        if not last_row:
+            return None
+
+        return _parse_row(last_row)
+
+    except Exception as exc:
+        logger.error("Failed reading CSV: %s", exc)
+        return None
+
+
+def _atomic_write(path: Path, rows: list[dict]) -> None:
+    """Perform atomic-like file replacement to prevent partial writes."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+        with tmp_path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(_FIELDS))
+            writer.writeheader()
+
+            for row in rows:
+                writer.writerow(row)
+
+        tmp_path.replace(path)
+
+    except Exception as exc:
+        logger.error("Atomic write failed: %s", exc)
+
+
+def _append_row(path: Path, row: DailyRow) -> None:
+    """Append row with header initialization if file is new."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = path.exists()
+
+        with path.open("a", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(_FIELDS))
+
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow(
+                {
+                    "date_utc": str(row.date_utc).strip(),
+                    "start_balance": f"{float(row.start_balance):.2f}",
+                    "peak_equity": f"{float(row.peak_equity):.2f}",
+                }
+            )
+
+    except Exception as exc:
+        logger.error("Append row failed: %s", exc)
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+__all__ = [
+    "DailyRow",
+    "get_peak_balance",
+    "initialize_daily_balance",
+    "update_peak_equity",
+]

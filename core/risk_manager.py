@@ -1,383 +1,18 @@
-# core/risk_engine.py - asset, portfolio, and transaction risk.
+# core/risk_manager.py - order-level and runtime risk management.
 
 from __future__ import annotations
 
-
-
-# ---- merged from core/portfolio_risk.py ----
-
-# core/portfolio_risk.py — Portfolio-level risk management.
-# Cross-asset correlation checks, total exposure limits, and portfolio drawdown.
-
-import logging
-import threading
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
-
-
-log = logging.getLogger("core.risk_engine")
-
-
-@dataclass
-class AssetExposure:
-    """Live exposure for a single asset."""
-    symbol: str = ""
-    side: str = ""           # "Buy" or "Sell"
-    volume: float = 0.0
-    unrealized_pnl: float = 0.0
-    margin_used: float = 0.0
-    position_count: int = 0
-    open_risk: float = 0.0
-
-
-class PortfolioRiskManager:
-    """
-    Institutional-grade portfolio-level risk management.
-
-    Responsibilities:
-      1. Max Daily Drawdown — hard stop ALL assets if combined PnL < -X%
-      2. Correlation Guard — reduce sizing when BTC + XAU leverage same direction
-      3. Total Exposure Cap — sum of all positions must not exceed N× equity
-      4. Position-level risk — enforce per-trade risk limits
-
-    This is called by the engine BEFORE any order is dispatched to execution.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_daily_drawdown_pct: float = 0.05,        # 5% max daily loss
-        hard_stop_buffer_pct: float = 0.0001,        # 1 bp early guard against overshoot
-        max_total_exposure_factor: float = 3.0,       # 3× equity
-        correlation_reduction: float = 0.50,          # Cut sizing 50% when correlated
-        max_risk_per_trade_pct: float = 0.015,        # 1.5% of equity per trade
-        max_concurrent_positions: int = 6,
-        max_total_drawdown_pct: float = 0.12,
-        max_asset_exposure_factor: float = 1.5,
-        max_asset_risk_pct: float = 0.03,
-    ) -> None:
-        self.max_daily_dd_pct = max_daily_drawdown_pct
-        self.hard_stop_buffer_pct = max(0.0, float(hard_stop_buffer_pct or 0.0))
-        self.max_exposure_factor = max_total_exposure_factor
-        self.correlation_reduction = correlation_reduction
-        self.max_risk_per_trade = max_risk_per_trade_pct
-        self.max_concurrent = max_concurrent_positions
-        self.max_total_drawdown_pct = max(0.0, float(max_total_drawdown_pct or 0.0))
-        self.max_asset_exposure_factor = max(0.0, float(max_asset_exposure_factor or 0.0))
-        self.max_asset_risk_pct = max(0.0, float(max_asset_risk_pct or 0.0))
-
-        # State
-        self._daily_start_equity: float = 0.0
-        self._daily_date: str = ""
-        self._hard_stopped: bool = False
-        self._hard_stop_reason: str = ""
-        self._exposures: Dict[str, AssetExposure] = {}
-        self._trade_log: List[float] = []
-        self._last_equity: float = 0.0
-        self._last_daily_drawdown_pct: float = 0.0
-        self._peak_equity: float = 0.0
-        self._last_peak_drawdown_pct: float = 0.0
-        self._lock = threading.RLock()
-
-    # ─── Public API ──────────────────────────────────────────────────
-
-    def set_daily_start_equity(self, equity: float, date_str: str) -> None:
-        """Called at start of each trading day to set baseline."""
-        with self._lock:
-            eq = float(equity or 0.0)
-            if date_str != self._daily_date:
-                self._daily_date = date_str
-                self._daily_start_equity = eq
-                self._hard_stopped = False
-                self._hard_stop_reason = ""
-                self._trade_log.clear()
-                log.info(
-                    "PORTFOLIO_DAILY_RESET | date=%s equity=%.2f max_dd=%.2f%%",
-                    date_str, eq, self.max_daily_dd_pct * 100,
-                )
-            if eq > 0.0 and eq > self._peak_equity:
-                self._peak_equity = eq
-
-    def update_exposure(self, symbol: str, exposure: AssetExposure) -> None:
-        """Update live exposure for an asset."""
-        with self._lock:
-            self._exposures[symbol] = exposure
-
-    def record_trade_pnl(self, pnl: float) -> None:
-        """Record a closed trade PnL for daily tracking."""
-        with self._lock:
-            self._trade_log.append(float(pnl))
-
-    def is_portfolio_hard_stopped(self) -> Tuple[bool, str]:
-        """Check if portfolio-level hard stop is active."""
-        with self._lock:
-            return self._hard_stopped, self._hard_stop_reason
-
-    def evaluate_equity(self, current_equity: float) -> Tuple[bool, str]:
-        """
-        Continuously enforce the portfolio daily drawdown rule.
-
-        This is intended for runtime loop checks, not only pre-order gating.
-        """
-        with self._lock:
-            equity = float(current_equity or 0.0)
-            self._last_equity = equity
-            if equity > 0.0 and equity > self._peak_equity:
-                self._peak_equity = equity
-            dd_blocked, dd_reason = self._check_daily_drawdown(equity)
-            peak_blocked, peak_reason = self._check_peak_drawdown(equity)
-            reason = dd_reason if dd_blocked else peak_reason
-            if (dd_blocked or peak_blocked) and not self._hard_stopped:
-                self._hard_stopped = True
-                self._hard_stop_reason = reason
-                log.critical("PORTFOLIO_HARD_STOP | %s", reason)
-            return self._hard_stopped, self._hard_stop_reason
-
-    def check_before_order(
-        self,
-        *,
-        asset: str,
-        side: str,
-        equity: float,
-        proposed_lot: float,
-        proposed_margin: float,
-        proposed_risk_amount: float = 0.0,
-        asset_exposure_factor: float = 0.0,
-        asset_risk_factor: float = 0.0,
-    ) -> Tuple[bool, float, str]:
-        """
-        Pre-order portfolio risk check.
-
-        Args:
-            asset: Symbol name (e.g. "BTCUSDm", "XAUUSDm").
-            side: "Buy" or "Sell".
-            equity: Current account equity.
-            proposed_lot: Lot size proposed by signal engine.
-            proposed_margin: Estimated margin for the proposed trade.
-
-        Returns:
-            (allowed, adjusted_lot, reason)
-            - allowed: True if trade passes all portfolio checks.
-            - adjusted_lot: Possibly reduced lot (if correlation guard triggers).
-            - reason: Empty string if allowed, otherwise the block reason.
-        """
-        with self._lock:
-            # 1. Hard stop check
-            if self._hard_stopped:
-                return False, 0.0, f"PORTFOLIO_HARD_STOP: {self._hard_stop_reason}"
-
-            # 2. Daily drawdown check
-            dd_blocked, dd_reason = self.evaluate_equity(equity)
-            if dd_blocked:
-                return False, 0.0, dd_reason
-
-            # 3. Max concurrent positions
-            total_positions = sum(e.position_count for e in self._exposures.values())
-            if total_positions >= self.max_concurrent:
-                return False, 0.0, f"MAX_CONCURRENT_POSITIONS: {total_positions}/{self.max_concurrent}"
-
-            # 4. Total exposure cap
-            total_margin = sum(e.margin_used for e in self._exposures.values()) + proposed_margin
-            if equity > 0 and total_margin / equity > self.max_exposure_factor:
-                return False, 0.0, (
-                    f"EXPOSURE_CAP: total_margin={total_margin:.2f} "
-                    f"exceeds {self.max_exposure_factor:.1f}x equity={equity:.2f}"
-                )
-
-            asset_key = str(asset or "").upper().strip()
-            asset_exposure = self._exposures.get(asset_key, AssetExposure(symbol=asset_key))
-            asset_margin = float(asset_exposure.margin_used) + float(proposed_margin or 0.0)
-            asset_exposure_cap = float(asset_exposure_factor or self.max_asset_exposure_factor)
-            if asset_exposure_cap > 0.0 and equity > 0.0 and (asset_margin / equity) > asset_exposure_cap:
-                return False, 0.0, (
-                    f"ASSET_EXPOSURE_CAP: {asset_key} margin={asset_margin:.2f} "
-                    f"exceeds {asset_exposure_cap:.2f}x equity={equity:.2f}"
-                )
-
-            asset_risk_limit = float(asset_risk_factor or self.max_asset_risk_pct)
-            proposed_risk = max(0.0, float(proposed_risk_amount or 0.0))
-            combined_asset_risk = float(asset_exposure.open_risk) + proposed_risk
-            if asset_risk_limit > 0.0 and equity > 0.0 and (combined_asset_risk / equity) > asset_risk_limit:
-                return False, 0.0, (
-                    f"ASSET_RISK_CAP: {asset_key} risk={combined_asset_risk / equity:.2%} "
-                    f"> {asset_risk_limit:.2%}"
-                )
-
-            # 5. Correlation guard — if BOTH assets open in SAME direction, reduce sizing
-            adjusted_lot = proposed_lot
-            correlated = self._check_correlation(asset, side)
-            if correlated:
-                adjusted_lot = round(proposed_lot * self.correlation_reduction, 2)
-                adjusted_lot = max(0.01, adjusted_lot)
-                log.info(
-                    "CORRELATION_GUARD | %s lot %.2f→%.2f (both assets same-side=%s)",
-                    asset, proposed_lot, adjusted_lot, side,
-                )
-
-            return True, adjusted_lot, ""
-
-    def get_portfolio_summary(self) -> Dict[str, Any]:
-        """Get a summary dict for health logging."""
-        with self._lock:
-            total_pnl = sum(e.unrealized_pnl for e in self._exposures.values())
-            total_margin = sum(e.margin_used for e in self._exposures.values())
-            total_positions = sum(e.position_count for e in self._exposures.values())
-            daily_closed_pnl = sum(self._trade_log)
-
-            return {
-                "daily_start_equity": self._daily_start_equity,
-                "peak_equity": self._peak_equity,
-                "unrealized_pnl": total_pnl,
-                "daily_closed_pnl": daily_closed_pnl,
-                "last_equity": self._last_equity,
-                "daily_drawdown_pct": self._last_daily_drawdown_pct,
-                "peak_drawdown_pct": self._last_peak_drawdown_pct,
-                "total_margin": total_margin,
-                "total_positions": total_positions,
-                "hard_stopped": self._hard_stopped,
-                "hard_stop_reason": self._hard_stop_reason,
-                "exposures": {
-                    sym: {
-                        "side": exp.side,
-                        "volume": exp.volume,
-                        "pnl": exp.unrealized_pnl,
-                        "positions": exp.position_count,
-                        "open_risk": exp.open_risk,
-                    }
-                    for sym, exp in self._exposures.items()
-                },
-            }
-
-    # ─── Private ─────────────────────────────────────────────────────
-
-    def _check_daily_drawdown(self, current_equity: float) -> Tuple[bool, str]:
-        """Check if daily drawdown exceeds limit."""
-        if self._daily_start_equity <= 0:
-            self._last_daily_drawdown_pct = 0.0
-            return False, ""
-        dd = (self._daily_start_equity - current_equity) / self._daily_start_equity
-        self._last_daily_drawdown_pct = float(max(0.0, dd))
-        trip_limit = max(0.0, float(self.max_daily_dd_pct) - float(self.hard_stop_buffer_pct))
-        if dd >= trip_limit:
-            reason = (
-                f"DAILY_DRAWDOWN_GUARD: {dd:.2%} >= guard {trip_limit:.2%} "
-                f"(limit={self.max_daily_dd_pct:.2%}, buffer={self.hard_stop_buffer_pct:.2%}) "
-                f"(start={self._daily_start_equity:.2f}, now={current_equity:.2f})"
-            )
-            return True, reason
-        return False, ""
-
-    def _check_peak_drawdown(self, current_equity: float) -> Tuple[bool, str]:
-        """Check if total drawdown from equity peak exceeds the hard stop."""
-        if self._peak_equity <= 0.0:
-            self._last_peak_drawdown_pct = 0.0
-            return False, ""
-        dd = (self._peak_equity - current_equity) / self._peak_equity
-        self._last_peak_drawdown_pct = float(max(0.0, dd))
-        if self.max_total_drawdown_pct > 0.0 and dd >= self.max_total_drawdown_pct:
-            reason = (
-                f"MAX_DRAWDOWN_STOP: {dd:.2%} >= {self.max_total_drawdown_pct:.2%} "
-                f"(peak={self._peak_equity:.2f}, now={current_equity:.2f})"
-            )
-            return True, reason
-        return False, ""
-
-    def _check_correlation(self, new_asset: str, new_side: str) -> bool:
-        """
-        Check if adding a position on new_asset in new_side direction
-        creates correlated exposure with existing positions.
-
-        BTC and XAU both tend to be "risk-off" assets — when both have
-        positions in the same direction, total risk is correlated.
-        """
-        for sym, exp in self._exposures.items():
-            if sym == new_asset:
-                continue
-            if exp.position_count > 0 and exp.side == new_side:
-                return True
-        return False
-
-# ---- merged from core/transaction_costs.py ----
-
-from dataclasses import dataclass
-from typing import Optional
-
-import numpy as np
-
-
-@dataclass(frozen=True)
-class CostBreakdown:
-    spread: float = 0.0
-    slippage: float = 0.0
-    commission: float = 0.0
-    funding: float = 0.0
-
-    @property
-    def total(self) -> float:
-        return float(self.spread + self.slippage + self.commission + self.funding)
-
-
-class TransactionCostModel:
-    """
-    Deterministic transaction cost model with optional random slippage jitter.
-    """
-
-    def __init__(
-        self,
-        *,
-        commission_bps: float = 0.0,
-        funding_rate_annual: float = 0.0,
-    ) -> None:
-        self.commission_bps = float(max(0.0, commission_bps))
-        self.funding_rate_annual = float(max(0.0, funding_rate_annual))
-
-    def estimate(
-        self,
-        *,
-        notional: float,
-        spread_bps: float,
-        slippage_bps: float,
-        volatility: float,
-        hold_minutes: float,
-        rng: Optional[np.random.Generator] = None,
-    ) -> CostBreakdown:
-        notional_f = float(max(0.0, notional))
-        spread_cost = notional_f * (float(max(0.0, spread_bps)) / 10_000.0)
-
-        slip_mult = 1.0 + min(max(float(volatility), 0.0) / 0.001, 3.0)
-        slippage_cost = notional_f * (float(max(0.0, slippage_bps)) / 10_000.0) * slip_mult
-        if rng is not None:
-            slippage_cost *= float(rng.uniform(0.8, 1.2))
-
-        # Round-turn commission (entry + exit).
-        commission = notional_f * (self.commission_bps / 10_000.0) * 2.0
-
-        hold_minutes_f = float(max(0.0, hold_minutes))
-        minutes_per_year = 365.25 * 24.0 * 60.0
-        funding = notional_f * self.funding_rate_annual * (hold_minutes_f / minutes_per_year)
-
-        return CostBreakdown(
-            spread=float(spread_cost),
-            slippage=float(slippage_cost),
-            commission=float(commission),
-            funding=float(funding),
-        )
-
 # ---- merged from core/risk_engine.py ----
-
 # core/risk_engine.py — Unified RiskManager for all assets.
 # Merges StrategiesBtc/_btc_risk/risk_manager.py (2400 lines)
 #    and StrategiesXau/_xau_risk/risk_manager.py (2191 lines)
 # into a single parameterized class (~2000 lines, zero duplication).
-
 import atexit
 import csv
 import json
 import math
-import os
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -391,11 +26,18 @@ try:
 except ImportError:
     mt5 = None
 
-from .core_config import BaseEngineConfig, BaseSymbolParams
-from .core_config import AccountCache, KillSwitchState, SignalThrottle
+import logging
+
+from .config import (
+    AccountCache,
+    BaseEngineConfig,
+    BaseSymbolParams,
+    KillSwitchState,
+    SignalThrottle,
+)
 from .utils import (
-    _atr_fallback,
     _atomic_write_text,
+    _atr_fallback,
     _is_finite,
     _side_norm,
     _utcnow,
@@ -410,8 +52,6 @@ from .utils import (
     volatility_trailing_stop,
 )
 
-import logging
-
 log = logging.getLogger("core.risk_engine")
 
 _DUMMY_LOCK = threading.RLock()
@@ -421,6 +61,7 @@ def _mt5_lock():
     # Lazy import avoids hard dependency and circular imports at module load.
     try:
         from mt5_client import MT5_LOCK as lock  # type: ignore
+
         return lock
     except Exception:
         return _DUMMY_LOCK
@@ -446,7 +87,7 @@ class RiskManager:
       - XAU: 24/5 with rollover blackout, tighter spreads
 
     Usage:
-        from core.core_config import BTCEngineConfig, BTCSymbolParams
+        from core.config import BTCEngineConfig, BTCSymbolParams
         cfg = BTCEngineConfig(...)
         rm = RiskManager(cfg, cfg.symbol_params)
     """
@@ -527,7 +168,7 @@ class RiskManager:
         self._vol_breaker_active: bool = False
         self._vol_breaker_until: float = 0.0
         self._vol_breaker_reason: str = ""
-        self._last_bar_close: float = 0.0   # track previous bar close for gap detection
+        self._last_bar_close: float = 0.0  # track previous bar close for gap detection
 
         # Daily target lock: once target is reached, trading stays blocked until UTC reset.
         self._daily_target_locked: bool = False
@@ -554,6 +195,7 @@ class RiskManager:
                 self._flush_exec_csv(force=True)
             except Exception:
                 pass
+
         atexit.register(_shutdown_wrapper)
 
         # init daily
@@ -567,7 +209,9 @@ class RiskManager:
 
         log.info(
             "RiskManager(%s) initialized | phase=%s max_risk=%.3f",
-            sp.base, self.phase, cfg.max_risk_per_trade,
+            sp.base,
+            self.phase,
+            cfg.max_risk_per_trade,
         )
 
     # ─── Validation ──────────────────────────────────────────────────
@@ -665,7 +309,9 @@ class RiskManager:
         """
         now = time.time()
         threshold = max(1, int(getattr(self.cfg, "mt5_breaker_fail_threshold", 3) or 3))
-        cooldown = max(1.0, float(getattr(self.cfg, "mt5_breaker_cooldown_sec", 30.0) or 30.0))
+        cooldown = max(
+            1.0, float(getattr(self.cfg, "mt5_breaker_cooldown_sec", 30.0) or 30.0)
+        )
 
         with self._lock:
             if self._mt5_breaker_active and now < self._mt5_breaker_until:
@@ -712,7 +358,9 @@ class RiskManager:
             old = self.phase
             self.phase = phase
             self._phase_reason = reason
-            log.info("PHASE %s → %s | reason=%s | asset=%s", old, phase, reason, self.sp.base)
+            log.info(
+                "PHASE %s → %s | reason=%s | asset=%s", old, phase, reason, self.sp.base
+            )
 
     def _enter_soft_stop(self, reason: str) -> None:
         """Trade-block until next UTC day (engine keeps running)."""
@@ -828,6 +476,119 @@ class RiskManager:
         except Exception:
             pass
 
+    @staticmethod
+    def _position_side(position: Any) -> str:
+        try:
+            raw_type = getattr(position, "type", -1)
+            p_type = int(raw_type if raw_type is not None else -1)
+        except Exception:
+            return ""
+        buy_types = {0}
+        sell_types = {1}
+        try:
+            if mt5 is not None:
+                buy_types.add(int(getattr(mt5, "POSITION_TYPE_BUY", 0) or 0))
+                sell_types.add(int(getattr(mt5, "POSITION_TYPE_SELL", 1) or 1))
+        except Exception:
+            pass
+        if p_type in buy_types:
+            return "Buy"
+        if p_type in sell_types:
+            return "Sell"
+        return ""
+
+    def _filter_guard_positions(self, positions: Any) -> List[Any]:
+        if not positions:
+            return []
+        try:
+            filtered = list(positions)
+        except Exception:
+            return []
+        if bool(getattr(self.cfg, "ignore_external_positions", False)):
+            try:
+                magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+            except Exception:
+                magic = 777001
+            filtered = [
+                p for p in filtered if int(getattr(p, "magic", 0) or 0) == magic
+            ]
+        return filtered
+
+    def position_guard_snapshot(self, side: str = "") -> Dict[str, Any]:
+        side_n = _side_norm(side)
+        symbol = str(getattr(self.sp, "symbol", "") or getattr(self.sp, "base", "") or "")
+        with self._lock:
+            tracked_open = bool(self._position_open)
+
+        if not symbol or mt5 is None:
+            has_any = bool(tracked_open)
+            return {
+                "known": False,
+                "count": 1 if has_any else 0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "has_any": has_any,
+                "same_side_open": False,
+                "opposing_open": False,
+                "tracked_open": tracked_open,
+                "source": "tracked_only",
+            }
+
+        try:
+            with _mt5_lock():
+                positions_raw = mt5.positions_get(symbol=symbol)
+        except Exception:
+            positions_raw = None
+
+        if positions_raw is None:
+            has_any = bool(tracked_open)
+            return {
+                "known": False,
+                "count": 1 if has_any else 0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "has_any": has_any,
+                "same_side_open": False,
+                "opposing_open": False,
+                "tracked_open": tracked_open,
+                "source": "tracked_only",
+            }
+
+        positions = self._filter_guard_positions(positions_raw)
+        buy_count = 0
+        sell_count = 0
+        for pos in positions:
+            pos_side = self._position_side(pos)
+            if pos_side == "Buy":
+                buy_count += 1
+            elif pos_side == "Sell":
+                sell_count += 1
+
+        count = int(len(positions))
+        with self._lock:
+            self._position_open = count > 0
+
+        same_side_open = False
+        opposing_open = False
+        if side_n == "Buy":
+            same_side_open = buy_count > 0
+            opposing_open = sell_count > 0
+        elif side_n == "Sell":
+            same_side_open = sell_count > 0
+            opposing_open = buy_count > 0
+
+        return {
+            "known": True,
+            "count": count,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "has_any": count > 0,
+            "same_side_open": same_side_open,
+            "opposing_open": opposing_open,
+            "tracked_open": tracked_open,
+            "source": "mt5",
+        }
+
     # ─── Daily reset ─────────────────────────────────────────────────
 
     def _reset_daily_state(self) -> None:
@@ -881,7 +642,9 @@ class RiskManager:
             self._reset_bot_balance_base()
             log.info(
                 "DAILY_RESET | %s | equity=%.2f peak=%.2f",
-                self.sp.base, self._acc.equity, self._peak_equity,
+                self.sp.base,
+                self._acc.equity,
+                self._peak_equity,
             )
 
     def _reset_bot_balance_base(self) -> None:
@@ -1008,14 +771,23 @@ class RiskManager:
                 self._exec_slippages.append(abs(float(slippage)))
                 if len(self._exec_slippages) > 200:
                     self._exec_slippages = self._exec_slippages[-100:]
+        if not ok:
+            try:
+                snapshot = self.position_guard_snapshot()
+                if bool(snapshot.get("known", False)) and not bool(
+                    snapshot.get("has_any", False)
+                ):
+                    with self._lock:
+                        self._position_open = False
+            except Exception:
+                pass
 
     def on_reconcile_positions(self, positions: Any) -> None:
         if positions is None:
-            with self._lock:
-                self._position_open = False
             return
         try:
-            cnt = len(positions) if hasattr(positions, "__len__") else 0
+            filtered = self._filter_guard_positions(positions)
+            cnt = len(filtered) if hasattr(filtered, "__len__") else 0
             with self._lock:
                 self._position_open = cnt > 0
         except Exception:
@@ -1026,7 +798,11 @@ class RiskManager:
             self._signals_today += 1
             allowed = self._throttle.register(max_per_hour=20)
             if not allowed:
-                log.warning("SIGNAL_THROTTLED | %s | hour_count=%d", self.sp.base, self._throttle.hour_window_count)
+                log.warning(
+                    "SIGNAL_THROTTLED | %s | hour_count=%d",
+                    self.sp.base,
+                    self._throttle.hour_window_count,
+                )
 
     # ─── Account helpers ─────────────────────────────────────────────
 
@@ -1114,7 +890,8 @@ class RiskManager:
             if (
                 not force
                 and self._symbol_pnl_cache_ts > 0.0
-                and (now_ts - self._symbol_pnl_cache_ts) < self._symbol_pnl_refresh_ttl_sec
+                and (now_ts - self._symbol_pnl_cache_ts)
+                < self._symbol_pnl_refresh_ttl_sec
             ):
                 return True
 
@@ -1180,6 +957,7 @@ class RiskManager:
                 return list(self._trades_today)
         try:
             from datetime import timedelta
+
             now = datetime.now(timezone.utc)
             start = now - timedelta(days=1)
             with _mt5_lock():
@@ -1219,9 +997,7 @@ class RiskManager:
             # This avoids noisy weekend hard-stop logs for non-24/7 assets (e.g. XAU).
             if not self.market_open():
                 return
-            self._enter_hard_stop(
-                f"kill_switch: exp={ks_exp:.3f} wr={ks_wr:.2f}"
-            )
+            self._enter_hard_stop(f"kill_switch: exp={ks_exp:.3f} wr={ks_wr:.2f}")
 
     def strategy_status(self) -> Dict[str, Any]:
         with self._lock:
@@ -1249,7 +1025,6 @@ class RiskManager:
         # when MT5 history/position data is unavailable.
         self._refresh_today_pnl_snapshot()
         with self._lock:
-            daily_pnl = float(self._daily_pnl)
             daily_pnl_pct = float(self._daily_pnl_pct)
 
         target_pct = self._daily_target_pct()
@@ -1302,7 +1077,9 @@ class RiskManager:
 
             new_eq = eq_dec + delta_dec
             self._acc.equity = float(new_eq)
-            self._daily_realized_pnl = float(Decimal(str(self._daily_realized_pnl)) + delta_dec)
+            self._daily_realized_pnl = float(
+                Decimal(str(self._daily_realized_pnl)) + delta_dec
+            )
             self._daily_unrealized_pnl = 0.0
             self._symbol_pnl_cache_ts = 0.0
 
@@ -1320,7 +1097,9 @@ class RiskManager:
 
     # ─── Volatility Circuit Breaker (Black Swan Protection) ─────────
 
-    def check_volatility_circuit_breaker(self, dfp: Optional[pd.DataFrame] = None) -> bool:
+    def check_volatility_circuit_breaker(
+        self, dfp: Optional[pd.DataFrame] = None
+    ) -> bool:
         """
         Black Swan protection: detect extreme volatility conditions.
 
@@ -1338,9 +1117,9 @@ class RiskManager:
         try:
             cols = {c.lower(): c for c in dfp.columns}
             h = dfp[cols.get("high", "High")].values.astype(np.float64)
-            l = dfp[cols.get("low", "Low")].values.astype(np.float64)
+            low_arr = dfp[cols.get("low", "Low")].values.astype(np.float64)
             c = dfp[cols.get("close", "Close")].values.astype(np.float64)
-            atr_arr = _atr_fallback(h, l, c, 14)
+            atr_arr = _atr_fallback(h, low_arr, c, 14)
             if atr_arr is None or len(atr_arr) < 55:
                 return False
 
@@ -1352,7 +1131,9 @@ class RiskManager:
             atr_sma50 = float(np.mean(atr_arr[-50:]))
             if atr_sma50 > 0:
                 atr_ratio = atr_last / atr_sma50
-                threshold = float(getattr(self.cfg, 'circuit_breaker_atr_ratio', 3.0) or 3.0)
+                threshold = float(
+                    getattr(self.cfg, "circuit_breaker_atr_ratio", 3.0) or 3.0
+                )
                 if atr_ratio > threshold:
                     reason = f"ATR_EXPANSION:{atr_ratio:.2f}x>{threshold:.1f}x"
                     self._trigger_vol_breaker(reason)
@@ -1361,7 +1142,9 @@ class RiskManager:
             # 2. Price gap check
             if len(c) >= 2:
                 gap = abs(float(c[-1]) - float(c[-2]))
-                gap_mult = float(getattr(self.cfg, 'circuit_breaker_gap_atr_mult', 2.0) or 2.0)
+                gap_mult = float(
+                    getattr(self.cfg, "circuit_breaker_gap_atr_mult", 2.0) or 2.0
+                )
                 if gap > gap_mult * atr_last:
                     gap_check_ok = True
                     bar_delta_sec = 0.0
@@ -1371,9 +1154,14 @@ class RiskManager:
                         if t_col in dfp.columns:
                             t_prev = pd.Timestamp(dfp[t_col].iat[-2])
                             t_last = pd.Timestamp(dfp[t_col].iat[-1])
-                            bar_delta_sec = max(0.0, float((t_last - t_prev).total_seconds()))
+                            bar_delta_sec = max(
+                                0.0, float((t_last - t_prev).total_seconds())
+                            )
                             tf_sec = float(
-                                tf_seconds(str(getattr(self.sp, "tf_primary", "M1") or "M1")) or 60
+                                tf_seconds(
+                                    str(getattr(self.sp, "tf_primary", "M1") or "M1")
+                                )
+                                or 60
                             )
                             max_bar_delta_sec = max(tf_sec * 1.5, tf_sec + 5.0)
                             if bar_delta_sec > max_bar_delta_sec:
@@ -1403,13 +1191,17 @@ class RiskManager:
     def _trigger_vol_breaker(self, reason: str) -> None:
         """Activate the volatility circuit breaker cooldown without all-day hard-stop."""
         with self._lock:
-            cooldown = float(getattr(self.cfg, 'circuit_breaker_cooldown_sec', 1800.0) or 1800.0)
+            cooldown = float(
+                getattr(self.cfg, "circuit_breaker_cooldown_sec", 1800.0) or 1800.0
+            )
             self._vol_breaker_active = True
             self._vol_breaker_until = time.time() + cooldown
             self._vol_breaker_reason = reason
             log.critical(
                 "VOL_CIRCUIT_BREAKER_TRIGGERED | %s | %s | cooldown=%.0fs",
-                self.sp.base, reason, cooldown,
+                self.sp.base,
+                reason,
+                cooldown,
             )
 
     def update_phase(self) -> None:
@@ -1437,9 +1229,9 @@ class RiskManager:
             if dfp is None or len(dfp) < 20:
                 return 50.0
             h = dfp["high"].values if "high" in dfp else dfp["High"].values
-            l = dfp["low"].values if "low" in dfp else dfp["Low"].values
+            low_arr = dfp["low"].values if "low" in dfp else dfp["Low"].values
             c = dfp["close"].values if "close" in dfp else dfp["Close"].values
-            atr_arr = _atr_fallback(h, l, c, 14)
+            atr_arr = _atr_fallback(h, low_arr, c, 14)
             n = min(lookback, len(atr_arr) - 1)
             if n < 5:
                 return 50.0
@@ -1481,6 +1273,12 @@ class RiskManager:
         if ks_status != "ACTIVE":
             reasons.append(f"KILL_SWITCH:{ks_status}")
             return False, reasons
+
+        if bool(getattr(self.cfg, "pause_analysis_on_position", False)):
+            pos_state = self.position_guard_snapshot()
+            if bool(pos_state.get("has_any", False)):
+                reasons.append("POSITION_OPEN_PAUSE")
+                return False, reasons
 
         if not self.market_open():
             reasons.append("MARKET_CLOSED")
@@ -1560,7 +1358,9 @@ class RiskManager:
             return False, reasons
 
         with self._lock:
-            exec_breaker_active = self._exec_breaker_active and time.time() < self._exec_breaker_until
+            exec_breaker_active = (
+                self._exec_breaker_active and time.time() < self._exec_breaker_until
+            )
         if exec_breaker_active:
             reasons.append("EXEC_BREAKER")
             return False, reasons
@@ -1587,7 +1387,10 @@ class RiskManager:
             daily_lock_reason = self._daily_target_lock_reason
         if soft_stop:
             if daily_locked:
-                return False, f"daily_target_locked:{daily_lock_reason or 'target_reached'}"
+                return (
+                    False,
+                    f"daily_target_locked:{daily_lock_reason or 'target_reached'}",
+                )
             return False, "soft_stop"
 
         if ks_status != "ACTIVE":
@@ -1610,7 +1413,9 @@ class RiskManager:
 
         return True, ""
 
-    def can_emit_signal(self, confidence: int, tz: Any = None) -> Tuple[bool, str]:
+    def can_emit_signal(
+        self, confidence: int, tz: Any = None, side: str = ""
+    ) -> Tuple[bool, str]:
         if confidence < self.cfg.min_confidence:
             return False, f"low_conf:{confidence}"
 
@@ -1631,6 +1436,24 @@ class RiskManager:
 
         if self._in_maintenance_blackout():
             return False, "maintenance"
+
+        side_n = _side_norm(side)
+        pos_state = self.position_guard_snapshot(side=side_n)
+        if bool(getattr(self.cfg, "pause_analysis_on_position", False)) and bool(
+            pos_state.get("has_any", False)
+        ):
+            return False, "position_open_pause"
+        if (
+            side_n in ("Buy", "Sell")
+            and not bool(getattr(self.cfg, "hedge_flip_enabled", False))
+            and bool(pos_state.get("opposing_open", False))
+        ):
+            return False, "opposing_position_open"
+        max_positions = int(
+            getattr(self.cfg, "max_open_positions_per_asset", 0) or 0
+        )
+        if max_positions > 0 and int(pos_state.get("count", 0) or 0) >= max_positions:
+            return False, f"max_positions:{pos_state.get('count', 0)}/{max_positions}"
 
         return True, ""
 
@@ -1726,7 +1549,9 @@ class RiskManager:
                 if info is not None:
                     point = float(getattr(info, "point", 0.0) or 0.0)
                     stops_level = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
-                    min_stop_distance = max(min_stop_distance, stops_level * max(point, 0.0))
+                    min_stop_distance = max(
+                        min_stop_distance, stops_level * max(point, 0.0)
+                    )
         except Exception:
             pass
         if point <= 0.0:
@@ -1737,6 +1562,29 @@ class RiskManager:
             return False, 0.0, f"gate_stop_distance_sl:{abs(entry - sl_val):.8f}"
         if abs(tp_val - entry) <= max(price_tol, min_stop_distance - price_tol):
             return False, 0.0, f"gate_stop_distance_tp:{abs(tp_val - entry):.8f}"
+
+        pos_state = self.position_guard_snapshot(side=side_n)
+        if bool(getattr(self.cfg, "pause_analysis_on_position", False)) and bool(
+            pos_state.get("has_any", False)
+        ):
+            return False, 0.0, "position_open_pause"
+        if (
+            not bool(getattr(self.cfg, "hedge_flip_enabled", False))
+            and bool(pos_state.get("opposing_open", False))
+        ):
+            return False, 0.0, "opposing_position_open"
+        max_positions_cfg = int(
+            getattr(self.cfg, "max_open_positions_per_asset", 0) or 0
+        )
+        if (
+            max_positions_cfg > 0
+            and int(pos_state.get("count", 0) or 0) >= max_positions_cfg
+        ):
+            return (
+                False,
+                0.0,
+                f"max_positions:{pos_state.get('count', 0)}/{max_positions_cfg}",
+            )
 
         # Cheap refresh for deterministic gating under high-frequency flow.
         now = time.time()
@@ -1776,14 +1624,22 @@ class RiskManager:
             allowed_lot = max(0.0, base_lot_val * mode_mult)
             tol = max(1e-8, allowed_lot * 1e-6)
             if lot_val > (allowed_lot + tol):
-                return False, 0.0, f"mode_{phase_now}_lot_violation:{lot_val:.8f}>{allowed_lot:.8f}"
+                return (
+                    False,
+                    0.0,
+                    f"mode_{phase_now}_lot_violation:{lot_val:.8f}>{allowed_lot:.8f}",
+                )
 
         return True, lot_val, "ok"
 
     # ─── SL/TP calculation ───────────────────────────────────────────
 
     def _apply_broker_constraints(
-        self, side: str, entry: float, sl: float, tp: float,
+        self,
+        side: str,
+        entry: float,
+        sl: float,
+        tp: float,
     ) -> Tuple[float, float, float]:
         """Ensure SL/TP respect broker minimum distance constraints."""
         if mt5 is None:
@@ -1793,7 +1649,9 @@ class RiskManager:
                 info = mt5.symbol_info(self.sp.symbol)
             if info is None:
                 return entry, sl, tp
-            stops_level = float(info.trade_stops_level or 0) * float(info.point or 0.00001)
+            stops_level = float(info.trade_stops_level or 0) * float(
+                info.point or 0.00001
+            )
             side_n = _side_norm(side)
             if side_n == "Buy":
                 sl = min(sl, entry - stops_level)
@@ -1928,7 +1786,10 @@ class RiskManager:
         if hard_cap > 0 and lot_clamped > hard_cap:
             log.warning(
                 "HARD_LOT_CAP | symbol=%s lot_raw=%.4f clamped_to=%.4f hard_cap=%.4f",
-                self.sp.symbol, lot_clamped, hard_cap, hard_cap,
+                self.sp.symbol,
+                lot_clamped,
+                hard_cap,
+                hard_cap,
             )
             lot_clamped = hard_cap
         return lot_clamped
@@ -1936,7 +1797,10 @@ class RiskManager:
     # ─── SL/TP calculation methods ───────────────────────────────────
 
     def _fallback_atr_sl_tp(
-        self, side: str, entry: float, adapt: Dict[str, Any],
+        self,
+        side: str,
+        entry: float,
+        adapt: Dict[str, Any],
     ) -> Tuple[float, float]:
         """ATR-based SL/TP using config multipliers."""
         atr = float(adapt.get("atr", 0.0))
@@ -1982,7 +1846,10 @@ class RiskManager:
         tp_min = max(0.8, tp_min)
         tp_max = max(tp_min, tp_max)
         tp = atr_take_profit(
-            entry, atr, side, confidence,
+            entry,
+            atr,
+            side,
+            confidence,
             min_mult=tp_min,
             max_mult=tp_max,
         )
@@ -2027,7 +1894,9 @@ class RiskManager:
             trap = abs(float(adapt.get("stop_hunt_strength", 0.0) or 0.0))
             ob_touch = float(adapt.get("ob_touch_proximity", 0.0) or 0.0)
 
-            tf_sec = int(tf_seconds(str(getattr(self.sp, "tf_primary", "M1") or "M1")) or 60)
+            tf_sec = int(
+                tf_seconds(str(getattr(self.sp, "tf_primary", "M1") or "M1")) or 60
+            )
             if tf_sec <= 60:
                 base_lookback = 24
             elif tf_sec <= 300:
@@ -2044,7 +1913,9 @@ class RiskManager:
                 min_dist = atr * (0.95 + 0.30 * (1.0 - conf))
                 if trap > 0.35 or ob_touch > 0.50:
                     min_dist *= 1.10
-                buffer = atr * (0.10 + 0.08 * (1.0 - conf) + 0.05 * ob_touch + 0.08 * trap)
+                buffer = atr * (
+                    0.10 + 0.08 * (1.0 - conf) + 0.05 * ob_touch + 0.08 * trap
+                )
                 if "BTC" in str(self.sp.base).upper():
                     buffer *= 1.15
             else:
@@ -2068,7 +1939,9 @@ class RiskManager:
                     if _is_finite(candidate, dist) and candidate < entry and dist > 0.0:
                         candidates.append((candidate, dist))
                 else:
-                    swing = float(pd.to_numeric(recent[high_col], errors="coerce").max())
+                    swing = float(
+                        pd.to_numeric(recent[high_col], errors="coerce").max()
+                    )
                     candidate = swing + frame_buffer
                     dist = candidate - entry
                     if _is_finite(candidate, dist) and candidate > entry and dist > 0.0:
@@ -2110,17 +1983,25 @@ class RiskManager:
 
         # 1. Breakeven check
         be = breakeven_price(
-            entry_price, tp_price, current_price, side,
+            entry_price,
+            tp_price,
+            current_price,
+            side,
             be_trigger_pct=self.cfg.breakeven_trigger_pct,
         )
 
         # 2. Volatility trailing stop
         trail_mult = float(self.cfg.trailing_stop_atr_mult)
         if self._is_xau_overlap():
-            overlap_mult = float(getattr(self.cfg, "xau_overlap_trail_mult", 0.80) or 0.80)
+            overlap_mult = float(
+                getattr(self.cfg, "xau_overlap_trail_mult", 0.80) or 0.80
+            )
             trail_mult = max(0.10, trail_mult * overlap_mult)
         trail = volatility_trailing_stop(
-            entry_price, current_price, atr, side,
+            entry_price,
+            current_price,
+            atr,
+            side,
             trail_atr_mult=trail_mult,
         )
 
@@ -2170,8 +2051,14 @@ class RiskManager:
         """
         side_n = _side_norm(side)
         result: Dict[str, Any] = {
-            "blocked": True, "reason": "init", "side": side_n,
-            "entry": 0.0, "sl": 0.0, "tp": 0.0, "lot": 0.0, "rr": 0.0,
+            "blocked": True,
+            "reason": "init",
+            "side": side_n,
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp": 0.0,
+            "lot": 0.0,
+            "rr": 0.0,
         }
         if side_n not in ("Buy", "Sell"):
             result["reason"] = "invalid_side"
@@ -2183,6 +2070,19 @@ class RiskManager:
 
         if conf01 <= 0.0:
             result["reason"] = "low_confidence:0.00"
+            return result
+
+        pos_state = self.position_guard_snapshot(side=side_n)
+        if bool(getattr(self.cfg, "pause_analysis_on_position", False)) and bool(
+            pos_state.get("has_any", False)
+        ):
+            result["reason"] = "position_open_pause"
+            return result
+        if (
+            not bool(getattr(self.cfg, "hedge_flip_enabled", False))
+            and bool(pos_state.get("opposing_open", False))
+        ):
+            result["reason"] = "opposing_position_open"
             return result
 
         # ML router strict floor: risk must obey model confidence.
@@ -2199,6 +2099,12 @@ class RiskManager:
                 return result
 
         # ── Max positions ──
+        if open_positions <= 0:
+            open_positions = int(pos_state.get("count", 0) or 0)
+        if max_positions <= 0:
+            max_positions = int(
+                getattr(self.cfg, "max_open_positions_per_asset", 0) or 0
+            )
         if max_positions > 0 and open_positions >= max_positions:
             result["reason"] = f"max_positions:{open_positions}/{max_positions}"
             return result
@@ -2223,9 +2129,13 @@ class RiskManager:
                 cols = {c.lower(): c for c in df.columns}
                 c = df[cols.get("close", "Close")].values
                 if "ker" not in adapt or not _is_finite(float(adapt.get("ker", 0.0))):
-                    adapt["ker"] = kaufman_efficiency_ratio(c, period=int(getattr(self.cfg, "ker_period", 10) or 10))
+                    adapt["ker"] = kaufman_efficiency_ratio(
+                        c, period=int(getattr(self.cfg, "ker_period", 10) or 10)
+                    )
                 if "rvi" not in adapt or not _is_finite(float(adapt.get("rvi", 0.0))):
-                    adapt["rvi"] = relative_volatility_index(c, period=int(getattr(self.cfg, "rvi_period", 14) or 14))
+                    adapt["rvi"] = relative_volatility_index(
+                        c, period=int(getattr(self.cfg, "rvi_period", 14) or 14)
+                    )
             except Exception:
                 pass
 
@@ -2244,7 +2154,9 @@ class RiskManager:
         tp = atr_tp
         if struct_sl is not None:
             sl_dist = abs(entry - sl)
-            rr_target = 1.05 if regime == "ml_router" else (1.20 if conf01 >= 0.80 else 1.05)
+            rr_target = (
+                1.05 if regime == "ml_router" else (1.20 if conf01 >= 0.80 else 1.05)
+            )
             if sl_dist > 0.0:
                 if side_n == "Buy":
                     tp = max(tp, entry + sl_dist * rr_target)
@@ -2276,7 +2188,9 @@ class RiskManager:
             sl_m = float(self.cfg.atr_sl_multiplier or 2.5)
             if sl_m > 0:
                 _sizing_adapt["atr"] = actual_sl_dist / sl_m
-        lot = self.calculate_position_size(side_n, entry, sl, tp, confidence, adapt=_sizing_adapt)
+        lot = self.calculate_position_size(
+            side_n, entry, sl, tp, confidence, adapt=_sizing_adapt
+        )
         if lot <= 0:
             result["reason"] = "kelly_zero"
             result["entry"] = entry
@@ -2390,7 +2304,8 @@ class RiskManager:
                     self._exec_breaker_until = time.time() + self.cfg.exec_breaker_sec
                     log.warning(
                         "EXEC_BREAKER_LATENCY | p95=%.1fms | %s",
-                        p95_lat, self.sp.base,
+                        p95_lat,
+                        self.sp.base,
                     )
 
                 if p95_slip > self.cfg.exec_max_p95_slippage_points:
@@ -2398,7 +2313,8 @@ class RiskManager:
                     self._exec_breaker_until = time.time() + self.cfg.exec_breaker_sec
                     log.warning(
                         "EXEC_BREAKER_SLIPPAGE | p95=%.1f pts | %s",
-                        p95_slip, self.sp.base,
+                        p95_slip,
+                        self.sp.base,
                     )
 
         # Fill telemetry must be durable immediately so broker fills are not
@@ -2406,7 +2322,11 @@ class RiskManager:
         self._flush_exec_csv(force=True)
 
     def record_execution_failure(
-        self, order_id: str, enqueue_time: float, send_time: float, reason: str,
+        self,
+        order_id: str,
+        enqueue_time: float,
+        send_time: float,
+        reason: str,
     ) -> None:
         metrics = {
             "ts": time.time(),
@@ -2426,7 +2346,9 @@ class RiskManager:
         """Fast: update RAM hist; flush periodically to CSV."""
         now = time.time()
         with self._lock:
-            should_flush = now - self._exec_csv_last_flush > self._exec_csv_flush_interval
+            should_flush = (
+                now - self._exec_csv_last_flush > self._exec_csv_flush_interval
+            )
         if should_flush:
             self._flush_exec_csv()
 
@@ -2441,11 +2363,21 @@ class RiskManager:
             self._exec_csv_path.parent.mkdir(parents=True, exist_ok=True)
             write_header = not self._exec_csv_path.exists()
             with open(self._exec_csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=[
-                    "ts", "order_id", "side", "latency_ms",
-                    "slippage_pts", "expected", "filled", "event",
-                    "reason", "asset",
-                ])
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "ts",
+                        "order_id",
+                        "side",
+                        "latency_ms",
+                        "slippage_pts",
+                        "expected",
+                        "filled",
+                        "event",
+                        "reason",
+                        "asset",
+                    ],
+                )
                 if write_header:
                     writer.writeheader()
                 for m in rows:
@@ -2469,9 +2401,16 @@ class RiskManager:
                 writer = csv.DictWriter(
                     f,
                     fieldnames=[
-                        "ts", "order_id", "side", "latency_ms",
-                        "slippage_pts", "expected", "filled", "event",
-                        "reason", "asset",
+                        "ts",
+                        "order_id",
+                        "side",
+                        "latency_ms",
+                        "slippage_pts",
+                        "expected",
+                        "filled",
+                        "event",
+                        "reason",
+                        "asset",
                     ],
                 )
                 writer.writeheader()
@@ -2531,8 +2470,12 @@ class RiskManager:
                     self._daily_pnl = state.get("daily_pnl", 0.0)
                     self._signals_today = state.get("signals_today", 0)
                     self._peak_equity = state.get("peak_equity", 0.0)
-                    self._daily_target_locked = bool(state.get("daily_target_locked", False))
-                    self._daily_target_lock_reason = str(state.get("daily_target_lock_reason", "") or "")
+                    self._daily_target_locked = bool(
+                        state.get("daily_target_locked", False)
+                    )
+                    self._daily_target_lock_reason = str(
+                        state.get("daily_target_lock_reason", "") or ""
+                    )
                 log.info("Loaded state for %s: phase=%s", self.sp.base, self.phase)
         except Exception:
             pass
@@ -2562,10 +2505,5 @@ class RiskManager:
                 "daily_target_lock_reason": self._daily_target_lock_reason,
             }
 
-__all__ = (
-    'AssetExposure',
-    'PortfolioRiskManager',
-    'CostBreakdown',
-    'TransactionCostModel',
-    'RiskManager',
-)
+
+__all__ = ("RiskManager",)

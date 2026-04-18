@@ -29,6 +29,7 @@ log = logging.getLogger("backtest.metrics_institutional")
 # Dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class InstitutionalBacktestMetrics:
     """Institutional-grade backtest metrics with regulatory compliance"""
@@ -43,19 +44,19 @@ class InstitutionalBacktestMetrics:
     sortino_ratio: float = 0.0
     calmar_ratio: float = 0.0
     information_ratio: float = 0.0  # vs buy-and-hold benchmark
-    omega_ratio: float = 0.0        # Probability-weighted ratio
+    omega_ratio: float = 0.0  # Probability-weighted ratio
 
     # ═══ Risk Metrics (Institutional) ══════════════════════════
     max_drawdown_pct: float = 0.0
     max_drawdown_duration_days: float = 0.0
     avg_drawdown_pct: float = 0.0
-    recovery_factor: float = 0.0    # Net profit / Max DD
+    recovery_factor: float = 0.0  # Net profit / Max DD
 
     volatility_annualized: float = 0.0
     downside_deviation: float = 0.0
     upside_deviation: float = 0.0
-    var_95: float = 0.0             # Value at Risk 95%
-    cvar_95: float = 0.0            # Conditional VaR (Expected Shortfall)
+    var_95: float = 0.0  # Value at Risk 95%
+    cvar_95: float = 0.0  # Conditional VaR (Expected Shortfall)
 
     # ═══ Trade Statistics ══════════════════════════════════════
     total_trades: int = 0
@@ -65,7 +66,7 @@ class InstitutionalBacktestMetrics:
 
     profit_factor: float = 0.0
     expectancy: float = 0.0
-    expectancy_ratio: float = 0.0   # Expectancy / Avg Loss
+    expectancy_ratio: float = 0.0  # Expectancy / Avg Loss
     no_loss_trades: bool = False
     no_win_trades: bool = False
     profit_factor_capped: bool = False
@@ -120,10 +121,10 @@ class InstitutionalBacktestMetrics:
 
     # ═══ Time-based Analysis ═══════════════════════════════════
     total_days: float = 0.0
-    trading_days: float = 0.0           # FIXED: now computed from real date span
-    avg_trades_per_day: float = 0.0     # FIXED: now computed properly
-    best_day_return: float = 0.0        # FIXED: now computed
-    worst_day_return: float = 0.0       # FIXED: now computed
+    trading_days: float = 0.0  # FIXED: now computed from real date span
+    avg_trades_per_day: float = 0.0  # FIXED: now computed properly
+    best_day_return: float = 0.0  # FIXED: now computed
+    worst_day_return: float = 0.0  # FIXED: now computed
 
     # ═══ Position Management ═══════════════════════════════════
     avg_position_size_pct: float = 0.0
@@ -145,6 +146,7 @@ class InstitutionalBacktestMetrics:
 # ─────────────────────────────────────────────────────────────────────────────
 # Core computation
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def compute_institutional_metrics(
     pnl_series: List[float],
@@ -203,27 +205,27 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     # 1. Trade-level statistics
     # ──────────────────────────────────────────────────────────
-    wins   = pnls[pnls > 0]
+    wins = pnls[pnls > 0]
     losses = pnls[pnls < 0]
 
     m.winning_trades = int(wins.size)
-    m.losing_trades  = int(losses.size)
+    m.losing_trades = int(losses.size)
     m.no_loss_trades = m.losing_trades == 0
-    m.no_win_trades  = m.winning_trades == 0
+    m.no_win_trades = m.winning_trades == 0
     m.win_rate = m.winning_trades / m.total_trades if m.total_trades > 0 else 0.0
 
-    m.avg_win  = float(np.mean(wins))   if wins.size  > 0 else 0.0
+    m.avg_win = float(np.mean(wins)) if wins.size > 0 else 0.0
     m.avg_loss = float(np.mean(losses)) if losses.size > 0 else 0.0
     m.avg_win_loss_ratio = (
         abs(m.avg_win / m.avg_loss) if m.avg_loss != 0 and m.avg_win > 0 else 0.0
     )
 
-    m.largest_win  = float(np.max(wins))   if wins.size  > 0 else 0.0
+    m.largest_win = float(np.max(wins)) if wins.size > 0 else 0.0
     m.largest_loss = float(np.min(losses)) if losses.size > 0 else 0.0
 
     # Profit factor — capped at 999 to keep JSON finite
-    gross_profit = float(np.sum(wins))            if wins.size  > 0 else 0.0
-    gross_loss   = abs(float(np.sum(losses)))     if losses.size > 0 else 0.0
+    gross_profit = float(np.sum(wins)) if wins.size > 0 else 0.0
+    gross_loss = abs(float(np.sum(losses))) if losses.size > 0 else 0.0
     pf_cap = 999.0
     if gross_loss > 0.0:
         pf_raw = gross_profit / gross_loss
@@ -252,9 +254,9 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     if pnls.size > 0:
         streaks = _calculate_streaks_vectorised(pnls)
-        m.max_consecutive_wins   = streaks["max_wins"]
+        m.max_consecutive_wins = streaks["max_wins"]
         m.max_consecutive_losses = streaks["max_losses"]
-        m.avg_consecutive_wins   = streaks["avg_wins"]
+        m.avg_consecutive_wins = streaks["avg_wins"]
         m.avg_consecutive_losses = streaks["avg_losses"]
 
     # ──────────────────────────────────────────────────────────
@@ -273,6 +275,7 @@ def compute_institutional_metrics(
     try:
         if start_date and end_date:
             import pandas as _pd
+
             s_dt = _pd.Timestamp(str(start_date))
             e_dt = _pd.Timestamp(str(end_date))
             data_days = max(1.0, (e_dt - s_dt).total_seconds() / 86400.0)
@@ -335,7 +338,7 @@ def compute_institutional_metrics(
 
     daily_returns = daily_pnls / initial_capital
     daily_mean = float(np.mean(daily_returns))
-    daily_std  = float(np.std(daily_returns, ddof=1)) if daily_returns.size > 1 else 0.0
+    daily_std = float(np.std(daily_returns, ddof=1)) if daily_returns.size > 1 else 0.0
 
     # ──────────────────────────────────────────────────────────
     # 6. Time-based stats — FIXED (v1 had wrong constants)
@@ -346,18 +349,16 @@ def compute_institutional_metrics(
         m.trading_days = round(data_days, 1)
     else:
         m.trading_days = round(data_days * (5.0 / 7.0), 1)
-    m.avg_trades_per_day = (
-        m.total_trades / max(m.trading_days, 1.0)
-    )
+    m.avg_trades_per_day = m.total_trades / max(m.trading_days, 1.0)
     # Best / worst day returns
-    m.best_day_return  = float(np.max(daily_returns))
+    m.best_day_return = float(np.max(daily_returns))
     m.worst_day_return = float(np.min(daily_returns))
 
     # ──────────────────────────────────────────────────────────
     # 7. Annualised return & volatility
     # ──────────────────────────────────────────────────────────
     m.annualized_return_pct = daily_mean * daily_periods
-    m.volatility_annualized = daily_std  * math.sqrt(daily_periods)
+    m.volatility_annualized = daily_std * math.sqrt(daily_periods)
 
     # ──────────────────────────────────────────────────────────
     # 8. Sharpe Ratio — daily excess returns, annualised
@@ -366,7 +367,8 @@ def compute_institutional_metrics(
     excess_daily = daily_mean - rf_per_day
     m.sharpe_ratio = (
         excess_daily / daily_std * math.sqrt(daily_periods)
-        if daily_std > 1e-15 else 0.0
+        if daily_std > 1e-15
+        else 0.0
     )
 
     # ──────────────────────────────────────────────────────────
@@ -378,7 +380,8 @@ def compute_institutional_metrics(
     )
     m.sortino_ratio = (
         excess_daily / m.downside_deviation * math.sqrt(daily_periods)
-        if m.downside_deviation > 1e-15 else 0.0
+        if m.downside_deviation > 1e-15
+        else 0.0
     )
     upside = daily_returns[daily_returns > rf_per_day]
     m.upside_deviation = float(np.std(upside, ddof=1)) if upside.size > 1 else 0.0
@@ -393,12 +396,15 @@ def compute_institutional_metrics(
     drawdown = np.nan_to_num(drawdown, nan=0.0, posinf=0.0, neginf=0.0)
 
     m.max_drawdown_pct = float(np.max(drawdown)) if drawdown.size > 0 else 0.0
-    m.avg_drawdown_pct = float(np.mean(drawdown[drawdown > 0])) if np.any(drawdown > 0) else 0.0
+    m.avg_drawdown_pct = (
+        float(np.mean(drawdown[drawdown > 0])) if np.any(drawdown > 0) else 0.0
+    )
 
     net_profit = m.final_capital - initial_capital
     m.recovery_factor = (
         net_profit / (initial_capital * m.max_drawdown_pct)
-        if m.max_drawdown_pct > 1e-15 else 0.0
+        if m.max_drawdown_pct > 1e-15
+        else 0.0
     )
 
     # Drawdown duration (in trade-bars, not calendar days)
@@ -406,7 +412,7 @@ def compute_institutional_metrics(
     if np.any(in_dd):
         dd_runs = np.diff(np.concatenate(([0], in_dd.astype(int), [0])))
         dd_starts = np.where(dd_runs == 1)[0]
-        dd_ends   = np.where(dd_runs == -1)[0]
+        dd_ends = np.where(dd_runs == -1)[0]
         if dd_starts.size > 0 and dd_ends.size > 0:
             m.max_drawdown_duration_days = float(
                 max(e - s for s, e in zip(dd_starts, dd_ends))
@@ -417,14 +423,15 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     m.calmar_ratio = (
         m.annualized_return_pct / m.max_drawdown_pct
-        if m.max_drawdown_pct > 1e-15 else 0.0
+        if m.max_drawdown_pct > 1e-15
+        else 0.0
     )
 
     # ──────────────────────────────────────────────────────────
     # 12. Omega Ratio — consistently on daily returns (FIXED)
     # ──────────────────────────────────────────────────────────
     # v1 mixed per-trade returns with rf_per_day (daily threshold) which was inconsistent.
-    gains_sum  = float(np.sum(daily_returns[daily_returns > rf_per_day] - rf_per_day))
+    gains_sum = float(np.sum(daily_returns[daily_returns > rf_per_day] - rf_per_day))
     losses_sum = float(np.sum(rf_per_day - daily_returns[daily_returns < rf_per_day]))
     m.omega_ratio = gains_sum / losses_sum if losses_sum > 1e-15 else 0.0
 
@@ -434,9 +441,11 @@ def compute_institutional_metrics(
     per_trade_returns = pnls / initial_capital
     if per_trade_returns.size > 0:
         var_threshold = float(np.percentile(per_trade_returns, 5))
-        m.var_95  = var_threshold * initial_capital
+        m.var_95 = var_threshold * initial_capital
         tail = per_trade_returns[per_trade_returns <= var_threshold]
-        m.cvar_95 = float(np.mean(tail)) * initial_capital if tail.size > 0 else m.var_95
+        m.cvar_95 = (
+            float(np.mean(tail)) * initial_capital if tail.size > 0 else m.var_95
+        )
 
     # ──────────────────────────────────────────────────────────
     # 14. Information Ratio vs buy-and-hold (FIXED — was always 0.0 in v1)
@@ -449,7 +458,8 @@ def compute_institutional_metrics(
         ae_std = float(np.std(active_excess, ddof=1)) if active_excess.size > 1 else 0.0
         m.information_ratio = (
             float(np.mean(active_excess)) / ae_std * math.sqrt(daily_periods)
-            if ae_std > 1e-15 else 0.0
+            if ae_std > 1e-15
+            else 0.0
         )
     except Exception:
         m.information_ratio = 0.0
@@ -457,14 +467,14 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     # 15. Transaction costs
     # ──────────────────────────────────────────────────────────
-    m.total_spread_cost    = spread_costs
-    m.total_swap_cost      = swap_costs
-    m.total_slippage_cost  = slippage_costs
-    m.total_commission     = commission_costs
-    m.total_fees           = spread_costs + swap_costs + slippage_costs + commission_costs
-    m.fee_impact_pct       = m.total_fees / initial_capital if initial_capital > 0 else 0.0
+    m.total_spread_cost = spread_costs
+    m.total_swap_cost = swap_costs
+    m.total_slippage_cost = slippage_costs
+    m.total_commission = commission_costs
+    m.total_fees = spread_costs + swap_costs + slippage_costs + commission_costs
+    m.fee_impact_pct = m.total_fees / initial_capital if initial_capital > 0 else 0.0
     if m.total_trades > 0:
-        m.avg_spread_per_trade   = spread_costs   / m.total_trades
+        m.avg_spread_per_trade = spread_costs / m.total_trades
         m.avg_slippage_per_trade = slippage_costs / m.total_trades
 
     # ──────────────────────────────────────────────────────────
@@ -472,7 +482,7 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     if trade_durations_min:
         durs = np.asarray(trade_durations_min, dtype=np.float64)
-        m.avg_trade_duration_minutes    = float(np.mean(durs))
+        m.avg_trade_duration_minutes = float(np.mean(durs))
         m.median_trade_duration_minutes = float(np.median(durs))
 
     # ──────────────────────────────────────────────────────────
@@ -480,8 +490,7 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     if trade_details:
         position_sizes = [
-            float(t.get("position_size_pct", 0.0) or 0.0)
-            for t in trade_details
+            float(t.get("position_size_pct", 0.0) or 0.0) for t in trade_details
         ]
         if position_sizes:
             ps = np.asarray(position_sizes, dtype=np.float64)
@@ -501,28 +510,29 @@ def compute_institutional_metrics(
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _calculate_streaks_vectorised(pnls: np.ndarray) -> Dict[str, Any]:
     """
     Vectorised consecutive-streak calculator using numpy run-length encoding.
-    
+
     Replaces the Python for-loop in v1 with pure numpy operations.
     """
-    is_win  = (pnls > 0).astype(np.int8)
+    is_win = (pnls > 0).astype(np.int8)
     # Pad boundary so diff always captures first/last run transitions
-    padded  = np.concatenate(([is_win[0] ^ 1], is_win, [is_win[-1] ^ 1]))
+    padded = np.concatenate(([is_win[0] ^ 1], is_win, [is_win[-1] ^ 1]))
     changes = np.diff(padded.astype(np.int16))
 
     run_starts = np.where(changes != 0)[0]
     run_lengths = np.diff(np.append(run_starts, len(padded) - 1))
-    run_values  = padded[run_starts]          # 0 = loss run, 1 = win run
+    run_values = padded[run_starts]  # 0 = loss run, 1 = win run
 
-    win_lengths  = run_lengths[run_values == 1]
+    win_lengths = run_lengths[run_values == 1]
     loss_lengths = run_lengths[run_values == 0]
 
     return {
-        "max_wins":   int(np.max(win_lengths))  if win_lengths.size  > 0 else 0,
+        "max_wins": int(np.max(win_lengths)) if win_lengths.size > 0 else 0,
         "max_losses": int(np.max(loss_lengths)) if loss_lengths.size > 0 else 0,
-        "avg_wins":   float(np.mean(win_lengths))  if win_lengths.size  > 0 else 0.0,
+        "avg_wins": float(np.mean(win_lengths)) if win_lengths.size > 0 else 0.0,
         "avg_losses": float(np.mean(loss_lengths)) if loss_lengths.size > 0 else 0.0,
     }
 
@@ -544,6 +554,7 @@ def _sanitize_json_payload(value: Any) -> Any:
 # ─────────────────────────────────────────────────────────────────────────────
 # Report formatter
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
     """Format comprehensive institutional human-readable report."""
@@ -608,63 +619,65 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
                 f"      {status} {scenario.get('name')}: Impact={scenario.get('impact', 0):.2f}"
             )
 
-    lines.extend([
-        "",
-        "  ══════════════════════════════════════════════════════════════════════════",
-        "  TRADE STATISTICS",
-        "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Total Trades:           {m.total_trades}",
-        f"    Win Rate:               {m.win_rate:.1%}  {'✅' if m.win_rate >= 0.58 else '❌'} (Target: >= 58%)",
-        f"    Profit Factor:          {m.profit_factor:.2f}",
-        f"    Expectancy:             ${m.expectancy:.2f}",
-        f"    Expectancy Ratio:       {m.expectancy_ratio:.2f}",
-        "",
-        f"    Avg Win:                ${m.avg_win:.2f}",
-        f"    Avg Loss:               ${m.avg_loss:.2f}",
-        f"    Win/Loss Ratio:         {m.avg_win_loss_ratio:.2f}",
-        f"    Largest Win:            ${m.largest_win:.2f}",
-        f"    Largest Loss:           ${m.largest_loss:.2f}",
-        "",
-        f"    Max Consecutive Wins:   {m.max_consecutive_wins}",
-        f"    Max Consecutive Losses: {m.max_consecutive_losses}",
-        f"    Avg Consecutive Wins:   {m.avg_consecutive_wins:.1f}",
-        f"    Avg Consecutive Losses: {m.avg_consecutive_losses:.1f}",
-        "",
-        f"    Avg Duration (min):     {m.avg_trade_duration_minutes:.1f}",
-        f"    Median Duration (min):  {m.median_trade_duration_minutes:.1f}",
-        "",
-        "  ══════════════════════════════════════════════════════════════════════════",
-        "  TIME-BASED ANALYSIS",
-        "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Total Calendar Days:    {m.total_days:.0f}",
-        f"    Est. Trading Days:      {m.trading_days:.0f}",
-        f"    Avg Trades / Day:       {m.avg_trades_per_day:.2f}",
-        f"    Best Day Return:        {m.best_day_return:+.4%}",
-        f"    Worst Day Return:       {m.worst_day_return:+.4%}",
-        "",
-        "  ══════════════════════════════════════════════════════════════════════════",
-        "  TRANSACTION COSTS (Reality Check)",
-        "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Spread Cost:            ${m.total_spread_cost:.2f}  (${m.avg_spread_per_trade:.2f}/trade)",
-        f"    Slippage Cost:          ${m.total_slippage_cost:.2f}  (${m.avg_slippage_per_trade:.2f}/trade)",
-        f"    Commission:             ${m.total_commission:.2f}",
-        f"    Swap/Funding:           ${m.total_swap_cost:.2f}",
-        f"    Total Fees:             ${m.total_fees:.2f}",
-        f"    Fee Impact:             {m.fee_impact_pct:.2%}",
-        "",
-        "  ══════════════════════════════════════════════════════════════════════════",
-        "  POSITION MANAGEMENT",
-        "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Avg Position Size:      {m.avg_position_size_pct:.1%}",
-        f"    Max Position Size:      {m.max_position_size_pct:.1%}",
-        f"    Kelly Optimal:          {m.kelly_optimal_fraction:.1%}",
-        "",
-        "=" * 80,
-        "",
-        f"  {'🏛️  INSTITUTIONAL GRADE VERIFIED ✅' if m.sharpe_ratio >= 2.0 and m.win_rate >= 0.58 and m.risk_of_ruin <= 0.01 and m.wfa_passed and m.stress_test_passed else '❌ DOES NOT MEET INSTITUTIONAL STANDARDS'}",
-        "",
-        "=" * 80,
-    ])
+    lines.extend(
+        [
+            "",
+            "  ══════════════════════════════════════════════════════════════════════════",
+            "  TRADE STATISTICS",
+            "  ──────────────────────────────────────────────────────────────────────────",
+            f"    Total Trades:           {m.total_trades}",
+            f"    Win Rate:               {m.win_rate:.1%}  {'✅' if m.win_rate >= 0.58 else '❌'} (Target: >= 58%)",
+            f"    Profit Factor:          {m.profit_factor:.2f}",
+            f"    Expectancy:             ${m.expectancy:.2f}",
+            f"    Expectancy Ratio:       {m.expectancy_ratio:.2f}",
+            "",
+            f"    Avg Win:                ${m.avg_win:.2f}",
+            f"    Avg Loss:               ${m.avg_loss:.2f}",
+            f"    Win/Loss Ratio:         {m.avg_win_loss_ratio:.2f}",
+            f"    Largest Win:            ${m.largest_win:.2f}",
+            f"    Largest Loss:           ${m.largest_loss:.2f}",
+            "",
+            f"    Max Consecutive Wins:   {m.max_consecutive_wins}",
+            f"    Max Consecutive Losses: {m.max_consecutive_losses}",
+            f"    Avg Consecutive Wins:   {m.avg_consecutive_wins:.1f}",
+            f"    Avg Consecutive Losses: {m.avg_consecutive_losses:.1f}",
+            "",
+            f"    Avg Duration (min):     {m.avg_trade_duration_minutes:.1f}",
+            f"    Median Duration (min):  {m.median_trade_duration_minutes:.1f}",
+            "",
+            "  ══════════════════════════════════════════════════════════════════════════",
+            "  TIME-BASED ANALYSIS",
+            "  ──────────────────────────────────────────────────────────────────────────",
+            f"    Total Calendar Days:    {m.total_days:.0f}",
+            f"    Est. Trading Days:      {m.trading_days:.0f}",
+            f"    Avg Trades / Day:       {m.avg_trades_per_day:.2f}",
+            f"    Best Day Return:        {m.best_day_return:+.4%}",
+            f"    Worst Day Return:       {m.worst_day_return:+.4%}",
+            "",
+            "  ══════════════════════════════════════════════════════════════════════════",
+            "  TRANSACTION COSTS (Reality Check)",
+            "  ──────────────────────────────────────────────────────────────────────────",
+            f"    Spread Cost:            ${m.total_spread_cost:.2f}  (${m.avg_spread_per_trade:.2f}/trade)",
+            f"    Slippage Cost:          ${m.total_slippage_cost:.2f}  (${m.avg_slippage_per_trade:.2f}/trade)",
+            f"    Commission:             ${m.total_commission:.2f}",
+            f"    Swap/Funding:           ${m.total_swap_cost:.2f}",
+            f"    Total Fees:             ${m.total_fees:.2f}",
+            f"    Fee Impact:             {m.fee_impact_pct:.2%}",
+            "",
+            "  ══════════════════════════════════════════════════════════════════════════",
+            "  POSITION MANAGEMENT",
+            "  ──────────────────────────────────────────────────────────────────────────",
+            f"    Avg Position Size:      {m.avg_position_size_pct:.1%}",
+            f"    Max Position Size:      {m.max_position_size_pct:.1%}",
+            f"    Kelly Optimal:          {m.kelly_optimal_fraction:.1%}",
+            "",
+            "=" * 80,
+            "",
+            f"  {'🏛️  INSTITUTIONAL GRADE VERIFIED ✅' if m.sharpe_ratio >= 2.0 and m.win_rate >= 0.58 and m.risk_of_ruin <= 0.01 and m.wfa_passed and m.stress_test_passed else '❌ DOES NOT MEET INSTITUTIONAL STANDARDS'}",
+            "",
+            "=" * 80,
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -672,6 +685,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Save helper
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def save_institutional_metrics(
     metrics: InstitutionalBacktestMetrics,

@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
-
-
-# ---- merged from core/model_manager.py ----
-
-import os
-import pickle
 import json
 import logging
+import os
+import pickle
+import shutil
+import threading
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from glob import glob
-from dataclasses import dataclass
-from typing import Any, Optional, List
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from log_config import get_artifact_dir
+
+from .config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
 
 log = logging.getLogger("core.model_engine")
 
-from log_config import get_artifact_dir
-from core.core_config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
+# ---- merged from core/model_manager.py ----
+
 
 @dataclass
 class ModelMetadata:
@@ -42,11 +46,13 @@ class ModelMetadata:
     wfa_failed_windows: int = 0
     training_audit: Optional[dict] = None
 
+
 class ModelManager:
     """
     The 'Holy Trinity' Gatekeeper.
     Manages Model Training -> Backtest Verification -> Live Deployment.
     """
+
     def __init__(self, models_dir: str = ""):
         if not models_dir:
             models_dir = str(get_artifact_dir("models"))
@@ -57,17 +63,17 @@ class ModelManager:
         """Save a new model with metadata."""
         version = metadata.version
         base_path = os.path.join(self.models_dir, f"v{version}")
-        
+
         # Save model pickle
         model_path = f"{base_path}.pkl"
         with open(model_path, "wb") as f:
             pickle.dump(model, f)
-            
+
         # Save metadata json
         meta_path = f"{base_path}.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata.__dict__, f, indent=4)
-            
+
         log.info(f"Model saved: {version} | Sharpe: {metadata.sharpe}")
         return base_path
 
@@ -83,7 +89,9 @@ class ModelManager:
             with open(model_path, "rb") as f:
                 return pickle.load(f)
         except Exception as exc:
-            log.error("Failed to load model version=%s path=%s err=%s", ver, model_path, exc)
+            log.error(
+                "Failed to load model version=%s path=%s err=%s", ver, model_path, exc
+            )
             return None
 
     def load_latest_verified_model(self) -> Optional[Any]:
@@ -97,18 +105,18 @@ class ModelManager:
             try:
                 with open(meta_file, "r") as f:
                     meta = json.load(f)
-                
+
                 # STRICT GATE: Only load VERIFIED models
                 if meta.get("status") != "VERIFIED":
                     continue
-                    
+
                 ts = meta.get("timestamp", "")
                 if ts > best_ts:
                     best_ts = ts
                     best_model_path = meta_file.replace(".json", ".pkl")
             except Exception:
                 continue
-                
+
         if best_model_path and os.path.exists(best_model_path):
             try:
                 with open(best_model_path, "rb") as f:
@@ -116,7 +124,7 @@ class ModelManager:
             except Exception as e:
                 log.error(f"Failed to load model {best_model_path}: {e}")
                 return None
-                
+
         log.warning("No VERIFIED models found in registry.")
         return None
 
@@ -129,11 +137,11 @@ class ModelManager:
         if not os.path.exists(meta_path):
             log.error(f"Model metadata not found: {version}")
             return False
-            
+
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                
+
             # QUANTUM GATING LOGIC (centralized thresholds)
             is_good = False
             meta["backtest_sharpe"] = sharpe
@@ -189,10 +197,10 @@ class ModelManager:
             )
             meta["status"] = "VERIFIED" if is_good else "REJECTED"
             meta["institutional_grade"] = bool(is_good)
-             
+
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=4)
-                
+
             if is_good:
                 log.info(
                     "Model %s VERIFIED (Sharpe=%.2f >= %.2f, WinRate=%.3f >= %.3f, MaxDD=%.3f <= %.3f)",
@@ -212,21 +220,17 @@ class ModelManager:
                     win_rate,
                     max_dd,
                 )
-             
+
             return is_good
         except Exception as e:
             log.error(f"Verification update failed: {e}")
             return False
 
+
 # Singleton
 model_manager = ModelManager()
 
 # ---- merged from core/model_retrainer.py ----
-
-import threading
-import time
-from pathlib import Path
-from typing import Iterable, Optional
 
 MAX_MODEL_AGE_HOURS = {
     "BTC": 24,  # Crypto changes fast
@@ -279,23 +283,8 @@ class ModelAgeChecker:
                 return True
         return False
 
+
 # ---- merged from core/model_gate.py ----
-
-import json
-import logging
-import os
-import pickle
-import shutil
-import threading
-import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
-
-from log_config import get_artifact_dir
-from core.core_config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
-
-log = logging.getLogger("core.model_engine")
 
 DEFAULT_REQUIRED_ASSETS: Tuple[str, ...] = ("XAU", "BTC")
 _LEGACY_BACKUP_DONE = False
@@ -320,7 +309,11 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 
 def _anti_overfit_gate_required() -> bool:
-    for name in ("LIVE_REQUIRE_ANTI_OVERFIT_GATE", "INSTITUTIONAL_REQUIRE_ALPHA_GATE", "AUTO_TRAIN_REQUIRE_ALPHA_GATE"):
+    for name in (
+        "LIVE_REQUIRE_ANTI_OVERFIT_GATE",
+        "INSTITUTIONAL_REQUIRE_ALPHA_GATE",
+        "AUTO_TRAIN_REQUIRE_ALPHA_GATE",
+    ):
         raw = str(os.environ.get(name, "") or "").strip().lower()
         if raw:
             return raw in _BOOL_TRUE
@@ -391,14 +384,18 @@ def _copy_if_exists(src: Path, dst_dir: Path) -> bool:
         return False
 
 
-def backup_legacy_shared_artifacts_once(models_dir: Optional[Path] = None) -> Optional[Path]:
+def backup_legacy_shared_artifacts_once(
+    models_dir: Optional[Path] = None,
+) -> Optional[Path]:
     global _LEGACY_BACKUP_DONE
     with _LEGACY_BACKUP_LOCK:
         if _LEGACY_BACKUP_DONE:
             return None
 
     try:
-        base = Path(models_dir) if models_dir is not None else get_artifact_dir("models")
+        base = (
+            Path(models_dir) if models_dir is not None else get_artifact_dir("models")
+        )
         base.mkdir(parents=True, exist_ok=True)
 
         legacy_candidates = []
@@ -457,7 +454,9 @@ class AssetGateStatus:
     legacy_fallback: bool = False
 
 
-def _state_from_legacy(models_dir: Path, asset: str) -> Tuple[Optional[Dict[str, Any]], Optional[Path], str]:
+def _state_from_legacy(
+    models_dir: Path, asset: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path], str]:
     g = _global_state_path(models_dir)
     if not g.exists():
         return None, None, "missing_global_state"
@@ -586,7 +585,8 @@ def _asset_gate_status(
         # Only warn, don't auto-reject. The checks below will validate metrics.
         log.warning(
             "LEGACY_STATE_DETECTED | asset=%s version=%s — continuing validation",
-            asset_u, version,
+            asset_u,
+            version,
         )
 
     if state_asset and state_asset != asset_u:
@@ -716,7 +716,9 @@ def _asset_gate_status(
             legacy_fallback=False,
         )
 
-    if anti_overfit_gate_required and (not state_anti_overfit_ok or state_tscv_folds < 2):
+    if anti_overfit_gate_required and (
+        not state_anti_overfit_ok or state_tscv_folds < 2
+    ):
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
@@ -964,7 +966,9 @@ def _asset_gate_status(
         )
         reason = f"meta_wfa_failed:{wfa_tag}"
         ok = False
-    elif anti_overfit_gate_required and (not meta_anti_overfit_ok or meta_tscv_folds < 2):
+    elif anti_overfit_gate_required and (
+        not meta_anti_overfit_ok or meta_tscv_folds < 2
+    ):
         reason = f"meta_anti_overfit_failed:passed={int(meta_anti_overfit_ok)}:tscv_folds={meta_tscv_folds}"
         ok = False
     elif meta_status != "VERIFIED":
@@ -1063,15 +1067,16 @@ def gate_ready(
     )
     return bool(details["ok"]), str(details.get("reason", "unknown"))
 
+
 __all__ = (
-    'ModelMetadata',
-    'ModelManager',
-    'model_manager',
-    'MAX_MODEL_AGE_HOURS',
-    'ModelAgeChecker',
-    'DEFAULT_REQUIRED_ASSETS',
-    'backup_legacy_shared_artifacts_once',
-    'AssetGateStatus',
-    'gate_details',
-    'gate_ready',
+    "ModelMetadata",
+    "ModelManager",
+    "model_manager",
+    "MAX_MODEL_AGE_HOURS",
+    "ModelAgeChecker",
+    "DEFAULT_REQUIRED_ASSETS",
+    "backup_legacy_shared_artifacts_once",
+    "AssetGateStatus",
+    "gate_details",
+    "gate_ready",
 )

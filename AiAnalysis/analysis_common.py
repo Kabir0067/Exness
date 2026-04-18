@@ -3,6 +3,7 @@ analysis_common.py — Provider invocation layer
 Supports: Gemini, Groq, Cerebras, OpenRouter
 Ranked chain: TOP-1 → TOP-2 → ... → heuristic fallback
 """
+
 from __future__ import annotations
 
 import ast
@@ -34,7 +35,7 @@ log = build_logger("ai.analysis_common", "analysis_common.log")
 #  Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-ACTION_BUY  = "Харид"
+ACTION_BUY = "Харид"
 ACTION_SELL = "Фурӯш"
 ACTION_HOLD = "Интизор"
 
@@ -44,23 +45,34 @@ _DISABLE_TTL_SEC = 1800.0
 SIGNAL_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "signal":       {"type": "string",  "enum": ["BUY", "SELL", "HOLD"]},
-        "confidence":   {"type": "number",  "minimum": 0.0, "maximum": 1.0},
-        "entry":        {"type": ["number", "null"]},
-        "stop_loss":    {"type": ["number", "null"]},
-        "take_profit":  {"type": ["number", "null"]},
-        "reason":       {"type": "string",  "minLength": 1},
-        "action_short": {"type": "string",  "enum": [ACTION_BUY, ACTION_SELL, ACTION_HOLD]},
+        "signal": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "entry": {"type": ["number", "null"]},
+        "stop_loss": {"type": ["number", "null"]},
+        "take_profit": {"type": ["number", "null"]},
+        "reason": {"type": "string", "minLength": 1},
+        "action_short": {
+            "type": "string",
+            "enum": [ACTION_BUY, ACTION_SELL, ACTION_HOLD],
+        },
     },
-    "required": ["signal", "confidence", "entry", "stop_loss", "take_profit", "reason", "action_short"],
+    "required": [
+        "signal",
+        "confidence",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "reason",
+        "action_short",
+    ],
     "additionalProperties": False,
 }
 
 PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
-    "gemini":     "Gemini",
+    "gemini": "Gemini",
     "openrouter": "OpenRouter",
-    "groq":       "Groq",
-    "cerebras":   "Cerebras",
+    "groq": "Groq",
+    "cerebras": "Cerebras",
 }
 
 
@@ -71,23 +83,28 @@ PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
 
 SCALPING_PROVIDERS: List[Dict[str, Any]] = [
     # Fast path first for scalping. Every model below passed a live API check.
-    {"rank": 1, "provider": "groq",     "model": "meta-llama/llama-4-scout-17b-16e-instruct"},
-    {"rank": 2, "provider": "groq",     "model": "moonshotai/kimi-k2-instruct-0905"},
-    {"rank": 3, "provider": "groq",     "model": "llama-3.3-70b-versatile"},
-    {"rank": 4, "provider": "gemini",   "model": "gemini-2.5-flash-lite"},
+    {
+        "rank": 1,
+        "provider": "groq",
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    },
+    {"rank": 2, "provider": "groq", "model": "moonshotai/kimi-k2-instruct-0905"},
+    {"rank": 3, "provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"rank": 4, "provider": "gemini", "model": "gemini-2.5-flash-lite"},
 ]
 
 INTRADAY_PROVIDERS: List[Dict[str, Any]] = [
     # Reasoning-heavy path first for intraday. Every model below passed a live API check.
-    {"rank": 1, "provider": "groq",     "model": "moonshotai/kimi-k2-instruct-0905"},
-    {"rank": 2, "provider": "groq",     "model": "llama-3.3-70b-versatile"},
-    {"rank": 3, "provider": "gemini",   "model": "gemini-2.5-flash-lite"},
+    {"rank": 1, "provider": "groq", "model": "moonshotai/kimi-k2-instruct-0905"},
+    {"rank": 2, "provider": "groq", "model": "llama-3.3-70b-versatile"},
+    {"rank": 3, "provider": "gemini", "model": "gemini-2.5-flash-lite"},
 ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Utility functions
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def expand_model_candidates(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     expanded: List[Dict[str, Any]] = []
@@ -98,18 +115,26 @@ def expand_model_candidates(items: Sequence[Dict[str, Any]]) -> List[Dict[str, A
             continue
         if item.get("model"):
             candidate = {
-                "rank":     int(item.get("rank") or next_rank),
+                "rank": int(item.get("rank") or next_rank),
                 "provider": provider_name,
-                "model":    str(item.get("model") or ""),
+                "model": str(item.get("model") or ""),
             }
             expanded.append(candidate)
             next_rank = max(next_rank, int(candidate["rank"]) + 1)
             continue
         for model in list(item.get("models") or []):
-            expanded.append({"rank": next_rank, "provider": provider_name, "model": str(model)})
+            expanded.append(
+                {"rank": next_rank, "provider": provider_name, "model": str(model)}
+            )
             next_rank += 1
 
-    expanded.sort(key=lambda row: (int(row.get("rank") or 9999), str(row.get("provider") or ""), str(row.get("model") or "")))
+    expanded.sort(
+        key=lambda row: (
+            int(row.get("rank") or 9999),
+            str(row.get("provider") or ""),
+            str(row.get("model") or ""),
+        )
+    )
     return expanded
 
 
@@ -118,7 +143,7 @@ def _candidate_key(provider_name: str, model: str) -> str:
 
 
 def _candidate_disabled_reason(provider_name: str, model: str) -> Optional[str]:
-    key      = _candidate_key(provider_name, model)
+    key = _candidate_key(provider_name, model)
     disabled = _DISABLED_CANDIDATES.get(key)
     if not disabled:
         return None
@@ -130,8 +155,16 @@ def _candidate_disabled_reason(provider_name: str, model: str) -> Optional[str]:
 
 
 def _mark_candidate_unavailable(provider_name: str, model: str, reason: str) -> None:
-    _DISABLED_CANDIDATES[_candidate_key(provider_name, model)] = (time.time() + _DISABLE_TTL_SEC, reason)
-    log.warning("candidate_disabled provider=%s model=%s reason=%s", provider_name, model, reason)
+    _DISABLED_CANDIDATES[_candidate_key(provider_name, model)] = (
+        time.time() + _DISABLE_TTL_SEC,
+        reason,
+    )
+    log.warning(
+        "candidate_disabled provider=%s model=%s reason=%s",
+        provider_name,
+        model,
+        reason,
+    )
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -153,7 +186,7 @@ def clean_json(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     cleaned = cleaned.replace("```json", "").replace("```", "").strip()
     start = cleaned.find("{")
-    end   = cleaned.rfind("}")
+    end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         return cleaned[start : end + 1]
     return cleaned
@@ -182,7 +215,11 @@ def parse_json_obj(text: str) -> Optional[Dict[str, Any]]:
 
 def _strip_unsupported_schema_keys(node: Any) -> Any:
     if isinstance(node, dict):
-        return {k: _strip_unsupported_schema_keys(v) for k, v in node.items() if k not in {"minLength"}}
+        return {
+            k: _strip_unsupported_schema_keys(v)
+            for k, v in node.items()
+            if k not in {"minLength"}
+        }
     if isinstance(node, list):
         return [_strip_unsupported_schema_keys(item) for item in node]
     return node
@@ -198,35 +235,47 @@ def action_short_for_signal(signal: str) -> str:
 
 
 def normalize_signal(result: Dict[str, Any], close: Optional[float]) -> Dict[str, Any]:
-    signal     = str(result.get("signal") or "HOLD").upper().strip()
+    signal = str(result.get("signal") or "HOLD").upper().strip()
     if signal not in ("BUY", "SELL", "HOLD"):
         signal = "HOLD"
-    confidence  = clamp(float(safe_float(result.get("confidence")) or 0.0), 0.0, 1.0)
-    entry       = safe_float(result.get("entry"))
-    stop_loss   = safe_float(result.get("stop_loss"))
+    confidence = clamp(float(safe_float(result.get("confidence")) or 0.0), 0.0, 1.0)
+    entry = safe_float(result.get("entry"))
+    stop_loss = safe_float(result.get("stop_loss"))
     take_profit = safe_float(result.get("take_profit"))
-    reason      = str(result.get("reason") or "AI reasoning unavailable").strip()
-    action_short = str(result.get("action_short") or action_short_for_signal(signal)).strip()
+    reason = str(result.get("reason") or "AI reasoning unavailable").strip()
+    action_short = str(
+        result.get("action_short") or action_short_for_signal(signal)
+    ).strip()
     if action_short not in (ACTION_BUY, ACTION_SELL, ACTION_HOLD):
         action_short = action_short_for_signal(signal)
     return {
-        "signal":       signal,
-        "confidence":   round(confidence, 2),
-        "entry":        float(entry)       if entry       is not None else (float(close) if close is not None else None),
-        "stop_loss":    float(stop_loss)   if stop_loss   is not None else None,
-        "take_profit":  float(take_profit) if take_profit is not None else None,
-        "reason":       reason,
+        "signal": signal,
+        "confidence": round(confidence, 2),
+        "entry": (
+            float(entry)
+            if entry is not None
+            else (float(close) if close is not None else None)
+        ),
+        "stop_loss": float(stop_loss) if stop_loss is not None else None,
+        "take_profit": float(take_profit) if take_profit is not None else None,
+        "reason": reason,
         "action_short": action_short,
     }
 
 
-def http_post_json(url: str, body: Dict[str, Any], headers: Dict[str, str], timeout: int) -> Tuple[int, str]:
-    data    = json.dumps(body).encode("utf-8")
+def http_post_json(
+    url: str, body: Dict[str, Any], headers: Dict[str, str], timeout: int
+) -> Tuple[int, str]:
+    data = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     context = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(request, timeout=int(timeout), context=context) as response:
-            return int(getattr(response, "status", 200)), response.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(
+            request, timeout=int(timeout), context=context
+        ) as response:
+            return int(getattr(response, "status", 200)), response.read().decode(
+                "utf-8", errors="replace"
+            )
     except urllib.error.HTTPError as exc:
         try:
             body_text = exc.read().decode("utf-8", errors="replace")
@@ -250,6 +299,7 @@ def _env_first(*keys: str) -> str:
 #  Provider implementations
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _parse_openai_compatible_response(raw: str) -> Optional[Dict[str, Any]]:
     payload = parse_json_obj(raw)
     if not payload:
@@ -272,7 +322,9 @@ def _parse_openai_compatible_response(raw: str) -> Optional[Dict[str, Any]]:
     return parse_json_obj(text)
 
 
-def _invoke_gemini(prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]) -> Dict[str, Any]:
+def _invoke_gemini(
+    prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]
+) -> Dict[str, Any]:
     api_key = _env_first("GEMINI_AI_API_KEY", "GOOGLE_API_KEY")
     if not api_key:
         log.warning("gemini_missing_api_key")
@@ -282,14 +334,14 @@ def _invoke_gemini(prompt: str, model: str, timeout: int, max_retries: int, clos
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature":   0.0,
+            "temperature": 0.0,
             "maxOutputTokens": 2048,
-            "thinkingConfig":  {"thinkingBudget": 0},
+            "thinkingConfig": {"thinkingBudget": 0},
             "responseMimeType": "application/json",
             "responseJsonSchema": SIGNAL_SCHEMA,
         },
     }
-    headers    = {"Content-Type": "application/json", "User-Agent": "AiBot/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "AiBot/1.0"}
     last_error = "retry_exhausted"
 
     for attempt in range(max_retries + 1):
@@ -300,15 +352,22 @@ def _invoke_gemini(prompt: str, model: str, timeout: int, max_retries: int, clos
         if status != 200:
             log.debug("gemini_http_error model=%s status=%s", model, status)
             return {"ok": False, "error": f"http_{status}: {clean_json(raw)[:220]}"}
-        payload    = parse_json_obj(raw)
+        payload = parse_json_obj(raw)
         if not payload:
             return {"ok": False, "error": "invalid_json_payload"}
         candidates = payload.get("candidates") or []
         if not candidates:
             return {"ok": False, "error": "empty_candidates"}
         parts_list = (((candidates[0] or {}).get("content") or {}).get("parts")) or []
-        text = next((str(item.get("text")) for item in parts_list if isinstance(item, dict) and item.get("text")), "")
-        obj  = parse_json_obj(text)
+        text = next(
+            (
+                str(item.get("text"))
+                for item in parts_list
+                if isinstance(item, dict) and item.get("text")
+            ),
+            "",
+        )
+        obj = parse_json_obj(text)
         if not obj:
             last_error = f"invalid_json_message: {clean_json(text)[:220]}"
             log.debug("gemini_invalid_json model=%s", model)
@@ -318,26 +377,28 @@ def _invoke_gemini(prompt: str, model: str, timeout: int, max_retries: int, clos
     return {"ok": False, "error": last_error}
 
 
-def _invoke_openrouter(prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]) -> Dict[str, Any]:
+def _invoke_openrouter(
+    prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]
+) -> Dict[str, Any]:
     api_key = _env_first("OPENROUTER_API_KEY", "OPEN_ROUTER")
     if not api_key:
         log.warning("openrouter_missing_api_key")
         return {"ok": False, "error": "missing_api_key"}
 
-    url  = "https://openrouter.ai/api/v1/chat/completions"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     body = {
-        "model":           model,
-        "messages":        [{"role": "user", "content": prompt}],
-        "temperature":     0.0,
-        "max_tokens":      1200,
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": 1200,
         "response_format": {"type": "json_object"},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://localhost",
-        "X-Title":       "InstitutionalAiBot",
-        "User-Agent":    "AiBot/1.0",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://localhost",
+        "X-Title": "InstitutionalAiBot",
+        "User-Agent": "AiBot/1.0",
     }
     last_error = "retry_exhausted"
     for attempt in range(max_retries + 1):
@@ -359,37 +420,45 @@ def _invoke_openrouter(prompt: str, model: str, timeout: int, max_retries: int, 
 
 
 def _invoke_groq(
-    prompt: str, model: str, timeout: int, max_retries: int,
-    close: Optional[float], schema_name: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    max_retries: int,
+    close: Optional[float],
+    schema_name: str,
 ) -> Dict[str, Any]:
     api_key = _env_first("GROQ_AI_API_KEY")
     if not api_key:
         log.warning("groq_missing_api_key")
         return {"ok": False, "error": "missing_api_key"}
 
-    url     = "https://api.groq.com/openai/v1/chat/completions"
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-        "User-Agent":    "AiBot/1.0",
+        "Content-Type": "application/json",
+        "User-Agent": "AiBot/1.0",
     }
     # Try strict JSON schema first, then plain JSON object
     bodies = [
         {
             "model": model,
-            "messages":    [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens":  1200,
+            "max_tokens": 1200,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": schema_name, "strict": True, "schema": SIGNAL_SCHEMA},
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": SIGNAL_SCHEMA,
+                },
             },
         },
         {
             "model": model,
-            "messages":    [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens":  1200,
+            "max_tokens": 1200,
             "response_format": {"type": "json_object"},
         },
     ]
@@ -403,8 +472,11 @@ def _invoke_groq(
             if status != 200:
                 last_error = f"http_{status}: {clean_json(raw)[:220]}"
                 log.debug("groq_http_error model=%s status=%s", model, status)
-                if status == 400 and "does not support response format `json_schema`" in raw:
-                    break   # fall through to json_object body
+                if (
+                    status == 400
+                    and "does not support response format `json_schema`" in raw
+                ):
+                    break  # fall through to json_object body
                 return {"ok": False, "error": last_error}
             obj = _parse_openai_compatible_response(raw)
             if not obj:
@@ -416,34 +488,40 @@ def _invoke_groq(
     return {"ok": False, "error": last_error}
 
 
-def _invoke_cerebras(prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]) -> Dict[str, Any]:
+def _invoke_cerebras(
+    prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]
+) -> Dict[str, Any]:
     api_key = _env_first("CEREBRAS_AI_API_KEY")
     if not api_key:
         log.warning("cerebras_missing_api_key")
         return {"ok": False, "error": "missing_api_key"}
 
-    url     = "https://api.cerebras.ai/v1/chat/completions"
+    url = "https://api.cerebras.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type":  "application/json",
-        "User-Agent":    "AiBot/1.0",
+        "Content-Type": "application/json",
+        "User-Agent": "AiBot/1.0",
     }
     bodies = [
         {
             "model": model,
-            "messages":    [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens":  1400,
+            "max_tokens": 1400,
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "trade_signal", "strict": True, "schema": _strip_unsupported_schema_keys(SIGNAL_SCHEMA)},
+                "json_schema": {
+                    "name": "trade_signal",
+                    "strict": True,
+                    "schema": _strip_unsupported_schema_keys(SIGNAL_SCHEMA),
+                },
             },
         },
         {
             "model": model,
-            "messages":    [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens":  900,
+            "max_tokens": 900,
             "response_format": {"type": "json_object"},
         },
     ]
@@ -457,7 +535,10 @@ def _invoke_cerebras(prompt: str, model: str, timeout: int, max_retries: int, cl
             if status != 200:
                 log.debug("cerebras_http_error model=%s status=%s", model, status)
                 last_error = f"http_{status}: {clean_json(raw)[:220]}"
-                if status in (400, 422) and ("response format" in raw.lower() or "wrong_api_format" in raw.lower()):
+                if status in (400, 422) and (
+                    "response format" in raw.lower()
+                    or "wrong_api_format" in raw.lower()
+                ):
                     break
                 if status == 429:
                     break
@@ -476,26 +557,29 @@ def _invoke_cerebras(prompt: str, model: str, timeout: int, max_retries: int, cl
 #  Provider dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def invoke_provider(
     provider_name: str,
-    model:         str,
-    prompt:        str,
-    timeout:       int,
-    max_retries:   int,
-    close:         Optional[float],
-    schema_name:   str,
+    model: str,
+    prompt: str,
+    timeout: int,
+    max_retries: int,
+    close: Optional[float],
+    schema_name: str,
 ) -> Dict[str, Any]:
-    started       = time.perf_counter()
+    started = time.perf_counter()
     provider_name = str(provider_name or "").strip().lower()
     disabled_reason = _candidate_disabled_reason(provider_name, model)
     if disabled_reason:
         return {
-            "ok":               False,
-            "error":            f"candidate_disabled: {disabled_reason}",
-            "provider":         provider_name,
-            "provider_display": PROVIDER_DISPLAY_NAMES.get(provider_name, provider_name.title()),
-            "model":            model,
-            "latency_ms":       0,
+            "ok": False,
+            "error": f"candidate_disabled: {disabled_reason}",
+            "provider": provider_name,
+            "provider_display": PROVIDER_DISPLAY_NAMES.get(
+                provider_name, provider_name.title()
+            ),
+            "model": model,
+            "latency_ms": 0,
         }
 
     if provider_name == "gemini":
@@ -509,10 +593,12 @@ def invoke_provider(
     else:
         response = {"ok": False, "error": f"unsupported_provider[{provider_name}]"}
 
-    response["provider"]         = provider_name
-    response["provider_display"] = PROVIDER_DISPLAY_NAMES.get(provider_name, provider_name.title())
-    response["model"]            = model
-    response["latency_ms"]       = int((time.perf_counter() - started) * 1000)
+    response["provider"] = provider_name
+    response["provider_display"] = PROVIDER_DISPLAY_NAMES.get(
+        provider_name, provider_name.title()
+    )
+    response["model"] = model
+    response["latency_ms"] = int((time.perf_counter() - started) * 1000)
 
     error_text = str(response.get("error") or "")
     if (
@@ -527,12 +613,17 @@ def invoke_provider(
     if response.get("ok"):
         log.info(
             "provider_ok provider=%s model=%s latency_ms=%s",
-            provider_name, model, response["latency_ms"],
+            provider_name,
+            model,
+            response["latency_ms"],
         )
     else:
         log.warning(
             "provider_fail provider=%s model=%s error=%s latency_ms=%s",
-            provider_name, model, error_text[:120], response["latency_ms"],
+            provider_name,
+            model,
+            error_text[:120],
+            response["latency_ms"],
         )
     return response
 
@@ -541,14 +632,15 @@ def invoke_provider(
 #  Chain runner
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def run_provider_chain(
-    providers:           Sequence[Dict[str, Any]],
-    prompt:              str,
-    schema_name:         str,
-    close:               Optional[float],
-    timeout_budget_sec:  float,
+    providers: Sequence[Dict[str, Any]],
+    prompt: str,
+    schema_name: str,
+    close: Optional[float],
+    timeout_budget_sec: float,
     timeout_per_call_sec: int,
-    max_retries:         int,
+    max_retries: int,
     actionable_confidence_floor: float = 0.70,
     hold_confidence_cutoff: float = 0.85,
 ) -> Optional[Dict[str, Any]]:
@@ -556,7 +648,9 @@ def run_provider_chain(
     best_hold: Optional[Dict[str, Any]] = None
     best_directional: Optional[Dict[str, Any]] = None
     for candidate in expand_model_candidates(providers):
-        remaining = int(max(1.0, min(float(timeout_per_call_sec), deadline - time.time())))
+        remaining = int(
+            max(1.0, min(float(timeout_per_call_sec), deadline - time.time()))
+        )
         if time.time() >= deadline:
             log.warning("provider_chain_deadline_exceeded schema=%s", schema_name)
             break
@@ -571,66 +665,92 @@ def run_provider_chain(
         )
         if attempt.get("ok"):
             result = dict(attempt["result"])
-            result["provider"]         = str(candidate.get("provider") or "")
+            result["provider"] = str(candidate.get("provider") or "")
             result["provider_display"] = attempt["provider_display"]
-            result["model"]            = str(candidate.get("model") or "")
-            result["model_rank"]       = int(candidate.get("rank") or 0)
-            result["latency_ms"]       = int(attempt["latency_ms"])
+            result["model"] = str(candidate.get("model") or "")
+            result["model_rank"] = int(candidate.get("rank") or 0)
+            result["latency_ms"] = int(attempt["latency_ms"])
             signal = str(result.get("signal") or "HOLD").upper()
             confidence = float(result.get("confidence") or 0.0)
 
             if signal in ("BUY", "SELL"):
-                if best_directional is None or confidence > float(best_directional.get("confidence") or 0.0):
+                if best_directional is None or confidence > float(
+                    best_directional.get("confidence") or 0.0
+                ):
                     best_directional = result
                 if confidence >= float(actionable_confidence_floor):
                     log.info(
                         "chain_selected rank=%s provider=%s model=%s latency_ms=%s signal=%s conf=%.2f",
-                        result["model_rank"], result["provider"], result["model"],
-                        result["latency_ms"], signal, confidence,
+                        result["model_rank"],
+                        result["provider"],
+                        result["model"],
+                        result["latency_ms"],
+                        signal,
+                        confidence,
                     )
                     return result
                 log.info(
                     "chain_directional_below_floor rank=%s provider=%s model=%s signal=%s conf=%.2f floor=%.2f",
-                    result["model_rank"], result["provider"], result["model"],
-                    signal, confidence, float(actionable_confidence_floor),
+                    result["model_rank"],
+                    result["provider"],
+                    result["model"],
+                    signal,
+                    confidence,
+                    float(actionable_confidence_floor),
                 )
                 continue
 
-            if best_hold is None or confidence > float(best_hold.get("confidence") or 0.0):
+            if best_hold is None or confidence > float(
+                best_hold.get("confidence") or 0.0
+            ):
                 best_hold = result
             if confidence >= float(hold_confidence_cutoff):
                 log.info(
                     "chain_selected_hold rank=%s provider=%s model=%s latency_ms=%s conf=%.2f",
-                    result["model_rank"], result["provider"], result["model"],
-                    result["latency_ms"], confidence,
+                    result["model_rank"],
+                    result["provider"],
+                    result["model"],
+                    result["latency_ms"],
+                    confidence,
                 )
                 return result
             log.info(
                 "chain_soft_hold_continue rank=%s provider=%s model=%s conf=%.2f cutoff=%.2f",
-                result["model_rank"], result["provider"], result["model"],
-                confidence, float(hold_confidence_cutoff),
+                result["model_rank"],
+                result["provider"],
+                result["model"],
+                confidence,
+                float(hold_confidence_cutoff),
             )
 
-    if best_hold is not None and float(best_hold.get("confidence") or 0.0) >= float(hold_confidence_cutoff):
+    if best_hold is not None and float(best_hold.get("confidence") or 0.0) >= float(
+        hold_confidence_cutoff
+    ):
         log.info(
             "chain_selected_hold_fallback rank=%s provider=%s model=%s conf=%.2f",
-            best_hold.get("model_rank"), best_hold.get("provider"),
-            best_hold.get("model"), float(best_hold.get("confidence") or 0.0),
+            best_hold.get("model_rank"),
+            best_hold.get("provider"),
+            best_hold.get("model"),
+            float(best_hold.get("confidence") or 0.0),
         )
         return best_hold
     if best_directional is not None:
         log.info(
             "chain_selected_best_directional rank=%s provider=%s model=%s signal=%s conf=%.2f",
-            best_directional.get("model_rank"), best_directional.get("provider"),
-            best_directional.get("model"), best_directional.get("signal"),
+            best_directional.get("model_rank"),
+            best_directional.get("provider"),
+            best_directional.get("model"),
+            best_directional.get("signal"),
             float(best_directional.get("confidence") or 0.0),
         )
         return best_directional
     if best_hold is not None:
         log.info(
             "chain_selected_best_hold rank=%s provider=%s model=%s conf=%.2f",
-            best_hold.get("model_rank"), best_hold.get("provider"),
-            best_hold.get("model"), float(best_hold.get("confidence") or 0.0),
+            best_hold.get("model_rank"),
+            best_hold.get("provider"),
+            best_hold.get("model"),
+            float(best_hold.get("confidence") or 0.0),
         )
         return best_hold
 
@@ -642,13 +762,14 @@ def run_provider_chain(
 #  Diagnostics runner
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def run_provider_diagnostics(
-    providers:            Sequence[Dict[str, Any]],
-    prompt:               str,
-    schema_name:          str,
-    close:                Optional[float],
+    providers: Sequence[Dict[str, Any]],
+    prompt: str,
+    schema_name: str,
+    close: Optional[float],
     timeout_per_call_sec: int,
-    max_retries:          int,
+    max_retries: int,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for candidate in expand_model_candidates(providers):
@@ -662,32 +783,38 @@ def run_provider_diagnostics(
             schema_name=schema_name,
         )
         if attempt.get("ok"):
-            results.append({
-                "rank":             int(candidate.get("rank") or 0),
-                "provider":         str(candidate.get("provider") or ""),
-                "provider_display": attempt["provider_display"],
-                "ok":               True,
-                "model":            str(candidate.get("model") or ""),
-                "latency_ms":       int(attempt["latency_ms"]),
-                "signal":           attempt["result"]["signal"],
-                "confidence":       attempt["result"]["confidence"],
-                "failures":         [],
-            })
+            results.append(
+                {
+                    "rank": int(candidate.get("rank") or 0),
+                    "provider": str(candidate.get("provider") or ""),
+                    "provider_display": attempt["provider_display"],
+                    "ok": True,
+                    "model": str(candidate.get("model") or ""),
+                    "latency_ms": int(attempt["latency_ms"]),
+                    "signal": attempt["result"]["signal"],
+                    "confidence": attempt["result"]["confidence"],
+                    "failures": [],
+                }
+            )
         else:
-            results.append({
-                "rank":             int(candidate.get("rank") or 0),
-                "provider":         str(candidate.get("provider") or ""),
-                "provider_display": PROVIDER_DISPLAY_NAMES.get(
-                    str(candidate.get("provider") or ""),
-                    str(candidate.get("provider") or "").title(),
-                ),
-                "ok":         False,
-                "model":      str(candidate.get("model") or ""),
-                "latency_ms": int(attempt.get("latency_ms") or 0),
-                "failures":   [{
-                    "model":      str(candidate.get("model") or ""),
-                    "error":      str(attempt.get("error") or "unknown_error"),
+            results.append(
+                {
+                    "rank": int(candidate.get("rank") or 0),
+                    "provider": str(candidate.get("provider") or ""),
+                    "provider_display": PROVIDER_DISPLAY_NAMES.get(
+                        str(candidate.get("provider") or ""),
+                        str(candidate.get("provider") or "").title(),
+                    ),
+                    "ok": False,
+                    "model": str(candidate.get("model") or ""),
                     "latency_ms": int(attempt.get("latency_ms") or 0),
-                }],
-            })
+                    "failures": [
+                        {
+                            "model": str(candidate.get("model") or ""),
+                            "error": str(attempt.get("error") or "unknown_error"),
+                            "latency_ms": int(attempt.get("latency_ms") or 0),
+                        }
+                    ],
+                }
+            )
     return results

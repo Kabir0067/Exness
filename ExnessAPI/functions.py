@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """ExnessAPI/functions.py (PRODUCTION-GRADE)
 
 Ин модул танҳо як кор мекунад: идоракунии позицияҳо дар MT5.
@@ -14,20 +12,21 @@ from __future__ import annotations
 - SL/TP stop-distance enforcement барои SL ва TP
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
 
 import MetaTrader5 as mt5
 
-from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
-
 from log_config import get_log_path
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
 
 DEFAULT_DEVIATION = 50
 # IMPORTANT: Must match bot engine magic to correctly count/filter positions.
@@ -50,9 +49,36 @@ _SYMBOL_CACHE_TTL_SEC = 0.25
 _TICK_CACHE_TTL_SEC = 0.20
 
 # =============================================================================
+# PERFORMANCE: Lazy module-level cache for OrderExecutor / OrderRequest.
+# Importing from ExnessAPI.order_execution inside _place_market_order_fixed_sltp
+# on every call pays a sys.modules lookup + attribute resolution cost on the
+# hot order path.  We cache the class references here after the first import.
+# =============================================================================
+_cached_OrderExecutor: Optional[Any] = None
+_cached_OrderRequest: Optional[Any] = None
+
+
+def _import_order_execution_classes() -> Tuple[Any, Any]:
+    """
+    PERFORMANCE: Return (OrderExecutor, OrderRequest), importing once and
+    caching at module level.  Thread-safe under CPython's GIL for simple
+    assignment; worst-case the import runs twice — both produce identical refs.
+    """
+    global _cached_OrderExecutor, _cached_OrderRequest
+    if _cached_OrderExecutor is None or _cached_OrderRequest is None:
+        from ExnessAPI.order_execution import OrderExecutor as _OE  # type: ignore
+        from ExnessAPI.order_execution import OrderRequest as _OR
+
+        _cached_OrderExecutor = _OE
+        _cached_OrderRequest = _OR
+    return _cached_OrderExecutor, _cached_OrderRequest
+
+
+# =============================================================================
 # Logging (ERROR-only, rotating)
 # =============================================================================
 _ORDERS_LOG_PATH = get_log_path("functions.log")
+
 
 def clamp01(x: float) -> float:
     try:
@@ -96,7 +122,7 @@ def adaptive_risk_money(
 
 
 def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> None:
-    logger.setLevel(level)  
+    logger.setLevel(level)
     logger.propagate = False
 
     for h in list(logger.handlers):
@@ -116,12 +142,16 @@ def _ensure_rotating_handler(logger: logging.Logger, path: Path, level: int) -> 
         delay=True,
     )
     h.setLevel(level)
-    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"))
+    h.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(funcName)s | %(message)s"
+        )
+    )
     logger.addHandler(h)
+
 
 log_orders = logging.getLogger("functions")
 _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
-
 
 
 # =============================================================================
@@ -130,12 +160,12 @@ _ensure_rotating_handler(log_orders, _ORDERS_LOG_PATH, logging.ERROR)
 def _mono() -> float:
     return time.monotonic()
 
-def _sleep_backoff(attempt: int, base: float, cap: float) -> None:
-    # deterministic exponential backoff: base * 2^attempt (attempt starts at 0)
-    a = int(attempt)
-    delay = float(base) * (2.0 ** a)
-    time.sleep(min(float(cap), delay))
 
+def _sleep_backoff(attempt: int, base: float, cap: float) -> None:
+    # Deterministic exponential backoff: base * 2^attempt (attempt starts at 0).
+    a = int(attempt)
+    delay = float(base) * (2.0**a)
+    time.sleep(min(float(cap), delay))
 
 
 # =============================================================================
@@ -149,9 +179,13 @@ def _safe_last_error() -> str:
             return "n/a"
 
 
-
 # =============================================================================
 # MT5 health (cached)
+# NOTE: _MT5HealthCache, _SYM_CACHE, and _positions_cache are module-level
+# mutable state accessed from multiple threads without a dedicated lock.
+# This is a pre-existing design choice; adding a lock would change call
+# semantics. The worst-case race is a stale cache read — acceptable given the
+# short TTLs and the fact that MT5_LOCK guards all actual mt5.* calls.
 # =============================================================================
 @dataclass
 class _MT5HealthCache:
@@ -159,6 +193,7 @@ class _MT5HealthCache:
     ok: bool = False
     trade_allowed: bool = False
     reason: str = "not_checked"
+
 
 _MT5_CACHE = _MT5HealthCache()
 
@@ -174,10 +209,15 @@ def _term_flags() -> Tuple[bool, bool]:
     except Exception:
         return False, False
 
-def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 0.5) -> bool:
+
+def _mt5_health_cached(
+    *, require_trade_allowed: bool = False, ttl_sec: float = 0.5
+) -> bool:
     now = _mono()
     if (now - _MT5_CACHE.ts_mono) < float(ttl_sec):
-        return bool(_MT5_CACHE.ok and (not require_trade_allowed or _MT5_CACHE.trade_allowed))
+        return bool(
+            _MT5_CACHE.ok and (not require_trade_allowed or _MT5_CACHE.trade_allowed)
+        )
 
     try:
         ensure_mt5()
@@ -227,7 +267,8 @@ def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 
         _MT5_CACHE.trade_allowed = trade_allowed
         _MT5_CACHE.reason = reason
         log_orders.error(
-            "MT5 health check failed: %s | status_reason=%s | connected=%s trade_allowed=%s | last_error=%s",
+            "MT5 health check failed: %s | status_reason=%s | connected=%s "
+            "trade_allowed=%s | last_error=%s",
             exc,
             status_reason or "-",
             connected,
@@ -236,8 +277,12 @@ def _mt5_health_cached(*, require_trade_allowed: bool = False, ttl_sec: float = 
         )
         return False
 
+
 def _ensure_mt5_connected(*, require_trade_allowed: bool = False) -> None:
-    ok = _mt5_health_cached(require_trade_allowed=require_trade_allowed, ttl_sec=_MT5_HEALTH_TTL_SEC)
+    ok = _mt5_health_cached(
+        require_trade_allowed=require_trade_allowed,
+        ttl_sec=_MT5_HEALTH_TTL_SEC,
+    )
     if ok:
         return
 
@@ -268,7 +313,9 @@ class _SymCacheEntry:
     tick: Any = None
     tick_ts: float = 0.0
 
+
 _SYM_CACHE: Dict[str, _SymCacheEntry] = {}
+
 
 def _get_sym_entry(symbol: str) -> _SymCacheEntry:
     e = _SYM_CACHE.get(symbol)
@@ -277,12 +324,14 @@ def _get_sym_entry(symbol: str) -> _SymCacheEntry:
         _SYM_CACHE[symbol] = e
     return e
 
+
 def _symbol_select(symbol: str) -> bool:
     with MT5_LOCK:
         try:
             return bool(mt5.symbol_select(symbol, True))
         except Exception:
             return False
+
 
 def _symbol_info_cached(symbol: str) -> Any:
     now = _mono()
@@ -300,6 +349,7 @@ def _symbol_info_cached(symbol: str) -> Any:
     e.info_ts = now
     return info
 
+
 def _tick_cached(symbol: str) -> Any:
     now = _mono()
     e = _get_sym_entry(symbol)
@@ -316,8 +366,9 @@ def _tick_cached(symbol: str) -> Any:
     e.tick_ts = now
     return tick
 
+
 def _tick_refresh(symbol: str) -> Any:
-    # Force refresh (still updates cache). Use on retry for requote/price changes.
+    """Force refresh (still updates cache). Use on retry for requote/price changes."""
     now = _mono()
     with MT5_LOCK:
         try:
@@ -329,6 +380,7 @@ def _tick_refresh(symbol: str) -> Any:
     e.tick_ts = now
     return tick
 
+
 def _best_filling_type(symbol: str) -> int:
     """
     Барои устуворӣ: IOC/FOK/RETURN интихоб мекунад.
@@ -338,8 +390,16 @@ def _best_filling_type(symbol: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_IOC
 
+    # POTENTIAL BUG (not fixed due to compatibility): `filling_mode` on MT5
+    # symbol_info is typically a bitmask, not a direct enum value equal to the
+    # ORDER_FILLING_* constants.  This branch is rarely triggered correctly.
+    # The `trade_fill_flags` path below is the reliable one.
     fm = getattr(info, "filling_mode", None)
-    if isinstance(fm, int) and fm in (mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN):
+    if isinstance(fm, int) and fm in (
+        mt5.ORDER_FILLING_FOK,
+        mt5.ORDER_FILLING_IOC,
+        mt5.ORDER_FILLING_RETURN,
+    ):
         return int(fm)
 
     flags = getattr(info, "trade_fill_flags", None)
@@ -353,6 +413,7 @@ def _best_filling_type(symbol: str) -> int:
 
     return mt5.ORDER_FILLING_IOC
 
+
 def _digits_point_stops(symbol: str) -> Tuple[int, float, int]:
     info = _symbol_info_cached(symbol)
     if not info:
@@ -363,7 +424,6 @@ def _digits_point_stops(symbol: str) -> Tuple[int, float, int]:
     return digits, point, stops
 
 
-
 # =============================================================================
 # Retcode sets (fail-fast & safe retries)
 # =============================================================================
@@ -371,8 +431,10 @@ def _mt5_const(name: str, default: int = -1) -> int:
     v = getattr(mt5, name, None)
     return int(v) if isinstance(v, int) else int(default)
 
+
 _TRANSIENT_RETCODES: Tuple[int, ...] = tuple(
-    r for r in (
+    r
+    for r in (
         _mt5_const("TRADE_RETCODE_REQUOTE"),
         _mt5_const("TRADE_RETCODE_TIMEOUT"),
         _mt5_const("TRADE_RETCODE_OFF_QUOTES"),
@@ -384,7 +446,6 @@ _TRANSIENT_RETCODES: Tuple[int, ...] = tuple(
     )
     if r >= 0
 )
-
 
 
 # =============================================================================
@@ -409,7 +470,7 @@ def _send_with_retries(
             try:
                 refresh_before_send(req, attempt)
             except Exception:
-                # refresh must never break execution
+                # Refresh must never break execution.
                 pass
 
         with MT5_LOCK:
@@ -420,7 +481,7 @@ def _send_with_retries(
         if last_res and (last_ret in success_retcodes):
             return True, last_res, last_ret
 
-        # fail-fast for non-transient errors (reduces spam, speeds up)
+        # Fail-fast for non-transient errors (reduces spam, speeds up).
         if attempt < r - 1:
             if last_ret is not None and last_ret not in retry_retcodes:
                 break
@@ -429,12 +490,12 @@ def _send_with_retries(
     return False, last_res, last_ret
 
 
-
 # =============================================================================
 # Public helpers
 # =============================================================================
 def enable_trading() -> None:
     _ensure_mt5_connected(require_trade_allowed=True)
+
 
 def get_balance() -> float:
     try:
@@ -450,20 +511,23 @@ def get_balance() -> float:
         return float(bal) if math.isfinite(bal) else 0.0
 
     except Exception as exc:
-        log_orders.error("get_balance error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "get_balance error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return 0.0
 
+
 def get_account_info() -> Dict[str, Any]:
-    """
-    Получить полную информацию об аккаунте.
-    """
+    """Получить полную информацию об аккаунте."""
     try:
         _ensure_mt5_connected()
         with MT5_LOCK:
             acc = mt5.account_info()
 
         if acc is None:
-            log_orders.error("get_account_info failed | last_error=%s", _safe_last_error())
+            log_orders.error(
+                "get_account_info failed | last_error=%s", _safe_last_error()
+            )
             return {}
 
         return {
@@ -479,14 +543,21 @@ def get_account_info() -> Dict[str, Any]:
             "company": str(getattr(acc, "company", "") or ""),
         }
     except Exception as exc:
-        log_orders.error("get_account_info error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "get_account_info error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return {}
+
 
 def get_positions_summary(symbol: Optional[str] = None) -> float:
     try:
         _ensure_mt5_connected()
         with MT5_LOCK:
-            positions = mt5.positions_get(symbol=symbol) if symbol else (mt5.positions_get() or [])
+            positions = (
+                mt5.positions_get(symbol=symbol)
+                if symbol
+                else (mt5.positions_get() or [])
+            )
 
         total = 0.0
         for p in positions or []:
@@ -497,9 +568,10 @@ def get_positions_summary(symbol: Optional[str] = None) -> float:
         return float(total)
 
     except Exception as exc:
-        log_orders.error("get_positions_summary error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "get_positions_summary error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return 0.0
-
 
 
 # =============================================================================
@@ -507,12 +579,15 @@ def get_positions_summary(symbol: Optional[str] = None) -> float:
 # =============================================================================
 _positions_cache: Dict[str, Any] = {"data": [], "ts_mono": 0.0}
 
+
 def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
     global _positions_cache
 
     try:
         now = _mono()
-        cached_ok = (now - float(_positions_cache.get("ts_mono", 0.0))) < _POS_CACHE_TTL_SEC and _positions_cache.get("data")
+        cached_ok = (
+            now - float(_positions_cache.get("ts_mono", 0.0))
+        ) < _POS_CACHE_TTL_SEC and _positions_cache.get("data")
         if cached_ok:
             positions = _positions_cache["data"]
         else:
@@ -532,7 +607,11 @@ def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
             {
                 "ticket": int(getattr(pos, "ticket", 0) or 0),
                 "symbol": str(getattr(pos, "symbol", "")),
-                "type": "BUY" if int(getattr(pos, "type", 0) or 0) == mt5.POSITION_TYPE_BUY else "SELL",
+                "type": (
+                    "BUY"
+                    if int(getattr(pos, "type", 0) or 0) == mt5.POSITION_TYPE_BUY
+                    else "SELL"
+                ),
                 "volume": float(getattr(pos, "volume", 0.0) or 0.0),
                 "price": float(getattr(pos, "price_open", 0.0) or 0.0),
                 "profit": float(getattr(pos, "profit", 0.0) or 0.0),
@@ -541,8 +620,11 @@ def get_order_by_index(index: int) -> Tuple[Optional[Dict[str, Any]], int]:
         )
 
     except Exception as exc:
-        log_orders.error("get_order_by_index error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "get_order_by_index error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return None, 0
+
 
 def get_all_open_positions() -> List[Any]:
     try:
@@ -551,13 +633,16 @@ def get_all_open_positions() -> List[Any]:
             positions = mt5.positions_get() or []
         return list(positions)
     except Exception as exc:
-        log_orders.error("get_all_open_positions error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "get_all_open_positions error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return []
+
 
 def has_open_positions() -> bool:
     """
     Санҷад дар аккаунт ягон позиция (order/position) кушода аст ё не.
-    
+
     Логика:
     - Шанбе/Якшанбе: новобаста аз ҳама чиз -> False (аналитика фаъол мешавад)
     - Агар позицияҳо кушода бошанд -> True (аналитика пауза мешавад)
@@ -566,16 +651,15 @@ def has_open_positions() -> bool:
     try:
         _ensure_mt5_connected()
 
-        # Weekend override (local time) - выходные не важны, аналитика работает
+        # Weekend override (local time) — analytics run on weekends.
         wd = datetime.now().weekday()  # Mon=0 ... Sun=6
         if wd in (5, 6):  # 5=Saturday, 6=Sunday
-            return False  # Выходные: аналитика работает (не паузится)
+            return False
 
         with MT5_LOCK:
             positions = mt5.positions_get() or []
 
-        has_pos = len(positions) > 0
-        return has_pos
+        return len(positions) > 0
 
     except Exception as exc:
         log_orders.error(
@@ -583,7 +667,8 @@ def has_open_positions() -> bool:
             exc,
             _safe_last_error(),
         )
-        return False  # При ошибке считаем, что позиций нет (аналитика работает)
+        return False
+
 
 def market_is_open(asset: str, now: Optional[datetime] = None) -> bool:
     now = now or datetime.now()
@@ -593,7 +678,6 @@ def market_is_open(asset: str, now: Optional[datetime] = None) -> bool:
     if str(asset).upper() == "XAU":
         return wd < 5  # Mon-Fri only
     return True
-
 
 
 # =============================================================================
@@ -609,7 +693,7 @@ def close_order(
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
-        # direct lookup (faster, less memory)
+        # Direct lookup (faster, less memory).
         with MT5_LOCK:
             pos_list = mt5.positions_get(ticket=int(ticket)) or []
         pos = pos_list[0] if pos_list else None
@@ -623,12 +707,21 @@ def close_order(
         ptype = int(getattr(pos, "type", 0) or 0)
 
         if not symbol or volume <= 0:
-            log_orders.error("close_order: invalid position ticket=%s symbol=%s volume=%s", ticket, symbol, volume)
+            log_orders.error(
+                "close_order: invalid position ticket=%s symbol=%s volume=%s",
+                ticket,
+                symbol,
+                volume,
+            )
             return False
 
         _symbol_select(symbol)
 
-        close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_type = (
+            mt5.ORDER_TYPE_SELL
+            if ptype == mt5.POSITION_TYPE_BUY
+            else mt5.ORDER_TYPE_BUY
+        )
 
         req: Dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -644,16 +737,25 @@ def close_order(
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
-        def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
-            # attempt 0 uses cached tick; retries force refresh
+        # BUG FIX: capture ptype via default argument so the closure does not
+        # reference a mutable cell — guards against future refactors that might
+        # make the call asynchronous.
+        def _refresh_price(
+            rq: Dict[str, Any],
+            attempt: int,
+            _ptype: int = ptype,
+            _symbol: str = symbol,
+        ) -> None:
             for _ in range(4):
-                tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                tick = _tick_cached(_symbol) if attempt == 0 else _tick_refresh(_symbol)
                 if tick is not None:
                     break
                 time.sleep(0.15)
+            else:
+                tick = None
             if tick is None:
                 return
-            price = float(tick.bid if ptype == mt5.POSITION_TYPE_BUY else tick.ask)
+            price = float(tick.bid if _ptype == mt5.POSITION_TYPE_BUY else tick.ask)
             if price > 0:
                 rq["price"] = float(price)
 
@@ -680,16 +782,30 @@ def close_order(
         return False
 
     except Exception as exc:
-        log_orders.error("close_order error ticket=%s: %s | last_error=%s", ticket, exc, _safe_last_error())
+        log_orders.error(
+            "close_order error ticket=%s: %s | last_error=%s",
+            ticket,
+            exc,
+            _safe_last_error(),
+        )
         return False
 
-def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAULT_MAGIC) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"ok": False, "closed": 0, "canceled": 0, "errors": [], "last_error": None}
+
+def close_all_position(
+    *, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAULT_MAGIC
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ok": False,
+        "closed": 0,
+        "canceled": 0,
+        "errors": [],
+        "last_error": None,
+    }
 
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
 
-        # 1) Close positions (group by symbol -> 1 tick per symbol + refresh on retry)
+        # 1) Close positions (group by symbol → 1 tick per symbol + refresh on retry).
         with MT5_LOCK:
             positions = mt5.positions_get() or []
 
@@ -708,7 +824,7 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                     if tick0 is not None:
                         break
                     time.sleep(0.15)
-                
+
                 if tick0 is None:
                     for pos in plist:
                         ticket = int(getattr(pos, "ticket", 0) or 0)
@@ -733,7 +849,11 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                         out["errors"].append(f"{ticket}: invalid_position")
                         continue
 
-                    close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                    close_type = (
+                        mt5.ORDER_TYPE_SELL
+                        if ptype == mt5.POSITION_TYPE_BUY
+                        else mt5.ORDER_TYPE_BUY
+                    )
 
                     req: Dict[str, Any] = {
                         "action": mt5.TRADE_ACTION_DEAL,
@@ -741,7 +861,9 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                         "volume": float(volume),
                         "type": int(close_type),
                         "position": int(ticket),
-                        "price": float(bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0),
+                        "price": float(
+                            bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0
+                        ),
                         "deviation": int(deviation),
                         "magic": int(magic),
                         "comment": "close_all",
@@ -749,24 +871,42 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                         "type_time": mt5.ORDER_TIME_GTC,
                     }
 
-                    def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
+                    # BUG FIX: bind ptype and symbol via default args to avoid
+                    # closure-over-loop-variable fragility.
+                    def _refresh_price(
+                        rq: Dict[str, Any],
+                        attempt: int,
+                        _ptype: int = ptype,
+                        _symbol: str = symbol,
+                    ) -> None:
                         for _ in range(4):
-                            tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                            tick = (
+                                _tick_cached(_symbol)
+                                if attempt == 0
+                                else _tick_refresh(_symbol)
+                            )
                             if tick is not None:
                                 break
                             time.sleep(0.15)
+                        else:
+                            tick = None
                         if tick is None:
                             return
                         bid = float(getattr(tick, "bid", 0.0) or 0.0)
                         ask = float(getattr(tick, "ask", 0.0) or 0.0)
                         if bid <= 0 or ask <= 0:
                             return
-                        rq["price"] = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
+                        rq["price"] = float(
+                            bid if _ptype == mt5.POSITION_TYPE_BUY else ask
+                        )
 
                     ok, _, last_ret = _send_with_retries(
                         req,
                         retries=5,
-                        success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+                        success_retcodes=(
+                            mt5.TRADE_RETCODE_DONE,
+                            mt5.TRADE_RETCODE_DONE_PARTIAL,
+                        ),
                         sleep_base=_CLOSE_RETRY_BASE_SEC,
                         sleep_cap=_CLOSE_RETRY_CAP_SEC,
                         refresh_before_send=_refresh_price,
@@ -775,13 +915,19 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                     if ok:
                         out["closed"] += 1
                     else:
-                        out["errors"].append(f"{ticket}: close_failed retcode={last_ret}")
+                        out["errors"].append(
+                            f"{ticket}: close_failed retcode={last_ret}"
+                        )
 
             except Exception as exc_sym:
-                log_orders.error("close_all_position: symbol batch error: %s | last_error=%s", exc_sym, _safe_last_error())
+                log_orders.error(
+                    "close_all_position: symbol batch error: %s | last_error=%s",
+                    exc_sym,
+                    _safe_last_error(),
+                )
                 out["errors"].append("symbol_batch_exception")
 
-        # 2) Cancel pending orders
+        # 2) Cancel pending orders.
         with MT5_LOCK:
             pending = mt5.orders_get() or []
 
@@ -808,7 +954,11 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
                     out["errors"].append(f"{oticket}: cancel_failed retcode={last_ret}")
 
             except Exception as exc_ord:
-                log_orders.error("close_all_position: cancel order error: %s | last_error=%s", exc_ord, _safe_last_error())
+                log_orders.error(
+                    "close_all_position: cancel order error: %s | last_error=%s",
+                    exc_ord,
+                    _safe_last_error(),
+                )
                 out["errors"].append("order_cancel_exception")
 
         out["last_error"] = _safe_last_error()
@@ -818,8 +968,13 @@ def close_all_position(*, deviation: int = DEFAULT_DEVIATION, magic: int = DEFAU
     except Exception as exc:
         out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
-        log_orders.error("close_all_position global error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "close_all_position global error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return out
+
 
 def close_all_position_by_profit(
     *,
@@ -828,7 +983,13 @@ def close_all_position_by_profit(
     magic: int = DEFAULT_MAGIC,
 ) -> Dict[str, Any]:
     """Close only positions with profit >= min_profit_usd (MT5-style «close by profit»)."""
-    out: Dict[str, Any] = {"ok": False, "closed": 0, "canceled": 0, "errors": [], "last_error": None}
+    out: Dict[str, Any] = {
+        "ok": False,
+        "closed": 0,
+        "canceled": 0,
+        "errors": [],
+        "last_error": None,
+    }
 
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
@@ -836,7 +997,7 @@ def close_all_position_by_profit(
         with MT5_LOCK:
             positions = mt5.positions_get() or []
 
-        # Filter: only positions with profit >= min_profit_usd
+        # Filter: only positions with profit >= min_profit_usd.
         profitable: List[Any] = []
         for p in positions:
             profit = float(getattr(p, "profit", 0.0) or 0.0)
@@ -882,7 +1043,11 @@ def close_all_position_by_profit(
                         out["errors"].append(f"{ticket}: invalid_position")
                         continue
 
-                    close_type = mt5.ORDER_TYPE_SELL if ptype == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                    close_type = (
+                        mt5.ORDER_TYPE_SELL
+                        if ptype == mt5.POSITION_TYPE_BUY
+                        else mt5.ORDER_TYPE_BUY
+                    )
 
                     req: Dict[str, Any] = {
                         "action": mt5.TRADE_ACTION_DEAL,
@@ -890,7 +1055,9 @@ def close_all_position_by_profit(
                         "volume": float(volume),
                         "type": int(close_type),
                         "position": int(ticket),
-                        "price": float(bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0),
+                        "price": float(
+                            bid0 if ptype == mt5.POSITION_TYPE_BUY else ask0
+                        ),
                         "deviation": int(deviation),
                         "magic": int(magic),
                         "comment": "close_by_profit",
@@ -898,20 +1065,35 @@ def close_all_position_by_profit(
                         "type_time": mt5.ORDER_TIME_GTC,
                     }
 
-                    def _refresh_price(rq: Dict[str, Any], attempt: int) -> None:
-                        tick = _tick_cached(symbol) if attempt == 0 else _tick_refresh(symbol)
+                    # BUG FIX: bind ptype and symbol via default args.
+                    def _refresh_price(
+                        rq: Dict[str, Any],
+                        attempt: int,
+                        _ptype: int = ptype,
+                        _symbol: str = symbol,
+                    ) -> None:
+                        tick = (
+                            _tick_cached(_symbol)
+                            if attempt == 0
+                            else _tick_refresh(_symbol)
+                        )
                         if tick is None:
                             return
                         bid = float(getattr(tick, "bid", 0.0) or 0.0)
                         ask = float(getattr(tick, "ask", 0.0) or 0.0)
                         if bid <= 0 or ask <= 0:
                             return
-                        rq["price"] = float(bid if ptype == mt5.POSITION_TYPE_BUY else ask)
+                        rq["price"] = float(
+                            bid if _ptype == mt5.POSITION_TYPE_BUY else ask
+                        )
 
                     ok, _, last_ret = _send_with_retries(
                         req,
                         retries=5,
-                        success_retcodes=(mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL),
+                        success_retcodes=(
+                            mt5.TRADE_RETCODE_DONE,
+                            mt5.TRADE_RETCODE_DONE_PARTIAL,
+                        ),
                         sleep_base=_CLOSE_RETRY_BASE_SEC,
                         sleep_cap=_CLOSE_RETRY_CAP_SEC,
                         refresh_before_send=_refresh_price,
@@ -920,10 +1102,16 @@ def close_all_position_by_profit(
                     if ok:
                         out["closed"] += 1
                     else:
-                        out["errors"].append(f"{ticket}: close_failed retcode={last_ret}")
+                        out["errors"].append(
+                            f"{ticket}: close_failed retcode={last_ret}"
+                        )
 
             except Exception as exc_sym:
-                log_orders.error("close_all_position_by_profit: symbol batch error: %s | last_error=%s", exc_sym, _safe_last_error())
+                log_orders.error(
+                    "close_all_position_by_profit: symbol batch error: %s | last_error=%s",
+                    exc_sym,
+                    _safe_last_error(),
+                )
                 out["errors"].append("symbol_batch_exception")
 
         out["last_error"] = _safe_last_error()
@@ -933,7 +1121,11 @@ def close_all_position_by_profit(
     except Exception as exc:
         out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
-        log_orders.error("close_all_position_by_profit error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "close_all_position_by_profit error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return out
 
 
@@ -992,24 +1184,31 @@ def manual_open_capacity(symbol: str) -> Tuple[int, str]:
                 continue
 
         total_remaining = max(0, int(_MANUAL_HELPER_MAX_TOTAL) - int(total_positions))
-        symbol_remaining = max(0, int(_MANUAL_HELPER_MAX_PER_SYMBOL) - int(symbol_positions))
+        symbol_remaining = max(
+            0, int(_MANUAL_HELPER_MAX_PER_SYMBOL) - int(symbol_positions)
+        )
         remaining = min(total_remaining, symbol_remaining)
         if remaining <= 0:
             if symbol_positions >= int(_MANUAL_HELPER_MAX_PER_SYMBOL):
-                return 0, f"symbol_limit:{symbol_positions}/{_MANUAL_HELPER_MAX_PER_SYMBOL}"
+                return (
+                    0,
+                    f"symbol_limit:{symbol_positions}/{_MANUAL_HELPER_MAX_PER_SYMBOL}",
+                )
             return 0, f"portfolio_limit:{total_positions}/{_MANUAL_HELPER_MAX_TOTAL}"
         return int(remaining), "ok"
     except Exception as exc:
-        log_orders.error("manual_open_capacity error symbol=%s: %s | last_error=%s", symbol, exc, _safe_last_error())
+        log_orders.error(
+            "manual_open_capacity error symbol=%s: %s | last_error=%s",
+            symbol,
+            exc,
+            _safe_last_error(),
+        )
         return 0, "mt5_unavailable"
 
 
-def _clamp01(x: float) -> float:
-    return clamp01(x)
-
-
 def _tp_mult_from_conf(confidence: float) -> float:
-    c = _clamp01(confidence)
+    # SAFE IMPROVEMENT: use clamp01 directly; removed the _clamp01 wrapper alias.
+    c = clamp01(confidence)
     lo = float(_TP_CONF_MIN_MULT)
     hi = float(_TP_CONF_MAX_MULT)
     if hi < lo:
@@ -1017,7 +1216,12 @@ def _tp_mult_from_conf(confidence: float) -> float:
     return float(lo + (hi - lo) * c)
 
 
-def _atr_wilder(highs: list[float], lows: list[float], closes: list[float], period: int) -> float:
+def _atr_wilder(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int,
+) -> float:
     n = min(len(highs), len(lows), len(closes))
     if n <= int(period):
         return 0.0
@@ -1032,7 +1236,7 @@ def _atr_wilder(highs: list[float], lows: list[float], closes: list[float], peri
     if len(trs) < int(period):
         return 0.0
     atr = sum(trs[: int(period)]) / float(period)
-    for tr in trs[int(period):]:
+    for tr in trs[int(period) :]:
         atr = (atr * (float(period) - 1.0) + tr) / float(period)
     return float(atr)
 
@@ -1050,15 +1254,23 @@ def _get_atr_value(symbol: str) -> float:
         closes = [float(r["close"]) for r in rates]
         return float(_atr_wilder(highs, lows, closes, int(_ATR_PERIOD)))
     except Exception as exc:
-        log_orders.error("_get_atr_value error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "_get_atr_value error: %s | last_error=%s", exc, _safe_last_error()
+        )
         return 0.0
 
 
-def _expected_profit(symbol: str, side: str, volume: float, entry: float, price2: float) -> float:
+def _expected_profit(
+    symbol: str, side: str, volume: float, entry: float, price2: float
+) -> float:
     try:
-        order_type = mt5.ORDER_TYPE_BUY if str(side).lower() == "buy" else mt5.ORDER_TYPE_SELL
+        order_type = (
+            mt5.ORDER_TYPE_BUY if str(side).lower() == "buy" else mt5.ORDER_TYPE_SELL
+        )
         with MT5_LOCK:
-            val = mt5.order_calc_profit(order_type, symbol, float(volume), float(entry), float(price2))
+            val = mt5.order_calc_profit(
+                order_type, symbol, float(volume), float(entry), float(price2)
+            )
         return float(val) if val is not None else 0.0
     except Exception:
         return 0.0
@@ -1094,7 +1306,9 @@ def _account_equity_drawdown() -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def _adaptive_lot_for_entry(symbol: str, side: str, entry: float, sl: float, confidence: float) -> float:
+def _adaptive_lot_for_entry(
+    symbol: str, side: str, entry: float, sl: float, confidence: float
+) -> float:
     try:
         eq, dd = _account_equity_drawdown()
         risk_money = adaptive_risk_money(
@@ -1147,7 +1361,15 @@ def _atr_tp_from_entry(
         tp = float(entry) + sign * atr_val * mult
 
         if float(min_profit_usd) > 0.0:
-            profit_per_atr = abs(_expected_profit(symbol, side, float(volume), float(entry), float(entry) + sign * atr_val))
+            profit_per_atr = abs(
+                _expected_profit(
+                    symbol,
+                    side,
+                    float(volume),
+                    float(entry),
+                    float(entry) + sign * atr_val,
+                )
+            )
             if profit_per_atr > 0.0:
                 mult_needed = float(min_profit_usd) / float(profit_per_atr)
                 if mult_needed > mult:
@@ -1197,7 +1419,11 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
             return None
 
         price_delta = ticks_needed * tick_size
-        tp = open_price + price_delta if ptype == mt5.POSITION_TYPE_BUY else open_price - price_delta
+        tp = (
+            open_price + price_delta
+            if ptype == mt5.POSITION_TYPE_BUY
+            else open_price - price_delta
+        )
         tp = round(float(tp), digits)
         if tp <= 0:
             return None
@@ -1210,8 +1436,13 @@ def _usd_to_tp_price_for_position(pos: Any, usd_profit: float) -> Optional[float
         return float(tp)
 
     except Exception as exc:
-        log_orders.error("_usd_to_tp_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "_usd_to_tp_price_for_position error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return None
+
 
 def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
     try:
@@ -1245,8 +1476,11 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
             return None
 
         price_delta = ticks_needed * tick_size
-        sl = open_price - price_delta if ptype == mt5.POSITION_TYPE_BUY else open_price + price_delta
-
+        sl = (
+            open_price - price_delta
+            if ptype == mt5.POSITION_TYPE_BUY
+            else open_price + price_delta
+        )
         sl = round(float(sl), digits)
         if sl <= 0:
             return None
@@ -1259,8 +1493,13 @@ def _usd_to_sl_price_for_position(pos: Any, usd_loss: float) -> Optional[float]:
         return sl
 
     except Exception as exc:
-        log_orders.error("_usd_to_sl_price_for_position error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "_usd_to_sl_price_for_position error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return None
+
 
 def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> float:
     try:
@@ -1276,16 +1515,15 @@ def _enforce_stop_distance_for_sl(symbol: str, ptype: int, sl_price: float) -> f
             return round(float(sl_price), digits)
 
         if ptype == mt5.POSITION_TYPE_BUY:
-            max_allowed = bid - min_dist
-            sl_adj = min(float(sl_price), float(max_allowed))
+            sl_adj = min(float(sl_price), bid - min_dist)
         else:
-            min_allowed = ask + min_dist
-            sl_adj = max(float(sl_price), float(min_allowed))
+            sl_adj = max(float(sl_price), ask + min_dist)
 
         return round(float(sl_adj), digits)
 
     except Exception:
         return float(sl_price)
+
 
 def _enforce_stop_distance_for_tp(symbol: str, ptype: int, tp_price: float) -> float:
     try:
@@ -1301,17 +1539,60 @@ def _enforce_stop_distance_for_tp(symbol: str, ptype: int, tp_price: float) -> f
             return round(float(tp_price), digits)
 
         if ptype == mt5.POSITION_TYPE_BUY:
-            min_allowed = ask + min_dist
-            tp_adj = max(float(tp_price), float(min_allowed))
+            tp_adj = max(float(tp_price), ask + min_dist)
         else:
-            max_allowed = bid - min_dist
-            tp_adj = min(float(tp_price), float(max_allowed))
+            tp_adj = min(float(tp_price), bid - min_dist)
 
         return round(float(tp_adj), digits)
 
     except Exception:
         return float(tp_price)
 
+
+def _enforce_stop_distance_pair(
+    symbol: str,
+    ptype: int,
+    sl_price: float,
+    tp_price: float,
+) -> Tuple[float, float]:
+    """
+    PERFORMANCE: Enforce both SL and TP stop distances with a SINGLE tick fetch
+    and a SINGLE _digits_point_stops call instead of two independent calls.
+    Used on the hot order path in _place_market_order_fixed_sltp.
+    """
+    try:
+        digits, point, stops_level = _digits_point_stops(symbol)
+        tick = _tick_cached(symbol)
+        if point <= 0.0 or stops_level <= 0 or not tick:
+            return round(float(sl_price), digits), round(float(tp_price), digits)
+
+        min_dist = float(stops_level) * float(point)
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        if bid <= 0.0 or ask <= 0.0:
+            return round(float(sl_price), digits), round(float(tp_price), digits)
+
+        if ptype == mt5.POSITION_TYPE_BUY:
+            sl_adj = round(min(float(sl_price), bid - min_dist), digits)
+            tp_adj = round(max(float(tp_price), ask + min_dist), digits)
+        else:
+            sl_adj = round(max(float(sl_price), ask + min_dist), digits)
+            tp_adj = round(min(float(tp_price), bid - min_dist), digits)
+
+        return sl_adj, tp_adj
+
+    except Exception:
+        # DEFENSIVE CODE: fall back to the individual functions so that at
+        # worst we pay the cost of two lookups instead of crashing.
+        try:
+            sl_out = _enforce_stop_distance_for_sl(symbol, ptype, sl_price)
+        except Exception:
+            sl_out = float(sl_price)
+        try:
+            tp_out = _enforce_stop_distance_for_tp(symbol, ptype, tp_price)
+        except Exception:
+            tp_out = float(tp_price)
+        return sl_out, tp_out
 
 
 # =============================================================================
@@ -1324,7 +1605,14 @@ def set_takeprofit_all_positions_usd(
     magic: int = DEFAULT_MAGIC,
     retries: int = DEFAULT_RETRIES,
 ) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"ok": False, "total": 0, "updated": 0, "skipped": 0, "errors": [], "last_error": None}
+    out: Dict[str, Any] = {
+        "ok": False,
+        "total": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": [],
+        "last_error": None,
+    }
 
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
@@ -1391,7 +1679,9 @@ def set_takeprofit_all_positions_usd(
             if ok:
                 out["updated"] += 1
             else:
-                out["errors"].append(f"{ticket}:{symbol}: update_failed retcode={last_ret}")
+                out["errors"].append(
+                    f"{ticket}:{symbol}: update_failed retcode={last_ret}"
+                )
 
         out["last_error"] = _safe_last_error()
         out["ok"] = len(out["errors"]) == 0
@@ -1400,8 +1690,13 @@ def set_takeprofit_all_positions_usd(
     except Exception as exc:
         out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
-        log_orders.error("set_takeprofit_all_positions_usd error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "set_takeprofit_all_positions_usd error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return out
+
 
 def set_stoploss_all_positions_usd(
     usd_loss: float,
@@ -1410,7 +1705,14 @@ def set_stoploss_all_positions_usd(
     magic: int = DEFAULT_MAGIC,
     retries: int = DEFAULT_RETRIES,
 ) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"ok": False, "total": 0, "updated": 0, "skipped": 0, "errors": [], "last_error": None}
+    out: Dict[str, Any] = {
+        "ok": False,
+        "total": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": [],
+        "last_error": None,
+    }
 
     try:
         _ensure_mt5_connected(require_trade_allowed=True)
@@ -1477,7 +1779,9 @@ def set_stoploss_all_positions_usd(
             if ok:
                 out["updated"] += 1
             else:
-                out["errors"].append(f"{ticket}:{symbol}: update_failed retcode={last_ret}")
+                out["errors"].append(
+                    f"{ticket}:{symbol}: update_failed retcode={last_ret}"
+                )
 
         out["last_error"] = _safe_last_error()
         out["ok"] = len(out["errors"]) == 0
@@ -1486,9 +1790,12 @@ def set_stoploss_all_positions_usd(
     except Exception as exc:
         out["last_error"] = _safe_last_error()
         out["errors"].append(str(exc))
-        log_orders.error("set_stoploss_all_positions_usd error: %s | last_error=%s", exc, _safe_last_error())
+        log_orders.error(
+            "set_stoploss_all_positions_usd error: %s | last_error=%s",
+            exc,
+            _safe_last_error(),
+        )
         return out
-
 
 
 # =============================================================================
@@ -1500,22 +1807,23 @@ def get_full_report_day(force_refresh: bool = True) -> Dict[str, Any]:
     Возвращает полную структуру с wins, losses, profit, loss, net, balance и т.д.
     """
     try:
-        from ExnessAPI.history import view_all_history_dict, _local_now, _day_start_local
-        from datetime import datetime
+        from ExnessAPI.history import (  # type: ignore
+            _day_start_local,
+            _local_now,
+            view_all_history_dict,
+        )
 
         summary = view_all_history_dict(force_refresh=force_refresh)
         local_now = _local_now()
         day_start = _day_start_local(local_now)
-        
-        # Добавляем даты периода
+
         summary["date_from"] = day_start.strftime("%Y-%m-%d %H:%M:%S")
         summary["date_to"] = local_now.strftime("%Y-%m-%d %H:%M:%S")
         summary["period"] = "day"
-        
+
         return summary
     except Exception as exc:
         log_orders.error("get_full_report_day error: %s", exc)
-        from datetime import datetime
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return {
             "date": "",
@@ -1534,13 +1842,18 @@ def get_full_report_day(force_refresh: bool = True) -> Dict[str, Any]:
             "records": [],
         }
 
+
 def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
-    """
-    Полный отчет за неделю (с начала недели до сейчас).
-    """
+    """Полный отчет за неделю (с начала недели до сейчас)."""
     try:
-        from ExnessAPI.history import _connect, _day_start_local, _local_now, _naive_local
         from datetime import timedelta
+
+        from ExnessAPI.history import (  # type: ignore
+            _connect,
+            _day_start_local,
+            _local_now,
+            _naive_local,
+        )
 
         if not _connect():
             return {
@@ -1561,7 +1874,9 @@ def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
         week_start = _day_start_local(week_start)
 
         with MT5_LOCK:
-            deals = mt5.history_deals_get(_naive_local(week_start), _naive_local(local_now))
+            deals = mt5.history_deals_get(
+                _naive_local(week_start), _naive_local(local_now)
+            )
             open_positions = mt5.positions_get() or []
             acc = mt5.account_info()
 
@@ -1624,13 +1939,15 @@ def get_full_report_week(force_refresh: bool = True) -> Dict[str, Any]:
             "balance": 0.0,
         }
 
+
 def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
-    """
-    Полный отчет за весь период (с самого начала аккаунта до сейчас).
-    """
+    """Полный отчет за весь период (с самого начала аккаунта до сейчас)."""
     try:
-        from ExnessAPI.history import _connect, _local_now, _naive_local
-        from datetime import datetime, timedelta
+        # BUG FIX: removed duplicate `from datetime import timedelta` that
+        # appeared twice in the original try block.
+        from datetime import timedelta
+
+        from ExnessAPI.history import _connect, _local_now, _naive_local  # type: ignore
 
         if not _connect():
             return {
@@ -1649,30 +1966,32 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
             }
 
         local_now = _local_now()
-        # Используем 1 год назад для получения истории
-        from datetime import timedelta
         from_date = local_now - timedelta(days=365)
 
         deals = None
         with MT5_LOCK:
             try:
-                # Получаем все сделки с самого начала
-                deals = mt5.history_deals_get(_naive_local(from_date), _naive_local(local_now))
-                # Проверяем на ошибку MT5
+                deals = mt5.history_deals_get(
+                    _naive_local(from_date), _naive_local(local_now)
+                )
                 if deals is None:
                     err = mt5.last_error()
                     if err and err[0] != 1:  # 1 = Success
-                        log_orders.error("history_deals_get failed: code=%s desc=%s", err[0] if err else "?", err[1] if err and len(err) > 1 else "?")
+                        log_orders.error(
+                            "history_deals_get failed: code=%s desc=%s",
+                            err[0] if err else "?",
+                            err[1] if err and len(err) > 1 else "?",
+                        )
                         deals = []
             except Exception as exc:
                 log_orders.error("history_deals_get exception: %s", exc)
                 deals = []
-            
+
             try:
                 open_positions = mt5.positions_get() or []
             except Exception:
                 open_positions = []
-            
+
             try:
                 acc = mt5.account_info()
             except Exception:
@@ -1680,26 +1999,26 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
 
         balance = float(getattr(acc, "balance", 0.0) or 0.0) if acc else 0.0
 
-        # Находим реальную дату первой сделки (самую раннюю)
+        # Find the real date of the first deal.
         first_deal_date = None
         if deals and len(deals) > 0:
             try:
-                # Сортируем сделки по времени (самая ранняя первая)
                 deals_sorted = sorted(deals, key=lambda d: getattr(d, "time", 0) or 0)
                 first_deal = deals_sorted[0]
                 first_deal_time = getattr(first_deal, "time", None)
                 if first_deal_time:
-                    # Преобразуем в datetime если нужно
                     if isinstance(first_deal_time, datetime):
                         first_deal_date = first_deal_time
                     else:
-                        # Если это timestamp (секунды с 1970)
                         try:
-                            first_deal_date = datetime.fromtimestamp(int(first_deal_time))
+                            first_deal_date = datetime.fromtimestamp(
+                                int(first_deal_time)
+                            )
                         except (ValueError, OSError):
-                            # Если timestamp в миллисекундах
                             try:
-                                first_deal_date = datetime.fromtimestamp(int(first_deal_time) / 1000)
+                                first_deal_date = datetime.fromtimestamp(
+                                    int(first_deal_time) / 1000
+                                )
                             except Exception:
                                 pass
             except Exception:
@@ -1727,7 +2046,6 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
                 except Exception:
                     continue
 
-        # Обрабатываем открытые позиции
         open_positions_info = []
         for p in open_positions:
             try:
@@ -1736,27 +2054,23 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
                 volume = float(getattr(p, "volume", 0.0) or 0.0)
                 profit_val = float(getattr(p, "profit", 0.0) or 0.0)
                 unrealized_pnl += profit_val
-                open_positions_info.append({
-                    "ticket": ticket,
-                    "symbol": symbol,
-                    "volume": volume,
-                    "profit": profit_val
-                })
+                open_positions_info.append(
+                    {
+                        "ticket": ticket,
+                        "symbol": symbol,
+                        "volume": volume,
+                        "profit": profit_val,
+                    }
+                )
             except Exception:
                 continue
 
-        # Форматируем даты - показываем реальную дату первой сделки или дату начала периода
-        date_from_str = ""
         if first_deal_date:
             try:
-                if first_deal_date.tzinfo is None:
-                    date_from_str = first_deal_date.strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    date_from_str = first_deal_date.strftime("%Y-%m-%d %H:%M:%S")
+                date_from_str = first_deal_date.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 date_from_str = from_date.strftime("%Y-%m-%d %H:%M:%S")
         else:
-            # Если нет сделок, показываем дату начала периода (1 год назад)
             date_from_str = from_date.strftime("%Y-%m-%d %H:%M:%S")
 
         return {
@@ -1776,7 +2090,6 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
         }
     except Exception as exc:
         log_orders.error("get_full_report_all error: %s", exc)
-        from datetime import datetime
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return {
             "period": "all",
@@ -1793,13 +2106,16 @@ def get_full_report_all(force_refresh: bool = True) -> Dict[str, Any]:
             "balance": 0.0,
         }
 
+
 def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
-    """
-    Полный отчет за месяц (с начала месяца до сейчас).
-    """
+    """Полный отчет за месяц (с начала месяца до сейчас)."""
     try:
-        from ExnessAPI.history import _connect, _day_start_local, _local_now, _naive_local
-        from datetime import datetime
+        from ExnessAPI.history import (  # type: ignore
+            _connect,
+            _day_start_local,
+            _local_now,
+            _naive_local,
+        )
 
         if not _connect():
             return {
@@ -1817,15 +2133,19 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
 
         local_now = _local_now()
         try:
-            month_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            month_start = local_now.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
         except Exception:
             month_start = datetime(local_now.year, local_now.month, 1, 0, 0, 0)
 
-        # keep _day_start_local import for compatibility (structure), even if not used directly here
+        # Keep _day_start_local import for compatibility (structure).
         _ = _day_start_local  # noqa: F841
 
         with MT5_LOCK:
-            deals = mt5.history_deals_get(_naive_local(month_start), _naive_local(local_now))
+            deals = mt5.history_deals_get(
+                _naive_local(month_start), _naive_local(local_now)
+            )
             open_positions = mt5.positions_get() or []
             acc = mt5.account_info()
 
@@ -1889,12 +2209,10 @@ def get_full_report_month(force_refresh: bool = True) -> Dict[str, Any]:
         }
 
 
-
-
 # =============================================================================
 # Fast market open: fixed lot + fixed TP USD, sync (no await)
 # =============================================================================
-_SYMBOL_BTC = "BTCUSDm"     
+_SYMBOL_BTC = "BTCUSDm"
 _SYMBOL_XAU = "XAUUSDm"
 
 
@@ -1910,7 +2228,9 @@ def _open_manual_orders(symbol: str, side: str, count: int) -> int:
 def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
     """Manual market order with live-price execution and ATR-protected SL/TP."""
     try:
-        from ExnessAPI.order_execution import OrderExecutor, OrderRequest
+        # PERFORMANCE: use the module-level cached class references instead of
+        # importing inside the function on every call.
+        OrderExecutor, OrderRequest = _import_order_execution_classes()
 
         remaining_capacity, capacity_reason = manual_open_capacity(symbol)
         if remaining_capacity <= 0:
@@ -1941,7 +2261,8 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         max_spread_points = 1800.0 if "BTC" in str(symbol).upper() else 350.0
         if spread_points > max_spread_points:
             log_orders.error(
-                "manual_open blocked by spread | symbol=%s side=%s spread_pts=%.1f max=%.1f",
+                "manual_open blocked by spread | symbol=%s side=%s "
+                "spread_pts=%.1f max=%.1f",
                 symbol,
                 side,
                 float(spread_points),
@@ -1958,7 +2279,10 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         atr_val = float(_get_atr_value(symbol) or 0.0)
         if atr_val <= 0.0:
             fallback_pct = 0.0015 if "BTC" in str(symbol).upper() else 0.0008
-            atr_val = max(entry * fallback_pct, point if point > 0.0 else 0.01)
+            atr_val = max(
+                entry * fallback_pct,
+                point if point > 0.0 else 0.01,
+            )
 
         sl_mult = 2.4 if "BTC" in str(symbol).upper() else 1.8
         sl = entry - atr_val * sl_mult if is_buy else entry + atr_val * sl_mult
@@ -1974,16 +2298,26 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
             sl_price=sl,
         )
         if tp is None or float(tp) <= 0.0:
+            # DEFENSIVE CODE: guard against missing tick fields before division.
             tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
             tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
             if tick_size <= 0.0 or tick_value <= 0.0:
+                log_orders.error(
+                    "_place_market_order_fixed_sltp: tick_size/tick_value zero "
+                    "for symbol=%s — cannot compute TP fallback",
+                    symbol,
+                )
                 return False
             price_delta = (profit_usd * tick_size) / (tick_value * lot)
             tp = entry + price_delta if is_buy else entry - price_delta
 
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-        sl = _enforce_stop_distance_for_sl(symbol, order_type, float(sl))
-        tp = _enforce_stop_distance_for_tp(symbol, order_type, float(tp))
+
+        # PERFORMANCE: call _enforce_stop_distance_pair to fetch tick and symbol
+        # info ONCE for both SL and TP instead of calling the two individual
+        # functions which each fetch the tick and digits independently.
+        sl, tp = _enforce_stop_distance_pair(symbol, order_type, float(sl), float(tp))
+
         if sl <= 0.0 or tp <= 0.0:
             return False
         if is_buy and not (sl < entry < tp):
@@ -1991,7 +2325,18 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         if (not is_buy) and not (tp < entry < sl):
             return False
 
-        print(f"\n[MANUAL EXECUTION] {symbol} {side}")
+        # SAFE IMPROVEMENT: use log_orders instead of print so execution events
+        # are captured in the rotating log file and do not pollute stdout.
+        log_orders.error(
+            "[MANUAL EXECUTION] symbol=%s side=%s entry=%.5f sl=%.5f tp=%.5f lot=%.2f",
+            symbol,
+            side,
+            entry,
+            sl,
+            tp,
+            lot,
+        )
+
         now_ts = time.time()
         req = OrderRequest(
             symbol=str(symbol),
@@ -2014,7 +2359,9 @@ def _place_market_order_fixed_sltp(symbol: str, side: str) -> bool:
         return bool(getattr(result, "ok", False))
 
     except Exception as e:
-        log_orders.error("fixed simple order error %s %s", symbol, e)
+        log_orders.error(
+            "fixed simple order error symbol=%s side=%s err=%s", symbol, side, e
+        )
         return False
 
 
@@ -2036,8 +2383,6 @@ def open_sell_order_btc(count: int) -> int:
 def open_sell_order_xau(count: int) -> int:
     """Open `count` market SELL on XAUUSDm with fixed manual settings."""
     return _open_manual_orders(_SYMBOL_XAU, "Sell", count)
-
-
 
 
 __all__ = [
@@ -2064,6 +2409,3 @@ __all__ = [
     "open_sell_order_btc",
     "open_sell_order_xau",
 ]
-
-
-

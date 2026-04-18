@@ -12,8 +12,8 @@
 from __future__ import annotations
 
 import datetime
-import math
 import logging
+import math
 import os
 import pathlib
 import pickle
@@ -59,6 +59,7 @@ except Exception:
     def ensure_mt5() -> bool:
         return False
 
+
 warnings.filterwarnings("ignore")
 log = logging.getLogger("backtest.model_train_institutional")
 log.setLevel(logging.INFO)
@@ -76,9 +77,9 @@ if not log.handlers:
     _fh.setFormatter(_fmt)
     log.addHandler(_fh)
 
-_LOG_DIR    = LOG_DIR / "model_training_institutional"
+_LOG_DIR = LOG_DIR / "model_training_institutional"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
-_ART_DUMPS   = get_artifact_dir("dumps")
+_ART_DUMPS = get_artifact_dir("dumps")
 _ART_CATBOOST = get_artifact_dir("catboost_info")
 
 
@@ -86,11 +87,12 @@ _ART_CATBOOST = get_artifact_dir("catboost_info")
 # Scaler implementations
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _NumpyStandardScaler:
     """Pure-numpy fallback scaler when sklearn is unavailable."""
 
     def __init__(self, dtype: np.dtype = np.float32) -> None:
-        self.mean_:  Optional[np.ndarray] = None
+        self.mean_: Optional[np.ndarray] = None
         self.scale_: Optional[np.ndarray] = None
         self.dtype = dtype
 
@@ -114,7 +116,7 @@ class _NumpyLinearRegressor:
 
     def __init__(self, l2: float = 1e-6) -> None:
         self.l2 = float(max(l2, 0.0))
-        self.coef_:     Optional[np.ndarray] = None
+        self.coef_: Optional[np.ndarray] = None
         self.intercept_: float = 0.0
 
     def fit(self, x: np.ndarray, y: np.ndarray) -> "_NumpyLinearRegressor":
@@ -124,9 +126,9 @@ class _NumpyLinearRegressor:
             raise RuntimeError("numpy_linear_invalid_shape_or_length_mismatch")
         if x_arr.shape[0] <= 0:
             raise RuntimeError("numpy_linear_empty_fit")
-        ones  = np.ones((x_arr.shape[0], 1), dtype=np.float64)
+        ones = np.ones((x_arr.shape[0], 1), dtype=np.float64)
         x_aug = np.concatenate([x_arr, ones], axis=1)
-        gram  = x_aug.T @ x_aug
+        gram = x_aug.T @ x_aug
         if self.l2 > 0.0:
             gram += self.l2 * np.eye(gram.shape[0], dtype=np.float64)
         rhs = x_aug.T @ y_arr
@@ -134,7 +136,7 @@ class _NumpyLinearRegressor:
             beta = np.linalg.solve(gram, rhs)
         except np.linalg.LinAlgError:
             beta = np.linalg.lstsq(x_aug, y_arr, rcond=None)[0]
-        self.coef_      = np.asarray(beta[:-1], dtype=np.float64)
+        self.coef_ = np.asarray(beta[:-1], dtype=np.float64)
         self.intercept_ = float(beta[-1])
         return self
 
@@ -152,12 +154,15 @@ class ScalerProtocol(Protocol):
     def transform(self, x: np.ndarray) -> np.ndarray: ...
 
 
-StandardScaler = _NumpyStandardScaler if _SKStandardScaler is None else _SKStandardScaler
+StandardScaler = (
+    _NumpyStandardScaler if _SKStandardScaler is None else _SKStandardScaler
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _cfg_dtype(cfg: "InstitutionalTrainConfig") -> np.dtype:
     raw = str(getattr(cfg, "float_dtype", "float32") or "float32").strip().lower()
@@ -205,7 +210,11 @@ def _console(msg: str) -> None:
         if line:
             log.info(line)
     if str(os.getenv("BACKTEST_ECHO_CONSOLE", "0") or "0").strip().lower() in {
-        "1", "true", "yes", "y", "on"
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
     }:
         try:
             real_out = getattr(sys, "__stdout__", None) or sys.stdout
@@ -219,6 +228,7 @@ def _console(msg: str) -> None:
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class InstitutionalTrainConfig:
     """Institutional training configuration with advanced features."""
@@ -229,8 +239,7 @@ class InstitutionalTrainConfig:
     # Target — ZERO look-ahead
     target_type: str = "returns_magnitude"
     prediction_horizon: int = 15
-    percent_increase: float = field(
-        default_factory=lambda: 0.0008)
+    percent_increase: float = field(default_factory=lambda: 0.0008)
 
     # Features
     window_size: int = 20
@@ -241,46 +250,79 @@ class InstitutionalTrainConfig:
     stoch_slowk_period: int = 3
     stoch_slowd_period: int = 3
     stoch_matype: int = 0
-    training_features: List[str] = field(default_factory=lambda: [
-        "ofi_proxy", "volume_delta",
-        "tick_momentum_3", "tick_momentum_8",
-        "liquidity_void_up", "liquidity_void_down", "liquidity_void_score",
-        "mtf_h1_slope", "mtf_h4_slope",
-        "mtf_h1_flow_proxy", "mtf_h4_flow_proxy",
-        "stop_hunt_flag", "stop_hunt_strength",
-        "ob_touch_proximity", "ob_pretouch_bias",
-        "dxy_ret_1", "us10y_ret_1",
-        "xau_dxy_corr_rolling", "xau_us10y_corr_rolling",
-        "ma4", "ma9", "ma13", "ma21", "ma50",
-        "ema5", "ema12", "ema26", "ema50",
-        "macd", "macd_signal", "macd_hist",
-        "rsi13", "rsi21",
-        "ppo13_5", "ppo27_7",
-        "momentum_10", "momentum_20",
-        "mom", "roc", "cci", "stoch_k", "stoch_d",
-        "atr_14", "bbands_width", "keltner_width",
-        "historical_vol_20",
-        "adi", "obv", "volume_sma_20",
-        "high_low_ratio", "close_position_in_range",
-        "price_acceleration",
-    ])
+    training_features: List[str] = field(
+        default_factory=lambda: [
+            "ofi_proxy",
+            "volume_delta",
+            "tick_momentum_3",
+            "tick_momentum_8",
+            "liquidity_void_up",
+            "liquidity_void_down",
+            "liquidity_void_score",
+            "mtf_h1_slope",
+            "mtf_h4_slope",
+            "mtf_h1_flow_proxy",
+            "mtf_h4_flow_proxy",
+            "stop_hunt_flag",
+            "stop_hunt_strength",
+            "ob_touch_proximity",
+            "ob_pretouch_bias",
+            "dxy_ret_1",
+            "us10y_ret_1",
+            "xau_dxy_corr_rolling",
+            "xau_us10y_corr_rolling",
+            "ma4",
+            "ma9",
+            "ma13",
+            "ma21",
+            "ma50",
+            "ema5",
+            "ema12",
+            "ema26",
+            "ema50",
+            "macd",
+            "macd_signal",
+            "macd_hist",
+            "rsi13",
+            "rsi21",
+            "ppo13_5",
+            "ppo27_7",
+            "momentum_10",
+            "momentum_20",
+            "mom",
+            "roc",
+            "cci",
+            "stoch_k",
+            "stoch_d",
+            "atr_14",
+            "bbands_width",
+            "keltner_width",
+            "historical_vol_20",
+            "adi",
+            "obv",
+            "volume_sma_20",
+            "high_low_ratio",
+            "close_position_in_range",
+            "price_acceleration",
+        ]
+    )
 
     # Model params
-    regressor_params: Dict[str, Any] = field(default_factory=lambda: {
-        "iterations": 2000,
-        "learning_rate": 0.03,
-        "depth": 7,
-        "l2_leaf_reg": 3.0,
-        "random_seed": 42,
-        "verbose": 0,
-        "task_type": "CPU",
-        "loss_function": "RMSE",
-        "eval_metric": "RMSE",
-        "train_dir": str(_ART_CATBOOST),
-    })
-    early_stopping_rounds: int = field(
-       default_factory=lambda: 0
+    regressor_params: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "iterations": 2000,
+            "learning_rate": 0.03,
+            "depth": 7,
+            "l2_leaf_reg": 3.0,
+            "random_seed": 42,
+            "verbose": 0,
+            "task_type": "CPU",
+            "loss_function": "RMSE",
+            "eval_metric": "RMSE",
+            "train_dir": str(_ART_CATBOOST),
+        }
     )
+    early_stopping_rounds: int = field(default_factory=lambda: 0)
 
     # Anti-overfit / validity controls (lightweight, chronological only).
     tscv_folds: int = 4
@@ -300,16 +342,12 @@ class InstitutionalTrainConfig:
 
     # Splits — train / val / test / holdout
     train_split: float = 0.60
-    val_split:   float = 0.75
-    test_split:  float = 0.90   # 10% pure holdout
+    val_split: float = 0.75
+    test_split: float = 0.90  # 10% pure holdout
 
     normalize_data: bool = True
-    float_dtype: str = field(
-    default_factory=lambda: "float32"
-    )
-    max_window_samples: int = field(
-        default_factory=lambda: 50000
-    )
+    float_dtype: str = field(default_factory=lambda: "float32")
+    max_window_samples: int = field(default_factory=lambda: 50000)
     model_version: str = "1.0_xau_institutional"
     dataname: str = "data/XAUUSD_1m.csv"
     dump_path: str = str(get_artifact_path("dumps", "xau_model_institutional.pkl"))
@@ -327,27 +365,64 @@ BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
     stoch_slowk_period=5,
     stoch_slowd_period=5,
     training_features=[
-        "ofi_proxy", "volume_delta",
-        "tick_momentum_3", "tick_momentum_8",
-        "liquidity_void_up", "liquidity_void_down", "liquidity_void_score",
-        "mtf_h1_slope", "mtf_h4_slope",
-        "mtf_h1_flow_proxy", "mtf_h4_flow_proxy",
-        "stop_hunt_flag", "stop_hunt_strength",
-        "ob_touch_proximity", "ob_pretouch_bias",
-        "dxy_ret_1", "us10y_ret_1",
-        "xau_dxy_corr_rolling", "xau_us10y_corr_rolling",
-        "ma4", "ma9", "ma13", "ma21", "ma50", "ma100",
-        "ema5", "ema12", "ema26", "ema50", "ema100",
-        "macd", "macd_signal", "macd_hist",
-        "rsi13", "rsi21",
-        "ppo13_5", "ppo27_7", "ppo48_12",
-        "momentum_10", "momentum_20",
-        "mom", "roc", "cci", "stoch_k", "stoch_d",
-        "atr_14", "bbands_width", "keltner_width",
-        "historical_vol_20", "historical_vol_50",
-        "adi", "obv", "volume_sma_20", "volume_sma_50",
-        "high_low_ratio", "close_position_in_range",
-        "price_acceleration", "volume_acceleration",
+        "ofi_proxy",
+        "volume_delta",
+        "tick_momentum_3",
+        "tick_momentum_8",
+        "liquidity_void_up",
+        "liquidity_void_down",
+        "liquidity_void_score",
+        "mtf_h1_slope",
+        "mtf_h4_slope",
+        "mtf_h1_flow_proxy",
+        "mtf_h4_flow_proxy",
+        "stop_hunt_flag",
+        "stop_hunt_strength",
+        "ob_touch_proximity",
+        "ob_pretouch_bias",
+        "dxy_ret_1",
+        "us10y_ret_1",
+        "xau_dxy_corr_rolling",
+        "xau_us10y_corr_rolling",
+        "ma4",
+        "ma9",
+        "ma13",
+        "ma21",
+        "ma50",
+        "ma100",
+        "ema5",
+        "ema12",
+        "ema26",
+        "ema50",
+        "ema100",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "rsi13",
+        "rsi21",
+        "ppo13_5",
+        "ppo27_7",
+        "ppo48_12",
+        "momentum_10",
+        "momentum_20",
+        "mom",
+        "roc",
+        "cci",
+        "stoch_k",
+        "stoch_d",
+        "atr_14",
+        "bbands_width",
+        "keltner_width",
+        "historical_vol_20",
+        "historical_vol_50",
+        "adi",
+        "obv",
+        "volume_sma_20",
+        "volume_sma_50",
+        "high_low_ratio",
+        "close_position_in_range",
+        "price_acceleration",
+        "volume_acceleration",
     ],
     regressor_params={
         "iterations": 2000,
@@ -369,7 +444,9 @@ BTC_TRAIN_CONFIG = InstitutionalTrainConfig(
 XAU_TRAIN_CONFIG = InstitutionalTrainConfig()
 
 
-def _apply_runtime_train_overrides(cfg: InstitutionalTrainConfig) -> InstitutionalTrainConfig:
+def _apply_runtime_train_overrides(
+    cfg: InstitutionalTrainConfig,
+) -> InstitutionalTrainConfig:
     fast_mode = _env_truthy("INSTITUTIONAL_FAST_MODE", "0")
 
     params = dict(cfg.regressor_params or {})
@@ -380,11 +457,15 @@ def _apply_runtime_train_overrides(cfg: InstitutionalTrainConfig) -> Institution
 
     cur_es = int(cfg.early_stopping_rounds or 0)
     es_default = max(cur_es, 120) if fast_mode and cur_es <= 0 else cur_es
-    new_es = _env_int("INSTITUTIONAL_EARLY_STOPPING_ROUNDS", es_default, min_v=0, max_v=1200)
+    new_es = _env_int(
+        "INSTITUTIONAL_EARLY_STOPPING_ROUNDS", es_default, min_v=0, max_v=1200
+    )
 
     cur_cv_samples = int(cfg.cv_max_samples or 35_000)
     cv_samples_default = min(cur_cv_samples, 18_000) if fast_mode else cur_cv_samples
-    new_cv_samples = _env_int("INSTITUTIONAL_CV_MAX_SAMPLES", cv_samples_default, min_v=2_000, max_v=250_000)
+    new_cv_samples = _env_int(
+        "INSTITUTIONAL_CV_MAX_SAMPLES", cv_samples_default, min_v=2_000, max_v=250_000
+    )
 
     cur_win_samples = int(cfg.max_window_samples or 50_000)
     win_samples_default = min(cur_win_samples, 25_000) if fast_mode else cur_win_samples
@@ -434,6 +515,7 @@ def _apply_runtime_train_overrides(cfg: InstitutionalTrainConfig) -> Institution
 
     return updated
 
+
 _MT5_SYMBOL_BY_BASE = {
     "XAUUSD": "XAUUSDm",
     "BTCUSD": "BTCUSDm",
@@ -452,6 +534,7 @@ _AUX_SERIES_CACHE: Dict[str, tuple[float, pd.Series]] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 # MT5 symbol resolution
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _resolve_mt5_symbol(symbol: str) -> str:
     """Resolve the best-matching MT5 ticker for a canonical asset name."""
@@ -489,8 +572,8 @@ def _resolve_mt5_symbol(symbol: str) -> str:
         symbols = None
     if symbols:
         base_u = base.upper()
-        names  = [s.name for s in symbols if hasattr(s, "name")]
-        exact  = [n for n in names if n.upper() == base_u]
+        names = [s.name for s in symbols if hasattr(s, "name")]
+        exact = [n for n in names if n.upper() == base_u]
         if exact:
             return exact[0]
         starts = [n for n in names if n.upper().startswith(base_u)]
@@ -507,6 +590,7 @@ def _resolve_mt5_symbol(symbol: str) -> str:
 # Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class Pipeline:
     """
     Institutional feature pipeline.
@@ -519,7 +603,7 @@ class Pipeline:
     """
 
     def __init__(self, cfg: InstitutionalTrainConfig) -> None:
-        self.cfg    = cfg
+        self.cfg = cfg
         self.scaler: Optional[ScalerProtocol] = None
         self._dtype = _cfg_dtype(cfg)
         self._aux_cache_ttl_sec = 30.0
@@ -633,7 +717,10 @@ class Pipeline:
         ws = max(1, int(getattr(self.cfg, "window_size", 20) or 20))
         base_budget = max(ws + 200, 500)
         feat_budget = max(
-            (self._feature_live_lookback_m1(feat) for feat in self.cfg.training_features),
+            (
+                self._feature_live_lookback_m1(feat)
+                for feat in self.cfg.training_features
+            ),
             default=0,
         )
         return max(base_budget, feat_budget + ws + 64)
@@ -641,8 +728,10 @@ class Pipeline:
     def _needs_macro_context(self) -> bool:
         feats = set(self.cfg.training_features)
         needed = {
-            "dxy_ret_1", "us10y_ret_1",
-            "xau_dxy_corr_rolling", "xau_us10y_corr_rolling",
+            "dxy_ret_1",
+            "us10y_ret_1",
+            "xau_dxy_corr_rolling",
+            "xau_us10y_corr_rolling",
         }
         return bool(feats & needed)
 
@@ -712,7 +801,9 @@ class Pipeline:
             with MT5_LOCK:
                 rates = mt5.copy_rates_range(sym, tf_id, start, end)
                 if rates is None or len(rates) == 0:
-                    bars = max(1200, int((end_utc - start_utc).total_seconds() // 300) + 400)
+                    bars = max(
+                        1200, int((end_utc - start_utc).total_seconds() // 300) + 400
+                    )
                     rates = mt5.copy_rates_from_pos(sym, tf_id, 0, bars)
             if rates is None or len(rates) == 0:
                 return None
@@ -747,8 +838,12 @@ class Pipeline:
         except Exception:
             pass
 
-        dxy_ser = self._load_aux_close_series(key="DXY", start_utc=start_utc, end_utc=end_utc)
-        us10y_ser = self._load_aux_close_series(key="US10Y", start_utc=start_utc, end_utc=end_utc)
+        dxy_ser = self._load_aux_close_series(
+            key="DXY", start_utc=start_utc, end_utc=end_utc
+        )
+        us10y_ser = self._load_aux_close_series(
+            key="US10Y", start_utc=start_utc, end_utc=end_utc
+        )
 
         if dxy_ser is not None and not dxy_ser.empty:
             out["DXY_Close"] = dxy_ser.reindex(out.index, method="ffill")
@@ -759,8 +854,15 @@ class Pipeline:
         else:
             out["US10Y_Close"] = np.nan
 
-        out["DXY_Close"] = pd.to_numeric(out["DXY_Close"], errors="coerce").ffill().bfill().fillna(0.0)
-        out["US10Y_Close"] = pd.to_numeric(out["US10Y_Close"], errors="coerce").ffill().bfill().fillna(0.0)
+        out["DXY_Close"] = (
+            pd.to_numeric(out["DXY_Close"], errors="coerce").ffill().bfill().fillna(0.0)
+        )
+        out["US10Y_Close"] = (
+            pd.to_numeric(out["US10Y_Close"], errors="coerce")
+            .ffill()
+            .bfill()
+            .fillna(0.0)
+        )
         return out
 
     # ------------------------------------------------------------------ #
@@ -781,8 +883,16 @@ class Pipeline:
         high = pd.to_numeric(df["High"], errors="coerce")
         low = pd.to_numeric(df["Low"], errors="coerce")
         volume = pd.to_numeric(df["Volume"], errors="coerce")
-        dxy_close = pd.to_numeric(df.get("DXY_Close"), errors="coerce") if "DXY_Close" in df.columns else None
-        us10y_close = pd.to_numeric(df.get("US10Y_Close"), errors="coerce") if "US10Y_Close" in df.columns else None
+        dxy_close = (
+            pd.to_numeric(df.get("DXY_Close"), errors="coerce")
+            if "DXY_Close" in df.columns
+            else None
+        )
+        us10y_close = (
+            pd.to_numeric(df.get("US10Y_Close"), errors="coerce")
+            if "US10Y_Close" in df.columns
+            else None
+        )
 
         close_np = close.to_numpy(dtype=np.float64)
         high_np = high.to_numpy(dtype=np.float64)
@@ -807,7 +917,9 @@ class Pipeline:
 
         def _atr(period: int) -> np.ndarray:
             if period not in _atr_cache:
-                _atr_cache[period] = talib.ATR(high_np, low_np, close_np, timeperiod=period)
+                _atr_cache[period] = talib.ATR(
+                    high_np, low_np, close_np, timeperiod=period
+                )
             return _atr_cache[period]
 
         def _vol_sma(period: int) -> pd.Series:
@@ -823,26 +935,37 @@ class Pipeline:
             if not isinstance(df.index, pd.DatetimeIndex):
                 _resampled_ohlcv[rule] = pd.DataFrame()
                 return _resampled_ohlcv[rule]
-            agg = pd.DataFrame({
-                "Open": open_px,
-                "High": high,
-                "Low": low,
-                "Close": close,
-                "Volume": volume,
-            }).resample(rule).agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }).dropna()
+            agg = (
+                pd.DataFrame(
+                    {
+                        "Open": open_px,
+                        "High": high,
+                        "Low": low,
+                        "Close": close,
+                        "Volume": volume,
+                    }
+                )
+                .resample(rule)
+                .agg(
+                    {
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }
+                )
+                .dropna()
+            )
             _resampled_ohlcv[rule] = agg
             return agg
 
         def _align_series_from_rule(rule: str, series: pd.Series) -> pd.Series:
             if series is None or series.empty:
                 return pd.Series(np.zeros(len(df), dtype=np.float64), index=df.index)
-            s = pd.Series(series.values, index=pd.DatetimeIndex(series.index)).sort_index()
+            s = pd.Series(
+                series.values, index=pd.DatetimeIndex(series.index)
+            ).sort_index()
             return s.reindex(df.index, method="ffill").fillna(0.0)
 
         def _mtf_slope(rule: str, lookback: int) -> pd.Series:
@@ -865,8 +988,14 @@ class Pipeline:
             v_rs = pd.to_numeric(rs["Volume"], errors="coerce")
             hl_rs = (h_rs - l_rs).replace(0.0, np.nan)
             clv_rs = ((c_rs - l_rs) - (h_rs - c_rs)) / hl_rs
-            v_rel_rs = v_rs / v_rs.rolling(20, min_periods=5).mean().replace(0.0, np.nan)
-            flow_rs = (clv_rs.clip(-1.0, 1.0) * v_rel_rs).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            v_rel_rs = v_rs / v_rs.rolling(20, min_periods=5).mean().replace(
+                0.0, np.nan
+            )
+            flow_rs = (
+                (clv_rs.clip(-1.0, 1.0) * v_rel_rs)
+                .replace([np.inf, -np.inf], 0.0)
+                .fillna(0.0)
+            )
             return _align_series_from_rule(rule, flow_rs)
 
         # Features to skip after their primary feature already wrote them
@@ -876,23 +1005,37 @@ class Pipeline:
 
         def _xau_ret_1() -> pd.Series:
             if "xau_ret_1" not in _macro_cache:
-                _macro_cache["xau_ret_1"] = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                _macro_cache["xau_ret_1"] = (
+                    close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
             return _macro_cache["xau_ret_1"]
 
         def _dxy_ret_1() -> pd.Series:
             if "dxy_ret_1" not in _macro_cache:
                 if dxy_close is None:
-                    _macro_cache["dxy_ret_1"] = pd.Series(np.zeros(len(df), dtype=np.float64), index=df.index)
+                    _macro_cache["dxy_ret_1"] = pd.Series(
+                        np.zeros(len(df), dtype=np.float64), index=df.index
+                    )
                 else:
-                    _macro_cache["dxy_ret_1"] = dxy_close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                    _macro_cache["dxy_ret_1"] = (
+                        dxy_close.pct_change()
+                        .replace([np.inf, -np.inf], 0.0)
+                        .fillna(0.0)
+                    )
             return _macro_cache["dxy_ret_1"]
 
         def _us10y_ret_1() -> pd.Series:
             if "us10y_ret_1" not in _macro_cache:
                 if us10y_close is None:
-                    _macro_cache["us10y_ret_1"] = pd.Series(np.zeros(len(df), dtype=np.float64), index=df.index)
+                    _macro_cache["us10y_ret_1"] = pd.Series(
+                        np.zeros(len(df), dtype=np.float64), index=df.index
+                    )
                 else:
-                    _macro_cache["us10y_ret_1"] = us10y_close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                    _macro_cache["us10y_ret_1"] = (
+                        us10y_close.pct_change()
+                        .replace([np.inf, -np.inf], 0.0)
+                        .fillna(0.0)
+                    )
             return _macro_cache["us10y_ret_1"]
 
         def _stop_hunt_flag() -> pd.Series:
@@ -913,17 +1056,31 @@ class Pipeline:
             hl = (high - low).replace(0.0, np.nan)
             lower_wick = (np.minimum(open_px, close) - low).clip(lower=0.0)
             upper_wick = (high - np.maximum(open_px, close)).clip(lower=0.0)
-            wick_dom = ((lower_wick - upper_wick) / hl).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            wick_dom = (
+                ((lower_wick - upper_wick) / hl)
+                .replace([np.inf, -np.inf], 0.0)
+                .fillna(0.0)
+            )
             vol_mu = volume.rolling(50, min_periods=10).mean()
             vol_sd = volume.rolling(50, min_periods=10).std().replace(0.0, np.nan)
-            vol_z = ((volume - vol_mu) / vol_sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            strength = flag * (0.55 * wick_dom.abs() + 0.45 * (vol_z.abs() / 3.0).clip(0.0, 1.0))
+            vol_z = (
+                ((volume - vol_mu) / vol_sd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            )
+            strength = flag * (
+                0.55 * wick_dom.abs() + 0.45 * (vol_z.abs() / 3.0).clip(0.0, 1.0)
+            )
             _micro_cache["stop_hunt_strength"] = strength.clip(-1.0, 1.0).fillna(0.0)
             return _micro_cache["stop_hunt_strength"]
 
         def _ob_pretouch() -> tuple[pd.Series, pd.Series]:
-            if "ob_touch_proximity" in _micro_cache and "ob_pretouch_bias" in _micro_cache:
-                return _micro_cache["ob_touch_proximity"], _micro_cache["ob_pretouch_bias"]
+            if (
+                "ob_touch_proximity" in _micro_cache
+                and "ob_pretouch_bias" in _micro_cache
+            ):
+                return (
+                    _micro_cache["ob_touch_proximity"],
+                    _micro_cache["ob_pretouch_bias"],
+                )
             atr14 = _s(_atr(14)).replace(0.0, np.nan)
             body = close - open_px
             prev_open = open_px.shift(1)
@@ -936,11 +1093,19 @@ class Pipeline:
                 np.where((prev_body > 0.0) & (body < -atr14 * 0.60), prev_open, np.nan),
                 index=df.index,
             ).ffill()
-            dist_bull = ((close - bull_ob).abs() / atr14).replace([np.inf, -np.inf], np.nan)
-            dist_bear = ((close - bear_ob).abs() / atr14).replace([np.inf, -np.inf], np.nan)
+            dist_bull = ((close - bull_ob).abs() / atr14).replace(
+                [np.inf, -np.inf], np.nan
+            )
+            dist_bear = ((close - bear_ob).abs() / atr14).replace(
+                [np.inf, -np.inf], np.nan
+            )
             nearest = pd.concat([dist_bull, dist_bear], axis=1).min(axis=1).fillna(9.0)
             prox = (1.0 - (nearest / 3.0).clip(0.0, 1.0)).fillna(0.0)
-            bias_raw = ((dist_bear - dist_bull) / 3.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            bias_raw = (
+                ((dist_bear - dist_bull) / 3.0)
+                .replace([np.inf, -np.inf], 0.0)
+                .fillna(0.0)
+            )
             bias = (bias_raw.clip(-1.0, 1.0) * prox).fillna(0.0)
             _micro_cache["ob_touch_proximity"] = prox
             _micro_cache["ob_pretouch_bias"] = bias
@@ -956,33 +1121,53 @@ class Pipeline:
                 hl = (high - low).replace(0.0, np.nan)
                 clv = ((close - low) - (high - close)) / hl
                 vol_rel = volume / _vol_sma(20).replace(0.0, np.nan)
-                df[feat] = (clv.clip(-1.0, 1.0) * vol_rel).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    (clv.clip(-1.0, 1.0) * vol_rel)
+                    .replace([np.inf, -np.inf], 0.0)
+                    .fillna(0.0)
+                )
             elif feat == "volume_delta":
                 hl = (high - low).replace(0.0, np.nan)
                 body_sign = ((close - open_px) / hl).clip(-1.0, 1.0)
                 vol_rel = volume / _vol_sma(20).replace(0.0, np.nan)
-                df[feat] = (body_sign * vol_rel).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    (body_sign * vol_rel).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
             elif feat == "tick_momentum_3":
                 atr14 = _s(_atr(14)).replace(0.0, np.nan)
-                df[feat] = ((close - close.shift(3)) / atr14).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    ((close - close.shift(3)) / atr14)
+                    .replace([np.inf, -np.inf], 0.0)
+                    .fillna(0.0)
+                )
             elif feat == "tick_momentum_8":
                 atr14 = _s(_atr(14)).replace(0.0, np.nan)
-                df[feat] = ((close - close.shift(8)) / atr14).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    ((close - close.shift(8)) / atr14)
+                    .replace([np.inf, -np.inf], 0.0)
+                    .fillna(0.0)
+                )
             elif feat == "liquidity_void_up":
                 prev_close = close.shift(1).replace(0.0, np.nan)
                 void_up = (low - high.shift(1)).clip(lower=0.0)
-                df[feat] = (void_up / prev_close).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    (void_up / prev_close).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
             elif feat == "liquidity_void_down":
                 prev_close = close.shift(1).replace(0.0, np.nan)
                 void_down = (low.shift(1) - high).clip(lower=0.0)
-                df[feat] = (void_down / prev_close).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    (void_down / prev_close).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
             elif feat == "liquidity_void_score":
                 prev_close = close.shift(1).replace(0.0, np.nan)
                 void_up = (low - high.shift(1)).clip(lower=0.0)
                 void_down = (low.shift(1) - high).clip(lower=0.0)
                 void_mag = (void_up + void_down) / prev_close
                 vol_rel = volume / _vol_sma(20).replace(0.0, np.nan)
-                df[feat] = (void_mag * vol_rel).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                df[feat] = (
+                    (void_mag * vol_rel).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                )
             elif feat == "mtf_h1_slope":
                 df[feat] = _mtf_slope("1h", lookback=8)
             elif feat == "mtf_h4_slope":
@@ -1027,9 +1212,9 @@ class Pipeline:
                         close_np, fastperiod=12, slowperiod=26, signalperiod=9
                     )
                 ml, ms, mh = _macd_cache
-                df["macd"]        = _s(ml)
+                df["macd"] = _s(ml)
                 df["macd_signal"] = _s(ms)
-                df["macd_hist"]   = _s(mh)
+                df["macd_hist"] = _s(mh)
                 _already_written.update({"macd", "macd_signal", "macd_hist"})
 
             # ── PPO ────────────────────────────────────────────────
@@ -1054,14 +1239,18 @@ class Pipeline:
             # ── CCI ────────────────────────────────────────────────
             elif feat == "cci":
                 df[feat] = _s(
-                    talib.CCI(high_np, low_np, close_np, timeperiod=int(self.cfg.cci_period))
+                    talib.CCI(
+                        high_np, low_np, close_np, timeperiod=int(self.cfg.cci_period)
+                    )
                 )
 
             # ── Stochastic (writes both k and d at once) ───────────
             elif feat in ("stoch_k", "stoch_d"):
                 if _stoch_cache is None:
                     _stoch_cache = talib.STOCH(
-                        high_np, low_np, close_np,
+                        high_np,
+                        low_np,
+                        close_np,
                         fastk_period=int(self.cfg.stoch_k_period),
                         slowk_period=int(self.cfg.stoch_slowk_period),
                         slowk_matype=int(self.cfg.stoch_matype),
@@ -1087,7 +1276,7 @@ class Pipeline:
 
             # ── Keltner Channel Width — reuses cached EMA & ATR ────
             elif feat == "keltner_width":
-                mid   = _ema(20)
+                mid = _ema(20)
                 atr20 = _atr(20)
                 upper = mid + 2.0 * atr20
                 lower = mid - 2.0 * atr20
@@ -1114,9 +1303,9 @@ class Pipeline:
             elif feat == "high_low_ratio":
                 df[feat] = (high / low - 1.0) * 100.0
             elif feat == "close_position_in_range":
-                df[feat] = (
-                    (close - low) / (high - low).replace(0.0, np.nan)
-                ).fillna(0.5)
+                df[feat] = ((close - low) / (high - low).replace(0.0, np.nan)).fillna(
+                    0.5
+                )
             elif feat == "price_acceleration":
                 df[feat] = close.pct_change().diff()
             elif feat == "volume_acceleration":
@@ -1139,15 +1328,15 @@ class Pipeline:
         The target at time t uses price at t + horizon (genuinely future).
         Rows near the tail where t + horizon > end are dropped via dropna.
         """
-        prices  = df[self.cfg.mean_price_indc].values
+        prices = df[self.cfg.mean_price_indc].values
         horizon = self.cfg.prediction_horizon
 
         targets = np.full(len(prices), np.nan, dtype=np.float64)
         valid_idx = len(prices) - horizon
         if valid_idx > 0:
-            targets[:valid_idx] = (
-                (prices[horizon:] - prices[:valid_idx]) / prices[:valid_idx]
-            )
+            targets[:valid_idx] = (prices[horizon:] - prices[:valid_idx]) / prices[
+                :valid_idx
+            ]
 
         df["target_return"] = targets
         if self.cfg.target_type == "returns_direction":
@@ -1171,18 +1360,20 @@ class Pipeline:
         allocation instead of appending to a Python list in a for-loop.
         Maintains identical output shape/dtype to v1.
         """
-        feat_matrix = df[self.cfg.training_features].to_numpy(dtype=self._dtype, copy=True)
-        y_arr       = df["target"].to_numpy(dtype=self._dtype, copy=False)
-        ret_arr     = df["target_return"].to_numpy(dtype=self._dtype, copy=False)
-        ws          = self.cfg.window_size
-        n_rows      = len(feat_matrix)
-        n_feats     = feat_matrix.shape[1]
+        feat_matrix = df[self.cfg.training_features].to_numpy(
+            dtype=self._dtype, copy=True
+        )
+        y_arr = df["target"].to_numpy(dtype=self._dtype, copy=False)
+        ret_arr = df["target_return"].to_numpy(dtype=self._dtype, copy=False)
+        ws = self.cfg.window_size
+        n_rows = len(feat_matrix)
+        n_feats = feat_matrix.shape[1]
 
         total = n_rows - ws + 1
         if total <= 0:
             return {
-                "X":   pd.Series([], dtype=object),
-                "y":   pd.Series([], dtype=self._dtype),
+                "X": pd.Series([], dtype=object),
+                "y": pd.Series([], dtype=self._dtype),
                 "ret": pd.Series([], dtype=self._dtype),
             }
 
@@ -1192,7 +1383,10 @@ class Pipeline:
         if max_samples > 0 and total > max_samples:
             stride = int(math.ceil(total / max_samples))
             log.info(
-                "Window sampling | total=%s max=%s stride=%s", total, max_samples, stride
+                "Window sampling | total=%s max=%s stride=%s",
+                total,
+                max_samples,
+                stride,
             )
 
         # Indices of the last row of each window
@@ -1202,19 +1396,21 @@ class Pipeline:
         # Each window[i] = feat_matrix[win_end_indices[i] - ws + 1 : win_end_indices[i] + 1]
         n_windows = win_end_indices.size
         # Vectorised gather using advanced indexing
-        row_offsets = np.arange(ws)                                    # (ws,)
-        window_start = win_end_indices[:, None] - (ws - 1 - row_offsets)  # (n_windows, ws)
+        row_offsets = np.arange(ws)  # (ws,)
+        window_start = win_end_indices[:, None] - (
+            ws - 1 - row_offsets
+        )  # (n_windows, ws)
         # Clamp just-in-case (should never be negative with ws-1 base index)
         window_start = np.clip(window_start, 0, n_rows - 1)
         # Gather: (n_windows, ws, n_feats)
-        windows_3d = feat_matrix[window_start]                          # advanced indexing
+        windows_3d = feat_matrix[window_start]  # advanced indexing
         # Flatten last two dims → (n_windows, ws * n_feats)
         flat_windows = windows_3d.reshape(n_windows, ws * n_feats)
 
         dates = df.index[win_end_indices]
         return {
-            "X":   pd.Series(list(flat_windows), index=dates),
-            "y":   pd.Series(y_arr[win_end_indices],   index=dates, dtype=self._dtype),
+            "X": pd.Series(list(flat_windows), index=dates),
+            "y": pd.Series(y_arr[win_end_indices], index=dates, dtype=self._dtype),
             "ret": pd.Series(ret_arr[win_end_indices], index=dates, dtype=self._dtype),
         }
 
@@ -1225,7 +1421,9 @@ class Pipeline:
         Used by live inference to avoid the training-time target construction path
         (which drops the latest bars by horizon and introduces avoidable lag).
         """
-        feat_matrix = df[self.cfg.training_features].to_numpy(dtype=self._dtype, copy=True)
+        feat_matrix = df[self.cfg.training_features].to_numpy(
+            dtype=self._dtype, copy=True
+        )
         ws = self.cfg.window_size
         n_rows = len(feat_matrix)
         n_feats = feat_matrix.shape[1]
@@ -1257,24 +1455,39 @@ class Pipeline:
             raise RuntimeError("train_windows_empty")
 
         train_end = dates[int(n * self.cfg.train_split)]
-        val_end   = dates[int(n * self.cfg.val_split)]
-        test_end  = dates[int(n * self.cfg.test_split)]
+        val_end = dates[int(n * self.cfg.val_split)]
+        test_end = dates[int(n * self.cfg.test_split)]
 
         def _slice(key: str, start, end) -> pd.Series:
             return Xy[key][start:end]
 
         return {
-            "train":   {"X": _slice("X", None, train_end), "y": _slice("y", None, train_end),   "ret": _slice("ret", None, train_end)},
-            "val":     {"X": _slice("X", train_end, val_end), "y": _slice("y", train_end, val_end), "ret": _slice("ret", train_end, val_end)},
-            "test":    {"X": _slice("X", val_end, test_end),  "y": _slice("y", val_end, test_end),  "ret": _slice("ret", val_end, test_end)},
-            "holdout": {"X": _slice("X", test_end, None),     "y": _slice("y", test_end, None),     "ret": _slice("ret", test_end, None)},
+            "train": {
+                "X": _slice("X", None, train_end),
+                "y": _slice("y", None, train_end),
+                "ret": _slice("ret", None, train_end),
+            },
+            "val": {
+                "X": _slice("X", train_end, val_end),
+                "y": _slice("y", train_end, val_end),
+                "ret": _slice("ret", train_end, val_end),
+            },
+            "test": {
+                "X": _slice("X", val_end, test_end),
+                "y": _slice("y", val_end, test_end),
+                "ret": _slice("ret", val_end, test_end),
+            },
+            "holdout": {
+                "X": _slice("X", test_end, None),
+                "y": _slice("y", test_end, None),
+                "ret": _slice("ret", test_end, None),
+            },
         }
 
     def normalize(self, splits: Dict) -> Dict:
-        """Fit scaler on train+val only; transform all splits. Prevents data leakage."""
+        """Fit scaler on training data only; transform all later splits."""
         train_x = _stack_series(splits["train"]["X"], self._dtype)
-        val_x   = _stack_series(splits["val"]["X"],   self._dtype)
-        self.scaler = _make_scaler(self._dtype).fit(np.concatenate([train_x, val_x]))
+        self.scaler = _make_scaler(self._dtype).fit(train_x)
 
         for part in ("train", "val", "test", "holdout"):
             x = _stack_series(splits[part]["X"], self._dtype)
@@ -1284,9 +1497,9 @@ class Pipeline:
 
     def fit(self, df: pd.DataFrame) -> Dict:
         """Full pipeline: indicators → target → windows → split → normalise."""
-        df     = self.add_indicators(df.copy())
-        df     = self.add_target_no_lookahead(df)
-        Xy     = self.create_windows(df)
+        df = self.add_indicators(df.copy())
+        df = self.add_target_no_lookahead(df)
+        Xy = self.create_windows(df)
         splits = self.split(Xy)
         if self.cfg.normalize_data:
             splits = self.normalize(splits)
@@ -1320,12 +1533,13 @@ class Pipeline:
 # CatBoost log sink
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _CatBoostLogSink:
     """File-like sink that routes CatBoost stdout/stderr into the Python logger."""
 
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger
-        self._buf    = ""
+        self._buf = ""
 
     def write(self, data: Any) -> None:
         s = str(data or "")
@@ -1349,6 +1563,7 @@ class _CatBoostLogSink:
 # Model wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class RegressionModel:
     """
     Institutional-grade regression model with CatBoost → sklearn → numpy fallback chain.
@@ -1356,7 +1571,7 @@ class RegressionModel:
 
     def __init__(self, cfg: InstitutionalTrainConfig) -> None:
         self.cfg = cfg
-        self._catboost_fit_kwargs:  Dict[str, Any] = {}
+        self._catboost_fit_kwargs: Dict[str, Any] = {}
         self._catboost_verbose_step: int = 0
 
         if CatBoostRegressor is not None:
@@ -1365,7 +1580,8 @@ class RegressionModel:
             cpu_total = max(1, int(os.cpu_count() or 1))
             if "thread_count" not in catboost_params:
                 env_threads_raw = str(
-                    os.getenv("CATBOOST_THREAD_COUNT", "") or os.getenv("INSTITUTIONAL_TRAIN_THREADS", "")
+                    os.getenv("CATBOOST_THREAD_COUNT", "")
+                    or os.getenv("INSTITUTIONAL_TRAIN_THREADS", "")
                 ).strip()
                 if env_threads_raw:
                     try:
@@ -1374,32 +1590,43 @@ class RegressionModel:
                         auto_threads = max(1, cpu_total - (2 if cpu_total > 8 else 1))
                 else:
                     auto_threads = max(1, cpu_total - (2 if cpu_total > 8 else 1))
-                catboost_params["thread_count"] = max(1, min(cpu_total, int(auto_threads)))
+                catboost_params["thread_count"] = max(
+                    1, min(cpu_total, int(auto_threads))
+                )
 
             if "used_ram_limit" not in catboost_params:
                 env_ram = str(os.getenv("CATBOOST_USED_RAM_LIMIT", "") or "").strip()
                 if env_ram:
                     catboost_params["used_ram_limit"] = env_ram
                 else:
-                    auto_ram_mb = max(1024, min(8192, int(catboost_params["thread_count"]) * 768))
+                    auto_ram_mb = max(
+                        1024, min(8192, int(catboost_params["thread_count"]) * 768)
+                    )
                     catboost_params["used_ram_limit"] = f"{auto_ram_mb}mb"
 
             verbose_step = int(catboost_params.pop("verbose", 100) or 100)
-            es_rounds    = int(catboost_params.pop(
-                "early_stopping_rounds",
-                getattr(cfg, "early_stopping_rounds", 0),
-            ) or 0)
+            es_rounds = int(
+                catboost_params.pop(
+                    "early_stopping_rounds",
+                    getattr(cfg, "early_stopping_rounds", 0),
+                )
+                or 0
+            )
             use_best_model = bool(catboost_params.pop("use_best_model", True))
 
             self._catboost_verbose_step = max(0, verbose_step)
             self._catboost_fit_kwargs = {
-                "verbose":        (self._catboost_verbose_step if self._catboost_verbose_step > 0 else False),
+                "verbose": (
+                    self._catboost_verbose_step
+                    if self._catboost_verbose_step > 0
+                    else False
+                ),
                 "use_best_model": use_best_model,
             }
             if es_rounds > 0:
                 self._catboost_fit_kwargs["early_stopping_rounds"] = es_rounds
 
-            self.model   = CatBoostRegressor(**catboost_params)
+            self.model = CatBoostRegressor(**catboost_params)
             self.backend = "catboost"
 
         elif HistGradientBoostingRegressor is not None:
@@ -1419,11 +1646,11 @@ class RegressionModel:
 
     def train(self, splits: Dict, *, announce: bool = True) -> None:
         """Train on train split, validate on val split."""
-        dtype   = _cfg_dtype(self.cfg)
+        dtype = _cfg_dtype(self.cfg)
         X_train = _stack_series(splits["train"]["X"], dtype)
         y_train = splits["train"]["y"].values
-        X_val   = _stack_series(splits["val"]["X"], dtype)
-        y_val   = splits["val"]["y"].values
+        X_val = _stack_series(splits["val"]["X"], dtype)
+        y_val = splits["val"]["y"].values
 
         if announce:
             total_iters = int(self.cfg.regressor_params.get("iterations", 3000))
@@ -1434,7 +1661,7 @@ class RegressionModel:
 
         if self.backend == "catboost":
             fit_kwargs: Dict[str, Any] = dict(self._catboost_fit_kwargs)
-            fit_kwargs["eval_set"]  = (X_val, y_val)
+            fit_kwargs["eval_set"] = (X_val, y_val)
             sink = _CatBoostLogSink(log)
             fit_kwargs["log_cout"] = sink
             fit_kwargs["log_cerr"] = sink
@@ -1452,8 +1679,12 @@ class RegressionModel:
             self.model.fit(X_train, y_train)
 
         if announce:
-            _console(f"   ✅ Training complete: {self.cfg.symbol} | backend={self.backend}")
-        log.info("Model training complete: %s | backend=%s", self.cfg.symbol, self.backend)
+            _console(
+                f"   ✅ Training complete: {self.cfg.symbol} | backend={self.backend}"
+            )
+        log.info(
+            "Model training complete: %s | backend=%s", self.cfg.symbol, self.backend
+        )
 
     def predict(self, X: pd.Series) -> np.ndarray:
         dtype = _cfg_dtype(self.cfg)
@@ -1463,6 +1694,7 @@ class RegressionModel:
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
     """
@@ -1507,7 +1739,7 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
     start_env: str = ""
     end_env: str = ""
 
-    rates    = None
+    rates = None
     last_err = (0, "")
 
     with MT5_LOCK:
@@ -1529,10 +1761,14 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
         # Try date-range fetch first
         if start_env and end_env:
             try:
-                start_dt = datetime.datetime.fromisoformat(start_env).replace(tzinfo=None)
-                end_dt   = datetime.datetime.fromisoformat(end_env).replace(tzinfo=None)
+                start_dt = datetime.datetime.fromisoformat(start_env).replace(
+                    tzinfo=None
+                )
+                end_dt = datetime.datetime.fromisoformat(end_env).replace(tzinfo=None)
                 log.info("Fetching range: %s -> %s", start_dt, end_dt)
-                rates    = mt5.copy_rates_range(mt5_symbol, mt5.TIMEFRAME_M1, start_dt, end_dt)
+                rates = mt5.copy_rates_range(
+                    mt5_symbol, mt5.TIMEFRAME_M1, start_dt, end_dt
+                )
                 last_err = mt5.last_error()
             except Exception as e:
                 log.warning("Range fetch error: %s", e)
@@ -1541,7 +1777,9 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
         if rates is None or len(rates) == 0:
             for bars in candidates:
                 try:
-                    rates    = mt5.copy_rates_from_pos(mt5_symbol, mt5.TIMEFRAME_M1, 0, int(bars))
+                    rates = mt5.copy_rates_from_pos(
+                        mt5_symbol, mt5.TIMEFRAME_M1, 0, int(bars)
+                    )
                     last_err = mt5.last_error()
                     if rates is not None and len(rates) > 0:
                         break
@@ -1555,10 +1793,15 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
 
     raw = pd.DataFrame(rates)
     raw["datetime"] = pd.to_datetime(raw["time"], unit="s", utc=True)
-    raw = raw.rename(columns={
-        "open": "Open", "high": "High", "low": "Low",
-        "close": "Close", "tick_volume": "Volume",
-    })
+    raw = raw.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "tick_volume": "Volume",
+        }
+    )
     df = raw.set_index("datetime")[["Open", "High", "Low", "Close", "Volume"]]
 
     if df.empty:
@@ -1570,6 +1813,7 @@ def _load_training_dataframe(cfg: InstitutionalTrainConfig) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 # Training entry points
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _calibrate_abs_threshold(
     preds: np.ndarray,
@@ -1632,21 +1876,20 @@ def _calibrate_abs_threshold(
                 # Choosing the strictest threshold here makes live trading brittle
                 # and can suppress valid signals even when a looser threshold
                 # already satisfies the directional-precision target.
-                if (
-                    cov > bm_cov + 1e-12
-                    or (
-                        abs(cov - bm_cov) <= 1e-12
-                        and (
-                            acc > bm_acc + 1e-12
-                            or (abs(acc - bm_acc) <= 1e-12 and float(q) < bm_q - 1e-12)
-                        )
+                if cov > bm_cov + 1e-12 or (
+                    abs(cov - bm_cov) <= 1e-12
+                    and (
+                        acc > bm_acc + 1e-12
+                        or (abs(acc - bm_acc) <= 1e-12 and float(q) < bm_q - 1e-12)
                     )
                 ):
                     best_meeting = candidate
             continue
         best_acc = float(best["direction_accuracy"])
         best_cov = float(best["coverage"])
-        if acc > best_acc + 1e-12 or (abs(acc - best_acc) <= 1e-12 and cov > best_cov + 1e-12):
+        if acc > best_acc + 1e-12 or (
+            abs(acc - best_acc) <= 1e-12 and cov > best_cov + 1e-12
+        ):
             best = candidate
     return best_meeting if best_meeting is not None else best
 
@@ -1658,7 +1901,9 @@ def _extract_flat_feature_importance(model: Any) -> Optional[np.ndarray]:
     """
     try:
         if hasattr(model, "get_feature_importance"):
-            arr = np.asarray(model.get_feature_importance(), dtype=np.float64).reshape(-1)
+            arr = np.asarray(model.get_feature_importance(), dtype=np.float64).reshape(
+                -1
+            )
             if arr.size > 0:
                 return np.abs(arr)
     except Exception:
@@ -1666,7 +1911,9 @@ def _extract_flat_feature_importance(model: Any) -> Optional[np.ndarray]:
 
     try:
         if hasattr(model, "feature_importances_"):
-            arr = np.asarray(getattr(model, "feature_importances_"), dtype=np.float64).reshape(-1)
+            arr = np.asarray(
+                getattr(model, "feature_importances_"), dtype=np.float64
+            ).reshape(-1)
             if arr.size > 0:
                 return np.abs(arr)
     except Exception:
@@ -1835,8 +2082,7 @@ def _build_fold_splits(
     if cfg.normalize_data:
         dtype = _cfg_dtype(cfg)
         train_x = _stack_series(split["train"]["X"], dtype)
-        val_x = _stack_series(split["val"]["X"], dtype)
-        scaler = _make_scaler(dtype).fit(np.concatenate([train_x, val_x], axis=0))
+        scaler = _make_scaler(dtype).fit(train_x)
         for part in ("train", "val", "test", "holdout"):
             x = _stack_series(split[part]["X"], dtype)
             x = np.asarray(scaler.transform(x), dtype=dtype)
@@ -1863,7 +2109,9 @@ def _eval_fold(
 
     mse = float(np.mean((p_test - y_test) ** 2))
     mae = float(np.mean(np.abs(p_test - y_test)))
-    dir_acc = float(np.mean(np.sign(p_test) == np.sign(y_test))) if len(y_test) > 0 else 0.0
+    dir_acc = (
+        float(np.mean(np.sign(p_test) == np.sign(y_test))) if len(y_test) > 0 else 0.0
+    )
 
     cal = _calibrate_abs_threshold(
         p_val,
@@ -1875,7 +2123,11 @@ def _eval_fold(
     mask = np.abs(p_test) >= thr if thr > 0.0 else np.ones_like(p_test, dtype=bool)
     active_n = int(np.sum(mask))
     active_cov = float(active_n / max(1, len(y_test)))
-    active_dir_acc = float(np.mean(np.sign(p_test[mask]) == np.sign(y_test[mask]))) if active_n > 0 else 0.0
+    active_dir_acc = (
+        float(np.mean(np.sign(p_test[mask]) == np.sign(y_test[mask])))
+        if active_n > 0
+        else 0.0
+    )
 
     return {
         "mse": mse,
@@ -1897,7 +2149,12 @@ def _run_time_series_cv(
     test_len = max(64, int(cfg.tscv_test_samples))
     min_train = max(200, int(cfg.tscv_min_train_samples))
     if n < (min_train + test_len):
-        return {"folds": [], "folds_evaluated": 0, "passed": False, "reason": "insufficient_samples"}
+        return {
+            "folds": [],
+            "folds_evaluated": 0,
+            "passed": False,
+            "reason": "insufficient_samples",
+        }
 
     folds: List[Dict[str, float]] = []
     for k in range(folds_req):
@@ -1905,7 +2162,9 @@ def _run_time_series_cv(
         test_end = train_end + test_len
         if test_end > n:
             break
-        split = _build_fold_splits(cfg, xy, train_start=0, train_end=train_end, test_end=test_end)
+        split = _build_fold_splits(
+            cfg, xy, train_start=0, train_end=train_end, test_end=test_end
+        )
         if split is None:
             continue
         try:
@@ -1915,7 +2174,12 @@ def _run_time_series_cv(
             continue
 
     if not folds:
-        return {"folds": [], "folds_evaluated": 0, "passed": False, "reason": "no_valid_folds"}
+        return {
+            "folds": [],
+            "folds_evaluated": 0,
+            "passed": False,
+            "reason": "no_valid_folds",
+        }
 
     act_acc = [float(f["active_direction_accuracy"]) for f in folds]
     act_cov = [float(f["active_coverage"]) for f in folds]
@@ -1969,7 +2233,9 @@ def _run_walk_forward_validation(
     failed = 0
     train_end = train_len
     while (train_end + test_len) <= n and len(windows) < max_windows:
-        split = _build_fold_splits(cfg, xy, train_start=0, train_end=train_end, test_end=(train_end + test_len))
+        split = _build_fold_splits(
+            cfg, xy, train_start=0, train_end=train_end, test_end=(train_end + test_len)
+        )
         if split is None:
             break
         try:
@@ -2024,7 +2290,13 @@ def _direction_balance(y: np.ndarray) -> Dict[str, Any]:
     arr = np.asarray(y, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
     if arr.size <= 0:
-        return {"positive": 0, "negative": 0, "flat": 0, "dominant_ratio": 1.0, "imbalanced": True}
+        return {
+            "positive": 0,
+            "negative": 0,
+            "flat": 0,
+            "dominant_ratio": 1.0,
+            "imbalanced": True,
+        }
     signs = np.sign(arr)
     positive = int(np.sum(signs > 0.0))
     negative = int(np.sum(signs < 0.0))
@@ -2083,19 +2355,31 @@ def _build_training_audit_report(
     training_features = list(getattr(cfg, "training_features", []) or [])
     suspicious_name_tokens = ("target", "label", "future", "lead", "lookahead", "leak")
     suspicious_feature_names = [
-        feat for feat in training_features
+        feat
+        for feat in training_features
         if any(tok in str(feat).lower() for tok in suspicious_name_tokens)
     ]
 
-    train_y = np.asarray(splits.get("train", {}).get("y", pd.Series(dtype=np.float64)).values, dtype=np.float64)
-    hold_y = np.asarray(splits.get("holdout", {}).get("y", pd.Series(dtype=np.float64)).values, dtype=np.float64)
-    train_pred = np.asarray(preds_by_split.get("train", np.array([], dtype=np.float64)), dtype=np.float64)
-    hold_pred = np.asarray(preds_by_split.get("holdout", np.array([], dtype=np.float64)), dtype=np.float64)
+    hold_y = np.asarray(
+        splits.get("holdout", {}).get("y", pd.Series(dtype=np.float64)).values,
+        dtype=np.float64,
+    )
+    hold_pred = np.asarray(
+        preds_by_split.get("holdout", np.array([], dtype=np.float64)), dtype=np.float64
+    )
 
     feature_target_corr_max = 0.0
     try:
-        if source_df is not None and not source_df.empty and "target" in source_df.columns:
-            corr_series = source_df[training_features + ["target"]].corr(numeric_only=True)["target"].drop(labels=["target"], errors="ignore")
+        if (
+            source_df is not None
+            and not source_df.empty
+            and "target" in source_df.columns
+        ):
+            corr_series = (
+                source_df[training_features + ["target"]]
+                .corr(numeric_only=True)["target"]
+                .drop(labels=["target"], errors="ignore")
+            )
             corr_vals = np.abs(corr_series.to_numpy(dtype=np.float64, copy=False))
             corr_vals = corr_vals[np.isfinite(corr_vals)]
             if corr_vals.size > 0:
@@ -2107,16 +2391,28 @@ def _build_training_audit_report(
     balance = _direction_balance(hold_y)
     regime_dependency = _regime_dependency_profile(hold_pred, hold_y)
 
-    train_dir_acc = float(results.get("train", {}).get("direction_accuracy", 0.0) or 0.0)
-    hold_dir_acc = float(results.get("holdout", {}).get("direction_accuracy", 0.0) or 0.0)
-    val_active_acc = float(alpha_calibration.get("val_direction_accuracy_active", 0.0) or 0.0)
-    hold_active_acc = float(alpha_calibration.get("holdout_direction_accuracy_active", 0.0) or 0.0)
-    hold_active_cov = float(alpha_calibration.get("holdout_coverage_active", 0.0) or 0.0)
+    train_dir_acc = float(
+        results.get("train", {}).get("direction_accuracy", 0.0) or 0.0
+    )
+    hold_dir_acc = float(
+        results.get("holdout", {}).get("direction_accuracy", 0.0) or 0.0
+    )
+    val_active_acc = float(
+        alpha_calibration.get("val_direction_accuracy_active", 0.0) or 0.0
+    )
+    hold_active_acc = float(
+        alpha_calibration.get("holdout_direction_accuracy_active", 0.0) or 0.0
+    )
+    hold_active_cov = float(
+        alpha_calibration.get("holdout_coverage_active", 0.0) or 0.0
+    )
     min_cov = float(alpha_calibration.get("target_active_min_coverage", 0.0) or 0.0)
     calibration_gap = abs(val_active_acc - hold_active_acc)
 
     val_thr = float(alpha_calibration.get("pred_abs_threshold", 0.0) or 0.0)
-    hold_thr = float(alpha_calibration.get("holdout_abs_threshold_from_quantile", 0.0) or 0.0)
+    hold_thr = float(
+        alpha_calibration.get("holdout_abs_threshold_from_quantile", 0.0) or 0.0
+    )
     threshold_ratio = (
         float(hold_thr / max(val_thr, 1e-12))
         if val_thr > 0.0 and hold_thr > 0.0
@@ -2141,7 +2437,9 @@ def _build_training_audit_report(
         stale_age_hours = cadence_hours * 2.0
 
     feature_leakage_detected = bool(suspicious_feature_names)
-    target_leakage_detected = bool((not chronology_ok) or feature_target_corr_max >= 0.995)
+    target_leakage_detected = bool(
+        (not chronology_ok) or feature_target_corr_max >= 0.995
+    )
     overfitting_detected = bool(
         (train_dir_acc - hold_dir_acc) > 0.12
         or not bool(anti_overfit.get("passed", False))
@@ -2238,7 +2536,7 @@ def train(
     _console(f"🏛️  INSTITUTIONAL MODEL TRAIN — {cfg.symbol}")
     t0 = time.time()
 
-    df       = _load_training_dataframe(cfg)
+    df = _load_training_dataframe(cfg)
     _console(f"   Loaded {len(df)} bars")
 
     cfg_effective = _apply_runtime_train_overrides(cfg)
@@ -2252,9 +2550,9 @@ def train(
     )
 
     model = RegressionModel(cfg_effective)
-    require_catboost = str(os.getenv("INSTITUTIONAL_REQUIRE_CATBOOST", "1") or "1").strip().lower() in {
-        "1", "true", "yes", "y", "on"
-    }
+    require_catboost = str(
+        os.getenv("INSTITUTIONAL_REQUIRE_CATBOOST", "1") or "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
     if require_catboost and model.backend != "catboost":
         raise RuntimeError(
             f"institutional_training_blocked:catboost_backend_required:got={model.backend}"
@@ -2273,13 +2571,16 @@ def train(
     if (
         selected_features
         and len(selected_features) < len(cfg_effective.training_features)
-        and len(selected_features) >= max(4, int(cfg_effective.feature_importance_min_features))
+        and len(selected_features)
+        >= max(4, int(cfg_effective.feature_importance_min_features))
     ):
         _console(
             "   Feature Filter: "
             f"{len(cfg_effective.training_features)} -> {len(selected_features)} alpha features"
         )
-        cfg_effective = replace(cfg_effective, training_features=list(selected_features))
+        cfg_effective = replace(
+            cfg_effective, training_features=list(selected_features)
+        )
         pipeline = Pipeline(cfg_effective)
         splits = pipeline.fit(df)
         model = RegressionModel(cfg_effective)
@@ -2292,19 +2593,20 @@ def train(
         )
         feature_importance = {k: float(v) for k, v in ranked_imp}
 
-    dtype   = _cfg_dtype(cfg_effective)
+    dtype = _cfg_dtype(cfg_effective)
     results: Dict[str, Dict[str, Any]] = {}
     preds_by_split: Dict[str, np.ndarray] = {}
     for split_name in ("train", "val", "test", "holdout"):
-        X      = _stack_series(splits[split_name]["X"], dtype)
-        y      = splits[split_name]["y"].values
-        preds  = model.model.predict(X)
+        X = _stack_series(splits[split_name]["X"], dtype)
+        y = splits[split_name]["y"].values
+        preds = model.model.predict(X)
         preds_by_split[split_name] = np.asarray(preds, dtype=np.float64)
-        mse    = float(np.mean((preds - y) ** 2))
-        mae    = float(np.mean(np.abs(preds - y)))
+        mse = float(np.mean((preds - y) ** 2))
+        mae = float(np.mean(np.abs(preds - y)))
         dir_acc = float(np.mean(np.sign(preds) == np.sign(y)))
         results[split_name] = {
-            "mse": mse, "mae": mae,
+            "mse": mse,
+            "mae": mae,
             "direction_accuracy": dir_acc,
             "samples": len(y),
         }
@@ -2329,7 +2631,11 @@ def train(
         hold_thr = float(np.percentile(np.abs(hold_pred), q_cal))
     else:
         hold_thr = pred_abs_thr
-    hold_mask = np.abs(hold_pred) >= hold_thr if hold_thr > 0.0 else np.ones_like(hold_pred, dtype=bool)
+    hold_mask = (
+        np.abs(hold_pred) >= hold_thr
+        if hold_thr > 0.0
+        else np.ones_like(hold_pred, dtype=bool)
+    )
     hold_n = int(np.sum(hold_mask))
     hold_acc_active = (
         float(np.mean(np.sign(hold_pred[hold_mask]) == np.sign(hold_y[hold_mask])))
@@ -2340,8 +2646,12 @@ def train(
     alpha_calibration = {
         "pred_abs_threshold": pred_abs_thr,
         "pred_quantile": q_cal,
-        "val_direction_accuracy_active": float(val_cal.get("direction_accuracy", 0.0) or 0.0),
-        "val_base_direction_accuracy": float(val_cal.get("base_direction_accuracy", 0.0) or 0.0),
+        "val_direction_accuracy_active": float(
+            val_cal.get("direction_accuracy", 0.0) or 0.0
+        ),
+        "val_base_direction_accuracy": float(
+            val_cal.get("base_direction_accuracy", 0.0) or 0.0
+        ),
         "val_coverage_active": float(val_cal.get("coverage", 0.0) or 0.0),
         "holdout_direction_accuracy_active": hold_acc_active,
         "holdout_coverage_active": hold_cov_active,
@@ -2355,7 +2665,9 @@ def train(
     results["holdout"]["active_threshold_quantile"] = q_cal
 
     # Chronological CV + walk-forward diagnostics (scientific anti-overfit checks).
-    cv_target_acc = max(0.0, min(1.0, float(cfg_effective.cv_target_direction_accuracy)))
+    cv_target_acc = max(
+        0.0, min(1.0, float(cfg_effective.cv_target_direction_accuracy))
+    )
     cv_target_cov = max(0.005, min(1.0, float(cfg_effective.cv_target_min_coverage)))
     cv_cfg = replace(
         cfg_effective,
@@ -2369,7 +2681,9 @@ def train(
     xy_full = raw_pipe.create_windows(raw_df)
     tscv_report = _run_time_series_cv(cv_cfg, xy_full)
     wfa_report = _run_walk_forward_validation(cv_cfg, xy_full)
-    anti_overfit_ok = bool(tscv_report.get("passed", False) and wfa_report.get("passed", False))
+    anti_overfit_ok = bool(
+        tscv_report.get("passed", False) and wfa_report.get("passed", False)
+    )
     anti_overfit = {
         "passed": anti_overfit_ok,
         "time_series_cv": tscv_report,
@@ -2407,9 +2721,9 @@ def train(
         and anti_overfit_ok
         and bool(training_audit.get("passed", False))
     )
-    alpha_gate_required = str(os.getenv("INSTITUTIONAL_REQUIRE_ALPHA_GATE", "1") or "1").strip().lower() in {
-        "1", "true", "yes", "y", "on"
-    }
+    alpha_gate_required = str(
+        os.getenv("INSTITUTIONAL_REQUIRE_ALPHA_GATE", "1") or "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
     alpha_gate_fail_reasons: List[str] = []
     if model.backend != "catboost":
         alpha_gate_fail_reasons.append(f"backend={model.backend}")
@@ -2424,7 +2738,9 @@ def train(
     if not anti_overfit_ok:
         tscv_passed = bool(tscv_report.get("passed", False))
         tscv_folds = int(tscv_report.get("folds_evaluated", 0) or 0)
-        tscv_mean_acc = float(tscv_report.get("mean_active_direction_accuracy", 0.0) or 0.0)
+        tscv_mean_acc = float(
+            tscv_report.get("mean_active_direction_accuracy", 0.0) or 0.0
+        )
         tscv_mean_cov = float(tscv_report.get("mean_active_coverage", 0.0) or 0.0)
         tscv_pass_acc = float(tscv_report.get("pass_acc_threshold", 0.0) or 0.0)
         tscv_pass_cov = float(tscv_report.get("pass_cov_threshold", 0.0) or 0.0)
@@ -2481,7 +2797,9 @@ def train(
         source="Backtest.model_train_institutional",
         anti_overfit_passed=bool(anti_overfit_ok),
         tscv_folds=int(tscv_report.get("folds_evaluated", 0) or 0),
-        tscv_mean_active_direction_accuracy=float(tscv_report.get("mean_active_direction_accuracy", 0.0) or 0.0),
+        tscv_mean_active_direction_accuracy=float(
+            tscv_report.get("mean_active_direction_accuracy", 0.0) or 0.0
+        ),
         wfa_passed=bool(wfa_report.get("passed", False)),
         wfa_total_windows=int(wfa_report.get("total", 0) or 0),
         wfa_failed_windows=int(wfa_report.get("failed", 0) or 0),
@@ -2496,7 +2814,9 @@ def train(
     elapsed = time.time() - t0
     _console(f"\n✅ Institutional training complete in {elapsed:.1f}s")
     _console(f"   Registry: {registry_base}.pkl")
-    _console(f"   Holdout Direction Accuracy: {results['holdout']['direction_accuracy']:.2%}")
+    _console(
+        f"   Holdout Direction Accuracy: {results['holdout']['direction_accuracy']:.2%}"
+    )
     _console(
         "   Holdout Active Direction Accuracy: "
         f"{hold_acc_active:.2%} @ coverage={hold_cov_active:.2%} "
@@ -2559,6 +2879,7 @@ def load_training_dataframe_for_asset(asset: str) -> pd.DataFrame:
 
 if __name__ == "__main__":
     import sys
+
     asset = sys.argv[1].upper() if len(sys.argv) > 1 else "XAU"
     if asset in ("BTC", "BTCUSD"):
         train(BTC_TRAIN_CONFIG)

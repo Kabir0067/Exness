@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
-
 import logging
 import threading
 import time
 import traceback
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 import pytz
 
-from core.core_config import XAUEngineConfig as EngineConfig, XAUSymbolParams as SymbolParams, TF_MAP
-from log_config import LOG_DIR as LOG_ROOT, get_log_path
+from core.config import TF_MAP
+from core.config import XAUEngineConfig as EngineConfig
+from core.config import XAUSymbolParams as SymbolParams
+from log_config import LOG_DIR as LOG_ROOT
+from log_config import get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5
 
 # =============================================================================
@@ -172,7 +174,9 @@ class MarketFeed:
         windows.
         """
         micro_w = max(1, int(micro_window_sec or 1))
-        cfg_target = float(getattr(self.sp, "micro_min_tps", 1.0) or 1.0) * float(micro_w)
+        cfg_target = float(getattr(self.sp, "micro_min_tps", 1.0) or 1.0) * float(
+            micro_w
+        )
         return int(min(24, max(2, round(cfg_target))))
 
     def _ensure_book_subscribed(self) -> None:
@@ -284,14 +288,18 @@ class MarketFeed:
                 df_cached = self._cache.get(key)
                 if now < ttl and df_cached is not None and not df_cached.empty:
                     if self.last_bar_age(df_cached) <= max_age:
-                        return df_cached
+                        return df_cached.copy(deep=True)
 
             # refresh path (no _data_lock held here)
             if not self._ensure_symbol_ready():
                 with self._data_lock:
                     df_cached = self._cache.get(key)
-                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
-                        return df_cached
+                    if (
+                        df_cached is not None
+                        and not df_cached.empty
+                        and self.last_bar_age(df_cached) <= max_age
+                    ):
+                        return df_cached.copy(deep=True)
                 return None
 
             tf_id = TF_MAP[timeframe]
@@ -310,8 +318,12 @@ class MarketFeed:
             if rates is None or len(rates) == 0:
                 with self._data_lock:
                     df_cached = self._cache.get(key)
-                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
-                        return df_cached
+                    if (
+                        df_cached is not None
+                        and not df_cached.empty
+                        and self.last_bar_age(df_cached) <= max_age
+                    ):
+                        return df_cached.copy(deep=True)
                 return None
 
             df = pd.DataFrame(rates)
@@ -319,8 +331,12 @@ class MarketFeed:
             if any(c not in df.columns for c in required) or df.empty:
                 with self._data_lock:
                     df_cached = self._cache.get(key)
-                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
-                        return df_cached
+                    if (
+                        df_cached is not None
+                        and not df_cached.empty
+                        and self.last_bar_age(df_cached) <= max_age
+                    ):
+                        return df_cached.copy(deep=True)
                 return None
 
             # UTC-aware timestamps
@@ -334,21 +350,27 @@ class MarketFeed:
                 # Only return cache if it is fresh; otherwise return None.
                 with self._data_lock:
                     df_cached = self._cache.get(key)
-                    if df_cached is not None and not df_cached.empty and self.last_bar_age(df_cached) <= max_age:
-                        return df_cached
+                    if (
+                        df_cached is not None
+                        and not df_cached.empty
+                        and self.last_bar_age(df_cached) <= max_age
+                    ):
+                        return df_cached.copy(deep=True)
                 return None
 
             ttl_sec = float(
                 self._cache_ttl_sec.get(
                     timeframe,
-                    max(0.05, float(getattr(self.cfg, "poll_seconds_fast", 1.0) or 1.0)),
+                    max(
+                        0.05, float(getattr(self.cfg, "poll_seconds_fast", 1.0) or 1.0)
+                    ),
                 )
             )
             with self._data_lock:
                 self._cache[key] = df
                 self._ttl[key] = now + ttl_sec
 
-            return df
+            return df.copy(deep=True)
 
         except Exception as exc:
             log_feed.error("get_rates error: %s | tb=%s", exc, traceback.format_exc())
@@ -358,7 +380,7 @@ class MarketFeed:
                     # return cache only if not stale
                     tf = timeframe if timeframe in TF_MAP else "M1"
                     if self.last_bar_age(df_cached) <= self._max_allowed_bar_age(tf):
-                        return df_cached
+                        return df_cached.copy(deep=True)
                 return None
 
     def last_bar_age(self, df: pd.DataFrame) -> float:
@@ -492,7 +514,9 @@ class MarketFeed:
                 since = datetime.utcnow() - timedelta(seconds=lookback)
 
             with MT5_LOCK:
-                ticks = mt5.copy_ticks_from(symbol, since, int(n_ticks), mt5.COPY_TICKS_ALL)
+                ticks = mt5.copy_ticks_from(
+                    symbol, since, int(n_ticks), mt5.COPY_TICKS_ALL
+                )
 
             self._last_tick_sync = time.time()
 
@@ -506,7 +530,9 @@ class MarketFeed:
             last = ticks["last"].astype(np.float64, copy=False)
             flg = ticks["flags"].astype(np.uint32, copy=False)
 
-            arr = np.column_stack((tm, bid, ask, vol, last, flg)).astype(np.float64, copy=False)
+            arr = np.column_stack((tm, bid, ask, vol, last, flg)).astype(
+                np.float64, copy=False
+            )
 
             # MT5 copy_ticks_* can lag behind the live quote stream on XAU.
             # If the latest quote is newer than the tick batch, append one
@@ -523,14 +549,16 @@ class MarketFeed:
                 last_val = float(arr[-1, 4]) if arr.shape[1] > 4 else 0.0
                 synth_last = last_val if last_val > 0.0 else (0.5 * (bid_q + ask_q))
                 synth_row = np.array(
-                    [[
-                        float(quote_time_msc),
-                        float(bid_q),
-                        float(ask_q),
-                        0.0,
-                        float(synth_last),
-                        0.0,
-                    ]],
+                    [
+                        [
+                            float(quote_time_msc),
+                            float(bid_q),
+                            float(ask_q),
+                            0.0,
+                            float(synth_last),
+                            0.0,
+                        ]
+                    ],
                     dtype=np.float64,
                 )
                 arr = np.vstack((arr, synth_row))
@@ -546,26 +574,36 @@ class MarketFeed:
 
             with self._data_lock:
                 self._tick_cache[symbol] = arr
-                seed_tail = arr[-min(len(arr), 600):] if len(arr) > 0 else None
+                seed_tail = arr[-min(len(arr), 600) :] if len(arr) > 0 else None
                 latest_arr_msc = int(arr[-1, 0]) if len(arr) > 0 else 0
-                last_cached_msc = int(self._tick_deque[-1][0]) if self._tick_deque else 0
+                last_cached_msc = (
+                    int(self._tick_deque[-1][0]) if self._tick_deque else 0
+                )
                 force_reseed = bool(
                     seed_tail is not None
                     and latest_arr_msc > 0
                     and (
                         last_cached_msc <= 0
                         or latest_arr_msc < max(0, last_seen - 5000)
-                        or (latest_arr_msc - last_cached_msc) > max(5000, int(poll_fast * 4000.0))
+                        or (latest_arr_msc - last_cached_msc)
+                        > max(5000, int(poll_fast * 4000.0))
                     )
                 )
 
                 if arr_new is not None and len(arr_new) > 0:
                     self._last_tick_msc = int(arr_new[-1, 0])
 
-                    tail = arr_new[-min(len(arr_new), 600):]
+                    tail = arr_new[-min(len(arr_new), 600) :]
                     for r in tail:
                         self._tick_deque.append(
-                            (float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+                            (
+                                float(r[0]),
+                                float(r[1]),
+                                float(r[2]),
+                                float(r[3]),
+                                float(r[4]),
+                                float(r[5]),
+                            )
                         )
                 elif seed_tail is not None and (
                     force_reseed or len(self._tick_deque) < min(32, len(seed_tail))
@@ -573,7 +611,14 @@ class MarketFeed:
                     self._tick_deque.clear()
                     for r in seed_tail:
                         self._tick_deque.append(
-                            (float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+                            (
+                                float(r[0]),
+                                float(r[1]),
+                                float(r[2]),
+                                float(r[3]),
+                                float(r[4]),
+                                float(r[5]),
+                            )
                         )
                     self._last_tick_msc = int(seed_tail[-1, 0])
 
@@ -618,11 +663,15 @@ class MarketFeed:
                 cumulative_delta_prev = float(self._cumulative_delta)
 
             if arr_live is None:
-                return TickStats(ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q)
+                return TickStats(
+                    ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q
+                )
 
             arr = np.asarray(arr_live, dtype=np.float64)
             if arr.ndim != 2 or arr.shape[1] < 6:
-                return TickStats(ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q)
+                return TickStats(
+                    ok=False, reason="bad_tick_shape", bid=bid_q, ask=ask_q
+                )
 
             win_ms = float(micro_w * 1000.0)
             # MT5 tick timestamps on this broker can lead local wall-clock time,
@@ -632,12 +681,12 @@ class MarketFeed:
             w = arr[arr[:, 0] >= start_ms]
             w_n = int(w.shape[0])
             # MOVED: Calculate stats even if low ticks, to provide volatility data to Risk Manager
-            
+
             times = w[:, 0] / 1000.0 if w_n > 0 else np.array([])
             bids = w[:, 1] if w_n > 0 else np.array([])
             asks = w[:, 2] if w_n > 0 else np.array([])
             vols = w[:, 3] if w_n > 0 else np.array([])
-            
+
             last_bid = float(bids[-1]) if bids.size else bid_q
             last_ask = float(asks[-1]) if asks.size else ask_q
 
@@ -714,9 +763,7 @@ class MarketFeed:
             # catching up. Treat that as a thin-but-live window instead of a
             # hard rejection; stale, spread, and noise breakers remain active.
             allow_thin_window = bool(
-                thin_window
-                and w_n >= 1
-                and tick_age_ms <= max(1200.0, win_ms * 0.5)
+                thin_window and w_n >= 1 and tick_age_ms <= max(1200.0, win_ms * 0.5)
             )
 
             imb = 0.0
@@ -729,29 +776,37 @@ class MarketFeed:
             # t-stat-like micro trend
             std = float(np.std(mid_diff)) if mid_diff.size > 1 else 0.0
             if std > 0 and mid_diff.size > 0:
-                micro_trend = float(np.mean(mid_diff) / (std / np.sqrt(float(mid_diff.size))))
+                micro_trend = float(
+                    np.mean(mid_diff) / (std / np.sqrt(float(mid_diff.size)))
+                )
             else:
                 micro_trend = 0.0
 
             # regime detection (lightweight)
             regime = "unknown"
-            if df_m1 is not None and len(df_m1) >= 60 and all(k in df_m1.columns for k in ("close", "high", "low")):
+            if (
+                df_m1 is not None
+                and len(df_m1) >= 60
+                and all(k in df_m1.columns for k in ("close", "high", "low"))
+            ):
                 c = df_m1["close"].values.astype(np.float64, copy=False)
                 h = df_m1["high"].values.astype(np.float64, copy=False)
-                l = df_m1["low"].values.astype(np.float64, copy=False)
+                low_arr = df_m1["low"].values.astype(np.float64, copy=False)
 
                 c50 = c[-50:]
                 h50 = h[-50:]
-                l50 = l[-50:]
+                low50 = low_arr[-50:]
 
                 atr_period = int(getattr(self.cfg, "atr_period", 14) or 14)
                 atr_rel_hi = float(getattr(self.cfg, "atr_rel_hi", 0.0025) or 0.0025)
-                bb_width_range_max = float(getattr(self.cfg, "bb_width_range_max", 0.005) or 0.005)
+                bb_width_range_max = float(
+                    getattr(self.cfg, "bb_width_range_max", 0.005) or 0.005
+                )
 
                 prev_c = np.roll(c50, 1)
                 tr = np.maximum(
-                    h50 - l50,
-                    np.maximum(np.abs(h50 - prev_c), np.abs(l50 - prev_c)),
+                    h50 - low50,
+                    np.maximum(np.abs(h50 - prev_c), np.abs(low50 - prev_c)),
                 )[1:]
 
                 alpha = 2.0 / (float(atr_period) + 1.0)
@@ -835,7 +890,9 @@ class MarketFeed:
             )
             return self._last_latency
         except Exception as exc:
-            log_feed.error("latency_stats error: %s | tb=%s", exc, traceback.format_exc())
+            log_feed.error(
+                "latency_stats error: %s | tb=%s", exc, traceback.format_exc()
+            )
             return LatencyStats()
 
     # --------------------------- zones ---------------------------
@@ -851,9 +908,21 @@ class MarketFeed:
             ask_prices = np.asarray([p for p, _ in book["asks"]], dtype=np.float64)
             ask_vols = np.asarray([v for _, v in book["asks"]], dtype=np.float64)
 
-            strong_support = float(np.average(bid_prices, weights=bid_vols)) if float(bid_vols.sum()) > 0 else None
-            strong_resistance = float(np.average(ask_prices, weights=ask_vols)) if float(ask_vols.sum()) > 0 else None
-            mid = float(0.5 * (bid_prices[0] + ask_prices[0])) if bid_prices.size and ask_prices.size else None
+            strong_support = (
+                float(np.average(bid_prices, weights=bid_vols))
+                if float(bid_vols.sum()) > 0
+                else None
+            )
+            strong_resistance = (
+                float(np.average(ask_prices, weights=ask_vols))
+                if float(ask_vols.sum()) > 0
+                else None
+            )
+            mid = (
+                float(0.5 * (bid_prices[0] + ask_prices[0]))
+                if bid_prices.size and ask_prices.size
+                else None
+            )
 
             all_prices = np.concatenate((bid_prices, ask_prices))
             all_vols = np.concatenate((bid_vols, ask_vols))
@@ -907,8 +976,15 @@ class MarketFeed:
                 value_area_low=value_area_low,
             )
         except Exception as exc:
-            log_feed.error("micro_price_zones error: %s | tb=%s", exc, traceback.format_exc())
+            log_feed.error(
+                "micro_price_zones error: %s | tb=%s", exc, traceback.format_exc()
+            )
             return MicroZones()
 
 
-__all__ = ["MarketFeed", "TickStats", "LatencyStats", "MicroZones"]
+__all__ = [
+    "MarketFeed", 
+    "TickStats", 
+    "LatencyStats", 
+    "MicroZones"
+    ]

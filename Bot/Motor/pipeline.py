@@ -1,17 +1,48 @@
+"""
+Bot/Motor/pipeline.py - Portfolio engine pipeline utilities and scheduling.
+
+Ин модул мантиқи вақтбандии бозор, назорати зичии сигналҳо,
+ва Pipeline-и дохилии як активро (AssetPipeline) дар бар мегирад.
+"""
+
 from __future__ import annotations
 
+import os
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Deque, List, Tuple
+from typing import TYPE_CHECKING, Any, Deque, List, Optional, Tuple
 
-from .models import log_health
-from .models import tf_seconds
+import MetaTrader5 as mt5
+
+# =============================================================================
+# Imports
+# =============================================================================
+from core.config import get_config_from_env as _get_core_config
+from core.feature_engine import FeatureEngine
+from core.risk_manager import RiskManager
+from core.signal_engine import SignalEngine
+from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
+from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
+from ExnessAPI.functions import market_is_open
+from mt5_client import MT5_LOCK, ensure_mt5, mt5_async_call, mt5_status
+
+from .models import AssetCandidate, log_err, log_health, parse_bar_key, tf_seconds
 
 if TYPE_CHECKING:
     from .engine import MultiAssetTradingEngine
 
+# =============================================================================
+# Global Constants / States
+# =============================================================================
+# CRITICAL: Stale Data Guard - Reject signals when data is too old
+STALE_DATA_THRESHOLD_SEC = 2.0  # STRICT: Reject signals if data is older than 2 seconds
 
+
+# =============================================================================
+# Classes
+# =============================================================================
 class UTCScheduler:
     """Source of Truth for Day/Time logic.
 
@@ -51,13 +82,16 @@ class UTCScheduler:
 class EngineScheduleManager:
     """Time/phase/idempotency coordinator extracted from the engine."""
 
-    def __init__(self, engine: "MultiAssetTradingEngine") -> None:
+    def __init__(self, engine: MultiAssetTradingEngine) -> None:
         self._e = engine
 
     def refresh_signal_cooldowns(self) -> None:
         e = self._e
         try:
-            if e._signal_cooldown_override_sec is not None and e._signal_cooldown_override_sec > 0:
+            if (
+                e._signal_cooldown_override_sec is not None
+                and e._signal_cooldown_override_sec > 0
+            ):
                 cd = float(e._signal_cooldown_override_sec)
                 e._signal_cooldown_sec_by_asset["XAU"] = cd
                 e._signal_cooldown_sec_by_asset["BTC"] = cd
@@ -67,7 +101,9 @@ class EngineScheduleManager:
                 try:
                     if pipe is None:
                         return 60.0
-                    tf = getattr(getattr(pipe.cfg, "symbol_params", None), "tf_primary", None)
+                    tf = getattr(
+                        getattr(pipe.cfg, "symbol_params", None), "tf_primary", None
+                    )
                     sec = tf_seconds(tf)
                     return float(sec) if sec else 60.0
                 except Exception:
@@ -192,7 +228,11 @@ class EngineScheduleManager:
             return True
 
         min_scale_delay = 30.0
-        if int(count) > 0 and int(order_index) <= 0 and (now - float(last_ts)) < min_scale_delay:
+        if (
+            int(count) > 0
+            and int(order_index) <= 0
+            and (now - float(last_ts)) < min_scale_delay
+        ):
             return True
 
         return False
@@ -213,7 +253,9 @@ class EngineScheduleManager:
         max_cd = max(e._signal_cooldown_sec_by_asset.values(), default=60.0)
         ttl = max(2.0 * float(max_cd), 120.0)
         cleaned = 0
-        while e._seen and (now - e._seen[0][2]) > ttl and cleaned < e._seen_cleanup_budget:
+        while (
+            e._seen and (now - e._seen[0][2]) > ttl and cleaned < e._seen_cleanup_budget
+        ):
             a, sid, ts = e._seen.popleft()
             rec = e._seen_index.get((a, sid))
             if rec and float(rec[0]) == float(ts):
@@ -221,7 +263,9 @@ class EngineScheduleManager:
             cleaned += 1
 
     @staticmethod
-    def prune_signal_window(window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0) -> None:
+    def prune_signal_window(
+        window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0
+    ) -> None:
         while window and (now_ts - float(window[0])) > float(lookback_sec):
             window.popleft()
 
@@ -241,7 +285,9 @@ class EngineScheduleManager:
         sec = (now.hour * 3600) + (now.minute * 60) + now.second
         return max(0.0, min(1.0, float(sec) / 86400.0))
 
-    def signal_density_controls(self, asset: str, now_ts: float) -> Tuple[float, float, float, int]:
+    def signal_density_controls(
+        self, asset: str, now_ts: float
+    ) -> Tuple[float, float, float, int]:
         e = self._e
         asset_u = str(asset or "").upper().strip()
         window = e._signal_emit_ts_by_asset.setdefault(asset_u, deque(maxlen=512))
@@ -255,12 +301,12 @@ class EngineScheduleManager:
             active_assets = max(1, len(tuple(UTCScheduler.get_active_assets())))
         except Exception:
             active_assets = 2
-        min_target = float(max(1.0, float(e._target_signals_per_24h_min) / float(active_assets)))
+
+        min_target = float(
+            max(1.0, float(e._target_signals_per_24h_min) / float(active_assets))
+        )
         max_target = float(
-            max(
-                min_target,
-                float(e._target_signals_per_24h_max) / float(active_assets),
-            )
+            max(min_target, float(e._target_signals_per_24h_max) / float(active_assets))
         )
 
         threshold_mult = 1.0
@@ -286,15 +332,21 @@ class EngineScheduleManager:
         expected_min_now = min_target_total * day_progress
 
         if global_count_24h < expected_min_now:
-            pace_deficit = (expected_min_now - float(global_count_24h)) / max(min_target_total, 1.0)
+            pace_deficit = (expected_min_now - float(global_count_24h)) / max(
+                min_target_total, 1.0
+            )
             urgency = min(1.0, max(0.0, pace_deficit))
             threshold_mult = max(0.52, float(threshold_mult) * (1.0 - (0.28 * urgency)))
             min_zscore = max(0.12, float(min_zscore) * (1.0 - (0.35 * urgency)))
             min_flow = max(0.005, float(min_flow) * (1.0 - (0.35 * urgency)))
         elif global_count_24h > max_target_total:
-            overflow = (float(global_count_24h) - max_target_total) / max(max_target_total, 1.0)
+            overflow = (float(global_count_24h) - max_target_total) / max(
+                max_target_total, 1.0
+            )
             pressure = min(1.0, max(0.0, overflow))
-            threshold_mult = min(1.35, float(threshold_mult) * (1.0 + (0.20 * pressure)))
+            threshold_mult = min(
+                1.35, float(threshold_mult) * (1.0 + (0.20 * pressure))
+            )
             min_zscore = min(1.95, float(min_zscore) * (1.0 + (0.25 * pressure)))
             min_flow = min(0.25, float(min_flow) * (1.0 + (0.25 * pressure)))
 
@@ -327,59 +379,10 @@ class EngineScheduleManager:
         return "XAU+BTC"
 
 
-# --- Asset pipeline --------------------------------------------------------
-import time
-import traceback
-from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
-
-import MetaTrader5 as mt5
-
-from ExnessAPI.functions import market_is_open
-from mt5_client import MT5_LOCK, ensure_mt5, mt5_async_call
-
-from .models import log_err, log_health
-from .models import AssetCandidate
-from .models import parse_bar_key, tf_seconds
-
-# =============================================================================
-# CRITICAL: Stale Data Guard - Reject signals when data is too old
-# =============================================================================
-STALE_DATA_THRESHOLD_SEC = 2.0  # STRICT: Reject signals if data is older than 2 seconds
-
-
-def _to_epoch_seconds(x: Any) -> Optional[float]:
-    """Robust conversion for pandas/mt5 datetime representations to epoch seconds."""
-    if x is None:
-        return None
-    try:
-        if isinstance(x, (int, float)):
-            v = float(x)
-            # Guard against RangeIndex / zero timestamps (non-epoch)
-            return v if v >= 1_000_000_000.0 else None
-        if isinstance(x, datetime):
-            dt = x
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            ts = float(dt.timestamp())
-            return ts if ts >= 1_000_000_000.0 else None
-        # pandas.Timestamp has .timestamp()
-        ts_fn = getattr(x, "timestamp", None)
-        if callable(ts_fn):
-            ts = float(ts_fn())
-            return ts if ts >= 1_000_000_000.0 else None
-    except Exception:
-        pass
-    try:
-        # numpy datetime64 / pandas can be cast via float? often fails, but keep safe
-        v = float(x)  # type: ignore[arg-type]
-        return v if v >= 1_000_000_000.0 else None
-    except Exception:
-        return None
-
-
 class _AssetPipeline:
-    def __init__(self, asset: str, cfg: Any, feed: Any, features: Any, risk: Any, signal: Any) -> None:
+    def __init__(
+        self, asset: str, cfg: Any, feed: Any, features: Any, risk: Any, signal: Any
+    ) -> None:
         self.asset = str(asset)
         self.cfg = cfg
         self.feed = feed
@@ -387,12 +390,10 @@ class _AssetPipeline:
         self.risk = risk
         self.signal = signal
 
-        # Signal
         self.last_signal = "Neutral"
         self.last_signal_ts = 0.0
         self.last_latency_ms = 0.0
 
-        # Market snapshot
         self.last_market_ok = True
         self.last_market_reason = "init"
         self.last_bar_age_sec = 0.0
@@ -409,48 +410,50 @@ class _AssetPipeline:
         self._signal_log_every = 5.0
         self._last_signal_log_ts = 0.0
 
-        # PATCH-S2: Per-filter rejection counter for signal diagnostics.
-        self._rejection_counts: dict = {}  # reason в†’ count
-        self._rejection_log_every = 300.0  # log summary every 5 minutes
+        self._rejection_counts: dict = {}
+        self._rejection_log_every = 300.0
         self._rejection_last_log_ts = 0.0
         self._total_cycles = 0
         self._total_signals = 0
 
-        # Market freshness thresholds
-        self._max_bar_age_mult = float(getattr(cfg, "market_max_bar_age_mult", 2.0) or 2.0)
-        # default tightened for scalping; can be overridden from cfg
-        self._min_bar_age_sec = float(getattr(cfg, "market_min_bar_age_sec", 30.0) or 30.0)
+        self._max_bar_age_mult = float(
+            getattr(cfg, "market_max_bar_age_mult", 2.0) or 2.0
+        )
+        self._min_bar_age_sec = float(
+            getattr(cfg, "market_min_bar_age_sec", 30.0) or 30.0
+        )
 
-        # Tick-based freshness (real-time data age)
-        self.last_tick_age_sec = 0.0  # Age from most recent tick, not bar
-        self._last_tick_ts = 0.0  # Timestamp of last tick update
+        self.last_tick_age_sec = 0.0
+        self._last_tick_ts = 0.0
 
         self._last_market_ok_ts = 0.0
-        self._market_validate_every = float(getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0)
+        self._market_validate_every = float(
+            getattr(cfg, "market_validate_interval_sec", 2.0) or 2.0
+        )
         self._last_reconcile_ts = 0.0
 
-        # Baseline sync (gap-safe)
         self._baseline_sync_bars = int(getattr(self.cfg, "baseline_sync_bars", 1) or 1)
-        self._baseline_gap_mult = float(getattr(self.cfg, "baseline_gap_mult", 3.0) or 3.0)
+        self._baseline_gap_mult = float(
+            getattr(self.cfg, "baseline_gap_mult", 3.0) or 3.0
+        )
         self._baseline_ready_bars = 0
         self._baseline_last_key: Optional[str] = None
         self._baseline_last_dt: Optional[datetime] = None
 
-        self._reconcile_interval = float(getattr(cfg, "reconcile_interval_sec", 15.0) or 15.0)
+        self._reconcile_interval = float(
+            getattr(cfg, "reconcile_interval_sec", 15.0) or 15.0
+        )
 
-        # Stale data guard metrics
         self._stale_data_rejections = 0
         self._last_stale_log_ts = 0.0
-        self._stale_log_interval_sec = 5.0  # Log every 5 seconds max (throttled)
+        self._stale_log_interval_sec = 5.0
 
-        # Signal caching to reduce CPU load
         self._last_computed_close = 0.0
         self._last_computed_ts = 0.0
-        self._cache_ttl_sec = 0.3  # Only recompute if price changed or 300ms elapsed
+        self._cache_ttl_sec = 0.3
         self._cached_candidate: Optional[AssetCandidate] = None
 
     def _baseline_gate(self, bar_key: str) -> Tuple[bool, str]:
-        """Return (ok, reason). If ok=False => block trade for baseline sync."""
         dt = parse_bar_key(bar_key)
         if dt is None:
             return True, "baseline_ok(parse_skip)"
@@ -479,7 +482,10 @@ class _AssetPipeline:
             self._baseline_last_dt = dt
 
         if self._baseline_ready_bars < self._baseline_sync_bars:
-            return False, f"baseline_sync({self._baseline_ready_bars}/{self._baseline_sync_bars})"
+            return (
+                False,
+                f"baseline_sync({self._baseline_ready_bars}/{self._baseline_sync_bars})",
+            )
 
         return True, "baseline_ok"
 
@@ -490,14 +496,20 @@ class _AssetPipeline:
             return ""
         return str(getattr(sp, "resolved", "") or getattr(sp, "base", ""))
 
+    def _apply_positions_filter(self, positions: List[Any]) -> List[Any]:
+        if bool(getattr(self.cfg, "ignore_external_positions", False)):
+            try:
+                magic = int(getattr(self.cfg, "magic", 777001) or 777001)
+            except Exception:
+                magic = 777001
+            return [p for p in positions if int(getattr(p, "magic", 0) or 0) == magic]
+        return positions
+
     def ensure_symbol_selected(self) -> None:
         symbol = self.symbol
         if not symbol:
             raise RuntimeError(f"{self.asset}: empty symbol")
 
-        # 1. Terminal check OUTSIDE MT5_LOCK вЂ” ensure_mt5 acquires MT5_LOCK internally.
-        # CRITICAL: never call ensure_mt5() while holding MT5_LOCK (threading.Lock is
-        # non-reentrant); doing so causes a 5-second timeout and MT5 reinit storm.
         if mt5.terminal_info() is None:
             log_health.warning(
                 "%s: terminal_info=None before ensure_symbol_selected, reconnecting...",
@@ -511,25 +523,28 @@ class _AssetPipeline:
         last_err: Optional[str] = None
         for attempt in range(1, 4):
             with MT5_LOCK:
-                # 2. Symbol auto-add / make visible вЂ” no nested ensure_mt5 inside lock
                 info = mt5.symbol_info(symbol)
                 needs_select = info is None or (
                     hasattr(info, "visible") and not bool(info.visible)
                 )
                 if not needs_select:
-                    return  # already selected and visible
+                    return
                 if mt5.symbol_select(symbol, True):
-                    return  # successfully added/made visible
+                    return
                 last_err = f"symbol_select failed: {symbol}"
 
             if attempt < 3:
                 log_health.warning(
                     "%s: ensure_symbol_selected attempt %d failed (%s), retrying in 2s...",
-                    self.asset, attempt, last_err,
+                    self.asset,
+                    attempt,
+                    last_err,
                 )
                 time.sleep(2.0)
 
-        raise RuntimeError(f"{self.asset}: {last_err or f'symbol_select failed: {symbol}'}")
+        raise RuntimeError(
+            f"{self.asset}: {last_err or f'symbol_select failed: {symbol}'}"
+        )
 
     def _fetch_df_for_validation(self):
         tf = getattr(self.cfg.symbol_params, "tf_primary", None)
@@ -544,11 +559,12 @@ class _AssetPipeline:
             return None
 
         try:
-            # Feed.get_rates(symbol, timeframe) вЂ” no tf= or count= kwargs
             df = self.feed.get_rates(symbol, tf)
             if df is None:
                 self.last_market_reason = (
-                    "no_rates_dry_run" if bool(getattr(self.cfg, "dry_run", False)) else "no_rates"
+                    "no_rates_dry_run"
+                    if bool(getattr(self.cfg, "dry_run", False))
+                    else "no_rates"
                 )
             return df
         except Exception:
@@ -577,12 +593,14 @@ class _AssetPipeline:
             try:
                 if hasattr(df, "columns") and "time" in df.columns:
                     last_ts_epoch = _to_epoch_seconds(df["time"].iloc[-1])
-                if last_ts_epoch is None and hasattr(df, "index") and len(getattr(df, "index", [])) > 0:
+                if (
+                    last_ts_epoch is None
+                    and hasattr(df, "index")
+                    and len(getattr(df, "index", [])) > 0
+                ):
                     idx = df.index
                     idx_val = idx[-1]
-                    idx_type = str(getattr(idx, "inferred_type", "") or "").lower()
-                    idx_dtype = str(getattr(idx, "dtype", "") or "").lower()
-                    if "datetime" in idx_type or "datetime" in idx_dtype or isinstance(idx_val, datetime):
+                    if isinstance(idx_val, datetime):
                         last_ts_epoch = _to_epoch_seconds(idx_val)
             except Exception:
                 last_ts_epoch = None
@@ -596,14 +614,17 @@ class _AssetPipeline:
                 age = max(0.0, now - float(last_ts_epoch))
                 self.last_bar_age_sec = float(age)
                 sp = getattr(self.cfg, "symbol_params", None)
-                tf_sec = tf_seconds(getattr(sp, "tf_primary", "M1") if sp else "M1") or 60.0
-                max_age = max(float(self._min_bar_age_sec), self._max_bar_age_mult * float(tf_sec))
+                tf_sec = (
+                    tf_seconds(getattr(sp, "tf_primary", "M1") if sp else "M1") or 60.0
+                )
+                max_age = max(
+                    float(self._min_bar_age_sec), self._max_bar_age_mult * float(tf_sec)
+                )
                 if age > max_age:
                     self.last_market_ok = False
                     self.last_market_reason = "stale"
                     return False
 
-            # Basic sanity on close
             if hasattr(df, "columns") and "close" in df.columns:
                 try:
                     s = df["close"]
@@ -630,25 +651,24 @@ class _AssetPipeline:
 
             if last_ts_epoch is not None:
                 try:
-                    self.last_market_ts = datetime.utcfromtimestamp(float(last_ts_epoch)).strftime("%Y-%m-%d %H:%M:%S")
+                    self.last_market_ts = datetime.utcfromtimestamp(
+                        float(last_ts_epoch)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     self.last_market_ts = "-"
             else:
                 self.last_market_ts = "-"
 
-            self.last_market_tf = str(getattr(self.cfg.symbol_params, "tf_primary", None) or "-")
+            self.last_market_tf = str(
+                getattr(self.cfg.symbol_params, "tf_primary", None) or "-"
+            )
 
-            # ==============================================================
-            # TICK FRESHNESS CHECK (Real-time data age, not bar age)
-            # M1 bars only update at minute boundaries, but ticks are live
-            # ==============================================================
             try:
-                symbol = getattr(self.cfg.symbol_params, "resolved", None) or getattr(self.cfg.symbol_params, "base", "")
+                symbol = getattr(self.cfg.symbol_params, "resolved", None) or getattr(
+                    self.cfg.symbol_params, "base", ""
+                )
                 tick = mt5_async_call(
-                    "symbol_info_tick",
-                    symbol,
-                    timeout=0.35,
-                    default=None,
+                    "symbol_info_tick", symbol, timeout=0.35, default=None
                 )
                 if tick is not None:
                     tick_time = getattr(tick, "time", 0)
@@ -656,7 +676,7 @@ class _AssetPipeline:
                         self._last_tick_ts = float(tick_time)
                         self.last_tick_age_sec = max(0.0, now - float(tick_time))
             except Exception:
-                pass  # Keep existing tick age if fetch fails
+                pass
 
             self.last_market_ok = True
             self.last_market_reason = "ok"
@@ -665,7 +685,12 @@ class _AssetPipeline:
         except Exception as exc:
             self.last_market_ok = False
             self.last_market_reason = "exception"
-            log_err.error("%s market_data_validate error: %s | tb=%s", self.asset, exc, traceback.format_exc())
+            log_err.error(
+                "%s market_data_validate error: %s | tb=%s",
+                self.asset,
+                exc,
+                traceback.format_exc(),
+            )
             return False
 
     def reconcile_positions(self) -> None:
@@ -677,30 +702,25 @@ class _AssetPipeline:
         try:
             with MT5_LOCK:
                 pos = mt5.positions_get(symbol=self.symbol) or []
-            if bool(getattr(self.cfg, "ignore_external_positions", False)):
-                try:
-                    magic = int(getattr(self.cfg, "magic", 777001) or 777001)
-                except Exception:
-                    magic = 777001
-                pos = [p for p in pos if int(getattr(p, "magic", 0) or 0) == magic]
+            pos = self._apply_positions_filter(pos)
             if self.risk and hasattr(self.risk, "on_reconcile_positions"):
                 try:
                     self.risk.on_reconcile_positions(pos)
                 except Exception:
                     pass
         except Exception as exc:
-            log_err.error("%s reconcile error: %s | tb=%s", self.asset, exc, traceback.format_exc())
+            log_err.error(
+                "%s reconcile error: %s | tb=%s",
+                self.asset,
+                exc,
+                traceback.format_exc(),
+            )
 
     def open_positions(self) -> int:
         try:
             with MT5_LOCK:
                 pos = mt5.positions_get(symbol=self.symbol) or []
-            if bool(getattr(self.cfg, "ignore_external_positions", False)):
-                try:
-                    magic = int(getattr(self.cfg, "magic", 777001) or 777001)
-                except Exception:
-                    magic = 777001
-                pos = [p for p in pos if int(getattr(p, "magic", 0) or 0) == magic]
+            pos = self._apply_positions_filter(pos)
             return int(len(pos))
         except Exception:
             return 0
@@ -709,19 +729,17 @@ class _AssetPipeline:
         try:
             now = time.time()
 
-            # =================================================================
-            # CRITICAL FIX: STALE DATA GUARD (Uses TICK freshness, not bar age)
-            # M1 bars only update at minute boundaries (always appear 0-60s old)
-            # Ticks are real-time, so tick age is the true data freshness
-            # =================================================================
-            # Use tick age for freshness check (reads from config, default 60s)
-            TICK_STALE_THRESHOLD_SEC = float(getattr(self.cfg, "tick_stale_threshold_sec", 60.0) or 60.0)
-            data_age = self.last_tick_age_sec if self._last_tick_ts > 0 else self.last_bar_age_sec
+            TICK_STALE_THRESHOLD_SEC = float(
+                getattr(self.cfg, "tick_stale_threshold_sec", 60.0) or 60.0
+            )
+            data_age = (
+                self.last_tick_age_sec
+                if self._last_tick_ts > 0
+                else self.last_bar_age_sec
+            )
 
             if data_age > TICK_STALE_THRESHOLD_SEC:
                 self._stale_data_rejections += 1
-
-                # Log periodically to avoid log spam (Time-based now)
                 now_log = time.time()
                 if (now_log - self._last_stale_log_ts) > self._stale_log_interval_sec:
                     self._last_stale_log_ts = now_log
@@ -748,18 +766,14 @@ class _AssetPipeline:
                     raw_result=None,
                 )
 
-            # =================================================================
-            # OPTIMIZATION: Signal Caching
-            # Don't recompute if price hasn't changed and cache is fresh
-            # =================================================================
-            price_unchanged = abs(self.last_market_close - self._last_computed_close) < 0.01
+            price_unchanged = (
+                abs(self.last_market_close - self._last_computed_close) < 0.01
+            )
             cache_fresh = (now - self._last_computed_ts) < self._cache_ttl_sec
 
             if price_unchanged and cache_fresh and self._cached_candidate is not None:
-                # Return cached candidate but update timestamp
                 return self._cached_candidate
 
-            # execute=True SAFE (no side effects) -> calculates lot/sl/tp
             res = self.signal.compute(execute=True)
 
             signal = str(getattr(res, "signal", "Neutral") or "Neutral")
@@ -777,9 +791,11 @@ class _AssetPipeline:
 
             blocked = bool(getattr(res, "trade_blocked", False))
             reasons = tuple(str(r) for r in (getattr(res, "reasons", []) or [])[:10])
-            signal_id = str(getattr(res, "signal_id", "") or f"{self.asset}_SIG_{int(time.time() * 1000)}")
+            signal_id = str(
+                getattr(res, "signal_id", "")
+                or f"{self.asset}_SIG_{int(time.time() * 1000)}"
+            )
 
-            # PATCH-S2: Track rejection reasons for diagnostics.
             self._total_cycles += 1
             if signal in ("Buy", "Sell", "Strong Buy", "Strong Sell"):
                 self._total_signals += 1
@@ -790,11 +806,19 @@ class _AssetPipeline:
             now_ts = time.time()
             if (now_ts - self._rejection_last_log_ts) >= self._rejection_log_every:
                 self._rejection_last_log_ts = now_ts
-                top_reasons = sorted(self._rejection_counts.items(), key=lambda x: -x[1])[:8]
-                top_str = " ".join(f"{k}={v}" for k, v in top_reasons) if top_reasons else "none"
+                top_reasons = sorted(
+                    self._rejection_counts.items(), key=lambda x: -x[1]
+                )[:8]
+                top_str = (
+                    " ".join(f"{k}={v}" for k, v in top_reasons)
+                    if top_reasons
+                    else "none"
+                )
                 log_health.info(
                     "FILTER_REJECTION_STATS | asset=%s cycles=%d signals=%d signal_rate=%.3f top_rejections=[%s]",
-                    self.asset, self._total_cycles, self._total_signals,
+                    self.asset,
+                    self._total_cycles,
+                    self._total_signals,
                     (self._total_signals / max(1, self._total_cycles)),
                     top_str,
                 )
@@ -815,7 +839,6 @@ class _AssetPipeline:
                     ",".join(reasons) if reasons else "-",
                 )
 
-            # Explicit block if market closed
             if self.asset == "XAU" and not market_is_open("XAU"):
                 return AssetCandidate(
                     asset=self.asset,
@@ -832,10 +855,13 @@ class _AssetPipeline:
                     raw_result=None,
                 )
 
-            baseline_ok, baseline_reason = self._baseline_gate(getattr(res, "bar_key", "") or "")
-            if not baseline_ok:
-                blocked = True
-                reasons = reasons + (baseline_reason,)
+            if "same_bar_dedup" not in reasons:
+                baseline_ok, baseline_reason = self._baseline_gate(
+                    getattr(res, "bar_key", "") or ""
+                )
+                if not baseline_ok:
+                    blocked = True
+                    reasons = reasons + (baseline_reason,)
 
             candidate = AssetCandidate(
                 asset=self.asset,
@@ -852,58 +878,19 @@ class _AssetPipeline:
                 raw_result=res,
             )
 
-            # Store in cache for optimization
             self._last_computed_close = self.last_market_close
             self._last_computed_ts = now
             self._cached_candidate = candidate
 
             return candidate
         except Exception as exc:
-            log_err.error("%s compute_candidate error: %s | tb=%s", self.asset, exc, traceback.format_exc())
+            log_err.error(
+                "%s compute_candidate error: %s | tb=%s",
+                self.asset,
+                exc,
+                traceback.format_exc(),
+            )
             return None
-
-# --- Engine mixin extracted from engine.py --------------------------------
-import os
-import traceback
-from typing import Any, Dict, Optional
-
-import MetaTrader5 as mt5
-
-from core.core_config import (
-    XAUEngineConfig as XauConfig,
-    BTCEngineConfig as BtcConfig,
-    get_config_from_env as _get_core_config,
-)
-from core.data_engine import FeatureEngine
-from core.risk_engine import RiskManager
-from core.signal_engine import SignalEngine
-from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
-from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
-from mt5_client import MT5_LOCK, ensure_mt5, mt5_status, mt5_async_call
-
-from .models import log_err, log_health
-
-
-def _apply_high_accuracy_mode(cfg, enable=True):
-    pass
-
-
-def get_xau_config():
-    return _get_core_config("XAU")
-
-
-def get_btc_config():
-    return _get_core_config("BTC")
-
-
-xau_apply_high_accuracy_mode = _apply_high_accuracy_mode
-btc_apply_high_accuracy_mode = _apply_high_accuracy_mode
-XauFeatureEngine = FeatureEngine
-BtcFeatureEngine = FeatureEngine
-XauRiskManager = RiskManager
-BtcRiskManager = RiskManager
-XauSignalEngine = SignalEngine
-BtcSignalEngine = SignalEngine
 
 
 class EnginePipelineMixin:
@@ -942,7 +929,9 @@ class EnginePipelineMixin:
     @staticmethod
     def _mt5_identity_mismatch(reason: str) -> bool:
         reason_s = str(reason or "").strip().lower()
-        return reason_s.startswith("wrong_account:") or reason_s.startswith("wrong_server:")
+        return reason_s.startswith("wrong_account:") or reason_s.startswith(
+            "wrong_server:"
+        )
 
     def _mt5_session_status(self) -> Tuple[bool, str]:
         with MT5_LOCK:
@@ -1021,17 +1010,46 @@ class EnginePipelineMixin:
         ok, _reason = self._mt5_session_status()
         return ok
 
+    def _throttled_mt5_health_log(
+        self, level: str, message: str, *, ttl_sec: Optional[float] = None
+    ) -> None:
+        ttl = max(
+            2.0,
+            float(
+                ttl_sec
+                if ttl_sec is not None
+                else (os.getenv("MT5_HEALTH_LOG_TTL_SEC", "8.0") or 8.0)
+            ),
+        )
+        now = time.time()
+        last_sig = str(getattr(self, "_mt5_health_log_sig", "") or "")
+        last_ts = float(getattr(self, "_mt5_health_log_ts", 0.0) or 0.0)
+
+        if message == last_sig and (now - last_ts) < ttl:
+            return
+
+        setattr(self, "_mt5_health_log_sig", message)
+        setattr(self, "_mt5_health_log_ts", now)
+
+        logger_fn = (
+            log_err.error if str(level).lower() == "error" else log_health.warning
+        )
+        logger_fn("%s", message)
+
     def _check_mt5_health(self) -> bool:
-        if self.dry_run:
+        if getattr(self, "dry_run", False):
             return True
         try:
             self._touch_runtime_progress()
             session_ok, session_reason = self._mt5_session_status()
             if session_ok:
                 self._mt5_ready = True
+                setattr(self, "_mt5_health_fail_count", 0)
                 return True
 
             self._mt5_ready = False
+            fail_count = int(getattr(self, "_mt5_health_fail_count", 0) or 0) + 1
+            setattr(self, "_mt5_health_fail_count", fail_count)
             if self._mt5_identity_mismatch(session_reason):
                 with self._lock:
                     self._manual_stop = True
@@ -1045,11 +1063,18 @@ class EnginePipelineMixin:
                 return False
 
             status_ok, status_reason = mt5_status()
-            log_health.warning(
-                "MT5_HEALTH_DEGRADED | status_ok=%s reason=%s session_reason=%s | action=ensure_mt5",
-                status_ok,
-                status_reason,
-                session_reason,
+            self._throttled_mt5_health_log(
+                "warning",
+                (
+                    "MT5_HEALTH_DEGRADED | status_ok=%s reason=%s "
+                    "session_reason=%s fail_count=%d | action=ensure_mt5"
+                )
+                % (
+                    status_ok,
+                    status_reason,
+                    session_reason,
+                    fail_count,
+                ),
             )
 
             ensure_mt5()
@@ -1068,55 +1093,182 @@ class EnginePipelineMixin:
                         status_reason,
                     )
                 else:
-                    log_health.warning(
-                        "MT5_HEALTH_RECOVERY_INCOMPLETE | status_ok=%s reason=%s session_reason=%s",
-                        status_ok,
-                        status_reason,
-                        recovered_reason,
+                    self._throttled_mt5_health_log(
+                        "warning",
+                        (
+                            "MT5_HEALTH_RECOVERY_INCOMPLETE | status_ok=%s "
+                            "reason=%s session_reason=%s fail_count=%d"
+                        )
+                        % (
+                            status_ok,
+                            status_reason,
+                            recovered_reason,
+                            fail_count,
+                        ),
                     )
+            else:
+                setattr(self, "_mt5_health_fail_count", 0)
             return recovered
         except Exception as exc:
             status_ok, status_reason = mt5_status()
-            log_err.error(
-                "mt5 health check error: %s | status_ok=%s reason=%s | tb=%s",
-                exc,
-                status_ok,
-                status_reason,
-                traceback.format_exc(),
+            fail_count = int(getattr(self, "_mt5_health_fail_count", 0) or 0) + 1
+            setattr(self, "_mt5_health_fail_count", fail_count)
+            self._throttled_mt5_health_log(
+                "error",
+                (
+                    "MT5_HEALTH_EXCEPTION | err=%s status_ok=%s reason=%s "
+                    "fail_count=%d | tb=%s"
+                )
+                % (
+                    exc,
+                    status_ok,
+                    status_reason,
+                    fail_count,
+                    traceback.format_exc(),
+                ),
+                ttl_sec=12.0,
             )
             return False
 
+    def _sync_symbol_params_from_mt5(self, cfg: Any, asset: str) -> None:
+        if getattr(self, "dry_run", False):
+            return
+
+        sp = getattr(cfg, "symbol_params", None)
+        if sp is None:
+            return
+
+        symbol = str(
+            getattr(sp, "resolved", None) or getattr(sp, "base", "") or ""
+        ).strip()
+        if not symbol:
+            return
+
+        try:
+            ensure_mt5()
+            with MT5_LOCK:
+                info = mt5.symbol_info(symbol)
+                if info is None or (
+                    hasattr(info, "visible") and not bool(info.visible)
+                ):
+                    try:
+                        mt5.symbol_select(symbol, True)
+                    except Exception:
+                        pass
+                    info = mt5.symbol_info(symbol)
+
+            if info is None:
+                log_health.warning(
+                    "SYMBOL_SPEC_SYNC_SKIP | asset=%s symbol=%s reason=symbol_info_none",
+                    asset,
+                    symbol,
+                )
+                return
+
+            resolved = str(getattr(info, "name", symbol) or symbol).strip() or symbol
+            digits = int(getattr(info, "digits", 0) or 0)
+            point = float(getattr(info, "point", 0.0) or 0.0)
+            contract_size = float(
+                getattr(info, "trade_contract_size", 0.0)
+                or getattr(info, "contract_size", 0.0)
+                or 0.0
+            )
+            lot_step = float(getattr(info, "volume_step", 0.0) or 0.0)
+            lot_min = float(getattr(info, "volume_min", 0.0) or 0.0)
+            lot_max = float(getattr(info, "volume_max", 0.0) or 0.0)
+
+            setattr(sp, "resolved", resolved)
+            if digits > 0:
+                setattr(sp, "digits", digits)
+            if contract_size > 0.0:
+                setattr(sp, "contract_size", contract_size)
+            if lot_step > 0.0:
+                setattr(sp, "lot_step", lot_step)
+            if lot_min > 0.0:
+                setattr(sp, "lot_min", lot_min)
+            if lot_max > 0.0:
+                setattr(sp, "lot_max", lot_max)
+
+            point_value = 0.0
+            if point > 0.0:
+                ref_contract = float(
+                    getattr(sp, "contract_size", 0.0) or contract_size or 0.0
+                )
+                if ref_contract > 0.0:
+                    point_value = float(point) * ref_contract
+            if point_value > 0.0:
+                setattr(sp, "point_value", point_value)
+
+            log_health.info(
+                "SYMBOL_SPEC_SYNC | asset=%s symbol=%s digits=%d point=%.6f contract_size=%.4f lot_step=%.4f lot_min=%.4f lot_max=%.4f",
+                asset,
+                resolved,
+                int(getattr(sp, "digits", 0) or 0),
+                float(point),
+                float(getattr(sp, "contract_size", 0.0) or 0.0),
+                float(getattr(sp, "lot_step", 0.0) or 0.0),
+                float(getattr(sp, "lot_min", 0.0) or 0.0),
+                float(getattr(sp, "lot_max", 0.0) or 0.0),
+            )
+        except Exception as exc:
+            log_health.warning(
+                "SYMBOL_SPEC_SYNC_FAILED | asset=%s symbol=%s err=%s",
+                asset,
+                symbol,
+                exc,
+            )
+
     def _build_pipelines(self) -> bool:
-        # Serialize concurrent calls вЂ” rapid start/stop/recover cannot overlap here.
         if not self._build_pipelines_lock.acquire(blocking=False):
             log_health.warning("BUILD_PIPELINES_SKIPPED | reason=already_building")
             return False
         try:
-            # XAU
+            if not getattr(self, "dry_run", False):
+                self._sync_symbol_params_from_mt5(self._xau_cfg, "XAU")
             xau_feed = XauMarketFeed(self._xau_cfg, self._xau_cfg.symbol_params)
-            xau_features = XauFeatureEngine(self._xau_cfg)
-            xau_risk = XauRiskManager(self._xau_cfg, self._xau_cfg.symbol_params)
-            xau_signal = XauSignalEngine(self._xau_cfg, self._xau_cfg.symbol_params, xau_feed, xau_features, xau_risk)
-            self._xau = _AssetPipeline("XAU", self._xau_cfg, xau_feed, xau_features, xau_risk, xau_signal)
-            if not self.dry_run:
+            xau_features = FeatureEngine(self._xau_cfg)
+            xau_risk = RiskManager(self._xau_cfg, self._xau_cfg.symbol_params)
+            xau_signal = SignalEngine(
+                self._xau_cfg,
+                self._xau_cfg.symbol_params,
+                xau_feed,
+                xau_features,
+                xau_risk,
+            )
+            self._xau = _AssetPipeline(
+                "XAU", self._xau_cfg, xau_feed, xau_features, xau_risk, xau_signal
+            )
+            if not getattr(self, "dry_run", False):
                 self._xau.ensure_symbol_selected()
 
-            # BTC
+            if not getattr(self, "dry_run", False):
+                self._sync_symbol_params_from_mt5(self._btc_cfg, "BTC")
             btc_feed = BtcMarketFeed(self._btc_cfg, self._btc_cfg.symbol_params)
-            btc_features = BtcFeatureEngine(self._btc_cfg)
-            btc_risk = BtcRiskManager(self._btc_cfg, self._btc_cfg.symbol_params)
-            btc_signal = BtcSignalEngine(self._btc_cfg, self._btc_cfg.symbol_params, btc_feed, btc_features, btc_risk)
-            self._btc = _AssetPipeline("BTC", self._btc_cfg, btc_feed, btc_features, btc_risk, btc_signal)
-            if not self.dry_run:
+            btc_features = FeatureEngine(self._btc_cfg)
+            btc_risk = RiskManager(self._btc_cfg, self._btc_cfg.symbol_params)
+            btc_signal = SignalEngine(
+                self._btc_cfg,
+                self._btc_cfg.symbol_params,
+                btc_feed,
+                btc_features,
+                btc_risk,
+            )
+            self._btc = _AssetPipeline(
+                "BTC", self._btc_cfg, btc_feed, btc_features, btc_risk, btc_signal
+            )
+            if not getattr(self, "dry_run", False):
                 self._btc.ensure_symbol_selected()
 
-            # IMPORTANT: cooldowns must be refreshed AFTER pipelines exist
             self._refresh_signal_cooldowns()
 
-            log_health.info("PIPELINES_BUILT | xau=%s btc=%s", self._xau.symbol, self._btc.symbol)
+            log_health.info(
+                "PIPELINES_BUILT | xau=%s btc=%s", self._xau.symbol, self._btc.symbol
+            )
             return True
         except Exception as exc:
-            log_err.error("build pipelines error: %s | tb=%s", exc, traceback.format_exc())
+            log_err.error(
+                "build pipelines error: %s | tb=%s", exc, traceback.format_exc()
+            )
             return False
         finally:
             self._build_pipelines_lock.release()
@@ -1129,11 +1281,8 @@ class EnginePipelineMixin:
         try:
             log_health.info("RECOVER_START")
 
-
-            # Stop worker first (prevents executing stale intents)
             self._stop_exec_workers(timeout=4.0)
 
-            # Drop stale queues + mapping
             self._drain_queue(self._order_q)
             self._drain_queue(self._result_q)
             with self._order_state_lock:
@@ -1203,19 +1352,19 @@ class EnginePipelineMixin:
         order_index: int = 0,
     ) -> bool:
         return self._schedule_manager.is_duplicate(
-            asset,
-            signal_id,
-            now,
-            max_orders,
-            order_index=order_index,
+            asset, signal_id, now, max_orders, order_index=order_index
         )
 
     def _mark_seen(self, asset: str, signal_id: str, now: float) -> None:
         self._schedule_manager.mark_seen(asset, signal_id, now)
 
     @staticmethod
-    def _prune_signal_window(window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0) -> None:
-        EngineScheduleManager.prune_signal_window(window, now_ts, lookback_sec=lookback_sec)
+    def _prune_signal_window(
+        window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0
+    ) -> None:
+        EngineScheduleManager.prune_signal_window(
+            window, now_ts, lookback_sec=lookback_sec
+        )
 
     @staticmethod
     def _p95(values: Deque[float] | List[float]) -> float:
@@ -1225,7 +1374,9 @@ class EnginePipelineMixin:
     def _utc_day_progress() -> float:
         return EngineScheduleManager.utc_day_progress()
 
-    def _signal_density_controls(self, asset: str, now_ts: float) -> Tuple[float, float, float, int]:
+    def _signal_density_controls(
+        self, asset: str, now_ts: float
+    ) -> Tuple[float, float, float, int]:
         return self._schedule_manager.signal_density_controls(asset, now_ts)
 
     def _record_signal_emit(self, asset: str, now_ts: float) -> None:
@@ -1233,3 +1384,79 @@ class EnginePipelineMixin:
 
     def _select_active_asset(self, open_xau: int, open_btc: int) -> str:
         return EngineScheduleManager.select_active_asset(open_xau, open_btc)
+
+
+# =============================================================================
+# Global Functions / Backward Compatibility
+# =============================================================================
+def _to_epoch_seconds(x: Any) -> Optional[float]:
+    """Robust conversion for pandas/mt5 datetime representations to epoch seconds."""
+    if x is None:
+        return None
+    try:
+        if isinstance(x, (int, float)):
+            v = float(x)
+            return v if v >= 1_000_000_000.0 else None
+        if isinstance(x, datetime):
+            dt = x
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = float(dt.timestamp())
+            return ts if ts >= 1_000_000_000.0 else None
+        ts_fn = getattr(x, "timestamp", None)
+        if callable(ts_fn):
+            ts = float(ts_fn())
+            return ts if ts >= 1_000_000_000.0 else None
+    except Exception:
+        pass
+    try:
+        v = float(x)  # type: ignore[arg-type]
+        return v if v >= 1_000_000_000.0 else None
+    except Exception:
+        return None
+
+
+def _apply_high_accuracy_mode(cfg, enable=True):
+    pass
+
+
+def get_xau_config():
+    return _get_core_config("XAU")
+
+
+def get_btc_config():
+    return _get_core_config("BTC")
+
+
+# Aliases
+xau_apply_high_accuracy_mode = _apply_high_accuracy_mode
+btc_apply_high_accuracy_mode = _apply_high_accuracy_mode
+XauFeatureEngine = FeatureEngine
+BtcFeatureEngine = FeatureEngine
+XauRiskManager = RiskManager
+BtcRiskManager = RiskManager
+XauSignalEngine = SignalEngine
+BtcSignalEngine = SignalEngine
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+__all__ = [
+    "BtcFeatureEngine",
+    "BtcRiskManager",
+    "BtcSignalEngine",
+    "EnginePipelineMixin",
+    "EngineScheduleManager",
+    "STALE_DATA_THRESHOLD_SEC",
+    "UTCScheduler",
+    "XauFeatureEngine",
+    "XauRiskManager",
+    "XauSignalEngine",
+    "_AssetPipeline",
+    "_apply_high_accuracy_mode",
+    "_to_epoch_seconds",
+    "btc_apply_high_accuracy_mode",
+    "get_btc_config",
+    "get_xau_config",
+    "xau_apply_high_accuracy_mode",
+]

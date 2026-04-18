@@ -1,57 +1,30 @@
-# Bot/bot.py
-from __future__ import annotations
-
-"""Telegram control plane (Exness Portfolio Bot)
+"""
+Bot/bot.py - Telegram control plane (Exness Portfolio Bot)
 
 Ин файл UI/Control қисми система мебошад.
 - Танҳо ADMIN истифода мебарад.
 - Engine/Strategy-ро идора мекунад (start/stop/status)
 - Амалҳои идоракунӣ: close_all, TP/SL (USD) барои ҳамаи позицияҳо
 
-Эзоҳ:
-- Логикаи тиҷорат дар portfolio_engine ва Strategies аст.
-- Ин ҷо танҳо Telegram ва даъват ба ExnessAPI/orders.py.
+Логикаи тиҷорат дар portfolio_engine ва Strategies аст.
+Ин ҷо танҳо Telegram ва даъватҳо ба ExnessAPI/orders.py.
 """
+
+from __future__ import annotations
 
 import html
 import re
+import threading
 import time
 import traceback
-import threading
 from typing import Any, Callable, Dict
 
 import telebot
 from telebot.types import KeyboardButton, ReplyKeyboardMarkup
-from mt5_client import mt5_status
 
 from AiAnalysis.intrd_ai_analys import analyse_intraday
 from AiAnalysis.scalp_ai_analys import analyse
-from DataFeed.ai_day_market_feed import get_ai_payload_btc_intraday, get_ai_payload_xau_intraday
-from DataFeed.scalp_ai_market_feed import get_ai_payload_btc, get_ai_payload_xau
-from ExnessAPI.functions import (
-    close_all_position,
-    close_all_position_by_profit,
-    close_order,
-    get_account_info,
-    get_balance,
-    get_full_report_all,
-    get_full_report_day,
-    get_full_report_month,
-    get_full_report_week,
-    get_order_by_index,
-    get_positions_summary,
-    manual_open_capacity,
-    open_buy_order_btc,
-    open_buy_order_xau,
-    open_sell_order_btc,
-    open_sell_order_xau,
-    set_stoploss_all_positions_usd,
-    set_takeprofit_all_positions_usd,
-)
-from ExnessAPI.history import *  # noqa: F401,F403 (your project uses it)
-from ExnessAPI.history import view_all_history_dict
-
-from .bot_utils import (
+from Bot.bot_utils import (
     ADMIN,
     AI_CALLBACK_PREFIX,
     HELPER_CALLBACK_PREFIX,
@@ -77,12 +50,13 @@ from .bot_utils import (
     _maybe_send_typing,
     _notify_daily_start,
     _notify_engine_stopped,
-    _notify_order_update,
     _notify_order_skipped,
+    _notify_order_update,
     _notify_phase_change,
     _notify_signal,
     _rk_remove,
     _send_clean,
+    _summary_cache,
     build_ai_keyboard,
     build_health_ribbon,
     build_helper_order_count_keyboard,
@@ -96,23 +70,95 @@ from .bot_utils import (
     is_admin_chat,
     log,
     order_keyboard,
+    send_action,
     set_bot_instance,
     set_orig_send_chat_action,
-    send_action,
     tg_call,
-    _summary_cache,
 )
+from DataFeed.ai_day_market_feed import (
+    get_ai_payload_btc_intraday,
+    get_ai_payload_xau_intraday,
+)
+from DataFeed.ai_scalp_market_feed import get_ai_payload_btc, get_ai_payload_xau
+from ExnessAPI.functions import (
+    close_all_position,
+    close_all_position_by_profit,
+    close_order,
+    get_account_info,
+    get_balance,
+    get_full_report_all,
+    get_full_report_day,
+    get_full_report_month,
+    get_full_report_week,
+    get_order_by_index,
+    get_positions_summary,
+    manual_open_capacity,
+    open_buy_order_btc,
+    open_buy_order_xau,
+    open_sell_order_btc,
+    open_sell_order_xau,
+    set_stoploss_all_positions_usd,
+    set_takeprofit_all_positions_usd,
+)
+from ExnessAPI.history import *  # noqa: F401, F403
+from ExnessAPI.history import view_all_history_dict
+from mt5_client import mt5_status
 
 # =============================================================================
-# Handler debounce — rejects duplicate commands within 1.5s (button storm protection)
+# Global Constants & Meta Definitions
+# =============================================================================
+_HANDLER_DEBOUNCE_SEC = 1.5
+
+BTN_START = "🚀 Оғози Тиҷорат"
+BTN_STOP = "🛑 Қатъи Тиҷорат"
+BTN_CLOSE_ALL = "❌ Бастани ҳама ордерҳо"
+BTN_CLOSE_PROFIT = "💰 Бастани фоидадорҳо"
+BTN_OPEN_ORDERS = "📋 Дидани Ордерҳои Кушода"
+BTN_PROFIT_D = "📈 Фоидаи Имрӯза"
+BTN_PROFIT_W = "📊 Фоидаи Ҳафтаина"
+BTN_PROFIT_M = "💹 Фоидаи Моҳона"
+BTN_BALANCE = "💳 Баланс"
+BTN_POS = "📊 Хулосаи Позицияҳо"
+BTN_ENGINE = "🔍 Санҷиши Муҳаррик"
+BTN_FULL = "🛠 Санҷиши Пурраи мотор"
+
+
+# =============================================================================
+# Global Mutex and State Variables
 # =============================================================================
 _HANDLER_LAST_TS: Dict[str, float] = {}
 _HANDLER_LOCK = threading.Lock()
-_HANDLER_DEBOUNCE_SEC = 1.5
+_CALLBACK_ROUTES = []
+
+
+bot = telebot.TeleBot(cfg.telegram_token)
+
+# Provide bot reference to low-level notification utilities
+set_bot_instance(bot)
+
+# Hook Telegram API core methods for telemetry/UI feedback
+_orig_send_message = bot.send_message
+_orig_edit_message_text = bot.edit_message_text
+_orig_answer_callback_query = bot.answer_callback_query
+_orig_send_chat_action = bot.send_chat_action
+_orig_set_my_commands = bot.set_my_commands
+
+set_orig_send_chat_action(_orig_send_chat_action)
+
+
+# =============================================================================
+# Formatter Functions & Core Tools
+# =============================================================================
+def format_usdt(val: Any) -> str:
+    """Format balance symmetrically."""
+    try:
+        return f"💰 <b>{float(val):.2f}$</b>"
+    except Exception:
+        return f"💰 <b>{val}</b>"
 
 
 def _debounce_check(key: str) -> bool:
-    """Return True if command should proceed; False if it arrived too soon after the last one."""
+    """Validate if command complies with rate limits (buttons spams)."""
     now = time.time()
     with _HANDLER_LOCK:
         last = _HANDLER_LAST_TS.get(key, 0.0)
@@ -122,41 +168,20 @@ def _debounce_check(key: str) -> bool:
     return True
 
 
-# =============================================================================
-# Bot instance
-# =============================================================================
-bot = telebot.TeleBot(cfg.telegram_token)
-
-# Set bot instance in utils for helper functions
-set_bot_instance(bot)
-
-# Patch critical bot methods ONCE (keeps your old code calls working)
-# + Adds "typing" for every outgoing message/edit
-# =============================================================================
-_orig_send_message = bot.send_message
-_orig_edit_message_text = bot.edit_message_text
-_orig_answer_callback_query = bot.answer_callback_query
-_orig_send_chat_action = bot.send_chat_action
-_orig_set_my_commands = bot.set_my_commands
-
-# Set the original send_chat_action reference in utils for _maybe_send_typing
-set_orig_send_chat_action(_orig_send_chat_action)
-
-
 def _safe_send_message(*a: Any, **kw: Any) -> Any:
     chat_id = _extract_chat_id_from_call("send_message", a, kw)
     if chat_id is not None and _blocked_chat_cache.get(chat_id):
         return None
 
-    # default: no link previews (clean UX)
     kw.setdefault("disable_web_page_preview", True)
-
     _maybe_send_typing(chat_id)
 
     return tg_call(
         _orig_send_message,
         *a,
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("send_message", exc, a, kw),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "send_message", exc, a, kw
+        ),
         **kw,
     )
 
@@ -171,7 +196,9 @@ def _safe_edit_message_text(*a: Any, **kw: Any) -> Any:
     return tg_call(
         _orig_edit_message_text,
         *a,
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("edit_message_text", exc, a, kw),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "edit_message_text", exc, a, kw
+        ),
         **kw,
     )
 
@@ -180,7 +207,9 @@ def _safe_answer_callback_query(*a: Any, **kw: Any) -> Any:
     return tg_call(
         _orig_answer_callback_query,
         *a,
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("answer_callback_query", exc, a, kw),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "answer_callback_query", exc, a, kw
+        ),
         **kw,
     )
 
@@ -192,7 +221,9 @@ def _safe_send_chat_action(*a: Any, **kw: Any) -> Any:
     return tg_call(
         _orig_send_chat_action,
         *a,
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("send_chat_action", exc, a, kw),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "send_chat_action", exc, a, kw
+        ),
         **kw,
     )
 
@@ -201,7 +232,9 @@ def _safe_set_my_commands(*a: Any, **kw: Any) -> Any:
     return tg_call(
         _orig_set_my_commands,
         *a,
-        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure("set_my_commands", exc, a, kw),
+        on_permanent_failure=lambda exc: _handle_permanent_telegram_failure(
+            "set_my_commands", exc, a, kw
+        ),
         **kw,
     )
 
@@ -212,15 +245,16 @@ bot.answer_callback_query = _safe_answer_callback_query
 bot.send_chat_action = _safe_send_chat_action
 bot.set_my_commands = _safe_set_my_commands
 
-# -----------------------------------------------------------------------------
-# ALIVE PROTOCOL: auto-wrap every handler with typing before any logic
-# -----------------------------------------------------------------------------
 _orig_message_handler = bot.message_handler
 _orig_callback_query_handler = bot.callback_query_handler
 
 
-def _with_action_wrapper(registrar: Callable[..., Any], action: str = "typing") -> Callable[..., Any]:
-    def _decorator_factory(*dargs: Any, **dkwargs: Any) -> Callable[[Callable[..., Any]], Any]:
+def _with_action_wrapper(
+    registrar: Callable[..., Any], action: str = "typing"
+) -> Callable[..., Any]:
+    def _decorator_factory(
+        *dargs: Any, **dkwargs: Any
+    ) -> Callable[[Callable[..., Any]], Any]:
         base_deco = registrar(*dargs, **dkwargs)
 
         def _apply(fn: Callable[..., Any]) -> Any:
@@ -232,7 +266,9 @@ def _with_action_wrapper(registrar: Callable[..., Any], action: str = "typing") 
 
 
 bot.message_handler = _with_action_wrapper(_orig_message_handler, "typing")
-bot.callback_query_handler = _with_action_wrapper(_orig_callback_query_handler, "typing")
+bot.callback_query_handler = _with_action_wrapper(
+    _orig_callback_query_handler, "typing"
+)
 
 engine.set_order_notifier(_notify_order_update)
 engine.set_skip_notifier(_notify_order_skipped)
@@ -241,8 +277,11 @@ engine.set_engine_stop_notifier(_notify_engine_stopped)
 engine.set_daily_start_notifier(_notify_daily_start)
 
 
-def admin_only_message(fn):
-    def wrapper(message):
+# =============================================================================
+# Permission Decorators
+# =============================================================================
+def admin_only_message(fn: Callable) -> Callable:
+    def wrapper(message: telebot.types.Message) -> None:
         try:
             chat_id = int(message.chat.id)
         except Exception:
@@ -260,15 +299,14 @@ def admin_only_message(fn):
     return wrapper
 
 
-def admin_only_callback(fn):
-    def wrapper(call):
+def admin_only_callback(fn: Callable) -> Callable:
+    def wrapper(call: telebot.types.CallbackQuery) -> None:
         try:
             chat_id = int(call.message.chat.id) if call.message else 0
             user_id = int(call.from_user.id) if call.from_user else 0
         except Exception:
             bot.answer_callback_query(call.id, "❌ Дастрасӣ нест")
             return
-        # Allow admin in private and group chats: either chat_id or user_id matches ADMIN.
         if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
             bot.answer_callback_query(call.id, "❌ Дастрасӣ нест")
             return
@@ -277,52 +315,71 @@ def admin_only_callback(fn):
     return wrapper
 
 
+def callback_route(pattern: str) -> Callable:
+    rx = re.compile(pattern)
+
+    def deco(fn: Callable) -> Callable:
+        _CALLBACK_ROUTES.append((rx, fn))
+        return fn
+
+    return deco
+
+
+def _ai_style_label(style: str) -> str:
+    return "Рӯзона" if str(style).lower() == "intraday" else "Скалп"
+
+
+def _ai_cached_banner(payload: Dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    if not bool(meta.get("cached_fallback")):
+        return ""
+    age = int(meta.get("cached_age_sec", 0) or 0)
+    mt5_reason = str(meta.get("mt5_reason", "") or "").strip()
+    suffix = f" | сабаб: <code>{html.escape(mt5_reason)}</code>" if mt5_reason else ""
+    return f"⚠️ <b>МАЪЛУМОТИ КЭШШУДА</b> | синну сол={age}с{suffix}"
+
+
+def _decorate_ai_text(text: str, payload: Dict[str, Any]) -> str:
+    banner = _ai_cached_banner(payload)
+    return f"{banner}\n\n{text}" if banner else text
+
+
+def _mt5_unavailable_message() -> str:
+    _, reason = mt5_status()
+    reason_raw = str(reason or "unknown")
+    reason_s = reason_raw
+    if reason_s.startswith("blocked_cooldown:"):
+        reason_s = reason_s.split(":", 1)[1]
+    hint = ""
+    if "algo_trading_disabled_in_terminal" in reason_s:
+        hint = (
+            "\n\nMT5: Tools -> Options -> Expert Advisors -> "
+            "Allow Algo Trading-ро фаъол кунед ва тугмаи AutoTrading-ро сабз гардонед."
+        )
+    elif "ipc_disconnected" in reason_s or "No IPC connection" in reason_s:
+        hint = "\n\nПайвасти Python ба MT5 канда шудааст. Терминали MT5 ва ботро аз нав оғоз кунед."
+    return f"⚠️ <b>MT5 ҳоло омода нест</b>\n<code>{html.escape(reason_s)}</code>{hint}"
+
+
 # =============================================================================
-# Commands
+# Main Telegram Commands Logic
 # =============================================================================
 def bot_commands() -> None:
-    """
-    Sets the main menu commands for the Telegram bot with a Premium UI design.
-    """
     commands = [
-        # --- 1. System & Control (Асосӣ) ---
         telebot.types.BotCommand("/start", "🚀 Оғоз / Менюи Асосӣ"),
         telebot.types.BotCommand("/buttons", "🎛️ Панели Идоракунӣ"),
-        
-        # --- 2. Analytics & AI (Ақли сунъӣ) ---
         telebot.types.BotCommand("/status", "🟢 Ҳолати Система (Live)"),
         telebot.types.BotCommand("/ai", "🧠 Таҳлили Бозор (AI)"),
-        
-        # --- 3. Finance & Data (Молия) ---
         telebot.types.BotCommand("/balance", "💳 Баланс ва Сармоя"),
         telebot.types.BotCommand("/history", "📜 Таърихи Савдо (Логҳо)"),
-        
-        # --- 4. Support (Дастгирӣ) ---
         telebot.types.BotCommand("/helpers", "📚 Роҳнамо ва Дастурҳо"),
     ]
-    
-    # Apply commands
+
     ok = bot.set_my_commands(commands)
     if not ok:
         log.warning("⚠️ Failed to update bot commands (API Error).")
     else:
         log.info("✅ Bot commands updated successfully with Premium UI.")
-
-# =============================================================================
-# Menu
-# =============================================================================
-BTN_START = "🚀 Оғози Тиҷорат"
-BTN_STOP = "🛑 Қатъи Тиҷорат"
-BTN_CLOSE_ALL = "❌ Бастани ҳама ордерҳо"
-BTN_CLOSE_PROFIT = "💰 Бастани фоидадорҳо"
-BTN_OPEN_ORDERS = "📋 Дидани Ордерҳои Кушода"
-BTN_PROFIT_D = "📈 Фоидаи Имрӯза"
-BTN_PROFIT_W = "📊 Фоидаи Ҳафтаина"
-BTN_PROFIT_M = "💹 Фоидаи Моҳона"
-BTN_BALANCE = "💳 Баланс"
-BTN_POS = "📊 Хулосаи Позицияҳо"
-BTN_ENGINE = "🔍 Санҷиши Муҳаррик"
-BTN_FULL = "🛠 Санҷиши Пурраи мотор"
 
 
 def buttons_func(message: telebot.types.Message) -> None:
@@ -332,7 +389,11 @@ def buttons_func(message: telebot.types.Message) -> None:
     markup.row(KeyboardButton(BTN_OPEN_ORDERS))
     markup.row(KeyboardButton(BTN_BALANCE), KeyboardButton(BTN_POS))
     markup.row(KeyboardButton(BTN_ENGINE), KeyboardButton(BTN_FULL))
-    markup.row(KeyboardButton(BTN_PROFIT_D), KeyboardButton(BTN_PROFIT_W), KeyboardButton(BTN_PROFIT_M))
+    markup.row(
+        KeyboardButton(BTN_PROFIT_D),
+        KeyboardButton(BTN_PROFIT_W),
+        KeyboardButton(BTN_PROFIT_M),
+    )
 
     bot.send_message(
         message.chat.id,
@@ -345,7 +406,9 @@ def buttons_func(message: telebot.types.Message) -> None:
 @bot.message_handler(commands=["tek_prof"])
 @admin_only_message
 def tek_profit_put(message: telebot.types.Message) -> None:
-    _send_clean(message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🎛 Ҳоло TP-ро интихоб мекунем.")
+    _send_clean(
+        message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🎛 Ҳоло TP-ро интихоб мекунем."
+    )
     kb = _build_tp_usd_keyboard()
     bot.send_message(
         message.chat.id,
@@ -355,7 +418,9 @@ def tek_profit_put(message: telebot.types.Message) -> None:
     )
 
 
-@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(TP_CALLBACK_PREFIX))
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data) and call.data.startswith(TP_CALLBACK_PREFIX)
+)
 @admin_only_callback
 def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").split(":", 1)[-1].strip().lower()
@@ -363,7 +428,9 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
     if data == "cancel":
         bot.answer_callback_query(call.id, "Бекор шуд")
         try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None
+            )
         except Exception:
             pass
         return
@@ -391,12 +458,13 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
 
     except Exception as exc:
         bot.answer_callback_query(call.id, "Хато ҳангоми коркард", show_alert=True)
-        bot.send_message(call.message.chat.id, f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>",
+            parse_mode="HTML",
+        )
 
 
-# =============================================================================
-# /helpers — TP/SL + ордеркушои (2,4,6,8,10,12,14,16)
-# =============================================================================
 @bot.message_handler(commands=["helpers"])
 @admin_only_message
 def helpers_handler(message: telebot.types.Message) -> None:
@@ -410,20 +478,11 @@ def helpers_handler(message: telebot.types.Message) -> None:
         reply_markup=build_helpers_keyboard(),
         parse_mode="HTML",
     )
-    return
-    _send_clean(message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🛠 Ёвариҳо.")
-    bot.send_message(
-        message.chat.id,
-        "🛠 <b>Ёвариҳо</b>\n\n"
-        "📈 <b>TP</b> / 🛡 <b>SL</b> — барои ҳамаи позицияҳои кушода (интихоби маблағ $).\n"
-        "🟢 <b>Харид</b> / 🔴 <b>Фурӯш</b> — аввал интихоб кунед, баъд шумораи ордерҳо: "
-        "<b>2, 4, 6, 8, 10, 12, 14, 16</b> (лот 0.02, SL/TP фикси).",
-        reply_markup=build_helpers_keyboard(),
-        parse_mode="HTML",
-    )
 
 
-@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(HELPER_CALLBACK_PREFIX))
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data) and call.data.startswith(HELPER_CALLBACK_PREFIX)
+)
 @admin_only_callback
 def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").replace(HELPER_CALLBACK_PREFIX, "", 1).strip().lower()
@@ -453,15 +512,20 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
         )
         return
 
-    # Buy/Sell: first choose side, then count
     if data in ("buy_btc", "sell_btc", "buy_xau", "sell_xau"):
         if not _debounce_check(f"helper:{call.message.chat.id}:{data}"):
-            bot.answer_callback_query(call.id, "⏳ Обрабатывается...", show_alert=False)
+            bot.answer_callback_query(
+                call.id, "⏳ Дар ҳоли коркард...", show_alert=False
+            )
             return
         try:
             st = engine.status()
-            if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
-                bot.answer_callback_query(call.id, "Manual helper blocked", show_alert=True)
+            if bool(getattr(st, "trading", False)) and not bool(
+                getattr(st, "manual_stop", False)
+            ):
+                bot.answer_callback_query(
+                    call.id, "Manual helper blocked", show_alert=True
+                )
                 bot.send_message(
                     call.message.chat.id,
                     "⚠️ <b>Manual helper баста шуд</b>\nАввал auto-trading-ро ба monitoring гузаронед, баъд helper-и дастиро истифода баред.",
@@ -494,7 +558,9 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     if count_str == "cancel":
         bot.answer_callback_query(call.id, "Бекор шуд")
         try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None
+            )
         except Exception:
             pass
         return
@@ -533,22 +599,38 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     if action == "buy_btc":
         bot.answer_callback_query(call.id, f"⏳ Хариди BTC ×{count} …")
         n = open_buy_order_btc(count)
-        bot.send_message(call.message.chat.id, f"🟢 <b>Хариди BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"🟢 <b>Хариди BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
+            parse_mode="HTML",
+        )
         return
     if action == "sell_btc":
         bot.answer_callback_query(call.id, f"⏳ Фурӯши BTC ×{count} …")
         n = open_sell_order_btc(count)
-        bot.send_message(call.message.chat.id, f"🔴 <b>Фурӯши BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"🔴 <b>Фурӯши BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
+            parse_mode="HTML",
+        )
         return
     if action == "buy_xau":
         bot.answer_callback_query(call.id, f"⏳ Хариди XAU ×{count} …")
         n = open_buy_order_xau(count)
-        bot.send_message(call.message.chat.id, f"🟢 <b>Хариди XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"🟢 <b>Хариди XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
+            parse_mode="HTML",
+        )
         return
     if action == "sell_xau":
         bot.answer_callback_query(call.id, f"⏳ Фурӯши XAU ×{count} …")
         n = open_sell_order_xau(count)
-        bot.send_message(call.message.chat.id, f"🔴 <b>Фурӯши XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"🔴 <b>Фурӯши XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
+            parse_mode="HTML",
+        )
         return
 
     bot.answer_callback_query(call.id, "Амал номаълум", show_alert=True)
@@ -557,7 +639,9 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
 @bot.message_handler(commands=["stop_ls"])
 @admin_only_message
 def tek_stoploss_put(message: telebot.types.Message) -> None:
-    _send_clean(message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🛡 Ҳоло SL-ро интихоб мекунем.")
+    _send_clean(
+        message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🛡 Ҳоло SL-ро интихоб мекунем."
+    )
     kb = _build_sl_usd_keyboard()
     bot.send_message(
         message.chat.id,
@@ -567,7 +651,9 @@ def tek_stoploss_put(message: telebot.types.Message) -> None:
     )
 
 
-@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(SL_CALLBACK_PREFIX))
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data) and call.data.startswith(SL_CALLBACK_PREFIX)
+)
 @admin_only_callback
 def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").split(":", 1)[-1].strip().lower()
@@ -575,7 +661,9 @@ def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
     if data == "cancel":
         bot.answer_callback_query(call.id, "Бекор шуд")
         try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None
+            )
         except Exception:
             pass
         return
@@ -603,19 +691,22 @@ def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
 
     except Exception as exc:
         bot.answer_callback_query(call.id, "Хато ҳангоми коркард", show_alert=True)
-        bot.send_message(call.message.chat.id, f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>", parse_mode="HTML")
+        bot.send_message(
+            call.message.chat.id,
+            f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>",
+            parse_mode="HTML",
+        )
 
 
-# =============================================================================
-# Daily summary (single source; no duplication)
-# =============================================================================
 def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     cache_key = ("daily", chat_id)
 
     if not force_refresh:
         cached = _summary_cache.get(cache_key)
         if cached is not None:
-            bot.send_message(chat_id, cached, parse_mode="HTML", reply_markup=_rk_remove())
+            bot.send_message(
+                chat_id, cached, parse_mode="HTML", reply_markup=_rk_remove()
+            )
             return
     else:
         _summary_cache.pop(cache_key, None)
@@ -625,7 +716,12 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     total_open = int(summary.get("total_open", 0) or 0)
 
     if total_closed == 0 and total_open == 0:
-        bot.send_message(chat_id, "📅 Имрӯз ҳеҷ ордер (кушода ё баста) вуҷуд надорад.", parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(
+            chat_id,
+            "📅 Имрӯз ҳеҷ ордер (кушода ё баста) вуҷуд надорад.",
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
         return
 
     text = _build_daily_summary_text(summary)
@@ -633,9 +729,6 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=_rk_remove())
 
 
-# =============================================================================
-# /start /history /balance /buttons /status
-# =============================================================================
 @bot.message_handler(commands=["start"])
 def start_handler(message: telebot.types.Message) -> None:
     try:
@@ -648,24 +741,31 @@ def start_handler(message: telebot.types.Message) -> None:
         user_id = 0
     if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
         deny(message)
-        # Notify admin about unauthorized access attempt
         try:
             user_id = int(message.from_user.id) if message.from_user else 0
-            username = str(message.from_user.username or "N/A") if message.from_user else "N/A"
+            username = (
+                str(message.from_user.username or "N/A") if message.from_user else "N/A"
+            )
             chat_id = int(message.chat.id)
-            first_name = str(message.from_user.first_name or "N/A") if message.from_user else "N/A"
-            last_name = str(message.from_user.last_name or "") if message.from_user else ""
+            first_name = (
+                str(message.from_user.first_name or "N/A")
+                if message.from_user
+                else "N/A"
+            )
+            last_name = (
+                str(message.from_user.last_name or "") if message.from_user else ""
+            )
 
             alert_msg = (
-                "⚠️ <b>Unauthorized Access Attempt</b>\n"
+                "⚠️ <b>Кӯшиши дастрасии ғайриқонунӣ</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 User ID: <code>{user_id}</code>\n"
-                f"💬 Chat ID: <code>{chat_id}</code>\n"
-                f"📛 Username: @{html.escape(username)}\n"
-                f"👨‍💼 Name: {html.escape(first_name)} {html.escape(last_name)}\n"
-                f"⏰ Time: {_format_time_only()}\n"
+                f"👤 ID корбар: <code>{user_id}</code>\n"
+                f"💬 ID чат: <code>{chat_id}</code>\n"
+                f"📛 Номи корбар: @{html.escape(username)}\n"
+                f"👨‍💼 Ном: {html.escape(first_name)} {html.escape(last_name)}\n"
+                f"⏰ Вақт: {_format_time_only()}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔒 Access denied."
+                "🔒 Дастрасӣ рад карда шуд."
             )
             bot.send_message(ADMIN, alert_msg, parse_mode="HTML")
         except Exception as exc:
@@ -684,12 +784,14 @@ def start_handler(message: telebot.types.Message) -> None:
 @bot.message_handler(commands=["history"])
 @admin_only_message
 def history_handler(message: telebot.types.Message) -> None:
-    """
-    /history - ҳисоботи пурра + маълумоти аккаунт (сенёр формат)
-    """
     ok_mt5, _ = mt5_status()
     if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(
+            message.chat.id,
+            _mt5_unavailable_message(),
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
         return
 
     try:
@@ -731,13 +833,16 @@ def history_handler(message: telebot.types.Message) -> None:
 
         total_closed = int(report.get("total_closed", 0) or 0)
         wins = int(report.get("wins", 0) or 0)
-        losses = int(report.get("losses", 0) or 0)
         total_profit = float(report.get("profit", 0.0) or 0.0)
         total_loss = float(report.get("loss", 0.0) or 0.0)
 
         if total_closed > 0:
             win_rate = (wins / total_closed) * 100.0
-            profit_factor = total_profit / total_loss if total_loss > 0 else (total_profit if total_profit > 0 else 0.0)
+            profit_factor = (
+                total_profit / total_loss
+                if total_loss > 0
+                else (total_profit if total_profit > 0 else 0.0)
+            )
             text += f"📊 WR: <b>{win_rate:.1f}%</b>"
             if profit_factor:
                 text += f" | PF: <b>{profit_factor:.2f}</b>"
@@ -745,7 +850,9 @@ def history_handler(message: telebot.types.Message) -> None:
 
         text += f"\n{_format_time_only()}\n"
 
-        bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(
+            message.chat.id, text, parse_mode="HTML", reply_markup=_rk_remove()
+        )
     except Exception as exc:
         bot.send_message(
             message.chat.id,
@@ -766,14 +873,26 @@ def buttons_handler(message: telebot.types.Message) -> None:
 def balance_handler(message: telebot.types.Message) -> None:
     ok_mt5, _ = mt5_status()
     if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(
+            message.chat.id,
+            _mt5_unavailable_message(),
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
         return
 
     bal = get_balance()
     if bal is None:
-        bot.send_message(message.chat.id, "⚠️ Хатогӣ ҳангоми гирифтани баланс.", parse_mode="HTML", reply_markup=_rk_remove())
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Хатогӣ ҳангоми гирифтани баланс.",
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
         return
-    bot.send_message(message.chat.id, f"💰 <b>Баланс</b>\n{format_usdt(bal)}", parse_mode="HTML", reply_markup=_rk_remove())
+    bot.send_message(
+        message.chat.id, format_usdt(bal), parse_mode="HTML", reply_markup=_rk_remove()
+    )
 
 
 @bot.message_handler(commands=["ai"])
@@ -785,66 +904,6 @@ def ai_menu_handler(message: telebot.types.Message) -> None:
         reply_markup=build_ai_keyboard(),
         parse_mode="HTML",
     )
-
-
-@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith(AI_CALLBACK_PREFIX))
-@admin_only_callback
-def ai_callback_handler(call: telebot.types.CallbackQuery) -> None:
-    action = call.data[len(AI_CALLBACK_PREFIX):]
-    chat_id = call.message.chat.id
-    message_id = call.message.message_id
-
-    if action == "xau_scalp":
-        mock_message = telebot.types.Message(
-            message_id=0,
-            from_user=call.from_user,
-            date=0,
-            chat=call.message.chat,
-            content_type="text",
-            options={},
-            json_string="",
-        )
-        handle_xau_ai(mock_message)
-        bot.answer_callback_query(call.id)
-        return
-    if action == "btc_scalp":
-        mock_message = telebot.types.Message(
-            message_id=0,
-            from_user=call.from_user,
-            date=0,
-            chat=call.message.chat,
-            content_type="text",
-            options={},
-            json_string="",
-        )
-        handle_btc_ai(mock_message)
-        bot.answer_callback_query(call.id)
-        return
-    if action == "xau_intraday":
-        handle_xau_ai_intraday(chat_id, message_id)
-    elif action == "btc_intraday":
-        handle_btc_ai_intraday(chat_id, message_id)
-
-    bot.answer_callback_query(call.id)
-
-
-def _ai_style_label(style: str) -> str:
-    return "Рӯзона" if str(style).lower() == "intraday" else "Скалп"
-
-
-def _ai_cached_banner(payload: Dict[str, Any]) -> str:
-    meta = payload.get("meta") or {}
-    if not bool(meta.get("cached_fallback")):
-        return ""
-    age = int(meta.get("cached_age_sec", 0) or 0)
-    mt5_reason = str(meta.get("mt5_reason", "") or "").strip()
-    suffix = f" | сабаб: <code>{html.escape(mt5_reason)}</code>" if mt5_reason else ""
-    return f"⚠️ <b>МАЪЛУМОТИ КЭШШУДА</b> | синну сол={age}с{suffix}"
-
-
-def _decorate_ai_text(text: str, payload: Dict[str, Any]) -> str:
-    banner = _ai_cached_banner(payload)
-    return f"{banner}\n\n{text}" if banner else text
 
 
 def _run_ai_panel(
@@ -863,11 +922,18 @@ def _run_ai_panel(
         if not ok_mt5:
             payload = payload_loader()
             if not payload:
-                bot.send_message(chat_id, _mt5_unavailable_message(), parse_mode="HTML", reply_markup=_rk_remove())
+                bot.send_message(
+                    chat_id,
+                    _mt5_unavailable_message(),
+                    parse_mode="HTML",
+                    reply_markup=_rk_remove(),
+                )
                 return
             result = analyzer(asset, payload)
             text = _decorate_ai_text(_format_ai_signal(asset, result), payload)
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=build_helpers_keyboard())
+            bot.send_message(
+                chat_id, text, parse_mode="HTML", reply_markup=build_helpers_keyboard()
+            )
             return
 
         loading = bot.send_message(
@@ -896,7 +962,13 @@ def _run_ai_panel(
             reply_markup=build_helpers_keyboard(),
         )
     except Exception as exc:
-        log.error("AI panel error asset=%s style=%s err=%s | tb=%s", asset, style, exc, traceback.format_exc())
+        log.error(
+            "AI panel error asset=%s style=%s err=%s | tb=%s",
+            asset,
+            style,
+            exc,
+            traceback.format_exc(),
+        )
         bot.send_message(
             chat_id,
             f"⚠️ Хатои таҳлили {asset} ({style_label}): <code>{html.escape(str(exc))}</code>",
@@ -905,452 +977,12 @@ def _run_ai_panel(
         )
 
 
-def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
-    _ = message_id
-    _run_ai_panel(
-        chat_id,
-        asset="XAU",
-        style="intraday",
-        payload_loader=get_ai_payload_xau_intraday,
-        analyzer=analyse_intraday,
-    )
-
-
-def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
-    _ = message_id
-    _run_ai_panel(
-        chat_id,
-        asset="BTC",
-        style="intraday",
-        payload_loader=get_ai_payload_btc_intraday,
-        analyzer=analyse_intraday,
-    )
-
-
-# =============================================================================
-# Status
-# =============================================================================
-@bot.message_handler(commands=["status"])
-@admin_only_message
-def status_handler(message: telebot.types.Message) -> None:
-    try:
-        status = engine.status()
-        ribbon = build_health_ribbon(status)
-        bot.send_message(
-            message.chat.id,
-            _format_status_message(status) + ribbon,
-            parse_mode="HTML",
-            reply_markup=_rk_remove(),
-        )
-    except Exception as exc:
-        log.error("/status handler error: %s | tb=%s", exc, traceback.format_exc())
-        bot.send_message(
-            message.chat.id,
-            "⚠️ Ҳангоми дархости статус мушкил пеш омад. Пайвастшавӣ ба MT5-ро санҷед.",
-            parse_mode="HTML",
-            reply_markup=_rk_remove(),
-        )
-
-
-# =============================================================================
-# Open orders (format + keyboard)
-# =============================================================================
-def start_view_open_orders(message: telebot.types.Message) -> None:
-    try:
-        chat_id = int(message.chat.id)
-    except Exception:
-        chat_id = 0
-    try:
-        user_id = int(message.from_user.id) if message.from_user else 0
-    except Exception:
-        user_id = 0
-    if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
-        return
-
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>")
-    order_data, total = get_order_by_index(0)
-
-    if not order_data or int(total or 0) == 0:
-        bot.send_message(message.chat.id, "📭 Ордерҳои кушода нестанд.", parse_mode="HTML", reply_markup=_rk_remove())
-        return
-
-    text = format_order(order_data)
-    kb = order_keyboard(0, int(total), int(order_data.get("ticket", 0) or 0))
-    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="HTML")
-
-
-# =============================================================================
-# Callback router (no monolith)
-# =============================================================================
-_CALLBACK_ROUTES = []
-
-
-def callback_route(pattern: str):
-    rx = re.compile(pattern)
-
-    def deco(fn):
-        _CALLBACK_ROUTES.append((rx, fn))
-        return fn
-
-    return deco
-
-
-@bot.callback_query_handler(func=lambda call: True)
-@admin_only_callback
-def callback_dispatch(call: telebot.types.CallbackQuery) -> None:
-    data = str(call.data or "")
-    if data == "noop":
-        bot.answer_callback_query(call.id)
-        return
-
-    for rx, fn in _CALLBACK_ROUTES:
-        m = rx.match(data)
-        if m:
-            try:
-                fn(call, m)
-            except Exception as exc:
-                log.error("Callback error data=%s err=%s | tb=%s", data, exc, traceback.format_exc())
-                bot.answer_callback_query(call.id, "❌ Хатогӣ рух дод")
-            return
-
-    bot.answer_callback_query(call.id)
-
-
-@callback_route(r"^orders:nav:(\d+)$")
-def cb_orders_nav(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
-    idx = int(m.group(1))
-    order_data, total = get_order_by_index(idx)
-
-    if not order_data or int(total or 0) == 0:
-        bot.answer_callback_query(call.id, "⚠️ Ордер дастрас нест.")
-        return
-
-    text = format_order(order_data)
-    kb = order_keyboard(idx, int(total), int(order_data.get("ticket", 0) or 0))
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=text,
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-    bot.answer_callback_query(call.id)
-
-
-@callback_route(r"^orders:close:(\d+):(\d+)$")
-def cb_orders_close(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
-    ticket = int(m.group(1))
-    idx = int(m.group(2))
-
-    ok = close_order(ticket)
-    bot.answer_callback_query(call.id, "✅ Баста шуд" if ok else "❌ Хатогӣ")
-
-    order_data, total = get_order_by_index(idx)
-    if order_data and int(total or 0) > 0:
-        text = format_order(order_data)
-        kb = order_keyboard(idx, int(total), int(order_data.get("ticket", 0) or 0))
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-    else:
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text="📭 Ордерҳои кушода нестанд.",
-            parse_mode="HTML",
-        )
-
-
-@callback_route(r"^orders:close_view$")
-def cb_orders_close_view(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text="🔒 Намоиш пӯшида шуд. Барои дидани дубора: /buttons",
-        parse_mode="HTML",
-    )
-    bot.answer_callback_query(call.id, "Намоиш пӯшида шуд.")
-
-
-# =============================================================================
-# Button dispatcher (maintainable; no huge if-elif)
-# =============================================================================
-def handle_profit_day(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    try:
-        report = get_full_report_day(force_refresh=True)
-        text = _format_full_report(report, "Имрӯза")
-        bot.send_message(message.chat.id, text, parse_mode="HTML")
-    except Exception as exc:
-        bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
-
-
-def handle_profit_week(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    try:
-        report = get_full_report_week(force_refresh=True)
-        text = _format_full_report(report, "Ҳафтаина")
-
-        total_closed = int(report.get("total_closed", 0) or 0)
-        wins = int(report.get("wins", 0) or 0)
-        total_profit = float(report.get("profit", 0.0) or 0.0)
-        total_loss = float(report.get("loss", 0.0) or 0.0)
-
-        if total_closed > 0:
-            win_rate = (wins / total_closed) * 100.0
-            profit_factor = total_profit / total_loss if total_loss > 0 else (total_profit if total_profit > 0 else 0.0)
-
-            text += f"<b>WR:</b> {win_rate:.1f}%"
-            if profit_factor > 0:
-                text += f" | <b>PF:</b> {profit_factor:.2f}"
-            text += "\n"
-
-        text += f"\n{_format_time_only()}\n"
-        bot.send_message(message.chat.id, text, parse_mode="HTML")
-    except Exception as exc:
-        bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
-
-
-def handle_profit_month(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    try:
-        report = get_full_report_month(force_refresh=True)
-        text = _format_full_report(report, "Моҳона")
-
-        total_closed = int(report.get("total_closed", 0) or 0)
-        wins = int(report.get("wins", 0) or 0)
-        total_profit = float(report.get("profit", 0.0) or 0.0)
-        total_loss = float(report.get("loss", 0.0) or 0.0)
-
-        if total_closed > 0:
-            win_rate = (wins / total_closed) * 100.0
-            profit_factor = total_profit / total_loss if total_loss > 0 else (total_profit if total_profit > 0 else 0.0)
-
-            text += f"<b>WR:</b> {win_rate:.1f}%"
-            if profit_factor > 0:
-                text += f" | <b>PF:</b> {profit_factor:.2f}"
-            text += "\n"
-
-        text += f"\n{_format_time_only()}\n"
-        bot.send_message(message.chat.id, text, parse_mode="HTML")
-    except Exception as exc:
-        bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
-
-
-def _mt5_unavailable_message() -> str:
-    _, reason = mt5_status()
-    reason_raw = str(reason or "unknown")
-    reason_s = reason_raw
-    if reason_s.startswith("blocked_cooldown:"):
-        reason_s = reason_s.split(":", 1)[1]
-    hint = ""
-    if "algo_trading_disabled_in_terminal" in reason_s:
-        hint = (
-            "\n\nMT5: Tools -> Options -> Expert Advisors -> "
-            "Allow Algo Trading-ро фаъол кунед ва тугмаи AutoTrading-ро сабз гардонед."
-        )
-    elif "ipc_disconnected" in reason_s or "No IPC connection" in reason_s:
-        hint = "\n\nПайвасти Python ба MT5 канда шудааст. Терминали MT5 ва ботро аз нав оғоз кунед."
-    return f"⚠️ <b>MT5 ҳоло омода нест</b>\n<code>{html.escape(reason_s)}</code>{hint}"
-
-
-def handle_open_orders(message: telebot.types.Message) -> None:
-    start_view_open_orders(message)
-
-
-def handle_close_all(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    res = close_all_position()
-    closed = int(res.get("closed", 0) or 0)
-    canceled = int(res.get("canceled", 0) or 0)
-    ok = bool(res.get("ok", False))
-    status_emoji = "✅" if ok else "⚠️"
-
-    lines = [f"{status_emoji} <b>Баста: {closed}</b>"]
-    if canceled > 0:
-        lines.append(f"🗑️ Бекор: <b>{canceled}</b>")
-
-    errs = list(res.get("errors") or [])
-    if errs:
-        preview = " | ".join(str(e)[:25] for e in errs[:2])
-        lines.append(f"⚠️ <code>{html.escape(preview)}</code>")
-
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
-
-
-def handle_close_by_profit(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    res = close_all_position_by_profit()
-    bot.send_message(message.chat.id, format_close_by_profit_result(res), parse_mode="HTML")
-
-
-def handle_positions_summary(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    summary = get_positions_summary()
-    bot.send_message(message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML")
-
-
-def handle_balance(message: telebot.types.Message) -> None:
-    ok_mt5, _ = mt5_status()
-    if not ok_mt5:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-
-    acc = get_account_info()
-    if not acc:
-        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
-        return
-    balance = float(acc.get("balance", 0.0) or 0.0)
-    bot.send_message(message.chat.id, f"💰 <b>Баланс</b>\n{format_usdt(balance)}", parse_mode="HTML")
-
-
-def handle_trade_start(message: telebot.types.Message) -> None:
-    if not _debounce_check(f"start:{message.chat.id}"):
-        bot.send_message(message.chat.id, "⏳ Команда уже обрабатывается...", parse_mode="HTML")
-        return
-    try:
-        st = engine.status()
-        if bool(getattr(st, "trading", False)) and not bool(getattr(st, "manual_stop", False)):
-            bot.send_message(message.chat.id, "ℹ️ <b>Система аллакай фаъол аст.</b>\nСавдо идома дорад.", parse_mode="HTML")
-            return
-
-        engine.clear_manual_stop()
-        st_after_clear = engine.status()
-        if bool(getattr(st_after_clear, "manual_stop", False)):
-            bot.send_message(
-                message.chat.id,
-                "Monitoring-only mode active. Trading start is blocked.",
-                parse_mode="HTML",
-            )
-            return
-        started = bool(engine.start())
-        if started:
-            bot.send_message(
-                message.chat.id,
-                "✅ <b>Система оғоз шуд (Савдо фаъол)</b>\n\nСавдои автоматӣ давом мекунад.",
-                parse_mode="HTML",
-            )
-            return
-
-        _, reason = mt5_status()
-        gate_reason = str(getattr(engine, "_gate_last_reason", "") or "")
-        blocked_assets = sorted(set(getattr(engine, "_blocked_assets", []) or []))
-        model_ready = bool(getattr(engine, "_model_loaded", False)) and bool(getattr(engine, "_backtest_passed", False))
-        reason_raw = str(reason or "unknown")
-        if (not model_ready) or blocked_assets:
-            reason_s = gate_reason or "gatekeeper_failed"
-            if blocked_assets:
-                reason_s = f"{reason_s} | blocked={','.join(blocked_assets)}"
-        else:
-            reason_s = reason_raw
-        if reason_s.startswith("blocked_cooldown:"):
-            reason_s = reason_s.split(":", 1)[1]
-        hint = ""
-        if "algo_trading_disabled_in_terminal" in reason_s:
-            hint = (
-                "\n\nMT5: Tools -> Options -> Expert Advisors -> "
-                "Allow Algo Trading, ва тугмаи AutoTrading-ро фаъол кунед."
-            )
-        bot.send_message(
-            message.chat.id,
-            f"⚠️ <b>Start иҷро нашуд</b>\n<code>{html.escape(reason_s)}</code>{hint}",
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
-
-
-def handle_trade_stop(message: telebot.types.Message) -> None:
-    if not _debounce_check(f"stop:{message.chat.id}"):
-        bot.send_message(message.chat.id, "⏳ Команда уже обрабатывается...", parse_mode="HTML")
-        return
-    try:
-        st = engine.status()
-        was_active = engine.request_manual_stop()
-        if was_active:
-            bot.send_message(
-                message.chat.id,
-                "🛑 <b>Система қатъ шуд (Мониторинг)</b>\n\n👁️ <i>Ҳолати мушоҳида фаъол шуд. Савдо қатъ гашт, аммо сигналҳои AI меоянд.</i>",
-                parse_mode="HTML",
-            )
-        elif bool(getattr(st, "manual_stop", False)):
-            bot.send_message(message.chat.id, "ℹ️ Manual stop аллакай фаъол аст (Мониторинг).", parse_mode="HTML")
-        else:
-            bot.send_message(message.chat.id, "ℹ️ Система аллакай қатъ аст.", parse_mode="HTML")
-    except Exception as exc:
-        bot.send_message(message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML")
-
-
-def handle_engine_check(message: telebot.types.Message) -> None:
-    status = engine.status()
-    bot.send_message(
-        message.chat.id,
-        (
-            "⚙️ <b>Статуси Муҳаррик</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 Пайваст: {'✅' if status.connected else '❌'}\n"
-            f"📈 Trading: {'✅' if status.trading else '❌'}\n"
-            f"⛔ Manual stop: {'✅' if status.manual_stop else '❌'}\n"
-            f"🎯 Актив: <b>{html.escape(str(status.active_asset))}</b>\n"
-            f"📉 DD: <b>{status.dd_pct * 100:.2f}%</b>\n"
-            f"📆 Today PnL: <b>{status.today_pnl:+.2f}$</b>\n"
-            f"📂 Позицияҳо: XAU <b>{status.open_trades_xau}</b> | BTC <b>{status.open_trades_btc}</b>\n"
-            f"🛎 Сигналҳо: XAU <b>{html.escape(str(status.last_signal_xau))}</b> | BTC <b>{html.escape(str(status.last_signal_btc))}</b>\n"
-            f"📥 Queue: <b>{status.exec_queue_size}</b>\n"
-            f"🧭 Controller: <b>{html.escape(str(getattr(status, 'controller_state', 'unknown')))}</b>\n"
-            f"🧪 Chaos: <b>{html.escape(str(getattr(status, 'chaos_state', 'unknown')))}</b>\n"
-            f"🚫 Gate: <code>{html.escape(str(getattr(status, 'gate_reason', '') or '-'))}</code>\n"
-            f"🛑 Halt: <code>{html.escape(str(getattr(status, 'risk_halt_reason', '') or '-'))}</code>\n"
-        ),
-        parse_mode="HTML",
-    )
-
-
-def handle_full_check(message: telebot.types.Message) -> None:
-    bot.send_message(message.chat.id, "🔄 <b>Санҷиши пурраи барнома оғоз шуд...</b>", parse_mode="HTML")
-    ok, detail = check_full_program()
-    bot.send_message(message.chat.id, detail, parse_mode="HTML")
-    if not ok:
-        log.warning("Full check found issues")
-
-
 def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
     signal = str(result.get("signal", "HOLD")).upper()
     confidence = float(result.get("confidence", 0.0) or 0.0)
-    reason = html.escape(str(result.get("reason", "")).strip() or "Тафсил дастрас нест.")
+    reason = html.escape(
+        str(result.get("reason", "")).strip() or "Тафсил дастрас нест."
+    )
     action = str(result.get("action_short", "")).strip() or (
         "Харид" if signal == "BUY" else ("Фурӯш" if signal == "SELL" else "Интизор")
     )
@@ -1359,7 +991,9 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
     take_profit = result.get("take_profit")
     style = str(result.get("analysis_style", "scalping") or "scalping").lower()
     style_label = _ai_style_label(style)
-    provider_display = str(result.get("provider_display") or result.get("provider") or "Local Heuristic")
+    provider_display = str(
+        result.get("provider_display") or result.get("provider") or "Local Heuristic"
+    )
     model = str(result.get("model") or "-")
     symbol = str(result.get("symbol") or (f"{asset}USDm")).strip()
     model_rank = int(result.get("model_rank", 0) or 0)
@@ -1376,7 +1010,12 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
 
     rr_value = None
     try:
-        if signal in ("BUY", "SELL") and entry is not None and stop_loss is not None and take_profit is not None:
+        if (
+            signal in ("BUY", "SELL")
+            and entry is not None
+            and stop_loss is not None
+            and take_profit is not None
+        ):
             risk = abs(float(entry) - float(stop_loss))
             reward = abs(float(take_profit) - float(entry))
             if risk > 0 and reward > 0:
@@ -1447,9 +1086,31 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
         lines.append("💡 <i>Барои иҷро аз тугмаҳои ёрирасони поён истифода кунед.</i>")
     elif signal == "HOLD":
         lines.append("")
-        lines.append("⏸ <i>Ҳоло беҳтар аст интизор шавед то тасдиқи қавитар пайдо шавад.</i>")
+        lines.append(
+            "⏸ <i>Ҳоло беҳтар аст интизор шавед то тасдиқи қавитар пайдо шавад.</i>"
+        )
 
     return "\n".join(lines)
+
+
+def handle_xau_ai_intraday(chat_id: int, message_id: int) -> None:
+    _run_ai_panel(
+        chat_id,
+        asset="XAU",
+        style="intraday",
+        payload_loader=get_ai_payload_xau_intraday,
+        analyzer=analyse_intraday,
+    )
+
+
+def handle_btc_ai_intraday(chat_id: int, message_id: int) -> None:
+    _run_ai_panel(
+        chat_id,
+        asset="BTC",
+        style="intraday",
+        payload_loader=get_ai_payload_btc_intraday,
+        analyzer=analyse_intraday,
+    )
 
 
 def handle_xau_ai(message: telebot.types.Message) -> None:
@@ -1470,6 +1131,485 @@ def handle_btc_ai(message: telebot.types.Message) -> None:
         payload_loader=get_ai_payload_btc,
         analyzer=analyse,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data) and call.data.startswith(AI_CALLBACK_PREFIX)
+)
+@admin_only_callback
+def ai_callback_handler(call: telebot.types.CallbackQuery) -> None:
+    action = call.data[len(AI_CALLBACK_PREFIX) :]
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    if action == "xau_scalp":
+        mock_message = telebot.types.Message(
+            message_id=0,
+            from_user=call.from_user,
+            date=0,
+            chat=call.message.chat,
+            content_type="text",
+            options={},
+            json_string="",
+        )
+        handle_xau_ai(mock_message)
+        bot.answer_callback_query(call.id)
+        return
+    if action == "btc_scalp":
+        mock_message = telebot.types.Message(
+            message_id=0,
+            from_user=call.from_user,
+            date=0,
+            chat=call.message.chat,
+            content_type="text",
+            options={},
+            json_string="",
+        )
+        handle_btc_ai(mock_message)
+        bot.answer_callback_query(call.id)
+        return
+    if action == "xau_intraday":
+        handle_xau_ai_intraday(chat_id, message_id)
+    elif action == "btc_intraday":
+        handle_btc_ai_intraday(chat_id, message_id)
+
+    bot.answer_callback_query(call.id)
+
+
+@bot.message_handler(commands=["status"])
+@admin_only_message
+def status_handler(message: telebot.types.Message) -> None:
+    try:
+        status = engine.status()
+        ribbon = build_health_ribbon(status)
+        bot.send_message(
+            message.chat.id,
+            _format_status_message(status) + ribbon,
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
+    except Exception as exc:
+        log.error("/status handler error: %s | tb=%s", exc, traceback.format_exc())
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Ҳангоми дархости статус мушкил пеш омад. Пайвастшавӣ ба MT5-ро санҷед.",
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
+
+
+def start_view_open_orders(message: telebot.types.Message) -> None:
+    try:
+        chat_id = int(message.chat.id)
+    except Exception:
+        chat_id = 0
+    try:
+        user_id = int(message.from_user.id) if message.from_user else 0
+    except Exception:
+        user_id = 0
+    if not bool((ADMIN and user_id == int(ADMIN)) or is_admin_chat(chat_id)):
+        return
+
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>")
+    order_data, total = get_order_by_index(0)
+
+    if not order_data or int(total or 0) == 0:
+        bot.send_message(
+            message.chat.id,
+            "📭 Ордерҳои кушода нестанд.",
+            parse_mode="HTML",
+            reply_markup=_rk_remove(),
+        )
+        return
+
+    text = format_order(order_data)
+    kb = order_keyboard(0, int(total), int(order_data.get("ticket", 0) or 0))
+    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda call: True)
+@admin_only_callback
+def callback_dispatch(call: telebot.types.CallbackQuery) -> None:
+    data = str(call.data or "")
+    if data == "noop":
+        bot.answer_callback_query(call.id)
+        return
+
+    for rx, fn in _CALLBACK_ROUTES:
+        m = rx.match(data)
+        if m:
+            try:
+                fn(call, m)
+            except Exception as exc:
+                log.error(
+                    "Callback error data=%s err=%s | tb=%s",
+                    data,
+                    exc,
+                    traceback.format_exc(),
+                )
+                bot.answer_callback_query(call.id, "❌ Хатогӣ рух дод")
+            return
+
+    bot.answer_callback_query(call.id)
+
+
+@callback_route(r"^orders:nav:(\d+)$")
+def cb_orders_nav(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
+    idx = int(m.group(1))
+    order_data, total = get_order_by_index(idx)
+
+    if not order_data or int(total or 0) == 0:
+        bot.answer_callback_query(call.id, "⚠️ Ордер дастрас нест.")
+        return
+
+    text = format_order(order_data)
+    kb = order_keyboard(idx, int(total), int(order_data.get("ticket", 0) or 0))
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    bot.answer_callback_query(call.id)
+
+
+@callback_route(r"^orders:close:(\d+):(\d+)$")
+def cb_orders_close(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
+    ticket = int(m.group(1))
+    idx = int(m.group(2))
+
+    ok = close_order(ticket)
+    bot.answer_callback_query(call.id, "✅ Баста шуд" if ok else "❌ Хатогӣ")
+
+    order_data, total = get_order_by_index(idx)
+    if order_data and int(total or 0) > 0:
+        text = format_order(order_data)
+        kb = order_keyboard(idx, int(total), int(order_data.get("ticket", 0) or 0))
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+    else:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="📭 Ордерҳои кушода нестанд.",
+            parse_mode="HTML",
+        )
+
+
+@callback_route(r"^orders:close_view$")
+def cb_orders_close_view(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="🔒 Намоиш пӯшида шуд. Барои дидани дубора: /buttons",
+        parse_mode="HTML",
+    )
+    bot.answer_callback_query(call.id, "Намоиш пӯшида шуд.")
+
+
+def handle_profit_day(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    try:
+        report = get_full_report_day(force_refresh=True)
+        text = _format_full_report(report, "Имрӯза")
+        bot.send_message(message.chat.id, text, parse_mode="HTML")
+    except Exception as exc:
+        bot.send_message(
+            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+        )
+
+
+def handle_profit_week(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    try:
+        report = get_full_report_week(force_refresh=True)
+        text = _format_full_report(report, "Ҳафтаина")
+
+        total_closed = int(report.get("total_closed", 0) or 0)
+        wins = int(report.get("wins", 0) or 0)
+        total_profit = float(report.get("profit", 0.0) or 0.0)
+        total_loss = float(report.get("loss", 0.0) or 0.0)
+
+        if total_closed > 0:
+            win_rate = (wins / total_closed) * 100.0
+            profit_factor = (
+                total_profit / total_loss
+                if total_loss > 0
+                else (total_profit if total_profit > 0 else 0.0)
+            )
+
+            text += f"<b>WR:</b> {win_rate:.1f}%"
+            if profit_factor > 0:
+                text += f" | <b>PF:</b> {profit_factor:.2f}"
+            text += "\n"
+
+        text += f"\n{_format_time_only()}\n"
+        bot.send_message(message.chat.id, text, parse_mode="HTML")
+    except Exception as exc:
+        bot.send_message(
+            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+        )
+
+
+def handle_profit_month(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    try:
+        report = get_full_report_month(force_refresh=True)
+        text = _format_full_report(report, "Моҳона")
+
+        total_closed = int(report.get("total_closed", 0) or 0)
+        wins = int(report.get("wins", 0) or 0)
+        total_profit = float(report.get("profit", 0.0) or 0.0)
+        total_loss = float(report.get("loss", 0.0) or 0.0)
+
+        if total_closed > 0:
+            win_rate = (wins / total_closed) * 100.0
+            profit_factor = (
+                total_profit / total_loss
+                if total_loss > 0
+                else (total_profit if total_profit > 0 else 0.0)
+            )
+
+            text += f"<b>WR:</b> {win_rate:.1f}%"
+            if profit_factor > 0:
+                text += f" | <b>PF:</b> {profit_factor:.2f}"
+            text += "\n"
+
+        text += f"\n{_format_time_only()}\n"
+        bot.send_message(message.chat.id, text, parse_mode="HTML")
+    except Exception as exc:
+        bot.send_message(
+            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+        )
+
+
+def handle_open_orders(message: telebot.types.Message) -> None:
+    start_view_open_orders(message)
+
+
+def handle_close_all(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    res = close_all_position()
+    closed = int(res.get("closed", 0) or 0)
+    canceled = int(res.get("canceled", 0) or 0)
+    ok = bool(res.get("ok", False))
+    status_emoji = "✅" if ok else "⚠️"
+
+    lines = [f"{status_emoji} <b>Баста: {closed}</b>"]
+    if canceled > 0:
+        lines.append(f"🗑️ Бекор: <b>{canceled}</b>")
+
+    errs = list(res.get("errors") or [])
+    if errs:
+        preview = " | ".join(str(e)[:25] for e in errs[:2])
+        lines.append(f"⚠️ <code>{html.escape(preview)}</code>")
+
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
+
+
+def handle_close_by_profit(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    res = close_all_position_by_profit()
+    bot.send_message(
+        message.chat.id, format_close_by_profit_result(res), parse_mode="HTML"
+    )
+
+
+def handle_positions_summary(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    summary = get_positions_summary()
+    bot.send_message(
+        message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML"
+    )
+
+
+def handle_balance(message: telebot.types.Message) -> None:
+    ok_mt5, _ = mt5_status()
+    if not ok_mt5:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+
+    acc = get_account_info()
+    if not acc:
+        bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
+        return
+    balance = float(acc.get("balance", 0.0) or 0.0)
+    bot.send_message(message.chat.id, format_usdt(balance), parse_mode="HTML")
+
+
+def handle_trade_start(message: telebot.types.Message) -> None:
+    if not _debounce_check(f"start:{message.chat.id}"):
+        bot.send_message(
+            message.chat.id,
+            "⏳ Команда аллакай дар ҳоли коркард аст...",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        st = engine.status()
+        if bool(getattr(st, "trading", False)) and not bool(
+            getattr(st, "manual_stop", False)
+        ):
+            bot.send_message(
+                message.chat.id,
+                "ℹ️ <b>Система аллакай фаъол аст.</b>\nСавдо идома дорад.",
+                parse_mode="HTML",
+            )
+            return
+
+        engine.clear_manual_stop()
+        st_after_clear = engine.status()
+        if bool(getattr(st_after_clear, "manual_stop", False)):
+            bot.send_message(
+                message.chat.id,
+                "Trading is still paused by active protection checks.",
+                parse_mode="HTML",
+            )
+            return
+        started = bool(engine.start())
+        if started:
+            bot.send_message(
+                message.chat.id,
+                "✅ <b>Система оғоз шуд (Савдо фаъол)</b>\n\nСавдои автоматӣ давом мекунад.",
+                parse_mode="HTML",
+            )
+            return
+
+        _, reason = mt5_status()
+        gate_reason = str(getattr(engine, "_gate_last_reason", "") or "")
+        blocked_assets = sorted(set(getattr(engine, "_blocked_assets", []) or []))
+        model_ready = bool(getattr(engine, "_model_loaded", False)) and bool(
+            getattr(engine, "_backtest_passed", False)
+        )
+        reason_raw = str(reason or "unknown")
+        if (not model_ready) or blocked_assets:
+            reason_s = gate_reason or "gatekeeper_failed"
+            if blocked_assets:
+                reason_s = f"{reason_s} | blocked={','.join(blocked_assets)}"
+        else:
+            reason_s = reason_raw
+        if reason_s.startswith("blocked_cooldown:"):
+            reason_s = reason_s.split(":", 1)[1]
+        hint = ""
+        if "algo_trading_disabled_in_terminal" in reason_s:
+            hint = (
+                "\n\nMT5: Tools -> Options -> Expert Advisors -> "
+                "Allow Algo Trading, ва тугмаи AutoTrading-ро фаъол кунед."
+            )
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ <b>Start иҷро нашуд</b>\n<code>{html.escape(reason_s)}</code>{hint}",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        bot.send_message(
+            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+        )
+
+
+def handle_trade_stop(message: telebot.types.Message) -> None:
+    if not _debounce_check(f"stop:{message.chat.id}"):
+        bot.send_message(
+            message.chat.id,
+            "⏳ Команда аллакай дар ҳоли коркард аст...",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        st = engine.status()
+        was_active = engine.request_manual_stop()
+        if was_active:
+            bot.send_message(
+                message.chat.id,
+                "🛑 <b>Система қатъ шуд (Мониторинг)</b>\n\n👁️ <i>Ҳолати мушоҳида фаъол шуд. Савдо қатъ гашт, аммо сигналҳои AI меоянд.</i>",
+                parse_mode="HTML",
+            )
+        elif bool(getattr(st, "manual_stop", False)):
+            bot.send_message(
+                message.chat.id,
+                "ℹ️ Manual stop аллакай фаъол аст (Мониторинг).",
+                parse_mode="HTML",
+            )
+        else:
+            bot.send_message(
+                message.chat.id, "ℹ️ Система аллакай қатъ аст.", parse_mode="HTML"
+            )
+    except Exception as exc:
+        bot.send_message(
+            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+        )
+
+
+def handle_engine_check(message: telebot.types.Message) -> None:
+    status = engine.status()
+    bot.send_message(
+        message.chat.id,
+        (
+            "⚙️ <b>Статуси Муҳаррик</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 Пайваст: {'✅' if status.connected else '❌'}\n"
+            f"📈 Trading: {'✅' if status.trading else '❌'}\n"
+            f"⛔ Manual stop: {'✅' if status.manual_stop else '❌'}\n"
+            f"🎯 Актив: <b>{html.escape(str(status.active_asset))}</b>\n"
+            f"📉 DD: <b>{status.dd_pct * 100:.2f}%</b>\n"
+            f"📆 Today PnL: <b>{status.today_pnl:+.2f}$</b>\n"
+            f"📂 Позицияҳо: XAU <b>{status.open_trades_xau}</b> | BTC <b>{status.open_trades_btc}</b>\n"
+            f"🛎 Сигналҳо: XAU <b>{html.escape(str(status.last_signal_xau))}</b> | BTC <b>{html.escape(str(status.last_signal_btc))}</b>\n"
+            f"📥 Queue: <b>{status.exec_queue_size}</b>\n"
+            f"🧭 Controller: <b>{html.escape(str(getattr(status, 'controller_state', 'unknown')))}</b>\n"
+            f"🧪 Chaos: <b>{html.escape(str(getattr(status, 'chaos_state', 'unknown')))}</b>\n"
+            f"🚫 Gate: <code>{html.escape(str(getattr(status, 'gate_reason', '') or '-'))}</code>\n"
+            f"🛑 Halt: <code>{html.escape(str(getattr(status, 'risk_halt_reason', '') or '-'))}</code>\n"
+        ),
+        parse_mode="HTML",
+    )
+
+
+def handle_full_check(message: telebot.types.Message) -> None:
+    bot.send_message(
+        message.chat.id,
+        "🔄 <b>Санҷиши пурраи барнома оғоз шуд...</b>",
+        parse_mode="HTML",
+    )
+    ok, detail = check_full_program()
+    bot.send_message(message.chat.id, detail, parse_mode="HTML")
+    if not ok:
+        log.warning("Full check found issues")
 
 
 BUTTONS: Dict[str, Callable[[telebot.types.Message], None]] = {
@@ -1513,17 +1653,35 @@ def message_dispatcher(message: telebot.types.Message) -> None:
         try:
             handler(message)
         except Exception as exc:
-            log.error("handler error text=%s err=%s | tb=%s", text, exc, traceback.format_exc())
-            bot.send_message(message.chat.id, "⚠️ Хатогӣ рух дод. Баъдтар дубора санҷед.", parse_mode="HTML")
+            log.error(
+                "handler error text=%s err=%s | tb=%s",
+                text,
+                exc,
+                traceback.format_exc(),
+            )
+            bot.send_message(
+                message.chat.id,
+                "⚠️ Хатогӣ рух дод. Баъдтар дубора санҷед.",
+                parse_mode="HTML",
+            )
         return
 
-    bot.send_message(message.chat.id, "❓ Амали номаълум. /buttons → меню.", parse_mode="HTML")
-
+    bot.send_message(
+        message.chat.id, "❓ Амали номаълум. /buttons → меню.", parse_mode="HTML"
+    )
 
 
 def send_signal_notification(asset: str, result: Dict[str, Any]) -> None:
-    """
-    Callback for engine to notify Telegram about a new signal.
-    Wired in main.py via engine.set_signal_notifier().
-    """
+    """Callback for engine to notify Telegram about a new signal."""
     _notify_signal(asset, result)
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+__all__ = [
+    "bot",
+    "bot_commands",
+    "send_daily_summary",
+    "send_signal_notification",
+]

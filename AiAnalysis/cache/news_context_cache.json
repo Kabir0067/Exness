@@ -1,6 +1,6 @@
 {
   "gold::scalping": {
-    "saved_ts": 1776083561.4529734,
+    "saved_ts": 1776418323.5971975,
     "ttl_sec": 3600.0,
     "data": {
       "status": "live",
@@ -15,102 +15,78 @@
       "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=4 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only"
     }
   },
-  "gold::intraday": {
-    "saved_ts": 1776083582.6339762,
-    "ttl_sec": 10800.0,
-    "data": {
-      "status": "live",
-      "asset": "gold",
-      "trade_style": "intraday",
-      "bias": "neutral",
-      "avg_sentiment": 0.0,
-      "headline_count": 0,
-      "high_impact_count": 0,
-      "window_hours": 18,
-      "headlines": [],
-      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=18 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=directional_overlay"
-    }
-  },
   "btc::scalping": {
-    "saved_ts": 1776083687.905833,
+    "saved_ts": 1776418375.0394988,
     "ttl_sec": 3600.0,
     "data": {
       "status": "live",
       "asset": "btc",
       "trade_style": "scalping",
       "bias": "neutral",
-      "avg_sentiment": -0.0484,
-      "headline_count": 3,
-      "high_impact_count": 0,
+      "avg_sentiment": -0.0575,
+      "headline_count": 2,
+      "high_impact_count": 1,
       "window_hours": 4,
       "headlines": [
         {
-          "title": "Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How",
-          "source": "finance.yahoo.com",
-          "published_at": "2026-04-13T10:28:00.000000Z",
-          "url": "https://finance.yahoo.com/markets/crypto/articles/holding-bitcoin-just-helped-sleep-102800677.html",
-          "score": -0.0824,
-          "high_impact": false
+          "title": "Crypto Strategist Warns Bitcoin Mirroring 2014 Bear Market With Recent Rally, Details Short-Term Price Ceiling for BTC",
+          "source": "dailyhodl.com",
+          "published_at": "2026-04-17T07:01:39.000000Z",
+          "url": "https://dailyhodl.com/2026/04/17/crypto-strategist-warns-bitcoin-mirroring-2014-bear-market-with-recent-rally-details-short-term-price-ceiling-for-btc/",
+          "score": -0.0926,
+          "high_impact": true
         },
         {
-          "title": "Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal",
-          "source": "benzinga.com",
-          "published_at": "2026-04-13T09:28:07.000000Z",
-          "url": "https://www.benzinga.com/markets/equities/26/04/51773375/stock-market-today-dow-futures-fall-as-trump-announces-strait-of-hormuz-blockade-goldman-sachs-f",
-          "score": -0.4404,
-          "high_impact": false
-        },
-        {
-          "title": "Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?",
-          "source": "finance.yahoo.com",
-          "published_at": "2026-04-13T09:17:00.000000Z",
-          "url": "https://finance.yahoo.com/markets/crypto/articles/strategys-michael-saylor-says-bitcoin-091700270.html",
-          "score": 0.3776,
+          "title": "Could This New Cryptocurrency Leave SOL and XRP Behind In 2026?",
+          "source": "financefeeds.com",
+          "published_at": "2026-04-17T07:00:36.000000Z",
+          "url": "https://financefeeds.com/could-this-new-cryptocurrency-leave-sol-and-xrp-behind-in-2026/",
+          "score": -0.0224,
           "high_impact": false
         }
       ],
-      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=4 | ARTICLES=3 | AVG_SENTIMENT=-0.05 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only\nTOP_HEADLINES:\n- 2026-04-13T10:28:00.000000Z | finance.yahoo.com | score=-0.08 | Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How\n- 2026-04-13T09:28:07.000000Z | benzinga.com | score=-0.44 | Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal\n- 2026-04-13T09:17:00.000000Z | finance.yahoo.com | score=+0.38 | Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?"
+      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=4 | ARTICLES=2 | AVG_SENTIMENT=-0.06 | BIAS=NEUTRAL | HIGH_IMPACT=1 | RULE=risk_filter_only\nTOP_HEADLINES:\n- 2026-04-17T07:01:39.000000Z | dailyhodl.com | score=-0.09 | Crypto Strategist Warns Bitcoin Mirroring 2014 Bear Market With Recent Rally, Details Short-Term Price Ceiling for BTC\n- 2026-04-17T07:00:36.000000Z | financefeeds.com | score=-0.02 | Could This New Cryptocurrency Leave SOL and XRP Behind In 2026?"
     }
   },
   "btc::intraday": {
-    "saved_ts": 1776083720.4684577,
+    "saved_ts": 1776418389.3400292,
     "ttl_sec": 10800.0,
     "data": {
       "status": "live",
       "asset": "btc",
       "trade_style": "intraday",
       "bias": "neutral",
-      "avg_sentiment": -0.0484,
+      "avg_sentiment": 0.0455,
       "headline_count": 3,
-      "high_impact_count": 0,
+      "high_impact_count": 1,
       "window_hours": 12,
       "headlines": [
         {
-          "title": "Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How",
-          "source": "finance.yahoo.com",
-          "published_at": "2026-04-13T10:28:00.000000Z",
-          "url": "https://finance.yahoo.com/markets/crypto/articles/holding-bitcoin-just-helped-sleep-102800677.html",
-          "score": -0.0824,
+          "title": "Crypto Strategist Warns Bitcoin Mirroring 2014 Bear Market With Recent Rally, Details Short-Term Price Ceiling for BTC",
+          "source": "dailyhodl.com",
+          "published_at": "2026-04-17T07:01:39.000000Z",
+          "url": "https://dailyhodl.com/2026/04/17/crypto-strategist-warns-bitcoin-mirroring-2014-bear-market-with-recent-rally-details-short-term-price-ceiling-for-btc/",
+          "score": -0.0926,
+          "high_impact": true
+        },
+        {
+          "title": "Could This New Cryptocurrency Leave SOL and XRP Behind In 2026?",
+          "source": "financefeeds.com",
+          "published_at": "2026-04-17T07:00:36.000000Z",
+          "url": "https://financefeeds.com/could-this-new-cryptocurrency-leave-sol-and-xrp-behind-in-2026/",
+          "score": -0.0224,
           "high_impact": false
         },
         {
-          "title": "Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal",
-          "source": "benzinga.com",
-          "published_at": "2026-04-13T09:28:07.000000Z",
-          "url": "https://www.benzinga.com/markets/equities/26/04/51773375/stock-market-today-dow-futures-fall-as-trump-announces-strait-of-hormuz-blockade-goldman-sachs-f",
-          "score": -0.4404,
-          "high_impact": false
-        },
-        {
-          "title": "Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?",
-          "source": "finance.yahoo.com",
-          "published_at": "2026-04-13T09:17:00.000000Z",
-          "url": "https://finance.yahoo.com/markets/crypto/articles/strategys-michael-saylor-says-bitcoin-091700270.html",
-          "score": 0.3776,
+          "title": "Crypto News: Why is Ethereum, XRP, and Bitcoin Price Surging? While Pepeto Surfaces as the Rare Entry Not To Miss",
+          "source": "financefeeds.com",
+          "published_at": "2026-04-17T05:00:33.000000Z",
+          "url": "https://financefeeds.com/crypto-news-why-is-ethereum-xrp-and-bitcoin-price-surging-while-pepeto-surfaces-as-the-rare-entry-not-to-miss/",
+          "score": 0.2515,
           "high_impact": false
         }
       ],
-      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=12 | ARTICLES=3 | AVG_SENTIMENT=-0.05 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=directional_overlay\nTOP_HEADLINES:\n- 2026-04-13T10:28:00.000000Z | finance.yahoo.com | score=-0.08 | Holding Some Bitcoin Just Helped Me Sleep Better At Night. Here's How\n- 2026-04-13T09:28:07.000000Z | benzinga.com | score=-0.44 | Stock Market Today: Dow Futures Fall As Trump Announces Strait Of Hormuz Blockade—Goldman Sachs, Fastenal\n- 2026-04-13T09:17:00.000000Z | finance.yahoo.com | score=+0.38 | Strategy's Michael Saylor Says \"Bitcoin Has Won.\" Does That Make It a Buy?"
+      "summary_text": "NEWS_OVERLAY=INTRADAY | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=BTC | WINDOW_HOURS=12 | ARTICLES=3 | AVG_SENTIMENT=+0.05 | BIAS=NEUTRAL | HIGH_IMPACT=1 | RULE=directional_overlay\nTOP_HEADLINES:\n- 2026-04-17T07:01:39.000000Z | dailyhodl.com | score=-0.09 | Crypto Strategist Warns Bitcoin Mirroring 2014 Bear Market With Recent Rally, Details Short-Term Price Ceiling for BTC\n- 2026-04-17T07:00:36.000000Z | financefeeds.com | score=-0.02 | Could This New Cryptocurrency Leave SOL and XRP Behind In 2026?\n- 2026-04-17T05:00:33.000000Z | financefeeds.com | score=+0.25 | Crypto News: Why is Ethereum, XRP, and Bitcoin Price Surging? While Pepeto Surfaces as the Rare Entry Not To Miss"
     }
   }
 }

@@ -1,23 +1,28 @@
-from __future__ import annotations
+"""
+Bot/portfolio_engine.py — Backward-compatible re-export facade.
 
-"""Portfolio engine (refactored into modules).
-
-This file is kept for backward compatibility.
-Public imports remain valid:
-- from portfolio_engine import engine, MultiAssetTradingEngine
+This file is maintained for backward compatibility.
+Public imports remain stable:
+    from portfolio_engine import engine, MultiAssetTradingEngine
 """
 
+from __future__ import annotations
+
 from .Motor.engine import MultiAssetTradingEngine, engine  # noqa: F401
-from .Motor.models import AssetCandidate, ExecutionResult, OrderIntent, PortfolioStatus  # noqa: F401
+from .Motor.models import (  # noqa: F401
+    AssetCandidate,
+    ExecutionResult,
+    OrderIntent,
+    PortfolioStatus,
+)
 from .Motor.pipeline import UTCScheduler  # noqa: F401
 
 __all__ = [
-    "UTCScheduler",
     "AssetCandidate",
-    "PortfolioStatus",
-    "OrderIntent",
     "ExecutionResult",
     "MultiAssetTradingEngine",
+    "OrderIntent",
+    "PortfolioStatus",
+    "UTCScheduler",
     "engine",
 ]
-

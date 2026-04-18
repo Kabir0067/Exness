@@ -1,13 +1,19 @@
-# core/utils.py — Unified utility functions for the entire trading system.
-# Consolidates duplicated code from _btc_risk/utils.py and _xau_risk/utils.py.
+"""
+core/utils.py — Unified utility functions for the entire trading system.
+
+Consolidates duplicated code from _btc_risk/utils.py and _xau_risk/utils.py.
+Provides numeric helpers, ATR calculations, position sizing, trailing stops,
+and timeframe conversions used system-wide.
+"""
+
 from __future__ import annotations
 
 import logging
 import math
 import traceback
-from types import MappingProxyType
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Tuple
 
 import numpy as np
@@ -17,18 +23,68 @@ log = logging.getLogger("core.utils")
 
 
 # =============================================================================
-# Time helpers
+# Global Constants
 # =============================================================================
+_SIDE_MAP = MappingProxyType(
+    {
+        "buy": "Buy",
+        "long": "Buy",
+        "b": "Buy",
+        "1": "Buy",
+        "order_type_buy": "Buy",
+        "op_buy": "Buy",
+        "sell": "Sell",
+        "short": "Sell",
+        "s": "Sell",
+        "-1": "Sell",
+        "order_type_sell": "Sell",
+        "op_sell": "Sell",
+        "neutral": "Neutral",
+        "hold": "Neutral",
+        "flat": "Neutral",
+        "0": "Neutral",
+    }
+)
 
+_TF_SECONDS = MappingProxyType(
+    {
+        "M1": 60,
+        "M2": 120,
+        "M3": 180,
+        "M5": 300,
+        "M10": 600,
+        "M15": 900,
+        "M20": 1200,
+        "M30": 1800,
+        "H1": 3600,
+        "H2": 7200,
+        "H4": 14400,
+        "H6": 21600,
+        "H8": 28800,
+        "D1": 86400,
+        "W1": 604800,
+    }
+)
+
+_BASE_LOT = 0.02
+_BASE_TP_USD = 2.0
+_STEP_BALANCE = 100.0
+_STEP_LOT = 0.01
+_STEP_TP_USD = 1.0
+_STEP_START_BALANCE = 200.0
+
+
+# =============================================================================
+# Time Helpers
+# =============================================================================
 def _utcnow() -> datetime:
     """Naive UTC datetime (tzinfo=None) for safe JSON/csv writes and date compares."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # =============================================================================
-# Numeric helpers
+# Numeric Helpers
 # =============================================================================
-
 def _is_finite(*xs: float) -> bool:
     """Check all values are finite floats."""
     try:
@@ -63,18 +119,8 @@ def percentile_rank(series: np.ndarray, value: float) -> float:
 
 
 # =============================================================================
-# Side normalization
+# Side Normalization
 # =============================================================================
-
-_SIDE_MAP = MappingProxyType({
-    "buy": "Buy", "long": "Buy", "b": "Buy", "1": "Buy",
-    "order_type_buy": "Buy", "op_buy": "Buy",
-    "sell": "Sell", "short": "Sell", "s": "Sell", "-1": "Sell",
-    "order_type_sell": "Sell", "op_sell": "Sell",
-    "neutral": "Neutral", "hold": "Neutral", "flat": "Neutral", "0": "Neutral",
-})
-
-
 def _side_norm(side: str) -> str:
     """Normalize any side string to 'Buy', 'Sell', or 'Neutral'."""
     s = str(side or "").strip().lower()
@@ -90,13 +136,13 @@ def _side_norm(side: str) -> str:
 
 
 def is_buy(side: str) -> bool:
+    """Return True if the normalized side is 'Buy'."""
     return _side_norm(side) == "Buy"
 
 
 # =============================================================================
 # File I/O
 # =============================================================================
-
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write text to a file via temp-rename pattern."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,9 +152,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 # =============================================================================
-# ATR calculation (TA-Lib)
+# ATR Calculation (TA-Lib)
 # =============================================================================
-
 def _atr_fallback(
     high: np.ndarray,
     low: np.ndarray,
@@ -117,10 +162,10 @@ def _atr_fallback(
 ) -> np.ndarray:
     """ATR via TA-Lib (fast, vectorized)."""
     h = np.asarray(high, dtype=np.float64)
-    l = np.asarray(low, dtype=np.float64)
+    low_arr = np.asarray(low, dtype=np.float64)
     c = np.asarray(close, dtype=np.float64)
     p = max(1, int(period))
-    return talib.ATR(h, l, c, timeperiod=p)
+    return talib.ATR(h, low_arr, c, timeperiod=p)
 
 
 def _atr_np(
@@ -138,12 +183,12 @@ def _atr_np(
 
 
 # =============================================================================
-# Fractal efficiency & volatility (KER / RVI)
+# Fractal Efficiency & Volatility (KER / RVI)
 # =============================================================================
-
 def kaufman_efficiency_ratio(close: np.ndarray, period: int = 10) -> float:
     """
     Kaufman Efficiency Ratio (KER) in [0, 1].
+
     Measures trend efficiency: 1.0 = smooth trend, 0.0 = noisy chop.
     """
     try:
@@ -152,7 +197,7 @@ def kaufman_efficiency_ratio(close: np.ndarray, period: int = 10) -> float:
         if len(c) < p + 1:
             return 0.0
         change = abs(float(c[-1] - c[-p - 1]))
-        volatility = float(np.sum(np.abs(np.diff(c[-(p + 1):]))))
+        volatility = float(np.sum(np.abs(np.diff(c[-(p + 1) :]))))
         if volatility <= 0.0:
             return 0.0
         return clamp01(change / volatility)
@@ -163,6 +208,7 @@ def kaufman_efficiency_ratio(close: np.ndarray, period: int = 10) -> float:
 def relative_volatility_index(close: np.ndarray, period: int = 14) -> float:
     """
     Relative Volatility Index (RVI) in [0, 1].
+
     Uses std-dev of up vs down moves; 0.5 is neutral.
     """
     try:
@@ -195,8 +241,9 @@ def fractal_volatility_stop(
     chaos_mult: float = 1.0,
 ) -> float:
     """
-    Volatility-adjusted fractal stop distance:
-      Dynamic_SL = ATR * (1 + RVI * rvi_weight) * base_mult * (1 + chaos_mult * (1 - KER))
+    Volatility-adjusted fractal stop distance.
+
+    Dynamic_SL = ATR * (1 + RVI * rvi_weight) * base_mult * (1 + chaos_mult * (1 - KER))
     """
     if not _is_finite(entry, atr) or atr <= 0:
         return float(entry)
@@ -215,9 +262,8 @@ def fractal_volatility_stop(
 
 
 # =============================================================================
-# Position sizing — Dynamic (ATR-based + equity %)
+# Position Sizing — Dynamic (ATR-based + equity %)
 # =============================================================================
-
 def dynamic_position_size(
     equity: float,
     risk_pct: float,
@@ -229,6 +275,7 @@ def dynamic_position_size(
 ) -> float:
     """
     Institutional-grade position sizing.
+
     Lot = (equity × risk_pct) / (ATR_in_points × point_value)
 
     Ensures risk per trade is constant in dollar terms regardless of volatility.
@@ -261,20 +308,12 @@ def dynamic_position_size(
 
 
 # =============================================================================
-# Lot ladder (legacy balance-based — kept for backward compatibility)
+# Lot Ladder (legacy balance-based — kept for backward compatibility)
 # =============================================================================
-
-_BASE_LOT = 0.02
-_BASE_TP_USD = 2.0
-_STEP_BALANCE = 100.0
-_STEP_LOT = 0.01
-_STEP_TP_USD = 1.0
-_STEP_START_BALANCE = 200.0
-
-
 def lot_and_tp_usd(balance: float) -> Tuple[float, float]:
     """
     Balance-based lot/TP ladder (shared by BTC and XAU).
+
       1..199   -> lot=0.02, tp=2
       200..299 -> lot=0.03, tp=3
       300..399 -> lot=0.04, tp=4
@@ -296,9 +335,8 @@ def lot_and_tp_usd(balance: float) -> Tuple[float, float]:
 
 
 # =============================================================================
-# TP / Risk-Reward helpers
+# TP / Risk-Reward Helpers
 # =============================================================================
-
 def tp_multiplier_from_conf(
     confidence: float,
     min_mult: float = 1.5,
@@ -307,11 +345,12 @@ def tp_multiplier_from_conf(
 ) -> float:
     """
     Scale TP multiplier linearly with confidence, adapted by volatility regime.
+
     - explosive: extend targets (+50%)
     - compressed: contract targets (-30%)
     """
     c = clamp01(confidence)
-    
+
     # Regime adjustments
     if regime == "explosive":
         max_mult *= 1.5
@@ -346,15 +385,14 @@ def atr_stop_loss(
     side: str,
     multiplier: float = 2.5,
 ) -> float:
-    """ATR-based stop-loss level. Default: 2.5× ATR from entry."""
+    """ATR-based stop-loss level. Default: 2.5x ATR from entry."""
     sign = -1.0 if is_buy(side) else 1.0
     return float(entry + sign * float(atr) * multiplier)
 
 
 # =============================================================================
-# Adaptive risk money (equity × confidence × phase × drawdown)
+# Adaptive Risk Money (equity x confidence x phase x drawdown)
 # =============================================================================
-
 def adaptive_risk_money(
     equity: float,
     base_risk_pct: float,
@@ -369,12 +407,12 @@ def adaptive_risk_money(
     """
     Dynamic risk money calculation for institutional-grade position sizing.
 
-    risk_money = equity × base_risk_pct × confidence × phase_mult × dd_factor
+    risk_money = equity x base_risk_pct x confidence x phase_mult x dd_factor
 
     Phase factors:
-      A (normal) → 1.2×
-      B (caution) → 0.8×
-      C (defensive) → 0.5×
+      A (normal) -> 1.2x
+      B (caution) -> 0.8x
+      C (defensive) -> 0.5x
 
     Drawdown guard: if drawdown > dd_cut, apply dd_mult (halves risk).
     """
@@ -395,9 +433,8 @@ def adaptive_risk_money(
 
 
 # =============================================================================
-# Trailing stop helpers
+# Trailing Stop Helpers
 # =============================================================================
-
 def volatility_trailing_stop(
     entry: float,
     current_price: float,
@@ -407,10 +444,11 @@ def volatility_trailing_stop(
 ) -> float:
     """
     Smart trailing stop based on volatility (ATR).
-    Trails behind price at trail_atr_mult × ATR distance.
 
-    For BUY: trail_stop = current_price - (ATR × mult)
-    For SELL: trail_stop = current_price + (ATR × mult)
+    Trails behind price at trail_atr_mult x ATR distance.
+
+    For BUY: trail_stop = current_price - (ATR x mult)
+    For SELL: trail_stop = current_price + (ATR x mult)
 
     Returns the trailing stop price.
     """
@@ -432,6 +470,7 @@ def breakeven_price(
 ) -> float | None:
     """
     Move stop to breakeven when price reaches be_trigger_pct of distance to TP.
+
     Returns entry (breakeven) if triggered, else None.
     """
     if not _is_finite(entry, tp, current_price):
@@ -451,17 +490,8 @@ def breakeven_price(
 
 
 # =============================================================================
-# Timeframe helpers
+# Timeframe Helpers
 # =============================================================================
-
-_TF_SECONDS = MappingProxyType({
-    "M1": 60, "M2": 120, "M3": 180, "M5": 300, "M10": 600,
-    "M15": 900, "M20": 1200, "M30": 1800,
-    "H1": 3600, "H2": 7200, "H4": 14400, "H6": 21600, "H8": 28800,
-    "D1": 86400, "W1": 604800,
-})
-
-
 def tf_seconds(tf: str) -> int:
     """Convert timeframe string (M1, M5, H1, etc.) to seconds."""
     return _TF_SECONDS.get(str(tf or "").strip().upper(), 60)

@@ -1,21 +1,42 @@
+"""
+Bot/Motor/execution.py - Engine execution worker, order queue and MT5 integration.
+
+Ин модул мантиқи иҷрои фармоишҳоро дарбар мегирад (ExecutionWorker),
+ки дар риштаҳои алоҳида (threads) бо истифода аз навбатҳо (Queues)
+фармоишҳоро ба MT5 мефиристанд.
+"""
+
 from __future__ import annotations
 
+import builtins
 import os
 import queue
 import threading
 import time
 import traceback
-from typing import Any, Callable, Optional
+from datetime import datetime
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from ExnessAPI.order_execution import (
-    OrderExecutor,
-    OrderRequest,
-    OrderResult as ExecOrderResult,
-    log_health as exec_health_log,
-)
+# =============================================================================
+# Imports
+# =============================================================================
+import MetaTrader5 as mt5
 
-from .models import log_err, log_health
-from .models import ExecutionResult, OrderIntent
+from ExnessAPI.functions import close_all_position
+from ExnessAPI.order_execution import OrderExecutor, OrderRequest
+from ExnessAPI.order_execution import OrderResult as ExecOrderResult
+from ExnessAPI.order_execution import log_health as exec_health_log
+from mt5_client import MT5_LOCK, mt5_async_call
+
+from .models import AssetCandidate, ExecutionResult, OrderIntent, log_err, log_health
+
+if TYPE_CHECKING:
+    from .engine import MultiAssetTradingEngine
+
+# =============================================================================
+# Classes
+# =============================================================================
 
 
 class ExecutionWorker(threading.Thread):
@@ -24,18 +45,20 @@ class ExecutionWorker(threading.Thread):
         order_queue: "queue.Queue[OrderIntent]",
         result_queue: "queue.Queue[ExecutionResult]",
         dry_run: bool,
-        order_notify_cb: Optional[Callable[[OrderIntent, ExecutionResult], None]] = None,
+        order_notify_cb: Optional[
+            Callable[[OrderIntent, ExecutionResult], None]
+        ] = None,
         result_fallback_cb: Optional[Callable[[ExecutionResult], None]] = None,
-        executor_factory: Optional[Callable[[], Any]] = None,
         worker_label: str = "exec",
     ) -> None:
-        super().__init__(daemon=True, name=f"ExecutionWorker-{str(worker_label or 'exec')}")
+        super().__init__(
+            daemon=True, name=f"ExecutionWorker-{str(worker_label or 'exec')}"
+        )
         self.order_queue = order_queue
         self.result_queue = result_queue
         self.dry_run = bool(dry_run)
         self.order_notify_cb = order_notify_cb
         self.result_fallback_cb = result_fallback_cb
-        self.executor_factory = executor_factory
         self.worker_label = str(worker_label or "exec")
         # IMPORTANT: do not shadow threading.Thread._stop
         self._stop_evt = threading.Event()
@@ -44,7 +67,9 @@ class ExecutionWorker(threading.Thread):
     def stop(self) -> None:
         self._stop_evt.set()
 
-    def _get_hook(self, intent: OrderIntent) -> Optional[Callable[[ExecOrderResult], None]]:
+    def _get_hook(
+        self, intent: OrderIntent
+    ) -> Optional[Callable[[ExecOrderResult], None]]:
         rm = intent.risk_manager
         if rm and hasattr(rm, "execution_hook"):
             fn = getattr(rm, "execution_hook", None)
@@ -52,7 +77,9 @@ class ExecutionWorker(threading.Thread):
                 return fn  # type: ignore[return-value]
         return None
 
-    def _get_telemetry_hooks(self, intent: OrderIntent) -> Optional[dict[str, Callable[..., None]]]:
+    def _get_telemetry_hooks(
+        self, intent: OrderIntent
+    ) -> Optional[dict[str, Callable[..., None]]]:
         rm = intent.risk_manager
         if not rm:
             return None
@@ -70,13 +97,10 @@ class ExecutionWorker(threading.Thread):
 
     def _build_executor(self) -> Any:
         if self._executor is None:
-            if self.executor_factory is not None:
-                self._executor = self.executor_factory()
-            else:
-                self._executor = OrderExecutor(
-                    auto_ensure_mt5=(not self.dry_run),
-                    symbol_cache_ttl=30.0,
-                )
+            self._executor = OrderExecutor(
+                auto_ensure_mt5=(not self.dry_run),
+                symbol_cache_ttl=30.0,
+            )
         return self._executor
 
     def _process(self, intent: OrderIntent) -> ExecutionResult:
@@ -99,8 +123,12 @@ class ExecutionWorker(threading.Thread):
                             tp=float(intent.tp),
                             signal_id=str(intent.signal_id),
                             stage="dispatch",
-                            base_lot=float(getattr(intent, "base_lot", intent.lot) or intent.lot),
-                            phase_snapshot=str(getattr(intent, "phase_snapshot", "") or ""),
+                            base_lot=float(
+                                getattr(intent, "base_lot", intent.lot) or intent.lot
+                            ),
+                            phase_snapshot=str(
+                                getattr(intent, "phase_snapshot", "") or ""
+                            ),
                         )
                     except TypeError:
                         allowed, gated_lot, gate_reason = gate_fn(  # type: ignore[misc]
@@ -115,9 +143,18 @@ class ExecutionWorker(threading.Thread):
                         reason = f"dispatch_gate:{gate_reason}"
                         if rm and hasattr(rm, "record_execution_failure"):
                             try:
-                                rm.record_execution_failure(str(intent.order_id), float(intent.enqueue_time), sent, reason)
-                            except Exception:
-                                pass
+                                rm.record_execution_failure(
+                                    str(intent.order_id),
+                                    float(intent.enqueue_time),
+                                    sent,
+                                    reason,
+                                )
+                            except Exception as exc:  # DEFENSIVE CODE
+                                log_err.error(
+                                    "EXEC_GATE_RECORD_FAILURE_ERROR | order_id=%s err=%s",
+                                    intent.order_id,
+                                    exc,
+                                )
                         return ExecutionResult(
                             order_id=str(intent.order_id),
                             signal_id=str(intent.signal_id),
@@ -178,7 +215,9 @@ class ExecutionWorker(threading.Thread):
                 sent_ts=float(getattr(r, "sent_ts", sent) or sent),
                 fill_ts=filled,
                 req_price=float(getattr(r, "req_price", intent.price) or intent.price),
-                exec_price=float(getattr(r, "exec_price", intent.price) or intent.price),
+                exec_price=float(
+                    getattr(r, "exec_price", intent.price) or intent.price
+                ),
                 volume=float(getattr(r, "volume", intent.lot) or intent.lot),
                 slippage=float(getattr(r, "slippage", 0.0) or 0.0),
                 retcode=retcode,
@@ -187,7 +226,9 @@ class ExecutionWorker(threading.Thread):
                 position_ticket=int(getattr(r, "position_ticket", 0) or 0),
             )
         except Exception as exc:
-            log_err.error("execution worker error: %s | tb=%s", exc, traceback.format_exc())
+            log_err.error(
+                "execution worker error: %s | tb=%s", exc, traceback.format_exc()
+            )
             return ExecutionResult(
                 order_id=str(intent.order_id),
                 signal_id=str(intent.signal_id),
@@ -211,8 +252,12 @@ class ExecutionWorker(threading.Thread):
         if rm and hasattr(rm, "on_execution_result"):
             try:
                 rm.on_execution_result(res)
-            except Exception:
-                pass
+            except Exception as exc:  # DEFENSIVE CODE
+                log_err.error(
+                    "EXEC_FALLBACK_RISK_UPDATE_ERROR | order_id=%s err=%s",
+                    intent.order_id,
+                    exc,
+                )
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -229,8 +274,14 @@ class ExecutionWorker(threading.Thread):
                 try:
                     self.result_queue.put(res, timeout=0.25)
                     published = True
-                except Exception:
+                except Exception as exc:  # DEFENSIVE CODE
                     published = False
+                    log_err.error(
+                        "EXEC_RESULT_QUEUE_PUT_FAILED | order_id=%s worker=%s err=%s",
+                        res.order_id,
+                        self.worker_label,
+                        exc,
+                    )
 
                 # If not published, resolve directly so pending broker-sync state
                 # does not leak and later turn into a false timeout.
@@ -253,8 +304,12 @@ class ExecutionWorker(threading.Thread):
                 if self.order_notify_cb:
                     try:
                         self.order_notify_cb(intent, res)
-                    except Exception:
-                        pass
+                    except Exception as exc:  # DEFENSIVE CODE
+                        log_err.error(
+                            "EXEC_NOTIFY_CB_ERROR | order_id=%s err=%s",
+                            res.order_id,
+                            exc,
+                        )
 
                 # Optional executor health log
                 try:
@@ -265,8 +320,13 @@ class ExecutionWorker(threading.Thread):
                         res.ok,
                         res.reason,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:  # DEFENSIVE CODE
+                    log_err.error(
+                        "EXEC_HEALTH_LOG_ERROR | worker=%s order_id=%s err=%s",
+                        self.worker_label,
+                        res.order_id,
+                        exc,
+                    )
 
             finally:
                 try:
@@ -276,20 +336,6 @@ class ExecutionWorker(threading.Thread):
 
 
 # --- Execution manager -----------------------------------------------------
-import builtins
-import queue
-import time
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
-
-from mt5_client import mt5_async_call
-
-from .models import log_err, log_health
-from .models import AssetCandidate, OrderIntent
-
-if TYPE_CHECKING:
-    from .engine import MultiAssetTradingEngine
-
-
 class ExecutionManager:
     """Owns enqueue-time order gating and queue dispatch semantics."""
 
@@ -322,22 +368,28 @@ class ExecutionManager:
             fn = getattr(risk, "update_phase", None)
             if callable(fn):
                 fn()
-        except Exception:
-            pass
+        except Exception as exc:  # DEFENSIVE CODE
+            log_err.error(
+                "ENQUEUE_PHASE_UPDATE_ERROR | asset=%s err=%s", cand.asset, exc
+            )
 
         try:
             hard_stop_attr = getattr(risk, "requires_hard_stop", False)
-            hard_stop_active = bool(hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr)
+            hard_stop_active = bool(
+                hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr
+            )
             if hard_stop_active:
                 log_health.info("ENQUEUE_SKIP | asset=%s reason=hard_stop", cand.asset)
                 return False, None
-        except Exception:
-            pass
+        except Exception as exc:  # DEFENSIVE CODE
+            log_err.error(
+                "ENQUEUE_HARD_STOP_CHECK_ERROR | asset=%s err=%s", cand.asset, exc
+            )
 
         phase = e._get_phase(risk)
         if phase == "C":
-            log_health.warning(
-                "PHASE_C_SHADOW | asset=%s signal=%s conf=%.2f lot=%.4f sl=%.2f tp=%.2f | BLOCKED - Shadow Mode Active",
+            log_health.info(
+                "PHASE_C_TRADE_PAUSE | asset=%s signal=%s conf=%.2f lot=%.4f sl=%.2f tp=%.2f",
                 cand.asset,
                 cand.signal,
                 cand.confidence,
@@ -345,43 +397,13 @@ class ExecutionManager:
                 cand.sl,
                 cand.tp,
             )
-            if e._signal_notifier:
-                try:
-                    tick = mt5_async_call(
-                        "symbol_info_tick",
-                        cand.symbol,
-                        timeout=0.35,
-                        default=None,
-                    )
-                    current_price = float(tick.ask if cand.signal == "Buy" else tick.bid) if tick else 0.0
-                    shadow_alert = {
-                        "type": "PHASE_C_SHADOW",
-                        "asset": cand.asset,
-                        "symbol": cand.symbol,
-                        "signal": cand.signal,
-                        "confidence": cand.confidence,
-                        "lot": cand.lot,
-                        "sl": cand.sl,
-                        "tp": cand.tp,
-                        "price": current_price,
-                        "blocked": True,
-                        "reason": "Phase C - лимити рӯзонаи риск пур шуд",
-                        "message": (
-                            f"⚠️ [PHASE C — Савдои соягӣ] Сигнали тасдиқшудаи {cand.signal} барои {cand.symbol}.\n"
-                            f"Нарх: {current_price:.2f} | Боварӣ: {cand.confidence:.0f}%\n"
-                            f"(Иҷрои савдо аз сабаби лимити риск манъ шуд)\n"
-                            f"Ҳаҷми эҳтимолӣ: {cand.lot:.2f} | SL: {cand.sl:.2f} | TP: {cand.tp:.2f}"
-                        ),
-                    }
-                    e._signal_notifier(cand.asset, shadow_alert)
-                except Exception as exc:
-                    log_health.error("PHASE_C_SHADOW notification error: %s", exc)
             return False, None
-
         last_close_ts = e._last_trade_close_ts.get(cand.asset, 0.0)
         time_since_close = now - last_close_ts
         if time_since_close < e._trade_cooldown_sec and last_close_ts > 0:
-            e._cooldown_blocked_count[cand.asset] = e._cooldown_blocked_count.get(cand.asset, 0) + 1
+            e._cooldown_blocked_count[cand.asset] = (
+                e._cooldown_blocked_count.get(cand.asset, 0) + 1
+            )
             if e._cooldown_blocked_count[cand.asset] % 10 == 1:
                 log_health.info(
                     "ENQUEUE_SKIP | asset=%s reason=trade_cooldown remaining=%.0fs total_blocked=%d",
@@ -407,9 +429,11 @@ class ExecutionManager:
         leverage = getattr(acc_info, "leverage", 100) if acc_info else 100
 
         c_size = float(getattr(cfg.symbol_params, "contract_size", 100.0))
-        proposed_margin = (float(cand.close if hasattr(cand, "close") else 0) * float(cand.lot) * c_size) / float(
-            leverage or 1
-        )
+        proposed_margin = (
+            float(cand.close if hasattr(cand, "close") else 0)
+            * float(cand.lot)
+            * c_size
+        ) / float(leverage or 1)
         if proposed_margin <= 0:
             tick_info = mt5_async_call(
                 "symbol_info_tick",
@@ -433,15 +457,20 @@ class ExecutionManager:
             default=None,
         )
         pre_price = float(
-            pre_tick.ask if (pre_tick is not None and cand.signal == "Buy")
+            pre_tick.ask
+            if (pre_tick is not None and cand.signal == "Buy")
             else (pre_tick.bid if pre_tick is not None else 0.0)
         )
         live_contract_size = float(getattr(pre_info, "trade_contract_size", 0.0) or 0.0)
         if live_contract_size <= 0.0:
-            live_contract_size = float(getattr(cfg.symbol_params, "contract_size", 1.0) or 1.0)
+            live_contract_size = float(
+                getattr(cfg.symbol_params, "contract_size", 1.0) or 1.0
+            )
         proposed_risk_amount = max(
             0.0,
-            abs(pre_price - float(cand.sl or 0.0)) * float(cand.lot) * live_contract_size,
+            abs(pre_price - float(cand.sl or 0.0))
+            * float(cand.lot)
+            * live_contract_size,
         )
 
         allowed, adj_lot, block_reason = e._portfolio_risk.check_before_order(
@@ -458,13 +487,16 @@ class ExecutionManager:
                 getattr(
                     cfg,
                     "max_asset_risk_per_asset_pct",
-                    max(0.0, float(getattr(cfg, "max_risk_per_trade", 0.0) or 0.0)) * 2.0,
+                    max(0.0, float(getattr(cfg, "max_risk_per_trade", 0.0) or 0.0))
+                    * 2.0,
                 )
                 or 0.0
             ),
         )
         if not allowed:
-            log_health.warning("PORTFOLIO_BLOCK | asset=%s reason=%s", cand.asset, block_reason)
+            log_health.warning(
+                "PORTFOLIO_BLOCK | asset=%s reason=%s", cand.asset, block_reason
+            )
             return False, None
 
         if adj_lot < cand.lot:
@@ -477,7 +509,11 @@ class ExecutionManager:
             lot_override = adj_lot
 
         last_id, last_sig = e._edge_last_trade.get(cand.asset, ("", "Neutral"))
-        if cand.signal in ("Buy", "Sell") and last_id == str(cand.signal_id) and last_sig == str(cand.signal):
+        if (
+            cand.signal in ("Buy", "Sell")
+            and last_id == str(cand.signal_id)
+            and last_sig == str(cand.signal)
+        ):
             last_log = e._last_log_id.get(cand.asset)
             if last_log != str(cand.signal_id):
                 log_health.info(
@@ -489,30 +525,50 @@ class ExecutionManager:
                 e._last_log_id[cand.asset] = str(cand.signal_id)
             return False, None
 
-        if e._is_duplicate(cand.asset, cand.signal_id, now, max_orders=int(order_count), order_index=int(order_index)):
+        if e._is_duplicate(
+            cand.asset,
+            cand.signal_id,
+            now,
+            max_orders=int(order_count),
+            order_index=int(order_index),
+        ):
             last_log = e._last_log_id.get(cand.asset)
             if last_log != str(cand.signal_id):
-                log_health.info("ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s", cand.asset, cand.signal_id)
+                log_health.info(
+                    "ENQUEUE_SKIP | asset=%s reason=duplicate signal_id=%s",
+                    cand.asset,
+                    cand.signal_id,
+                )
                 e._last_log_id[cand.asset] = str(cand.signal_id)
             return False, None
 
-        tick = pre_tick if pre_tick is not None else mt5_async_call(
-            "symbol_info_tick",
-            cand.symbol,
-            timeout=0.35,
-            default=None,
+        tick = (
+            pre_tick
+            if pre_tick is not None
+            else mt5_async_call(
+                "symbol_info_tick",
+                cand.symbol,
+                timeout=0.35,
+                default=None,
+            )
         )
-        info = pre_info if pre_info is not None else mt5_async_call(
-            "symbol_info",
-            cand.symbol,
-            timeout=0.5,
-            default=None,
+        info = (
+            pre_info
+            if pre_info is not None
+            else mt5_async_call(
+                "symbol_info",
+                cand.symbol,
+                timeout=0.5,
+                default=None,
+            )
         )
         if tick is None:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=tick_missing", cand.asset)
             return False, None
         if info is None:
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=symbol_info_missing", cand.asset)
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=symbol_info_missing", cand.asset
+            )
             return False, None
 
         price = float(tick.ask if cand.signal == "Buy" else tick.bid)
@@ -520,8 +576,13 @@ class ExecutionManager:
             log_health.info("ENQUEUE_SKIP | asset=%s reason=bad_price", cand.asset)
             return False, None
 
-        current_spread_points = float(tick.ask - tick.bid) / float(info.point) if info.point else 99999.0
-        max_spread_pts = float(getattr(cfg, "max_spread_points", 0) or 0)
+        current_spread_points = (
+            float(tick.ask - tick.bid) / float(info.point) if info.point else 99999.0
+        )
+        max_spread_pts = max(
+            float(getattr(cfg, "max_spread_points", 0) or 0),
+            float(getattr(cfg, "exec_max_spread_points", 0) or 0),
+        )
         if max_spread_pts <= 0:
             max_spread_pts = 2500.0 if cand.asset == "BTC" else 350.0
 
@@ -546,8 +607,8 @@ class ExecutionManager:
                 price = float(builtins.round(price, digits))
                 sl_val = float(builtins.round(sl_val, digits))
                 tp_val = float(builtins.round(tp_val, digits))
-            except Exception:
-                pass
+            except Exception as exc:  # DEFENSIVE CODE
+                log_err.error("PRICE_ROUNDING_ERROR | asset=%s err=%s", cand.asset, exc)
 
         if cand.signal == "Buy":
             if not (sl_val < price < tp_val):
@@ -573,7 +634,9 @@ class ExecutionManager:
         lot_val = float(lot_override) if lot_override is not None else float(cand.lot)
         lot_val = e._apply_asset_lot_cap(cand.asset, lot_val, "enqueue")
         if lot_val <= 0:
-            log_health.info("ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset)
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=lot_nonpositive", cand.asset
+            )
             return False, None
 
         base_lot_val = float(lot_val)
@@ -614,7 +677,9 @@ class ExecutionManager:
                         tp=float(tp_val),
                     )
                 except Exception as exc:
-                    log_err.error("ENQUEUE_GATE_EXCEPTION | asset=%s err=%s", cand.asset, exc)
+                    log_err.error(
+                        "ENQUEUE_GATE_EXCEPTION | asset=%s err=%s", cand.asset, exc
+                    )
                     return False, None
 
                 if not allowed:
@@ -627,7 +692,10 @@ class ExecutionManager:
                 lot_val = float(gated_lot or lot_val)
                 lot_val = e._apply_asset_lot_cap(cand.asset, lot_val, "enqueue_gate")
                 if lot_val <= 0.0:
-                    log_health.info("ENQUEUE_SKIP | asset=%s reason=gate_lot_nonpositive", cand.asset)
+                    log_health.info(
+                        "ENQUEUE_SKIP | asset=%s reason=gate_lot_nonpositive",
+                        cand.asset,
+                    )
                     return False, None
 
         order_id = e._next_order_id(cand.asset)
@@ -664,11 +732,35 @@ class ExecutionManager:
             e._clear_pending_order(str(order_id))
             if risk and hasattr(risk, "record_execution_failure"):
                 try:
-                    risk.record_execution_failure(order_id, now, now, "queue_backlog_drop")
-                except Exception:
-                    pass
-            log_health.warning("ENQUEUE_FAIL | asset=%s reason=queue_full order_id=%s", cand.asset, order_id)
+                    risk.record_execution_failure(
+                        order_id, now, now, "queue_backlog_drop"
+                    )
+                except Exception as exc:  # DEFENSIVE CODE
+                    log_err.error(
+                        "ENQUEUE_RECORD_FAILURE_ERROR | order_id=%s err=%s",
+                        order_id,
+                        exc,
+                )
+            log_health.warning(
+                "ENQUEUE_FAIL | asset=%s reason=queue_full order_id=%s",
+                cand.asset,
+                order_id,
+            )
             return False, None
+
+        if risk and hasattr(risk, "on_position_opened"):
+            try:
+                # Mark the symbol as occupied as soon as the order enters the
+                # live dispatch path so a second opposite order cannot race in
+                # before fill reconciliation arrives.
+                risk.on_position_opened()
+            except Exception as exc:  # DEFENSIVE CODE
+                log_err.error(
+                    "POSITION_OPEN_MARK_ERROR | asset=%s order_id=%s err=%s",
+                    cand.asset,
+                    order_id,
+                    exc,
+                )
 
         e._mark_seen(cand.asset, cand.signal_id, now)
         e._last_selected_asset = cand.asset
@@ -678,13 +770,27 @@ class ExecutionManager:
             if hasattr(risk, "register_signal_emitted"):
                 try:
                     risk.register_signal_emitted()
-                except Exception:
-                    pass
+                except Exception as exc:  # DEFENSIVE CODE
+                    log_err.error(
+                        "REGISTER_SIGNAL_EMITTED_ERROR | asset=%s err=%s",
+                        cand.asset,
+                        exc,
+                    )
             if hasattr(risk, "track_signal_survival"):
                 try:
-                    risk.track_signal_survival(order_id, cand.signal, price, sl_val, tp_val, now, cand.confidence)
-                except Exception:
-                    pass
+                    risk.track_signal_survival(
+                        order_id,
+                        cand.signal,
+                        price,
+                        sl_val,
+                        tp_val,
+                        now,
+                        cand.confidence,
+                    )
+                except Exception as exc:  # DEFENSIVE CODE
+                    log_err.error(
+                        "TRACK_SIGNAL_SURVIVAL_ERROR | asset=%s err=%s", cand.asset, exc
+                    )
 
         return True, str(order_id)
 
@@ -748,7 +854,8 @@ class ExecutionManager:
             return 0
         try:
             return int(pipe.open_positions())
-        except Exception:
+        except Exception as exc:  # DEFENSIVE CODE
+            log_err.error("ASSET_OPEN_POSITIONS_ERROR | asset=%s err=%s", asset, exc)
             return 0
 
     def asset_max_positions(self, asset: str) -> int:
@@ -760,8 +867,12 @@ class ExecutionManager:
         e = self._e
         asset_u = str(asset or "").upper().strip()
         cfg = e._xau_cfg if asset_u == "XAU" else e._btc_cfg
-        broker_max = float(getattr(getattr(cfg, "symbol_params", None), "lot_max", 0.0) or 0.0)
-        cap = float(e._max_lot_cap.get(asset_u, broker_max if broker_max > 0.0 else 0.0) or 0.0)
+        broker_max = float(
+            getattr(getattr(cfg, "symbol_params", None), "lot_max", 0.0) or 0.0
+        )
+        cap = float(
+            e._max_lot_cap.get(asset_u, broker_max if broker_max > 0.0 else 0.0) or 0.0
+        )
         if broker_max > 0.0:
             if cap <= 0.0:
                 cap = broker_max
@@ -794,7 +905,9 @@ class ExecutionManager:
 
         try:
             hard_stop_attr = getattr(pipe.risk, "requires_hard_stop", False)
-            hard_stop_active = bool(hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr)
+            hard_stop_active = bool(
+                hard_stop_attr() if callable(hard_stop_attr) else hard_stop_attr
+            )
             if hard_stop_active:
                 return 0
         except Exception:
@@ -845,7 +958,9 @@ class ExecutionManager:
                 continue
 
             if e._manual_stop:
-                log_health.info("FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset)
+                log_health.info(
+                    "FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset
+                )
                 continue
 
             open_positions = self.asset_open_positions(selected.asset)
@@ -863,7 +978,11 @@ class ExecutionManager:
             if int(order_count) <= 0:
                 continue
 
-            risk = e._xau.risk if selected.asset == "XAU" and e._xau else (e._btc.risk if e._btc else None)
+            risk = (
+                e._xau.risk
+                if selected.asset == "XAU" and e._xau
+                else (e._btc.risk if e._btc else None)
+            )
             cfg = e._xau_cfg if selected.asset == "XAU" else e._btc_cfg
             lots = self.split_lot(float(selected.lot), order_count, risk, cfg)
             signal_enqueued = False
@@ -886,12 +1005,9 @@ class ExecutionManager:
                         )
                         current_sig_id = str(selected.signal_id)
                         current_sig = str(selected.signal)
-                        if (
-                            e._signal_notifier
-                            and not (
-                                last_notified_id == current_sig_id
-                                and last_notified_sig == current_sig
-                            )
+                        if e._signal_notifier and not (
+                            last_notified_id == current_sig_id
+                            and last_notified_sig == current_sig
                         ):
                             try:
                                 e._signal_notifier(
@@ -905,7 +1021,11 @@ class ExecutionManager:
                                         "signal_id": current_sig_id,
                                         "order_id": str(oid or ""),
                                         "lot": float(lot_val),
-                                        "phase": (e._get_phase(risk) if risk is not None else ""),
+                                        "phase": (
+                                            e._get_phase(risk)
+                                            if risk is not None
+                                            else ""
+                                        ),
                                         "blocked": False,
                                     },
                                 )
@@ -916,7 +1036,10 @@ class ExecutionManager:
                                     current_sig_id,
                                     exc,
                                 )
-                        e._edge_last_notified[selected.asset] = (current_sig_id, current_sig)
+                        e._edge_last_notified[selected.asset] = (
+                            current_sig_id,
+                            current_sig,
+                        )
                         signal_enqueued = True
 
                     log_health.info(
@@ -938,8 +1061,12 @@ class ExecutionManager:
 
             try:
                 e._resolve_order_result(r)
-            except Exception:
-                pass
+            except Exception as exc:  # DEFENSIVE CODE
+                log_err.error(
+                    "VERIFICATION_RESOLVE_ERROR | order_id=%s err=%s",
+                    getattr(r, "order_id", "unknown"),
+                    exc,
+                )
             finally:
                 try:
                     e._result_q.task_done()
@@ -964,21 +1091,6 @@ class ExecutionManager:
 
 
 # --- Order sync manager ----------------------------------------------------
-import time
-from datetime import datetime
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
-
-import MetaTrader5 as mt5
-from mt5_client import MT5_LOCK
-
-from .models import log_err, log_health
-from .models import ExecutionResult, OrderIntent
-
-if TYPE_CHECKING:
-    from .engine import MultiAssetTradingEngine
-
-
 class OrderSyncManager:
     """Owns pending-order state tracking and broker reconciliation."""
 
@@ -1008,7 +1120,9 @@ class OrderSyncManager:
             return self._e._pending_order_meta.pop(str(order_id), None)
 
     @staticmethod
-    def _should_defer_result(r: ExecutionResult, meta: Optional[Dict[str, Any]]) -> bool:
+    def _should_defer_result(
+        r: ExecutionResult, meta: Optional[Dict[str, Any]]
+    ) -> bool:
         if not isinstance(meta, dict) or bool(r.ok):
             return False
         reason = str(r.reason or "").lower()
@@ -1080,7 +1194,9 @@ class OrderSyncManager:
             try:
                 rm.on_execution_result(r)
             except Exception as exc:
-                log_err.error("ORDER_SYNC_RISK_UPDATE_ERROR | order_id=%s err=%s", order_id, exc)
+                log_err.error(
+                    "ORDER_SYNC_RISK_UPDATE_ERROR | order_id=%s err=%s", order_id, exc
+                )
         if (
             isinstance(meta, dict)
             and str(r.reason or "").startswith("sync_")
@@ -1105,8 +1221,12 @@ class OrderSyncManager:
             signal = str(meta.get("signal", "") or "")
             if signal not in ("Buy", "Sell"):
                 return None
-            want_pos_type = mt5.POSITION_TYPE_BUY if signal == "Buy" else mt5.POSITION_TYPE_SELL
-            want_deal_type = mt5.ORDER_TYPE_BUY if signal == "Buy" else mt5.ORDER_TYPE_SELL
+            want_pos_type = (
+                mt5.POSITION_TYPE_BUY if signal == "Buy" else mt5.POSITION_TYPE_SELL
+            )
+            want_deal_type = (
+                mt5.ORDER_TYPE_BUY if signal == "Buy" else mt5.ORDER_TYPE_SELL
+            )
             enqueue_ts = float(meta.get("enqueue_ts", 0.0) or 0.0)
             req_price = float(meta.get("req_price", 0.0) or 0.0)
             req_lot = float(meta.get("lot", 0.0) or 0.0)
@@ -1139,7 +1259,9 @@ class OrderSyncManager:
                         req_price=float(req_price),
                         exec_price=float(p_price if p_price > 0 else req_price),
                         volume=float(p_vol if p_vol > 0 else req_lot),
-                        slippage=float(abs((p_price if p_price > 0 else req_price) - req_price)),
+                        slippage=float(
+                            abs((p_price if p_price > 0 else req_price) - req_price)
+                        ),
                         retcode=0,
                         order_ticket=0,
                         deal_ticket=0,
@@ -1193,7 +1315,9 @@ class OrderSyncManager:
                     req_price=float(req_price),
                     exec_price=float(b_price if b_price > 0 else req_price),
                     volume=float(b_vol if b_vol > 0 else req_lot),
-                    slippage=float(abs((b_price if b_price > 0 else req_price) - req_price)),
+                    slippage=float(
+                        abs((b_price if b_price > 0 else req_price) - req_price)
+                    ),
                     retcode=0,
                     order_ticket=0,
                     deal_ticket=int(b_ticket),
@@ -1249,14 +1373,12 @@ class OrderSyncManager:
             try:
                 self.resolve_order_result(sync_res)
             except Exception as exc:
-                log_err.error("ORDER_SYNC_RESOLVE_ERROR | order_id=%s err=%s", order_id, exc)
+                log_err.error(
+                    "ORDER_SYNC_RESOLVE_ERROR | order_id=%s err=%s", order_id, exc
+                )
+
 
 # --- Engine mixin extracted from engine.py --------------------------------
-from typing import Dict, Iterable, List
-
-from ExnessAPI.functions import close_all_position
-
-
 class EngineExecutionMixin:
     def _restart_exec_worker(self) -> None:
         self._stop_exec_workers(timeout=4.0)
@@ -1340,8 +1462,12 @@ class EngineExecutionMixin:
     def _resolve_order_result(self, r: ExecutionResult) -> None:
         self._order_sync_manager.resolve_order_result(r)
 
-    def _probe_pending_order_state(self, order_id: str, meta: Dict[str, Any], now_ts: float) -> Optional[ExecutionResult]:
-        return self._order_sync_manager.probe_pending_order_state(order_id, meta, now_ts)
+    def _probe_pending_order_state(
+        self, order_id: str, meta: Dict[str, Any], now_ts: float
+    ) -> Optional[ExecutionResult]:
+        return self._order_sync_manager.probe_pending_order_state(
+            order_id, meta, now_ts
+        )
 
     def _sync_pending_orders(self) -> None:
         self._order_sync_manager.sync_pending_orders()
@@ -1470,34 +1596,57 @@ class EngineExecutionMixin:
         transitions to prevent orphaned positions.
         """
         if self.dry_run:
-            log_health.warning("EMERGENCY_FLATTEN_SKIP | reason=%s mode=dry_run", reason)
+            log_health.warning(
+                "EMERGENCY_FLATTEN_SKIP | reason=%s mode=dry_run", reason
+            )
             return True
 
         reason_s = str(reason or "unspecified")
         now = time.time()
         with self._lock:
             if (
-                (now - self._last_flatten_ts) < self._flatten_cooldown_sec
-                and reason_s == self._last_flatten_reason
-            ):
+                now - self._last_flatten_ts
+            ) < self._flatten_cooldown_sec and reason_s == self._last_flatten_reason:
                 return False
             self._last_flatten_ts = now
             self._last_flatten_reason = reason_s
 
-        log_err.critical("EMERGENCY_FLATTEN_START | reason=%s retries=%d", reason_s, self._flatten_retries)
+        log_err.critical(
+            "EMERGENCY_FLATTEN_START | reason=%s retries=%d",
+            reason_s,
+            self._flatten_retries,
+        )
         ok = False
         for attempt in range(1, self._flatten_retries + 1):
             try:
                 ok = bool(self.close_all())
             except Exception as exc:
                 ok = False
-                log_err.error("EMERGENCY_FLATTEN_EXCEPTION | attempt=%d reason=%s err=%s", attempt, reason_s, exc)
+                log_err.error(
+                    "EMERGENCY_FLATTEN_EXCEPTION | attempt=%d reason=%s err=%s",
+                    attempt,
+                    reason_s,
+                    exc,
+                )
 
             if ok:
-                log_health.critical("EMERGENCY_FLATTEN_DONE | reason=%s attempt=%d", reason_s, attempt)
+                log_health.critical(
+                    "EMERGENCY_FLATTEN_DONE | reason=%s attempt=%d", reason_s, attempt
+                )
                 return True
 
             time.sleep(self._flatten_backoff_sec * float(attempt))
 
         log_err.critical("EMERGENCY_FLATTEN_FAILED | reason=%s", reason_s)
         return False
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+__all__ = [
+    "EngineExecutionMixin",
+    "ExecutionManager",
+    "ExecutionWorker",
+    "OrderSyncManager",
+]

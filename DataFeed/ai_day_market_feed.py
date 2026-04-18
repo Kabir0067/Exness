@@ -1,24 +1,17 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-_root = Path(__file__).resolve().parent.parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-import time
 import logging
 import math
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import MetaTrader5 as mt5
+
 from log_config import get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
-
 
 Timeframe = Literal["H1", "H4", "D1"]
 
@@ -39,7 +32,9 @@ if not log.handlers:
         encoding="utf-8",
     )
     fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
     log.addHandler(fh)
 
 
@@ -84,7 +79,9 @@ def _cached_payload(symbol: str, reason: str) -> Optional[Dict[str, Any]]:
     meta["mt5_reason"] = str(reason or "unknown")
     try:
         st = str(out.get("summary_text", "") or "")
-        out["summary_text"] = st + f"\nFALLBACK=CACHED | AGE_SEC={int(max(0.0, age))} | MT5={reason}"
+        out["summary_text"] = (
+            st + f"\nFALLBACK=CACHED | AGE_SEC={int(max(0.0, age))} | MT5={reason}"
+        )
     except Exception:
         pass
     return out
@@ -206,21 +203,23 @@ def _stoch_rsi_snapshot(values: List[float]) -> Dict[str, Any]:
     raw_k: List[float] = []
     period = 14
     for idx in range(period - 1, len(rsi_values)):
-        window = rsi_values[idx - period + 1: idx + 1]
+        window = rsi_values[idx - period + 1 : idx + 1]
         low = min(window)
         high = max(window)
         current = rsi_values[idx]
         if high - low <= 1e-12:
             raw_k.append(50.0)
         else:
-            raw_k.append(float(_clamp((current - low) / (high - low) * 100.0, 0.0, 100.0)))
+            raw_k.append(
+                float(_clamp((current - low) / (high - low) * 100.0, 0.0, 100.0))
+            )
     k_series: List[float] = []
     for idx in range(len(raw_k)):
-        window = raw_k[max(0, idx - 2): idx + 1]
+        window = raw_k[max(0, idx - 2) : idx + 1]
         k_series.append(_sma(window))
     d_series: List[float] = []
     for idx in range(len(k_series)):
-        window = k_series[max(0, idx - 2): idx + 1]
+        window = k_series[max(0, idx - 2) : idx + 1]
         d_series.append(_sma(window))
     k_now = float(k_series[-1])
     d_now = float(d_series[-1])
@@ -246,7 +245,9 @@ def _stoch_rsi_snapshot(values: List[float]) -> Dict[str, Any]:
     }
 
 
-def _volume_snapshot(candles: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
+def _volume_snapshot(
+    candles: List[Tuple[int, float, float, float, float, float]],
+) -> Dict[str, Any]:
     volumes = [float(c[5]) for c in candles if len(c) >= 6]
     if not volumes:
         return {"current": 0.0, "avg_20": 0.0, "ratio": 1.0}
@@ -260,7 +261,9 @@ def _volume_snapshot(candles: List[Tuple[int, float, float, float, float, float]
     }
 
 
-def _price_action_snapshot(candles: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
+def _price_action_snapshot(
+    candles: List[Tuple[int, float, float, float, float, float]],
+) -> Dict[str, Any]:
     if len(candles) < 3:
         return {"pattern": "none"}
     prev = candles[-2]
@@ -276,11 +279,17 @@ def _price_action_snapshot(candles: List[Tuple[int, float, float, float, float, 
     recent_low = min((float(c[3]) for c in recent), default=low)
     pattern = "none"
     if (
-        prev_close < prev_open and close > open_ and open_ <= prev_close and close >= prev_open
+        prev_close < prev_open
+        and close > open_
+        and open_ <= prev_close
+        and close >= prev_open
     ):
         pattern = "bullish_engulfing"
     elif (
-        prev_close > prev_open and close < open_ and open_ >= prev_close and close <= prev_open
+        prev_close > prev_open
+        and close < open_
+        and open_ >= prev_close
+        and close <= prev_open
     ):
         pattern = "bearish_engulfing"
     elif body > 0 and lower >= (body * 2.0) and upper <= max(body * 0.6, 1e-9):
@@ -413,7 +422,7 @@ def _order_block_snapshot(
     threshold = max(float(atr_14) * 0.12, 1e-9)
     for idx in range(max(1, len(candles) - 32), len(candles) - 3):
         _, open_, high, low, close, _ = candles[idx]
-        future = candles[idx + 1: idx + 4]
+        future = candles[idx + 1 : idx + 4]
         future_closes = [float(c[4]) for c in future]
         open_ = float(open_)
         high = float(high)
@@ -428,7 +437,14 @@ def _order_block_snapshot(
                     "top": round(top, 6),
                     "bottom": round(bottom, 6),
                     "mid": round((top + bottom) * 0.5, 6),
-                    "strength": round(_clamp((max(future_closes) - high) / max(float(atr_14), 1e-9), 0.0, 3.0), 3),
+                    "strength": round(
+                        _clamp(
+                            (max(future_closes) - high) / max(float(atr_14), 1e-9),
+                            0.0,
+                            3.0,
+                        ),
+                        3,
+                    ),
                 }
             )
         elif close > open_ and min(future_closes, default=close) < (low - threshold):
@@ -440,7 +456,14 @@ def _order_block_snapshot(
                     "top": round(top, 6),
                     "bottom": round(bottom, 6),
                     "mid": round((top + bottom) * 0.5, 6),
-                    "strength": round(_clamp((low - min(future_closes)) / max(float(atr_14), 1e-9), 0.0, 3.0), 3),
+                    "strength": round(
+                        _clamp(
+                            (low - min(future_closes)) / max(float(atr_14), 1e-9),
+                            0.0,
+                            3.0,
+                        ),
+                        3,
+                    ),
                 }
             )
     return blocks[-5:]
@@ -507,7 +530,9 @@ def _market_state_from_intraday(
         directional_bias = h4_dir
     else:
         directional_bias = "balanced"
-    separation = abs(float(p_h4.ema_20) - float(p_h4.ema_50)) / max(float(p_h4.atr_14), 1e-9)
+    separation = abs(float(p_h4.ema_20) - float(p_h4.ema_50)) / max(
+        float(p_h4.atr_14), 1e-9
+    )
     regime = "trending" if separation >= 0.35 else "ranging"
     spread_points = meta.get("spread_points")
     if spread_points is not None and float(spread_points) > 2500:
@@ -604,7 +629,9 @@ class GetDataRealTimeBaseForAiIntraday:
         return meta
 
     # ---------- DATA SOURCE ----------
-    def fetch_ohlcv(self, tf: Timeframe, limit: int) -> List[Tuple[int, float, float, float, float, float]]:
+    def fetch_ohlcv(
+        self, tf: Timeframe, limit: int
+    ) -> List[Tuple[int, float, float, float, float, float]]:
         """
         CLOSED candles only. Ascending time.
         """
@@ -682,17 +709,19 @@ class GetDataRealTimeBaseForAiIntraday:
     def _vwap(ohlcv: List[Tuple[int, float, float, float, float, float]]) -> float:
         pv_sum = 0.0
         v_sum = 0.0
-        for _, _o, h, l, c, v in ohlcv:
-            tp = (h + l + c) / 3.0
+        for _, _o, h, bar_low, c, v in ohlcv:
+            tp = (h + bar_low + c) / 3.0
             pv_sum += tp * v
             v_sum += v
         if v_sum == 0:
-            _t, _o, h, l, c, _v = ohlcv[-1]
-            return float((h + l + c) / 3.0)
+            _t, _o, h, last_low, c, _v = ohlcv[-1]
+            return float((h + last_low + c) / 3.0)
         return float(pv_sum / v_sum)
 
     @staticmethod
-    def _atr(ohlcv: List[Tuple[int, float, float, float, float, float]], period: int = 14) -> float:
+    def _atr(
+        ohlcv: List[Tuple[int, float, float, float, float, float]], period: int = 14
+    ) -> float:
         if len(ohlcv) < period + 1:
             raise ValueError(f"Need >= {period+1} candles for ATR({period})")
 
@@ -896,7 +925,10 @@ def get_ai_payload_xau_intraday() -> Optional[Dict[str, Any]]:
     if blocked_reason:
         cached = _cached_payload("XAUUSDm_INTRADAY", blocked_reason)
         if cached is not None:
-            log.warning("get_ai_payload_xau_intraday: using cached payload due mt5_block=%s", blocked_reason)
+            log.warning(
+                "get_ai_payload_xau_intraday: using cached payload due mt5_block=%s",
+                blocked_reason,
+            )
             return cached
         log.error("get_ai_payload_xau_intraday blocked: %s", blocked_reason)
         return None
@@ -924,7 +956,10 @@ def get_ai_payload_btc_intraday() -> Optional[Dict[str, Any]]:
     if blocked_reason:
         cached = _cached_payload("BTCUSDm_INTRADAY", blocked_reason)
         if cached is not None:
-            log.warning("get_ai_payload_btc_intraday: using cached payload due mt5_block=%s", blocked_reason)
+            log.warning(
+                "get_ai_payload_btc_intraday: using cached payload due mt5_block=%s",
+                blocked_reason,
+            )
             return cached
         log.error("get_ai_payload_btc_intraday blocked: %s", blocked_reason)
         return None
@@ -945,5 +980,3 @@ def get_ai_payload_btc_intraday() -> Optional[Dict[str, Any]]:
             log.warning("get_ai_payload_btc_intraday: fallback cached after exception")
             return cached
         return None
-
-
