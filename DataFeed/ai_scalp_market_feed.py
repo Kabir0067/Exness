@@ -10,6 +10,8 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import MetaTrader5 as mt5
+import numpy as np
+import talib
 
 from log_config import get_log_path
 from mt5_client import MT5_LOCK, ensure_mt5, mt5_status
@@ -38,6 +40,12 @@ if not log.handlers:
     )
     log.addHandler(fh)
 
+
+# Liveness-once flags — эмит як маротиба INFO лог дар аввалин муваффақияти
+# ҳар симбол, то админ бубинад "feed ҷорӣ кор мекунад" ва мутмаин шавад,
+# ки handler дуруст bind шудааст (ai_market_feed.log = size=0 буд).
+_LIVENESS_LOGGED_XAU = False
+_LIVENESS_LOGGED_BTC = False
 
 _PAYLOAD_CACHE_TTL_SEC = 300.0
 _NON_RETRIABLE_MARKERS = (
@@ -129,62 +137,79 @@ def _stddev(values: List[float]) -> float:
     return float(math.sqrt(max(variance, 0.0)))
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# TA-Lib-backed indicators (SINGLE SOURCE OF TRUTH across train / backtest /
+# live inference). Hand-rolled implementations are DELETED — they produced
+# off-by-warmup values that disagreed with TA-Lib / TradingView.
+# ─────────────────────────────────────────────────────────────────────────
 def _ema_series(values: List[float], period: int) -> List[float]:
-    if not values:
+    """TA-Lib EMA with warmup back-fill to preserve caller contract (same length)."""
+    n = len(values)
+    if n == 0:
         return []
-    window = max(1, min(int(period), len(values)))
-    alpha = 2.0 / (window + 1.0)
-    ema = _sma(values[:window])
-    out: List[float] = []
-    for value in values:
-        ema = (float(value) * alpha) + (ema * (1.0 - alpha))
-        out.append(float(ema))
-    return out
+    period = max(1, int(period))
+    arr = np.asarray(values, dtype=np.float64)
+    if n < period:
+        # Not enough data for a stable EMA — fall back to cumulative SMA
+        # so the output length is preserved and values are conservative.
+        out = np.full(n, np.nan, dtype=np.float64)
+        for i in range(n):
+            out[i] = float(np.mean(arr[: i + 1]))
+        return [float(v) for v in out]
+    ema = talib.EMA(arr, timeperiod=period)
+    # TA-Lib returns NaN for the first (period-1) values. Back-fill with
+    # the first valid EMA so the output length matches the input length
+    # and downstream index-based accesses remain safe.
+    first_valid = np.argmax(~np.isnan(ema)) if np.any(~np.isnan(ema)) else 0
+    if np.isnan(ema[first_valid]):
+        return [float(v) for v in arr]
+    fv = float(ema[first_valid])
+    out = np.where(np.isnan(ema), fv, ema)
+    return [float(v) for v in out]
 
 
 def _rsi_series(values: List[float], period: int = 14) -> List[float]:
-    if len(values) < 2:
-        return [50.0 for _ in values]
+    """TA-Lib Wilder RSI with neutral back-fill during warmup."""
+    n = len(values)
+    if n < 2:
+        return [50.0 for _ in range(n)]
     period = max(2, int(period))
-    deltas = [float(values[i]) - float(values[i - 1]) for i in range(1, len(values))]
-    gains = [max(delta, 0.0) for delta in deltas]
-    losses = [max(-delta, 0.0) for delta in deltas]
-    seed_len = min(period, len(deltas))
-    avg_gain = sum(gains[:seed_len]) / seed_len if seed_len else 0.0
-    avg_loss = sum(losses[:seed_len]) / seed_len if seed_len else 0.0
-    rsis: List[float] = [50.0]
-    for idx in range(len(deltas)):
-        if idx >= seed_len:
-            avg_gain = ((avg_gain * (period - 1)) + gains[idx]) / period
-            avg_loss = ((avg_loss * (period - 1)) + losses[idx]) / period
-        elif idx > 0:
-            span = idx + 1
-            avg_gain = sum(gains[:span]) / span
-            avg_loss = sum(losses[:span]) / span
-        if avg_loss <= 1e-12:
-            rsi = 100.0 if avg_gain > 0 else 50.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100.0 - (100.0 / (1.0 + rs))
-        rsis.append(float(_clamp(rsi, 0.0, 100.0)))
-    return rsis
+    arr = np.asarray(values, dtype=np.float64)
+    if n <= period:
+        return [50.0 for _ in range(n)]
+    rsi = talib.RSI(arr, timeperiod=period)
+    # Fill warmup NaN with neutral 50 (safe default — no directional bias).
+    rsi = np.where(np.isnan(rsi), 50.0, rsi)
+    # Clamp to [0, 100] for safety (TA-Lib output is already in range, but
+    # guard against any numerical drift).
+    rsi = np.clip(rsi, 0.0, 100.0)
+    return [float(v) for v in rsi]
 
 
 def _macd_snapshot(values: List[float]) -> Dict[str, Any]:
-    if len(values) < 8:
+    """
+    MACD(12,26,9) via TA-Lib — single source of truth, matches
+    TradingView / industry-standard implementations exactly.
+    """
+    if len(values) < 26:  # TA-Lib needs at least slowperiod bars
         return {"line": 0.0, "signal": 0.0, "histogram": 0.0, "cross": "none"}
-    fast = _ema_series(values, 12)
-    slow = _ema_series(values, 26)
-    macd_line = [float(f - s) for f, s in zip(fast, slow)]
-    signal_line = _ema_series(macd_line, 9)
-    hist = [float(m - s) for m, s in zip(macd_line, signal_line)]
-    current_macd = macd_line[-1]
-    current_signal = signal_line[-1]
-    current_hist = hist[-1]
+    arr = np.asarray(values, dtype=np.float64)
+    macd_arr, signal_arr, hist_arr = talib.MACD(
+        arr, fastperiod=12, slowperiod=26, signalperiod=9
+    )
+    # Find the last non-NaN sample for a stable current reading.
+    valid = np.where(~np.isnan(signal_arr))[0]
+    if valid.size == 0:
+        return {"line": 0.0, "signal": 0.0, "histogram": 0.0, "cross": "none"}
+    last = int(valid[-1])
+    current_macd = float(macd_arr[last])
+    current_signal = float(signal_arr[last])
+    current_hist = float(hist_arr[last])
     cross = "none"
-    if len(macd_line) >= 2 and len(signal_line) >= 2:
-        prev_macd = macd_line[-2]
-        prev_signal = signal_line[-2]
+    if valid.size >= 2:
+        prev = int(valid[-2])
+        prev_macd = float(macd_arr[prev])
+        prev_signal = float(signal_arr[prev])
         if prev_macd <= prev_signal and current_macd > current_signal:
             cross = "bullish_cross"
         elif prev_macd >= prev_signal and current_macd < current_signal:
@@ -417,56 +442,107 @@ def _order_block_snapshot(
     candles: List[Tuple[int, float, float, float, float, float]],
     atr_14: float,
 ) -> List[Dict[str, Any]]:
+    """
+    Identify Order Blocks using ONLY past bars relative to each candidate.
+
+    CRITICAL FIX — LOOKAHEAD ELIMINATED:
+      The previous implementation inspected `candles[idx+1 : idx+4]` (i.e.
+      future closes relative to `idx`) to decide whether bar `idx` was a
+      valid order block. This leaked future price information into the
+      feature seen by the AI at inference time, creating a synthetic
+      edge in backtest that did NOT exist live.
+
+    NEW LOGIC (pure past-only, causal):
+      For each candidate bar `idx` we look BACKWARDS at preceding bars
+      `[idx - lookback : idx]` and ask: was there a clear institutional
+      move that CULMINATED at `idx` (rejection / absorption)? A bar is
+      flagged as a bullish OB if:
+        * it is a down-close (close < open) — the last bear candle
+        * the displacement from the PREVIOUS candle's range exceeds
+          threshold (the prior bar closed strongly above this bar's high)
+      Symmetric rule for bearish OB. This uses only past information
+      available at bar `idx`, so the feature is causally valid.
+
+      NOTE: we intentionally keep the feature simple and causal; a
+      richer OB labeller should be offline (for training targets only),
+      never in a live feature payload.
+    """
     if len(candles) < 6:
         return []
     blocks: List[Dict[str, Any]] = []
     threshold = max(float(atr_14) * 0.12, 1e-9)
-    for idx in range(max(1, len(candles) - 32), len(candles) - 3):
+    atr_safe = max(float(atr_14), 1e-9)
+    # Scan recent window but only examine bar `idx` against bars BEFORE it.
+    # We leave the final 3 bars scannable since no +k look-forward is used.
+    for idx in range(max(2, len(candles) - 32), len(candles)):
         _, open_, high, low, close, _ = candles[idx]
-        future = candles[idx + 1 : idx + 4]
-        future_closes = [float(c[4]) for c in future]
         open_ = float(open_)
         high = float(high)
         low = float(low)
         close = float(close)
-        if close < open_ and max(future_closes, default=close) > (high + threshold):
-            top = max(open_, close)
-            bottom = low
-            blocks.append(
-                {
-                    "direction": "bullish",
-                    "top": round(top, 6),
-                    "bottom": round(bottom, 6),
-                    "mid": round((top + bottom) * 0.5, 6),
-                    "strength": round(
-                        _clamp(
-                            (max(future_closes) - high) / max(float(atr_14), 1e-9),
-                            0.0,
-                            3.0,
-                        ),
-                        3,
-                    ),
-                }
-            )
-        elif close > open_ and min(future_closes, default=close) < (low - threshold):
-            top = high
-            bottom = min(open_, close)
-            blocks.append(
-                {
-                    "direction": "bearish",
-                    "top": round(top, 6),
-                    "bottom": round(bottom, 6),
-                    "mid": round((top + bottom) * 0.5, 6),
-                    "strength": round(
-                        _clamp(
-                            (low - min(future_closes)) / max(float(atr_14), 1e-9),
-                            0.0,
-                            3.0,
-                        ),
-                        3,
-                    ),
-                }
-            )
+        # Past-only confirmation: the 1–3 bars BEFORE idx.
+        past = candles[max(0, idx - 3) : idx]
+        if not past:
+            continue
+        past_highs = [float(c[2]) for c in past]
+        past_lows = [float(c[3]) for c in past]
+
+        # Bullish OB: down-close bar that was immediately followed (prior in
+        # time perspective we use past-of-idx) by strong UP displacement. We
+        # invert: the current bar `idx` acts as confirmation; the candidate
+        # OB is the most recent past down-close bar whose low has been left
+        # behind by the up-move from `idx`'s past bars.
+        if close > open_ and max(past_highs) < (close - threshold):
+            # Bullish displacement confirmed: prior highs exceeded by close.
+            # Candidate OB = last down-close bar among `past`.
+            ob_bar = None
+            for c in reversed(past):
+                c_open, c_close = float(c[1]), float(c[4])
+                if c_close < c_open:
+                    ob_bar = c
+                    break
+            if ob_bar is not None:
+                o_open = float(ob_bar[1])
+                o_high = float(ob_bar[2])
+                o_low = float(ob_bar[3])
+                o_close = float(ob_bar[4])
+                top = max(o_open, o_close)
+                bottom = o_low
+                strength = (close - o_high) / atr_safe
+                blocks.append(
+                    {
+                        "direction": "bullish",
+                        "top": round(top, 6),
+                        "bottom": round(bottom, 6),
+                        "mid": round((top + bottom) * 0.5, 6),
+                        "strength": round(_clamp(strength, 0.0, 3.0), 3),
+                    }
+                )
+        elif close < open_ and min(past_lows) > (close + threshold):
+            # Bearish displacement confirmed: prior lows broken below by close.
+            ob_bar = None
+            for c in reversed(past):
+                c_open, c_close = float(c[1]), float(c[4])
+                if c_close > c_open:
+                    ob_bar = c
+                    break
+            if ob_bar is not None:
+                o_open = float(ob_bar[1])
+                o_high = float(ob_bar[2])
+                o_low = float(ob_bar[3])
+                o_close = float(ob_bar[4])
+                top = o_high
+                bottom = min(o_open, o_close)
+                strength = (o_low - close) / atr_safe
+                blocks.append(
+                    {
+                        "direction": "bearish",
+                        "top": round(top, 6),
+                        "bottom": round(bottom, 6),
+                        "mid": round((top + bottom) * 0.5, 6),
+                        "strength": round(_clamp(strength, 0.0, 3.0), 3),
+                    }
+                )
     return blocks[-5:]
 
 
@@ -952,6 +1028,18 @@ def get_ai_payload_xau() -> Optional[Dict[str, Any]]:
         p1 = xau._build_pack("M1")
         payload = _payload_from_packs("XAUUSDm", p15, p5, p1, meta)
         _cache_payload("XAUUSDm", payload)
+        global _LIVENESS_LOGGED_XAU
+        if not _LIVENESS_LOGGED_XAU:
+            _LIVENESS_LOGGED_XAU = True
+            try:
+                log.info(
+                    "FEED_READY | symbol=XAUUSDm bars_m15=%d bars_m5=%d bars_m1=%d",
+                    len(p15 or []),
+                    len(p5 or []),
+                    len(p1 or []),
+                )
+            except Exception:
+                pass
         return payload
     except Exception as e:
         log.error("get_ai_payload_xau failed: %s", e)
@@ -983,6 +1071,18 @@ def get_ai_payload_btc() -> Optional[Dict[str, Any]]:
         p1 = btc._build_pack("M1")
         payload = _payload_from_packs("BTCUSDm", p15, p5, p1, meta)
         _cache_payload("BTCUSDm", payload)
+        global _LIVENESS_LOGGED_BTC
+        if not _LIVENESS_LOGGED_BTC:
+            _LIVENESS_LOGGED_BTC = True
+            try:
+                log.info(
+                    "FEED_READY | symbol=BTCUSDm bars_m15=%d bars_m5=%d bars_m1=%d",
+                    len(p15 or []),
+                    len(p5 or []),
+                    len(p1 or []),
+                )
+            except Exception:
+                pass
         return payload
     except Exception as e:
         log.error("get_ai_payload_btc failed: %s", e)

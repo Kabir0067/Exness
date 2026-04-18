@@ -336,7 +336,20 @@ def compute_institutional_metrics(
         else:
             daily_pnls[0] = float(np.sum(pnls))
 
-    daily_returns = daily_pnls / initial_capital
+    # ──────────────────────────────────────────────────────────
+    # Equity-based daily returns (institutional, log-equivalent safe):
+    #   r_t = equity_t / equity_{t-1} - 1
+    #
+    # CRITICAL FIX — was: r_t = pnl_t / initial_capital (wrong base; ignores
+    # compounding and understates volatility after drawdowns / winning streaks).
+    # The equity-based formula is the standard for Sharpe/Sortino/Calmar and
+    # is consistent with how live equity evolves.
+    # ──────────────────────────────────────────────────────────
+    daily_equity = np.cumsum(daily_pnls, dtype=np.float64) + float(initial_capital)
+    prev_equity = np.concatenate(([float(initial_capital)], daily_equity[:-1]))
+    safe_prev = np.where(prev_equity > 0.0, prev_equity, np.nan)
+    daily_returns = (daily_equity - prev_equity) / safe_prev
+    daily_returns = np.nan_to_num(daily_returns, nan=0.0, posinf=0.0, neginf=0.0)
     daily_mean = float(np.mean(daily_returns))
     daily_std = float(np.std(daily_returns, ddof=1)) if daily_returns.size > 1 else 0.0
 

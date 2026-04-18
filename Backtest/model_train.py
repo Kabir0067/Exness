@@ -854,15 +854,28 @@ class Pipeline:
         else:
             out["US10Y_Close"] = np.nan
 
-        out["DXY_Close"] = (
-            pd.to_numeric(out["DXY_Close"], errors="coerce").ffill().bfill().fillna(0.0)
+        # CRITICAL FIX — NO LOOKAHEAD:
+        # Previously used ffill().bfill().fillna(0.0) which backfilled future
+        # values into past bars (data leakage). Now only forward-fill with a
+        # strict max_gap; anything still missing stays NaN and is later handled
+        # by the downstream numeric/feature pipeline (drop/mask, not synthetic).
+        #
+        # max_gap rationale: DXY/US10Y are daily/hourly macro series reindexed
+        # to the asset's bar timestamps. A forward-fill of up to MAX_FFILL_BARS
+        # covers normal weekend/holiday gaps without introducing phantom data.
+        MAX_FFILL_BARS = int(
+            os.getenv("MACRO_MAX_FFILL_BARS", "1440")  # ~24h on M1, ~60 bars on D1
+            or "1440"
         )
-        out["US10Y_Close"] = (
-            pd.to_numeric(out["US10Y_Close"], errors="coerce")
-            .ffill()
-            .bfill()
-            .fillna(0.0)
-        )
+        out["DXY_Close"] = pd.to_numeric(
+            out["DXY_Close"], errors="coerce"
+        ).ffill(limit=MAX_FFILL_BARS)
+        out["US10Y_Close"] = pd.to_numeric(
+            out["US10Y_Close"], errors="coerce"
+        ).ffill(limit=MAX_FFILL_BARS)
+        # Leave NaN where no past macro value exists — downstream consumers
+        # must treat NaN as "feature unavailable for this bar" and either
+        # drop, mask, or use a 0-mean/z-score neutral. NEVER synthesise values.
         return out
 
     # ------------------------------------------------------------------ #
@@ -1894,6 +1907,97 @@ def _calibrate_abs_threshold(
     return best_meeting if best_meeting is not None else best
 
 
+def _fit_probability_calibrator(
+    preds: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    method: str = "isotonic",
+) -> Dict[str, Any]:
+    """
+    Fit a PROBABILITY CALIBRATOR that converts `|pred|` into a calibrated
+    P(direction_correct) on the VALIDATION set only.
+
+    CRITICAL — Section 3 (ML & Probability Correction):
+      The raw `|pred|` magnitude of a regressor is NOT a probability and has
+      no guaranteed monotone relationship with directional accuracy. Using
+      it as a "confidence" to size positions (pseudo-Kelly) is statistically
+      invalid. This function fits an Isotonic (default) or Sigmoid (Platt)
+      calibrator on the held-out VAL set:
+
+          P_hat(hit | |pred|) = f( |pred| )
+
+      where `hit = (sign(pred) == sign(y))`.
+
+    Returns a JSON-serialisable dict that the live inference layer can use
+    via `core.utils.calibrated_probability` without re-importing sklearn
+    (the calibrator is reduced to a piecewise-linear (x, y) table).
+
+    * Isotonic: sklearn IsotonicRegression (out-of-bounds = clip).
+    * Sigmoid (Platt): 2-parameter sigmoid a * |pred| + b, fit via
+      scipy/sklearn logistic regression.
+
+    Fallback: if sklearn/scipy unavailable OR insufficient samples, returns
+    an empty dict. Callers must treat absence as "no calibrator" and fall
+    back to the (already institutional-safe) fixed-risk path.
+    """
+    p = np.asarray(preds, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    n = int(min(len(p), len(y)))
+    if n < 50:  # minimum viable sample for calibration
+        return {}
+    p = p[:n]
+    y = y[:n]
+    mag = np.abs(p)
+    hit = (np.sign(p) == np.sign(y)).astype(np.float64)
+    # Guard: need both classes in validation set.
+    if float(hit.sum()) <= 1.0 or float((1.0 - hit).sum()) <= 1.0:
+        return {}
+
+    method_u = str(method or "isotonic").lower().strip()
+    try:
+        if method_u.startswith("sigmoid") or method_u.startswith("platt"):
+            from sklearn.linear_model import LogisticRegression
+
+            lr = LogisticRegression(solver="lbfgs", max_iter=500)
+            lr.fit(mag.reshape(-1, 1), hit.astype(int))
+            a = float(lr.coef_[0][0])
+            b = float(lr.intercept_[0])
+            # Materialise a piecewise table for live-side portability.
+            xs = np.quantile(mag, np.linspace(0.0, 1.0, 64))
+            xs = np.unique(xs)
+            ys = 1.0 / (1.0 + np.exp(-(a * xs + b)))
+            return {
+                "method": "sigmoid",
+                "a": a,
+                "b": b,
+                "x": [float(v) for v in xs],
+                "y": [float(v) for v in ys],
+                "n_samples": int(n),
+                "base_rate": float(hit.mean()),
+            }
+        else:
+            from sklearn.isotonic import IsotonicRegression
+
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            iso.fit(mag, hit)
+            # Export a (x, y) step table over the training support so that
+            # `core.utils.calibrated_probability` can do a pure-numpy lookup
+            # without re-importing sklearn in the live path.
+            xs = np.unique(np.quantile(mag, np.linspace(0.0, 1.0, 128)))
+            ys = iso.predict(xs)
+            ys = np.clip(ys, 0.0, 1.0)
+            return {
+                "method": "isotonic",
+                "x": [float(v) for v in xs],
+                "y": [float(v) for v in ys],
+                "n_samples": int(n),
+                "base_rate": float(hit.mean()),
+            }
+    except Exception as exc:
+        log.warning("probability_calibrator_fit_failed | method=%s err=%s", method_u, exc)
+        return {}
+
+
 def _extract_flat_feature_importance(model: Any) -> Optional[np.ndarray]:
     """
     Extract per-column flat importances from the trained regressor.
@@ -2040,32 +2144,68 @@ def _build_fold_splits(
     train_end: int,
     test_end: int,
 ) -> Optional[Dict[str, Dict[str, pd.Series]]]:
+    """
+    Build train/val/test splits with PURGED + EMBARGOED boundaries.
+
+    CRITICAL — López de Prado 2018 "Advances in Financial ML":
+      Targets built with a forward horizon of `h` bars cause the last `h`
+      train samples to OVERLAP (in their look-forward window) with the
+      first `h` val samples. Using these samples for training leaks
+      val-set information into the fit. The institutional remedy is:
+
+        1. PURGE: drop the last `h` samples of the train set (they look
+           into the val region).
+        2. EMBARGO: insert a gap of `e >= h` bars between val and test
+           so that autocorrelation / microstructure effects do not bleed
+           across the evaluation boundary.
+
+    Both steps are applied below. `e = h` is the minimum; we use
+    `max(h, PURGED_EMBARGO_BARS env, int(h * 1.0))` for safety.
+    """
     X_all = xy["X"]
     y_all = xy["y"]
     r_all = xy["ret"]
+
+    # Forward horizon used to build labels (bars).
+    horizon = int(getattr(cfg, "prediction_horizon", 15) or 15)
+    horizon = max(1, horizon)
+    try:
+        embargo_extra = int(os.getenv("PURGED_EMBARGO_BARS", str(horizon)) or str(horizon))
+    except Exception:
+        embargo_extra = horizon
+    embargo = max(horizon, int(embargo_extra))
 
     n = int(len(X_all))
     a = max(0, int(train_start))
     b = min(n, int(train_end))
     c = min(n, int(test_end))
-    if b - a < 64 or c - b < 32:
+    if b - a < (64 + embargo) or c - b < (32 + embargo):
         return None
 
     val_len = max(32, int((b - a) * 0.20))
-    if (b - a) - val_len < 32:
+    if (b - a) - val_len < (32 + embargo):
         return None
     val_start = b - val_len
 
+    # Purge the last `horizon` bars of the train block — they LOOK
+    # FORWARD into the val block and would leak the target.
+    train_end_purged = max(a, val_start - horizon)
+    # Embargo between val and test: drop the last `embargo` val bars.
+    val_end_embargoed = max(val_start, b - embargo)
+
+    if train_end_purged - a < 64 or val_end_embargoed - val_start < 32:
+        return None
+
     split = {
         "train": {
-            "X": X_all.iloc[a:val_start],
-            "y": y_all.iloc[a:val_start],
-            "ret": r_all.iloc[a:val_start],
+            "X": X_all.iloc[a:train_end_purged],
+            "y": y_all.iloc[a:train_end_purged],
+            "ret": r_all.iloc[a:train_end_purged],
         },
         "val": {
-            "X": X_all.iloc[val_start:b],
-            "y": y_all.iloc[val_start:b],
-            "ret": r_all.iloc[val_start:b],
+            "X": X_all.iloc[val_start:val_end_embargoed],
+            "y": y_all.iloc[val_start:val_end_embargoed],
+            "ret": r_all.iloc[val_start:val_end_embargoed],
         },
         "test": {
             "X": X_all.iloc[b:c],
@@ -2643,6 +2783,22 @@ def train(
         else 0.0
     )
     hold_cov_active = float(hold_n / max(1, len(hold_y)))
+    # ─── PROBABILITY CALIBRATOR (Section 3) ────────────────────────────
+    # Fit an isotonic (or sigmoid) calibrator mapping |pred| -> P(hit) on the
+    # VALIDATION fold. This is later consumed by the live inference layer
+    # (core.utils.calibrated_probability) to replace the heuristic
+    # "confidence" with a calibrated probability. Sample-pessimistic: if
+    # sklearn is unavailable or val set is too small, the calibrator is
+    # omitted and the live layer falls back to fixed-risk sizing.
+    calib_method = str(
+        os.getenv("PROBABILITY_CALIBRATION_METHOD", "isotonic") or "isotonic"
+    ).strip()
+    probability_calibrator = _fit_probability_calibrator(
+        preds_by_split.get("val", np.array([], dtype=np.float64)),
+        np.asarray(splits["val"]["y"].values, dtype=np.float64),
+        method=calib_method,
+    )
+
     alpha_calibration = {
         "pred_abs_threshold": pred_abs_thr,
         "pred_quantile": q_cal,
@@ -2658,6 +2814,7 @@ def train(
         "holdout_abs_threshold_from_quantile": hold_thr,
         "target_active_direction_accuracy": target_acc,
         "target_active_min_coverage": min_cov,
+        "probability_calibrator": probability_calibrator,
     }
     results["holdout"]["active_direction_accuracy"] = hold_acc_active
     results["holdout"]["active_coverage"] = hold_cov_active

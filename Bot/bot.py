@@ -150,11 +150,11 @@ set_orig_send_chat_action(_orig_send_chat_action)
 # Formatter Functions & Core Tools
 # =============================================================================
 def format_usdt(val: Any) -> str:
-    """Format balance symmetrically."""
+    """Format a USD amount in a compact, styled way."""
     try:
-        return f"💰 <b>{float(val):.2f}$</b>"
+        return f"<b>{float(val):.2f}$</b>"
     except Exception:
-        return f"💰 <b>{val}</b>"
+        return f"<b>{val}</b>"
 
 
 def _debounce_check(key: str) -> bool:
@@ -335,8 +335,12 @@ def _ai_cached_banner(payload: Dict[str, Any]) -> str:
         return ""
     age = int(meta.get("cached_age_sec", 0) or 0)
     mt5_reason = str(meta.get("mt5_reason", "") or "").strip()
-    suffix = f" | сабаб: <code>{html.escape(mt5_reason)}</code>" if mt5_reason else ""
-    return f"⚠️ <b>МАЪЛУМОТИ КЭШШУДА</b> | синну сол={age}с{suffix}"
+    suffix = f"\n💬 Сабаб: <code>{html.escape(mt5_reason)}</code>" if mt5_reason else ""
+    return (
+        "⚠️ <b>ДИҚҚАТ: МАЪЛУМОТИ ЗАХИРАШУДА ИСТИФОДА ШУД</b>\n"
+        f"🕐 Синни маълумот: <b>{age} сония</b>"
+        f"{suffix}"
+    )
 
 
 def _decorate_ai_text(text: str, payload: Dict[str, Any]) -> str:
@@ -346,19 +350,31 @@ def _decorate_ai_text(text: str, payload: Dict[str, Any]) -> str:
 
 def _mt5_unavailable_message() -> str:
     _, reason = mt5_status()
-    reason_raw = str(reason or "unknown")
+    reason_raw = str(reason or "сабаб номаълум")
     reason_s = reason_raw
     if reason_s.startswith("blocked_cooldown:"):
         reason_s = reason_s.split(":", 1)[1]
     hint = ""
     if "algo_trading_disabled_in_terminal" in reason_s:
         hint = (
-            "\n\nMT5: Tools -> Options -> Expert Advisors -> "
-            "Allow Algo Trading-ро фаъол кунед ва тугмаи AutoTrading-ро сабз гардонед."
+            "\n\n💡 <b>Роҳи ҳалли мушкилот:</b>\n"
+            "1️⃣ Терминали MT5-ро кушоед\n"
+            "2️⃣ Ба менюи: <code>Tools → Options → Expert Advisors</code>\n"
+            "3️⃣ Сатри «Allow Algo Trading»-ро фаъол созед\n"
+            "4️⃣ Тугмаи «AutoTrading»-и дар болои терминал будаашро сабз гардонед"
         )
     elif "ipc_disconnected" in reason_s or "No IPC connection" in reason_s:
-        hint = "\n\nПайвасти Python ба MT5 канда шудааст. Терминали MT5 ва ботро аз нав оғоз кунед."
-    return f"⚠️ <b>MT5 ҳоло омода нест</b>\n<code>{html.escape(reason_s)}</code>{hint}"
+        hint = (
+            "\n\n💡 <b>Роҳи ҳалли мушкилот:</b>\n"
+            "Пайвасти бот ба терминали MT5 қатъ шудааст.\n"
+            "Лутфан аввал терминали MT5-ро, сипас ботро аз нав оғоз кунед."
+        )
+    return (
+        "⚠️ <b>ТЕРМИНАЛИ MT5 ҲОЛО ОМОДА НЕСТ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💬 Тафсилот: <code>{html.escape(reason_s)}</code>"
+        f"{hint}"
+    )
 
 
 # =============================================================================
@@ -366,13 +382,13 @@ def _mt5_unavailable_message() -> str:
 # =============================================================================
 def bot_commands() -> None:
     commands = [
-        telebot.types.BotCommand("/start", "🚀 Оғоз / Менюи Асосӣ"),
-        telebot.types.BotCommand("/buttons", "🎛️ Панели Идоракунӣ"),
-        telebot.types.BotCommand("/status", "🟢 Ҳолати Система (Live)"),
-        telebot.types.BotCommand("/ai", "🧠 Таҳлили Бозор (AI)"),
-        telebot.types.BotCommand("/balance", "💳 Баланс ва Сармоя"),
-        telebot.types.BotCommand("/history", "📜 Таърихи Савдо (Логҳо)"),
-        telebot.types.BotCommand("/helpers", "📚 Роҳнамо ва Дастурҳо"),
+        telebot.types.BotCommand("/start", "🚀 Оғоз ва менюи асосӣ"),
+        telebot.types.BotCommand("/buttons", "🎛 Панели идоракунии савдо"),
+        telebot.types.BotCommand("/status", "📊 Ҳолати ҷории система"),
+        telebot.types.BotCommand("/ai", "🧠 Таҳлили бозор бо AI"),
+        telebot.types.BotCommand("/balance", "💳 Баланс ва сармоя"),
+        telebot.types.BotCommand("/history", "📜 Ҳисоботи пурра аз оғоз"),
+        telebot.types.BotCommand("/helpers", "🛠 Ёвариҳои савдои дастӣ"),
     ]
 
     ok = bot.set_my_commands(commands)
@@ -397,7 +413,11 @@ def buttons_func(message: telebot.types.Message) -> None:
 
     bot.send_message(
         message.chat.id,
-        "🎛 <b>Панели идоракунии бот</b>\nЛутфан амалиётро интихоб кунед ⬇️",
+        (
+            "🎛 <b>ПАНЕЛИ ИДОРАКУНИИ САВДО</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Лутфан амалиёти дилхоҳро аз тугмаҳои поён интихоб кунед ⬇️"
+        ),
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -407,12 +427,19 @@ def buttons_func(message: telebot.types.Message) -> None:
 @admin_only_message
 def tek_profit_put(message: telebot.types.Message) -> None:
     _send_clean(
-        message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🎛 Ҳоло TP-ро интихоб мекунем."
+        message.chat.id,
+        "⌨️ <b>Менюи асосӣ муваққатан пӯшида шуд</b>\n🎯 Ҳоло Тейк-Профитро танзим мекунем...",
     )
     kb = _build_tp_usd_keyboard()
     bot.send_message(
         message.chat.id,
-        "🎛 <b>Тейк-профит (бо ATR ва ҳадди ақал дар USD)</b>\nБарои <b>ҳамаи позицияҳои кушода</b> интихоб кунед:",
+        (
+            "🎯 <b>ТАНЗИМИ ТЕЙК-ПРОФИТ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Маблағи Тейк-Профитро барои <b>ҳамаи позицияҳои кушода</b> "
+            "интихоб кунед:\n"
+            "<i>(ҳисобот бо назардошти ATR ва ҳадди ақали USD)</i>"
+        ),
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -426,7 +453,7 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").split(":", 1)[-1].strip().lower()
 
     if data == "cancel":
-        bot.answer_callback_query(call.id, "Бекор шуд")
+        bot.answer_callback_query(call.id, "Амал бекор карда шуд")
         try:
             bot.edit_message_reply_markup(
                 call.message.chat.id, call.message.message_id, reply_markup=None
@@ -438,10 +465,14 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
     try:
         usd = float(data)
         if not (TP_USD_MIN <= usd <= TP_USD_MAX):
-            bot.answer_callback_query(call.id, "Диапазон: 1..10", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                f"Диапазон: {TP_USD_MIN}..{TP_USD_MAX}$",
+                show_alert=True,
+            )
             return
 
-        bot.answer_callback_query(call.id, f"⏳ TP={usd:.0f}$ ...")
+        bot.answer_callback_query(call.id, f"⏳ Дар ҳоли танзими TP = {usd:.0f}$ ...")
         res = set_takeprofit_all_positions_usd(usd_profit=usd)
 
         text = _format_tp_result(usd, res)
@@ -457,10 +488,16 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
             bot.send_message(call.message.chat.id, text, parse_mode="HTML")
 
     except Exception as exc:
-        bot.answer_callback_query(call.id, "Хато ҳангоми коркард", show_alert=True)
+        bot.answer_callback_query(
+            call.id, "Ҳангоми иҷро хатогӣ рух дод", show_alert=True
+        )
         bot.send_message(
             call.message.chat.id,
-            f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>",
+            (
+                "⚠️ <b>ҲАНГОМИ ТАНЗИМИ ТЕЙК-ПРОФИТ ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
             parse_mode="HTML",
         )
 
@@ -468,13 +505,21 @@ def on_tp_usd_click(call: telebot.types.CallbackQuery) -> None:
 @bot.message_handler(commands=["helpers"])
 @admin_only_message
 def helpers_handler(message: telebot.types.Message) -> None:
-    _send_clean(message.chat.id, "⌨️ <b>Менюи helper боз шуд</b>\n🛠 Ёвариҳо.")
+    _send_clean(
+        message.chat.id,
+        "⌨️ <b>Менюи асосӣ муваққатан пӯшида шуд</b>\n🛠 Менюи ёвариҳо кушода мешавад...",
+    )
     bot.send_message(
         message.chat.id,
-        "🛠 <b>Ёвариҳо</b>\n\n"
-        "📈 <b>TP</b> / 🛡 <b>SL</b> — барои ҳамаи позицияҳои кушода.\n"
-        "🟢 <b>Харид</b> / 🔴 <b>Фурӯш</b> — helper-и дастӣ акнун танҳо "
-        "<b>1 safe order</b> мекушояд ва bulk stacking иҷозат нест.",
+        (
+            "🛠 <b>МЕНЮИ ЁВАРИҲОИ ДАСТӢ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🎯 <b>Тейк-Профит / Стоп-Лосс</b>\n"
+            "    барои ҳамаи позицияҳои кушода\n\n"
+            "🟢 <b>Харид</b> / 🔴 <b>Фурӯш</b>\n"
+            "    кушодани ордери дастӣ (танҳо 1 ордери ҳифзшуда)\n\n"
+            "ℹ️ <i>Эзоҳ: кушодани якбораи бисёр ордерҳо манъ аст.</i>"
+        ),
         reply_markup=build_helpers_keyboard(),
         parse_mode="HTML",
     )
@@ -487,26 +532,37 @@ def helpers_handler(message: telebot.types.Message) -> None:
 def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").replace(HELPER_CALLBACK_PREFIX, "", 1).strip().lower()
     if not data:
-        bot.answer_callback_query(call.id, "Бекор")
+        bot.answer_callback_query(call.id, "Амал бекор карда шуд")
         return
 
     if data == "tp":
-        bot.answer_callback_query(call.id, "📈 TP …")
+        bot.answer_callback_query(call.id, "🎯 Танзими Тейк-Профит...")
         kb = _build_tp_usd_keyboard()
         bot.send_message(
             call.message.chat.id,
-            "📈 <b>Тейк-профит (бо ATR ва ҳадди ақал дар USD)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед:",
+            (
+                "🎯 <b>ТАНЗИМИ ТЕЙК-ПРОФИТ</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Маблағи Тейк-Профитро барои <b>ҳамаи позицияҳои кушода</b> "
+                "интихоб кунед:\n"
+                "<i>(ҳисобот бо назардошти ATR ва ҳадди ақали USD)</i>"
+            ),
             reply_markup=kb,
             parse_mode="HTML",
         )
         return
 
     if data == "sl":
-        bot.answer_callback_query(call.id, "🛡 SL …")
+        bot.answer_callback_query(call.id, "🛡 Танзими Стоп-Лосс...")
         kb = _build_sl_usd_keyboard()
         bot.send_message(
             call.message.chat.id,
-            "🛡 <b>Стоп-лосс (USD)</b>\nБарои ҳамаи позицияҳои кушода интихоб кунед (1..10$):",
+            (
+                "🛡 <b>ТАНЗИМИ СТОП-ЛОСС</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Ҳадди зиёнро барои <b>ҳамаи позицияҳои кушода</b> интихоб кунед\n"
+                f"<i>(диапазон: {SL_USD_MIN}$ то {SL_USD_MAX}$)</i>"
+            ),
             reply_markup=kb,
             parse_mode="HTML",
         )
@@ -515,7 +571,8 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     if data in ("buy_btc", "sell_btc", "buy_xau", "sell_xau"):
         if not _debounce_check(f"helper:{call.message.chat.id}:{data}"):
             bot.answer_callback_query(
-                call.id, "⏳ Дар ҳоли коркард...", show_alert=False
+                call.id, "⏳ Лутфан интизор шавед, амал ҳанӯз коркард мешавад...",
+                show_alert=False,
             )
             return
         try:
@@ -524,26 +581,52 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
                 getattr(st, "manual_stop", False)
             ):
                 bot.answer_callback_query(
-                    call.id, "Manual helper blocked", show_alert=True
+                    call.id,
+                    "Кушодани ордери дастӣ ҳоло иҷозат дода намешавад",
+                    show_alert=True,
                 )
                 bot.send_message(
                     call.message.chat.id,
-                    "⚠️ <b>Manual helper баста шуд</b>\nАввал auto-trading-ро ба monitoring гузаронед, баъд helper-и дастиро истифода баред.",
+                    (
+                        "⚠️ <b>КУШОДАНИ ОРДЕРИ ДАСТӢ МАНЪ АСТ</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "Ҳоло системаи савдои худкор фаъол аст.\n\n"
+                        "💡 <b>Барои истифодаи ёвариҳои дастӣ:</b>\n"
+                        "1️⃣ Аввал тугмаи «🛑 Қатъи Тиҷорат»-ро пахш кунед\n"
+                        "2️⃣ Пас аз гузаштан ба ҳолати мониторинг\n"
+                        "    ёвариҳои дастӣ дастрас мешаванд"
+                    ),
                     parse_mode="HTML",
                 )
                 return
         except Exception:
             pass
-        bot.answer_callback_query(call.id, "Шумораро интихоб кунед")
+        bot.answer_callback_query(call.id, "Шумораи ордерҳоро интихоб кунед")
         titles = {
-            "buy_btc": "🟢 <b>Хариди BTC</b> — шумораи ордерҳо",
-            "sell_btc": "🔴 <b>Фурӯши BTC</b> — шумораи ордерҳо",
-            "buy_xau": "🟢 <b>Хариди XAU</b> — шумораи ордерҳо",
-            "sell_xau": "🔴 <b>Фурӯши XAU</b> — шумораи ордерҳо",
+            "buy_btc": (
+                "🟢 <b>ХАРИДИ БИТКОИН (BTC)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Шумораи ордерҳоро барои кушодан интихоб кунед:"
+            ),
+            "sell_btc": (
+                "🔴 <b>ФУРӮШИ БИТКОИН (BTC)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Шумораи ордерҳоро барои кушодан интихоб кунед:"
+            ),
+            "buy_xau": (
+                "🟢 <b>ХАРИДИ ТИЛЛО (XAU)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Шумораи ордерҳоро барои кушодан интихоб кунед:"
+            ),
+            "sell_xau": (
+                "🔴 <b>ФУРӮШИ ТИЛЛО (XAU)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Шумораи ордерҳоро барои кушодан интихоб кунед:"
+            ),
         }
         bot.send_message(
             call.message.chat.id,
-            titles.get(data, "Шумора:"),
+            titles.get(data, "Шумораи ордерҳоро интихоб кунед:"),
             reply_markup=build_helper_order_count_keyboard(data),
             parse_mode="HTML",
         )
@@ -551,12 +634,14 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
 
     parts = data.split(":", 1)
     if len(parts) != 2:
-        bot.answer_callback_query(call.id, "Формат нодуруст", show_alert=True)
+        bot.answer_callback_query(
+            call.id, "Формати дархост нодуруст аст", show_alert=True
+        )
         return
     action, count_str = parts[0].strip(), parts[1].strip()
 
     if count_str == "cancel":
-        bot.answer_callback_query(call.id, "Бекор шуд")
+        bot.answer_callback_query(call.id, "Амал бекор карда шуд")
         try:
             bot.edit_message_reply_markup(
                 call.message.chat.id, call.message.message_id, reply_markup=None
@@ -568,11 +653,17 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
     try:
         count = int(count_str)
     except ValueError:
-        bot.answer_callback_query(call.id, "Адад нодуруст", show_alert=True)
+        bot.answer_callback_query(
+            call.id, "Адади интихобшуда нодуруст аст", show_alert=True
+        )
         return
     if count not in tuple(int(x) for x in HELPER_ORDER_COUNTS):
-        allowed_txt = ",".join(str(int(x)) for x in HELPER_ORDER_COUNTS)
-        bot.answer_callback_query(call.id, f"Адад: {allowed_txt}", show_alert=True)
+        allowed_txt = ", ".join(str(int(x)) for x in HELPER_ORDER_COUNTS)
+        bot.answer_callback_query(
+            call.id,
+            f"Танҳо ададҳои {allowed_txt} иҷозат дода шудаанд",
+            show_alert=True,
+        )
         return
 
     symbol_map = {
@@ -588,64 +679,81 @@ def on_helper_click(call: telebot.types.CallbackQuery) -> None:
         except Exception:
             remaining, reason = 0, "guard_error"
         if remaining <= 0:
-            bot.answer_callback_query(call.id, "Manual helper blocked", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                "Кушодани ордери дастӣ ҳоло иҷозат дода намешавад",
+                show_alert=True,
+            )
             bot.send_message(
                 call.message.chat.id,
-                f"⚠️ <b>Manual helper blocked</b>\n<code>{html.escape(str(reason))}</code>",
+                (
+                    "⚠️ <b>КУШОДАНИ ОРДЕРИ ДАСТӢ МАНЪ ШУД</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💬 Сабаб: <code>{html.escape(str(reason))}</code>"
+                ),
                 parse_mode="HTML",
             )
             return
 
-    if action == "buy_btc":
-        bot.answer_callback_query(call.id, f"⏳ Хариди BTC ×{count} …")
-        n = open_buy_order_btc(count)
+    def _send_manual_result(
+        asset_label: str, side_emoji: str, side_label: str, count: int, n: int
+    ) -> None:
         bot.send_message(
             call.message.chat.id,
-            f"🟢 <b>Хариди BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
+            (
+                f"{side_emoji} <b>{side_label.upper()}И {asset_label}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 Дархости кушодан: <b>{count}</b> ордер\n"
+                f"✅ Бо муваффақият кушода шуд: <b>{n}</b> ордер"
+                + (
+                    f"\n⚠️ Кушода нашуд: <b>{count - n}</b> ордер"
+                    if n < count
+                    else ""
+                )
+            ),
             parse_mode="HTML",
         )
+
+    if action == "buy_btc":
+        bot.answer_callback_query(call.id, f"⏳ Хариди BTC × {count} ...")
+        n = open_buy_order_btc(count)
+        _send_manual_result("БИТКОИН (BTC)", "🟢", "Харид", count, n)
         return
     if action == "sell_btc":
-        bot.answer_callback_query(call.id, f"⏳ Фурӯши BTC ×{count} …")
+        bot.answer_callback_query(call.id, f"⏳ Фурӯши BTC × {count} ...")
         n = open_sell_order_btc(count)
-        bot.send_message(
-            call.message.chat.id,
-            f"🔴 <b>Фурӯши BTC</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
-            parse_mode="HTML",
-        )
+        _send_manual_result("БИТКОИН (BTC)", "🔴", "Фурӯш", count, n)
         return
     if action == "buy_xau":
-        bot.answer_callback_query(call.id, f"⏳ Хариди XAU ×{count} …")
+        bot.answer_callback_query(call.id, f"⏳ Хариди XAU × {count} ...")
         n = open_buy_order_xau(count)
-        bot.send_message(
-            call.message.chat.id,
-            f"🟢 <b>Хариди XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
-            parse_mode="HTML",
-        )
+        _send_manual_result("ТИЛЛО (XAU)", "🟢", "Харид", count, n)
         return
     if action == "sell_xau":
-        bot.answer_callback_query(call.id, f"⏳ Фурӯши XAU ×{count} …")
+        bot.answer_callback_query(call.id, f"⏳ Фурӯши XAU × {count} ...")
         n = open_sell_order_xau(count)
-        bot.send_message(
-            call.message.chat.id,
-            f"🔴 <b>Фурӯши XAU</b> ×{count}\n✅ Фиристода шуд: <b>{n}</b>",
-            parse_mode="HTML",
-        )
+        _send_manual_result("ТИЛЛО (XAU)", "🔴", "Фурӯш", count, n)
         return
 
-    bot.answer_callback_query(call.id, "Амал номаълум", show_alert=True)
+    bot.answer_callback_query(call.id, "Амали интихобшуда номаълум аст", show_alert=True)
 
 
 @bot.message_handler(commands=["stop_ls"])
 @admin_only_message
 def tek_stoploss_put(message: telebot.types.Message) -> None:
     _send_clean(
-        message.chat.id, "⌨️ <b>Меню пӯшида шуд</b>\n🛡 Ҳоло SL-ро интихоб мекунем."
+        message.chat.id,
+        "⌨️ <b>Менюи асосӣ муваққатан пӯшида шуд</b>\n🛡 Ҳоло Стоп-Лоссро танзим мекунем...",
     )
     kb = _build_sl_usd_keyboard()
     bot.send_message(
         message.chat.id,
-        "🛡 <b>Стоп-лосс (USD)</b>\nБарои <b>ҳамаи позицияҳои кушода</b> интихоб кунед (1..10$):",
+        (
+            "🛡 <b>ТАНЗИМИ СТОП-ЛОСС</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Ҳадди зиёнро барои <b>ҳамаи позицияҳои кушода</b> интихоб кунед\n"
+            f"<i>(диапазон: {SL_USD_MIN}$ то {SL_USD_MAX}$)</i>"
+        ),
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -659,7 +767,7 @@ def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
     data = (call.data or "").split(":", 1)[-1].strip().lower()
 
     if data == "cancel":
-        bot.answer_callback_query(call.id, "Бекор шуд")
+        bot.answer_callback_query(call.id, "Амал бекор карда шуд")
         try:
             bot.edit_message_reply_markup(
                 call.message.chat.id, call.message.message_id, reply_markup=None
@@ -671,10 +779,14 @@ def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
     try:
         usd = float(data)
         if not (SL_USD_MIN <= usd <= SL_USD_MAX):
-            bot.answer_callback_query(call.id, "Диапазон: 1..10", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                f"Диапазон: {SL_USD_MIN}..{SL_USD_MAX}$",
+                show_alert=True,
+            )
             return
 
-        bot.answer_callback_query(call.id, f"⏳ SL={usd:.0f}$ ...")
+        bot.answer_callback_query(call.id, f"⏳ Дар ҳоли танзими SL = {usd:.0f}$ ...")
         res = set_stoploss_all_positions_usd(usd_loss=usd)
 
         text = _format_sl_result(usd, res)
@@ -690,10 +802,16 @@ def on_sl_usd_click(call: telebot.types.CallbackQuery) -> None:
             bot.send_message(call.message.chat.id, text, parse_mode="HTML")
 
     except Exception as exc:
-        bot.answer_callback_query(call.id, "Хато ҳангоми коркард", show_alert=True)
+        bot.answer_callback_query(
+            call.id, "Ҳангоми иҷро хатогӣ рух дод", show_alert=True
+        )
         bot.send_message(
             call.message.chat.id,
-            f"⚠️ Хато ҳангоми коркард: <code>{exc}</code>",
+            (
+                "⚠️ <b>ҲАНГОМИ ТАНЗИМИ СТОП-ЛОСС ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
             parse_mode="HTML",
         )
 
@@ -718,7 +836,12 @@ def send_daily_summary(chat_id: int, *, force_refresh: bool = True) -> None:
     if total_closed == 0 and total_open == 0:
         bot.send_message(
             chat_id,
-            "📅 Имрӯз ҳеҷ ордер (кушода ё баста) вуҷуд надорад.",
+            (
+                "📅 <b>ХУЛОСАИ ИМРӮЗА</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "ℹ️ Имрӯз ҳеҷ ордер (на кушода, на баста) мавҷуд нест.\n"
+                "Система дар ҳолати мушоҳида қарор дорад."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
@@ -757,15 +880,15 @@ def start_handler(message: telebot.types.Message) -> None:
             )
 
             alert_msg = (
-                "⚠️ <b>Кӯшиши дастрасии ғайриқонунӣ</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 ID корбар: <code>{user_id}</code>\n"
-                f"💬 ID чат: <code>{chat_id}</code>\n"
-                f"📛 Номи корбар: @{html.escape(username)}\n"
-                f"👨‍💼 Ном: {html.escape(first_name)} {html.escape(last_name)}\n"
+                "🚨 <b>КӮШИШИ ДАСТРАСИИ БЕИҶОЗАТ</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 ID-и корбар: <code>{user_id}</code>\n"
+                f"💬 ID-и чат: <code>{chat_id}</code>\n"
+                f"📛 Номи корбарӣ: @{html.escape(username)}\n"
+                f"🧑 Ном: {html.escape(first_name)} {html.escape(last_name)}\n"
                 f"⏰ Вақт: {_format_time_only()}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🔒 Дастрасӣ рад карда шуд."
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🔒 Дастрасӣ автоматӣ рад карда шуд."
             )
             bot.send_message(ADMIN, alert_msg, parse_mode="HTML")
         except Exception as exc:
@@ -774,7 +897,13 @@ def start_handler(message: telebot.types.Message) -> None:
 
     bot.send_message(
         message.chat.id,
-        "👋 <b>Хуш омадед!</b>\nБарои идоракунӣ менюро истифода баред: /buttons",
+        (
+            "👋 <b>ХУШ ОМАДЕД!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🤖 Ин боти савдои автоматии Exness аст.\n"
+            "🎛 Барои идоракунӣ аз менюи поён истифода баред\n"
+            "    ё фармони <code>/buttons</code>-ро пахш кунед."
+        ),
         parse_mode="HTML",
         reply_markup=_rk_remove(),
     )
@@ -795,7 +924,10 @@ def history_handler(message: telebot.types.Message) -> None:
         return
 
     try:
-        _send_clean(message.chat.id, "📥 <b>Гирифтани ҳисобот...</b>")
+        _send_clean(
+            message.chat.id,
+            "📥 <b>ДАР ҲОЛИ ТАЙЁР КАРДАНИ ҲИСОБОТ...</b>\nЛутфан чанд сония интизор шавед.",
+        )
 
         report = get_full_report_all(force_refresh=True)
         acc_info = get_account_info()
@@ -804,17 +936,19 @@ def history_handler(message: telebot.types.Message) -> None:
 
         open_positions = report.get("open_positions", [])
         if open_positions and len(open_positions) > 0:
-            text += "\n<b>Кушода:</b> "
+            text += "\n🔓 <b>Позицияҳои кушода:</b>\n"
             for i, pos in enumerate(open_positions[:5]):
-                if i > 0:
-                    text += " | "
                 ticket = pos.get("ticket", 0)
                 symbol = pos.get("symbol", "")
                 profit = pos.get("profit", 0.0)
-                text += f"#{ticket} {html.escape(str(symbol))} <b>{profit:+.2f}$</b>"
+                profit_icon = "🟢" if float(profit) >= 0 else "🔴"
+                text += (
+                    f"   {profit_icon} #{ticket} "
+                    f"{html.escape(str(symbol))} "
+                    f"<b>{float(profit):+.2f}$</b>\n"
+                )
             if len(open_positions) > 5:
-                text += f" | +{len(open_positions) - 5}"
-            text += "\n"
+                text += f"   ➕ ва боз <b>{len(open_positions) - 5}</b> ордери дигар\n"
 
         if acc_info:
             login = acc_info.get("login", 0)
@@ -823,13 +957,17 @@ def history_handler(message: telebot.types.Message) -> None:
             profit = acc_info.get("profit", 0.0)
             margin_level = acc_info.get("margin_level", 0.0)
 
-            text += f"\n👤 Login: <b>{login}</b>\n"
-            text += f"💰 <b>{balance:.2f}$</b> | Equity: <b>{equity:.2f}$</b>"
+            text += (
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "👤 <b>МАЪЛУМОТИ ҲИСОБ</b>\n"
+                f"🔢 Логин: <b>{login}</b>\n"
+                f"💰 Баланс: <b>{balance:.2f}$</b>\n"
+                f"📈 Сармоя (Equity): <b>{equity:.2f}$</b>\n"
+            )
             if profit != 0:
-                text += f" | P&L: <b>{profit:+.2f}$</b>"
+                text += f"💵 Фоидаи кушодаҳо: <b>{profit:+.2f}$</b>\n"
             if margin_level:
-                text += f" | ML: <b>{margin_level:.1f}%</b>"
-            text += "\n"
+                text += f"🛡 Сатҳи маржа: <b>{margin_level:.1f}%</b>\n"
 
         total_closed = int(report.get("total_closed", 0) or 0)
         wins = int(report.get("wins", 0) or 0)
@@ -843,12 +981,15 @@ def history_handler(message: telebot.types.Message) -> None:
                 if total_loss > 0
                 else (total_profit if total_profit > 0 else 0.0)
             )
-            text += f"📊 WR: <b>{win_rate:.1f}%</b>"
+            text += (
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📊 <b>САМАРАНОКИИ УМУМӢ</b>\n"
+                f"🎯 Сатҳи муваффақият: <b>{win_rate:.1f}%</b>\n"
+            )
             if profit_factor:
-                text += f" | PF: <b>{profit_factor:.2f}</b>"
-            text += "\n"
+                text += f"📐 Омили фоида (PF): <b>{profit_factor:.2f}</b>\n"
 
-        text += f"\n{_format_time_only()}\n"
+        text += f"\n⏰ Вақти ҳисобот: {_format_time_only()}\n"
 
         bot.send_message(
             message.chat.id, text, parse_mode="HTML", reply_markup=_rk_remove()
@@ -856,7 +997,12 @@ def history_handler(message: telebot.types.Message) -> None:
     except Exception as exc:
         bot.send_message(
             message.chat.id,
-            f"⚠️ Хатогӣ ҳангоми гирифтани таърих: <code>{exc}</code>",
+            (
+                "⚠️ <b>ҲАНГОМИ ТАЙЁР КАРДАНИ ҲИСОБОТ ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>\n"
+                "💡 Баъди чанд сония дубора кӯшиш кунед."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
@@ -885,13 +1031,25 @@ def balance_handler(message: telebot.types.Message) -> None:
     if bal is None:
         bot.send_message(
             message.chat.id,
-            "⚠️ Хатогӣ ҳангоми гирифтани баланс.",
+            (
+                "⚠️ <b>БАЛАНС ДАСТРАС НАШУД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Ҳоло маълумоти ҳисоб аз MT5 гирифта нашуд.\n"
+                "💡 Лутфан баъди чанд сония дубора кӯшиш кунед."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
         return
     bot.send_message(
-        message.chat.id, format_usdt(bal), parse_mode="HTML", reply_markup=_rk_remove()
+        message.chat.id,
+        (
+            "💳 <b>БАЛАНСИ ҲИСОБ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Маблағи ҷорӣ: {format_usdt(bal)}"
+        ),
+        parse_mode="HTML",
+        reply_markup=_rk_remove(),
     )
 
 
@@ -900,7 +1058,13 @@ def balance_handler(message: telebot.types.Message) -> None:
 def ai_menu_handler(message: telebot.types.Message) -> None:
     bot.send_message(
         message.chat.id,
-        "🤖 <b>Менюи таҳлили ИИ</b>\n\nНавъи таҳлилро интихоб кунед:",
+        (
+            "🤖 <b>МЕНЮИ ТАҲЛИЛИ СУНЪӢ (AI)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Намуди таҳлилро интихоб кунед:\n\n"
+            "⚡ <b>Скалп</b> — таҳлили фаврӣ барои савдоҳои кӯтоҳ\n"
+            "📊 <b>Рӯзона</b> — таҳлили васеъ барои савдоҳои рӯзона"
+        ),
         reply_markup=build_ai_keyboard(),
         parse_mode="HTML",
     )
@@ -938,14 +1102,29 @@ def _run_ai_panel(
 
         loading = bot.send_message(
             chat_id,
-            f"🔄 <b>AI {asset} | {style_label}</b>\n⏳ Дар ҳоли гирифтани маълумот ва таҳлил...",
+            (
+                f"🔄 <b>ТАҲЛИЛИ AI — {asset} ({style_label})</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ Дар ҳоли гирифтани маълумоти бозор...\n"
+                "🧠 Таҳлил бо системаи сунъӣ оғоз шуд...\n"
+                "<i>Лутфан чанд сония интизор шавед.</i>"
+            ),
             parse_mode="HTML",
         )
 
         payload = payload_loader()
         if not payload:
             bot.edit_message_text(
-                f"⚠️ <b>{asset} | {style_label}</b>\n\nМаълумоти бозор дастрас нест.\nMT5 ва {symbol}-ро дар Market Watch санҷед.",
+                (
+                    f"⚠️ <b>{asset} — {style_label}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "❌ Маълумоти ҷории бозор дастрас нест.\n\n"
+                    "💡 <b>Роҳи ҳалли мушкилот:</b>\n"
+                    "• Боварӣ ҳосил кунед, ки MT5 кушода аст\n"
+                    f"• Символи <code>{symbol}</code>-ро ба "
+                    "Market Watch илова кунед\n"
+                    "• Баъдтар дубора кӯшиш кунед"
+                ),
                 chat_id,
                 loading.message_id,
                 parse_mode="HTML",
@@ -971,7 +1150,13 @@ def _run_ai_panel(
         )
         bot.send_message(
             chat_id,
-            f"⚠️ Хатои таҳлили {asset} ({style_label}): <code>{html.escape(str(exc))}</code>",
+            (
+                f"⚠️ <b>ҲАНГОМИ ТАҲЛИЛИ {asset} ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Навъи таҳлил: <b>{style_label}</b>\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>\n"
+                "💡 Лутфан баъди якчанд сония дубора кӯшиш кунед."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
@@ -1002,11 +1187,11 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
 
     def _news_bias_label(value: str) -> str:
         mapping = {
-            "bullish": "Мусбат",
-            "bearish": "Манфӣ",
-            "neutral": "Бетараф",
+            "bullish": "📈 Мусбат",
+            "bearish": "📉 Манфӣ",
+            "neutral": "⚖️ Бетараф",
         }
-        return mapping.get(str(value or "").lower(), "Бетараф")
+        return mapping.get(str(value or "").lower(), "⚖️ Бетараф")
 
     rr_value = None
     try:
@@ -1035,59 +1220,65 @@ def _format_ai_signal(asset: str, result: Dict[str, Any]) -> str:
         icon, label = "⚪", "ИНТИЗОР"
         direction = "⏸️"
 
+    asset_name = "ТИЛЛО" if asset.upper() == "XAU" else ("БИТКОИН" if asset.upper() == "BTC" else asset)
+
     lines = [
-        f"{icon} <b>AI {asset} | {style_label} | {label}</b>",
-        f"🎯 Боварӣ: <b>{conf_pct}</b> {direction}",
-        f"🧠 Муҳаррик: <b>{html.escape(provider_display)}</b> | <code>{html.escape(model)}</code>"
-        + (f" | TOP-{model_rank}" if model_rank > 0 else ""),
-        f"📌 Символ: <b>{html.escape(symbol)}</b>"
-        + (f" | ⏱ {latency_ms}ms" if latency_ms > 0 else ""),
+        f"{icon} <b>ТАҲЛИЛИ AI — {asset_name} ({asset})</b>",
+        f"📊 Намуди таҳлил: <b>{style_label}</b>",
+        f"🎯 Тавсия: {direction} <b>{label}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
+        f"🧠 Сатҳи боварӣ: <b>{conf_pct}</b>",
+        f"🤖 Манбаи таҳлил: <b>{html.escape(provider_display)}</b>"
+        + (f" (ҷой: #{model_rank})" if model_rank > 0 else ""),
+        f"💻 Модели истифодашуда: <code>{html.escape(model)}</code>",
+        f"💎 Символ: <b>{html.escape(symbol)}</b>"
+        + (f" | ⏱ {latency_ms} мс" if latency_ms > 0 else ""),
     ]
 
     if signal in ("BUY", "SELL"):
-        if entry is not None:
-            lines.append(f"🔹 Вуруд: <code>{_fmt_price(entry)}</code>")
-
-        sl_tp_line = []
-        if stop_loss is not None:
-            sl_tp_line.append(f"🛡 SL: <code>{_fmt_price(stop_loss)}</code>")
-        if take_profit is not None:
-            sl_tp_line.append(f"💰 TP: <code>{_fmt_price(take_profit)}</code>")
-
-        if sl_tp_line:
-            lines.append(" | ".join(sl_tp_line))
-        if rr_value is not None:
-            lines.append(f"⚖️ R:R: <b>{rr_value:.2f}</b>")
-
         lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📌 <b>НУҚТАҲОИ ТАВСИЯШАВАНДА</b>")
+        if entry is not None:
+            lines.append(f"🔹 Нархи вуруд: <code>{_fmt_price(entry)}</code>")
+        if stop_loss is not None:
+            lines.append(f"🛡 Стоп-Лосс: <code>{_fmt_price(stop_loss)}</code>")
+        if take_profit is not None:
+            lines.append(f"🎯 Тейк-Профит: <code>{_fmt_price(take_profit)}</code>")
+        if rr_value is not None:
+            lines.append(f"⚖️ Таносуби Риск/Фоида: <b>{rr_value:.2f}</b>")
 
     if news:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📰 <b>ФАЗОИ ХАБАРҲО</b>")
         sentiment = float(news.get("avg_sentiment", 0.0) or 0.0)
         high_impact = int(news.get("high_impact_count", 0) or 0)
         news_status = str(news.get("status", "") or "").strip()
         lines.append(
-            f"📰 Хабарҳо: <b>{_news_bias_label(str(news.get('bias', 'neutral')))}</b>"
-            f" | Sent={sentiment:+.2f} | High={high_impact}"
-            + (f" | {html.escape(news_status)}" if news_status else "")
+            f"   Самт: <b>{_news_bias_label(str(news.get('bias', 'neutral')))}</b>"
         )
+        lines.append(f"   Эҳсосот: <b>{sentiment:+.2f}</b>")
+        lines.append(f"   Хабарҳои муҳим: <b>{high_impact}</b>")
+        if news_status:
+            lines.append(f"   Ҳолат: <i>{html.escape(news_status)}</i>")
         summary = str(news.get("ai_summary") or news.get("summary_text") or "").strip()
         if summary:
             summary = html.escape(summary.splitlines()[0][:220])
-            lines.append(f"🗞 Хулоса: {summary}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"🗞 Хулоса: <i>{summary}</i>")
 
-    lines.append(f"📝 <b>Таҳлил:</b>\n{reason}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📝 <b>Таҳлили муфассал:</b>\n{reason}")
     lines.append("")
-    lines.append(f"✅ <b>Тавсия: {action}</b>")
+    lines.append(f"✅ <b>Хулосаи ниҳоӣ: {action}</b>")
 
     if signal in ("BUY", "SELL") and confidence >= 0.75:
         lines.append("")
-        lines.append("💡 <i>Барои иҷро аз тугмаҳои ёрирасони поён истифода кунед.</i>")
+        lines.append(
+            "💡 <i>Барои кушодани ордер аз тугмаҳои ёрирасони поён истифода кунед.</i>"
+        )
     elif signal == "HOLD":
         lines.append("")
         lines.append(
-            "⏸ <i>Ҳоло беҳтар аст интизор шавед то тасдиқи қавитар пайдо шавад.</i>"
+            "⏸ <i>Ҳоло беҳтар аст интизор шавед то сигнали қавитар пайдо шавад.</i>"
         )
 
     return "\n".join(lines)
@@ -1192,7 +1383,12 @@ def status_handler(message: telebot.types.Message) -> None:
         log.error("/status handler error: %s | tb=%s", exc, traceback.format_exc())
         bot.send_message(
             message.chat.id,
-            "⚠️ Ҳангоми дархости статус мушкил пеш омад. Пайвастшавӣ ба MT5-ро санҷед.",
+            (
+                "⚠️ <b>ҲАНГОМИ ГИРИФТАНИ ҲОЛАТИ СИСТЕМА ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 Лутфан пайвасти MT5-ро санҷед ва баъди якчанд сония "
+                "дубора кӯшиш кунед."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
@@ -1215,13 +1411,21 @@ def start_view_open_orders(message: telebot.types.Message) -> None:
         bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
         return
 
-    _send_clean(message.chat.id, "📋 <b>Ордерҳои кушода</b>")
+    _send_clean(
+        message.chat.id,
+        "📋 <b>ОРДЕРҲОИ ҲОЛО КУШОДА</b>\n<i>Дар ҳоли гирифтани маълумот...</i>",
+    )
     order_data, total = get_order_by_index(0)
 
     if not order_data or int(total or 0) == 0:
         bot.send_message(
             message.chat.id,
-            "📭 Ордерҳои кушода нестанд.",
+            (
+                "📭 <b>ҲОЛО ЯГОН ОРДЕРИ КУШОДА НЕСТ</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "ℹ️ Система дар ҳолати мушоҳида ё оромӣ қарор дорад.\n"
+                "Ҳамин ки сигнали мувофиқ пайдо шавад, ордер кушода хоҳад шуд."
+            ),
             parse_mode="HTML",
             reply_markup=_rk_remove(),
         )
@@ -1252,7 +1456,9 @@ def callback_dispatch(call: telebot.types.CallbackQuery) -> None:
                     exc,
                     traceback.format_exc(),
                 )
-                bot.answer_callback_query(call.id, "❌ Хатогӣ рух дод")
+                bot.answer_callback_query(
+                    call.id, "❌ Ҳангоми иҷро хатогӣ рух дод"
+                )
             return
 
     bot.answer_callback_query(call.id)
@@ -1264,7 +1470,7 @@ def cb_orders_nav(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None:
     order_data, total = get_order_by_index(idx)
 
     if not order_data or int(total or 0) == 0:
-        bot.answer_callback_query(call.id, "⚠️ Ордер дастрас нест.")
+        bot.answer_callback_query(call.id, "⚠️ Ин ордер ҳоло дастрас нест")
         return
 
     text = format_order(order_data)
@@ -1285,7 +1491,10 @@ def cb_orders_close(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None
     idx = int(m.group(2))
 
     ok = close_order(ticket)
-    bot.answer_callback_query(call.id, "✅ Баста шуд" if ok else "❌ Хатогӣ")
+    bot.answer_callback_query(
+        call.id,
+        "✅ Ордер бо муваффақият баста шуд" if ok else "❌ Бастан ноком шуд",
+    )
 
     order_data, total = get_order_by_index(idx)
     if order_data and int(total or 0) > 0:
@@ -1302,7 +1511,11 @@ def cb_orders_close(call: telebot.types.CallbackQuery, m: re.Match[str]) -> None
         bot.edit_message_text(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            text="📭 Ордерҳои кушода нестанд.",
+            text=(
+                "📭 <b>ҲАМАИ ОРДЕРҲО БАСТА ШУДАНД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "ℹ️ Ҳоло ягон ордери кушода боқӣ намондааст."
+            ),
             parse_mode="HTML",
         )
 
@@ -1312,10 +1525,15 @@ def cb_orders_close_view(call: telebot.types.CallbackQuery, m: re.Match[str]) ->
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
-        text="🔒 Намоиш пӯшида шуд. Барои дидани дубора: /buttons",
+        text=(
+            "🔒 <b>НАМОИШИ ОРДЕРҲО ПӮШИДА ШУД</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💡 Барои дидани дубора фармони\n"
+            "<code>/buttons</code>-ро истифода баред."
+        ),
         parse_mode="HTML",
     )
-    bot.answer_callback_query(call.id, "Намоиш пӯшида шуд.")
+    bot.answer_callback_query(call.id, "Намоиш пӯшида шуд")
 
 
 def handle_profit_day(message: telebot.types.Message) -> None:
@@ -1330,7 +1548,13 @@ def handle_profit_day(message: telebot.types.Message) -> None:
         bot.send_message(message.chat.id, text, parse_mode="HTML")
     except Exception as exc:
         bot.send_message(
-            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+            message.chat.id,
+            (
+                "⚠️ <b>ҲАНГОМИ ТАЙЁР КАРДАНИ ҲИСОБОТИ ИМРӮЗА ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -1357,16 +1581,22 @@ def handle_profit_week(message: telebot.types.Message) -> None:
                 else (total_profit if total_profit > 0 else 0.0)
             )
 
-            text += f"<b>WR:</b> {win_rate:.1f}%"
+            text += f"🎯 Сатҳи муваффақият: <b>{win_rate:.1f}%</b>"
             if profit_factor > 0:
-                text += f" | <b>PF:</b> {profit_factor:.2f}"
+                text += f" | 📐 Омили фоида: <b>{profit_factor:.2f}</b>"
             text += "\n"
 
-        text += f"\n{_format_time_only()}\n"
+        text += f"\n⏰ Вақти ҳисобот: {_format_time_only()}\n"
         bot.send_message(message.chat.id, text, parse_mode="HTML")
     except Exception as exc:
         bot.send_message(
-            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+            message.chat.id,
+            (
+                "⚠️ <b>ҲАНГОМИ ТАЙЁР КАРДАНИ ҲИСОБОТИ ҲАФТАИНА ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -1393,16 +1623,22 @@ def handle_profit_month(message: telebot.types.Message) -> None:
                 else (total_profit if total_profit > 0 else 0.0)
             )
 
-            text += f"<b>WR:</b> {win_rate:.1f}%"
+            text += f"🎯 Сатҳи муваффақият: <b>{win_rate:.1f}%</b>"
             if profit_factor > 0:
-                text += f" | <b>PF:</b> {profit_factor:.2f}"
+                text += f" | 📐 Омили фоида: <b>{profit_factor:.2f}</b>"
             text += "\n"
 
-        text += f"\n{_format_time_only()}\n"
+        text += f"\n⏰ Вақти ҳисобот: {_format_time_only()}\n"
         bot.send_message(message.chat.id, text, parse_mode="HTML")
     except Exception as exc:
         bot.send_message(
-            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+            message.chat.id,
+            (
+                "⚠️ <b>ҲАНГОМИ ТАЙЁР КАРДАНИ ҲИСОБОТИ МОҲОНА ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -1422,14 +1658,20 @@ def handle_close_all(message: telebot.types.Message) -> None:
     ok = bool(res.get("ok", False))
     status_emoji = "✅" if ok else "⚠️"
 
-    lines = [f"{status_emoji} <b>Баста: {closed}</b>"]
+    lines = [
+        f"{status_emoji} <b>БАСТАНИ ҲАМАИ ОРДЕРҲО</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔒 Баста шуд: <b>{closed}</b> ордер",
+    ]
     if canceled > 0:
-        lines.append(f"🗑️ Бекор: <b>{canceled}</b>")
+        lines.append(f"🗑 Бекор карда шуд: <b>{canceled}</b> ордер")
+    if closed == 0 and canceled == 0 and ok:
+        lines.append("ℹ️ Ҳоло ягон ордери кушода вуҷуд надошт")
 
     errs = list(res.get("errors") or [])
     if errs:
-        preview = " | ".join(str(e)[:25] for e in errs[:2])
-        lines.append(f"⚠️ <code>{html.escape(preview)}</code>")
+        preview = " • ".join(str(e)[:25] for e in errs[:2])
+        lines.append(f"⚠️ Огоҳиҳо: <code>{html.escape(preview)}</code>")
 
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
 
@@ -1453,8 +1695,20 @@ def handle_positions_summary(message: telebot.types.Message) -> None:
         return
 
     summary = get_positions_summary()
+    try:
+        summary_val = float(summary)
+    except Exception:
+        summary_val = 0.0
+    emoji = "🟢" if summary_val >= 0 else "🔴"
     bot.send_message(
-        message.chat.id, f"📊 <b>{format_usdt(summary)}</b>", parse_mode="HTML"
+        message.chat.id,
+        (
+            "📊 <b>ХУЛОСАИ ПОЗИЦИЯҲОИ КУШОДА</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{emoji} Фоида/Зиёни ҷамъи ҳамаи позицияҳо: "
+            f"{format_usdt(summary_val)}"
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -1469,14 +1723,25 @@ def handle_balance(message: telebot.types.Message) -> None:
         bot.send_message(message.chat.id, _mt5_unavailable_message(), parse_mode="HTML")
         return
     balance = float(acc.get("balance", 0.0) or 0.0)
-    bot.send_message(message.chat.id, format_usdt(balance), parse_mode="HTML")
+    bot.send_message(
+        message.chat.id,
+        (
+            "💳 <b>БАЛАНСИ ҲИСОБ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Маблағи ҷорӣ: {format_usdt(balance)}"
+        ),
+        parse_mode="HTML",
+    )
 
 
 def handle_trade_start(message: telebot.types.Message) -> None:
     if not _debounce_check(f"start:{message.chat.id}"):
         bot.send_message(
             message.chat.id,
-            "⏳ Команда аллакай дар ҳоли коркард аст...",
+            (
+                "⏳ <b>Амали қаблӣ ҳанӯз дар ҳоли коркард аст</b>\n"
+                "Лутфан чанд сония интизор шавед..."
+            ),
             parse_mode="HTML",
         )
         return
@@ -1487,7 +1752,12 @@ def handle_trade_start(message: telebot.types.Message) -> None:
         ):
             bot.send_message(
                 message.chat.id,
-                "ℹ️ <b>Система аллакай фаъол аст.</b>\nСавдо идома дорад.",
+                (
+                    "ℹ️ <b>СИСТЕМА АЛЛАКАЙ ФАЪОЛ АСТ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Савдои автоматӣ дар ҳолати кор қарор дорад.\n"
+                    "Ҳеҷ амали иловагӣ лозим нест."
+                ),
                 parse_mode="HTML",
             )
             return
@@ -1497,7 +1767,12 @@ def handle_trade_start(message: telebot.types.Message) -> None:
         if bool(getattr(st_after_clear, "manual_stop", False)):
             bot.send_message(
                 message.chat.id,
-                "Trading is still paused by active protection checks.",
+                (
+                    "🛡 <b>САВДО АЗ ТАРАФИ СИСТЕМАИ ҲИФЗ МАНЪ АСТ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "Системаи муҳофизати риск ҳоло оғози савдоро иҷозат намедиҳад.\n"
+                    "💡 Лутфан баъди чанд дақиқа дубора кӯшиш кунед."
+                ),
                 parse_mode="HTML",
             )
             return
@@ -1505,7 +1780,14 @@ def handle_trade_start(message: telebot.types.Message) -> None:
         if started:
             bot.send_message(
                 message.chat.id,
-                "✅ <b>Система оғоз шуд (Савдо фаъол)</b>\n\nСавдои автоматӣ давом мекунад.",
+                (
+                    "✅ <b>САВДОИ АВТОМАТӢ БО МУВАФФАҚИЯТ ОҒОЗ ШУД</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "🚀 Система акнун фаъол аст ва ҳолати бозорро назорат мекунад.\n"
+                    "📡 Ҳангоми пайдо шудани сигнали дуруст ордер кушода хоҳад шуд.\n\n"
+                    "💡 <i>Барои қатъ кардани савдо тугмаи "
+                    "«🛑 Қатъи Тиҷорат»-ро истифода баред.</i>"
+                ),
                 parse_mode="HTML",
             )
             return
@@ -1516,11 +1798,13 @@ def handle_trade_start(message: telebot.types.Message) -> None:
         model_ready = bool(getattr(engine, "_model_loaded", False)) and bool(
             getattr(engine, "_backtest_passed", False)
         )
-        reason_raw = str(reason or "unknown")
+        reason_raw = str(reason or "сабаб номаълум")
         if (not model_ready) or blocked_assets:
-            reason_s = gate_reason or "gatekeeper_failed"
+            reason_s = gate_reason or "санҷиши омодагии модел ноком шуд"
             if blocked_assets:
-                reason_s = f"{reason_s} | blocked={','.join(blocked_assets)}"
+                reason_s = (
+                    f"{reason_s} | активҳои манъшуда: {', '.join(blocked_assets)}"
+                )
         else:
             reason_s = reason_raw
         if reason_s.startswith("blocked_cooldown:"):
@@ -1528,17 +1812,31 @@ def handle_trade_start(message: telebot.types.Message) -> None:
         hint = ""
         if "algo_trading_disabled_in_terminal" in reason_s:
             hint = (
-                "\n\nMT5: Tools -> Options -> Expert Advisors -> "
-                "Allow Algo Trading, ва тугмаи AutoTrading-ро фаъол кунед."
+                "\n\n💡 <b>Роҳи ҳалли мушкилот:</b>\n"
+                "1️⃣ Терминали MT5-ро кушоед\n"
+                "2️⃣ Ба менюи: <code>Tools → Options → Expert Advisors</code>\n"
+                "3️⃣ Сатри «Allow Algo Trading»-ро фаъол созед\n"
+                "4️⃣ Тугмаи «AutoTrading»-ро сабз гардонед"
             )
         bot.send_message(
             message.chat.id,
-            f"⚠️ <b>Start иҷро нашуд</b>\n<code>{html.escape(reason_s)}</code>{hint}",
+            (
+                "⚠️ <b>САВДО ОҒОЗ НАШУД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Сабаб: <code>{html.escape(reason_s)}</code>"
+                f"{hint}"
+            ),
             parse_mode="HTML",
         )
     except Exception as exc:
         bot.send_message(
-            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+            message.chat.id,
+            (
+                "⚠️ <b>ҲАНГОМИ ОҒОЗИ САВДО ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -1546,7 +1844,10 @@ def handle_trade_stop(message: telebot.types.Message) -> None:
     if not _debounce_check(f"stop:{message.chat.id}"):
         bot.send_message(
             message.chat.id,
-            "⏳ Команда аллакай дар ҳоли коркард аст...",
+            (
+                "⏳ <b>Амали қаблӣ ҳанӯз дар ҳоли коркард аст</b>\n"
+                "Лутфан чанд сония интизор шавед..."
+            ),
             parse_mode="HTML",
         )
         return
@@ -1556,45 +1857,84 @@ def handle_trade_stop(message: telebot.types.Message) -> None:
         if was_active:
             bot.send_message(
                 message.chat.id,
-                "🛑 <b>Система қатъ шуд (Мониторинг)</b>\n\n👁️ <i>Ҳолати мушоҳида фаъол шуд. Савдо қатъ гашт, аммо сигналҳои AI меоянд.</i>",
+                (
+                    "🛑 <b>САВДОИ АВТОМАТӢ ҚАТЪ ГАРДИД</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "👁 Система ба <b>ҳолати мушоҳида</b> гузашт.\n\n"
+                    "ℹ️ <i>Савдо муваққатан манъ аст, вале таҳлили AI ва "
+                    "сигналҳо омада истодаанд. Барои оғози дубора тугмаи "
+                    "«🚀 Оғози Тиҷорат»-ро пахш кунед.</i>"
+                ),
                 parse_mode="HTML",
             )
         elif bool(getattr(st, "manual_stop", False)):
             bot.send_message(
                 message.chat.id,
-                "ℹ️ Manual stop аллакай фаъол аст (Мониторинг).",
+                (
+                    "ℹ️ <b>САВДО АЛЛАКАЙ ҚАТЪ АСТ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "👁 Система дар ҳолати мушоҳида қарор дорад."
+                ),
                 parse_mode="HTML",
             )
         else:
             bot.send_message(
-                message.chat.id, "ℹ️ Система аллакай қатъ аст.", parse_mode="HTML"
+                message.chat.id,
+                (
+                    "ℹ️ <b>СИСТЕМА АЛЛАКАЙ ХОМӮШ АСТ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "Савдои автоматӣ ҳоло фаъол нест."
+                ),
+                parse_mode="HTML",
             )
     except Exception as exc:
         bot.send_message(
-            message.chat.id, f"⚠️ Хатогӣ: <code>{exc}</code>", parse_mode="HTML"
+            message.chat.id,
+            (
+                "⚠️ <b>ҲАНГОМИ ҚАТЪИ САВДО ХАТОГӢ РУХ ДОД</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+            ),
+            parse_mode="HTML",
         )
 
 
 def handle_engine_check(message: telebot.types.Message) -> None:
     status = engine.status()
+    mt5_conn = "🟢 Пайваст" if status.connected else "🔴 Қатъ шудааст"
+    trading_icon = "✅ Фаъол" if status.trading else "⏸ Хомӯш"
+    manual_stop_icon = "🛑 Фаъол" if status.manual_stop else "⚪ Ғайрифаъол"
+    gate_val = str(getattr(status, "gate_reason", "") or "").strip() or "мушкилот нест"
+    halt_val = (
+        str(getattr(status, "risk_halt_reason", "") or "").strip() or "мушкилот нест"
+    )
+    controller = str(getattr(status, "controller_state", "номаълум"))
+    chaos = str(getattr(status, "chaos_state", "номаълум"))
     bot.send_message(
         message.chat.id,
         (
-            "⚙️ <b>Статуси Муҳаррик</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 Пайваст: {'✅' if status.connected else '❌'}\n"
-            f"📈 Trading: {'✅' if status.trading else '❌'}\n"
-            f"⛔ Manual stop: {'✅' if status.manual_stop else '❌'}\n"
-            f"🎯 Актив: <b>{html.escape(str(status.active_asset))}</b>\n"
-            f"📉 DD: <b>{status.dd_pct * 100:.2f}%</b>\n"
-            f"📆 Today PnL: <b>{status.today_pnl:+.2f}$</b>\n"
-            f"📂 Позицияҳо: XAU <b>{status.open_trades_xau}</b> | BTC <b>{status.open_trades_btc}</b>\n"
-            f"🛎 Сигналҳо: XAU <b>{html.escape(str(status.last_signal_xau))}</b> | BTC <b>{html.escape(str(status.last_signal_btc))}</b>\n"
-            f"📥 Queue: <b>{status.exec_queue_size}</b>\n"
-            f"🧭 Controller: <b>{html.escape(str(getattr(status, 'controller_state', 'unknown')))}</b>\n"
-            f"🧪 Chaos: <b>{html.escape(str(getattr(status, 'chaos_state', 'unknown')))}</b>\n"
-            f"🚫 Gate: <code>{html.escape(str(getattr(status, 'gate_reason', '') or '-'))}</code>\n"
-            f"🛑 Halt: <code>{html.escape(str(getattr(status, 'risk_halt_reason', '') or '-'))}</code>\n"
+            "⚙️ <b>ҲОЛАТИ МУФАССАЛИ МУҲАРРИК</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 Пайваст ба MT5: <b>{mt5_conn}</b>\n"
+            f"📈 Савдои худкор: <b>{trading_icon}</b>\n"
+            f"🛑 Қатъи дастӣ: <b>{manual_stop_icon}</b>\n"
+            f"🎯 Активи фаъол: <b>{html.escape(str(status.active_asset))}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📉 Коҳиши сармоя (DD): <b>{status.dd_pct * 100:.2f}%</b>\n"
+            f"💵 Фоидаи имрӯза: <b>{status.today_pnl:+.2f}$</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🥇 Позицияҳои XAU: <b>{status.open_trades_xau}</b>\n"
+            f"₿ Позицияҳои BTC: <b>{status.open_trades_btc}</b>\n"
+            f"📡 Сигнали охирини XAU: <b>"
+            f"{html.escape(str(status.last_signal_xau))}</b>\n"
+            f"📡 Сигнали охирини BTC: <b>"
+            f"{html.escape(str(status.last_signal_btc))}</b>\n"
+            f"📥 Навбати иҷро: <b>{status.exec_queue_size}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧭 Ҳолати контроллер: <b>{html.escape(controller)}</b>\n"
+            f"🧪 Ҳолати тестӣ: <b>{html.escape(chaos)}</b>\n"
+            f"🚫 Филтри сигнал: <code>{html.escape(gate_val)}</code>\n"
+            f"🛡 Филтри риск: <code>{html.escape(halt_val)}</code>"
         ),
         parse_mode="HTML",
     )
@@ -1603,7 +1943,12 @@ def handle_engine_check(message: telebot.types.Message) -> None:
 def handle_full_check(message: telebot.types.Message) -> None:
     bot.send_message(
         message.chat.id,
-        "🔄 <b>Санҷиши пурраи барнома оғоз шуд...</b>",
+        (
+            "🔄 <b>САНҶИШИ ПУРРАИ СИСТЕМА ОҒОЗ ШУД...</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "⏳ Лутфан чанд сония интизор шавед.\n"
+            "🔍 Санҷиши модулҳо, пайваст ва риск..."
+        ),
         parse_mode="HTML",
     )
     ok, detail = check_full_program()
@@ -1661,13 +2006,25 @@ def message_dispatcher(message: telebot.types.Message) -> None:
             )
             bot.send_message(
                 message.chat.id,
-                "⚠️ Хатогӣ рух дод. Баъдтар дубора санҷед.",
+                (
+                    "⚠️ <b>ҲАНГОМИ ИҶРОИ АМАЛ ХАТОГӢ РУХ ДОД</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "💡 Лутфан баъди чанд сония дубора кӯшиш кунед."
+                ),
                 parse_mode="HTML",
             )
         return
 
     bot.send_message(
-        message.chat.id, "❓ Амали номаълум. /buttons → меню.", parse_mode="HTML"
+        message.chat.id,
+        (
+            "❓ <b>АМАЛИ НОМАЪЛУМ</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Ман ин паёмро нафаҳмидам.\n"
+            "💡 Барои кушодани менюи асосӣ фармони\n"
+            "<code>/buttons</code>-ро истифода баред."
+        ),
+        parse_mode="HTML",
     )
 
 

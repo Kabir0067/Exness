@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import talib
@@ -443,22 +443,89 @@ def volatility_trailing_stop(
     trail_atr_mult: float = 1.5,
 ) -> float:
     """
-    Smart trailing stop based on volatility (ATR).
+    Institutional trailing stop based on volatility (ATR).
 
-    Trails behind price at trail_atr_mult x ATR distance.
+    Contract (CRITICAL — no adverse moves, no broker rejects):
 
-    For BUY: trail_stop = current_price - (ATR x mult)
-    For SELL: trail_stop = current_price + (ATR x mult)
+      * For BUY:
+          SL_trail = min(entry, current_price - ATR*mult)
+          → NEVER allow SL > entry (protects breakeven, avoids locking
+            in a worse-than-breakeven loss).
+          → SL must remain strictly below current_price (valid for BUY),
+            which is guaranteed because dist = ATR*mult > 0.
 
-    Returns the trailing stop price.
+      * For SELL:
+          SL_trail = max(entry, current_price + ATR*mult)
+          → NEVER allow SL < entry (mirrors BUY: protects breakeven).
+          → SL must remain strictly above current_price (valid for SELL),
+            which is guaranteed because dist = ATR*mult > 0.
+
+    Rationale:
+      Previous version used `max(entry, current-dist)` for BUY and
+      `min(entry, current+dist)` for SELL. In a losing scenario this
+      produced a candidate SL on the WRONG side of current_price
+      (e.g. SELL: current=101, entry=100 → SL=100 < current → would
+      instantly close at a loss or be rejected by the broker). The
+      new formula anchors SL to the breakeven side and lets the outer
+      check_trailing_stop() pick the best-valid SL.
     """
     if not _is_finite(entry, current_price, atr) or atr <= 0:
         return entry
     dist = atr * trail_atr_mult
     if is_buy(side):
-        return max(entry, current_price - dist)
-    else:
-        return min(entry, current_price + dist)
+        # BUY: SL never above entry; never adverse.
+        return min(float(entry), float(current_price) - float(dist))
+    # SELL: SL never below entry; never adverse.
+    return max(float(entry), float(current_price) + float(dist))
+
+
+def calibrated_probability(
+    pred_val: float,
+    calibrator: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """
+    Look up calibrated P(direction_correct | |pred|) from a calibrator dict
+    produced by `Backtest.model_train._fit_probability_calibrator`.
+
+    Contract:
+      * Input `pred_val` is the raw regressor output (signed).
+      * The calibrator is a dict of the form:
+          {"method": "isotonic" | "sigmoid",
+           "x": [abs_pred_grid],
+           "y": [probability_grid],
+           "base_rate": float,
+           "n_samples": int}
+      * Returns a probability in [0.0, 1.0] via linear interpolation on the
+        piecewise table (no sklearn required at inference time). For out-of-
+        range |pred|, the calibrator clips at boundary y-values — this is
+        conservative (does not extrapolate to unobserved regimes).
+      * Returns None if the calibrator is missing or malformed — the caller
+        must then fall back to fixed-risk sizing (Section 3 contract).
+
+    CRITICAL — Institutional safety: the output of this function should be
+    used in place of the heuristic "confidence" for risk sizing and the
+    probability-aware gate. The raw pred magnitude MUST NOT be fed directly
+    into Kelly or any sizing formula that assumes calibrated P.
+    """
+    if not calibrator or not isinstance(calibrator, dict):
+        return None
+    xs = calibrator.get("x")
+    ys = calibrator.get("y")
+    if not isinstance(xs, (list, tuple)) or not isinstance(ys, (list, tuple)):
+        return None
+    if len(xs) != len(ys) or len(xs) == 0:
+        return None
+    try:
+        mag = float(abs(float(pred_val)))
+        x_arr = np.asarray(xs, dtype=np.float64)
+        y_arr = np.asarray(ys, dtype=np.float64)
+        # np.interp clips at boundaries (no extrapolation) — institutional safe.
+        p = float(np.interp(mag, x_arr, y_arr))
+        if not math.isfinite(p):
+            return None
+        return max(0.0, min(1.0, p))
+    except Exception:
+        return None
 
 
 def breakeven_price(

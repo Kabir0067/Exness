@@ -529,7 +529,18 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 )
 
             self._log_ml_signal(asset, sig)
-            self._emit_analysis_signal(asset, sig)
+            # NOTE (truthful-signal fix):
+            # The Telegram "analysis signal" notifier used to fire HERE — right
+            # after the ML inference but BEFORE the pipeline confluence check.
+            # That produced the "СИГНАЛИ ТАҲЛИЛӢ" messages for signals that
+            # were later silently rejected by the pipeline (e.g. tm=-1.00,
+            # baseline_warmup, struct<thr, mr-contradiction). From the user's
+            # perspective this looked like a stream of false/ghost signals.
+            #
+            # Fix: defer notification to `step_risk_calc`, and emit ONLY when
+            # `_build_ml_candidate` returns a non-None candidate — i.e. the
+            # pipeline confluence gate has already accepted the trade. See
+            # `step_risk_calc` below.
             signals[asset] = sig
 
         ctx.ml_signals = signals
@@ -549,6 +560,22 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 continue
             cand = self._e._build_ml_candidate(asset, sig)
             if cand is not None:
+                # ─── Truthful-signal notifier ───────────────────────────────
+                # Pipeline confluence accepted the ML signal. Only NOW do we
+                # notify Telegram with the "analysis signal" (the user will
+                # subsequently see LIVE_ENQUEUED / order opened / order failed
+                # updates as the execution layer drives the intent forward).
+                # If the pipeline rejects the signal, no message is sent at
+                # all — this is the definition of a confirmed (non-ghost)
+                # signal.
+                try:
+                    self._emit_analysis_signal(asset, sig)
+                except Exception as _emit_exc:
+                    log_err.error(
+                        "ANALYSIS_SIGNAL_EMIT_ERROR | asset=%s err=%s",
+                        asset,
+                        _emit_exc,
+                    )
                 candidates.append(cand)
 
         ctx.candidates = candidates
@@ -1295,6 +1322,17 @@ class EngineRuntimeMixin:
         now = time.time()
         with self._lock:
             self._last_runtime_heartbeat_ts = now
+        # ─── External watchdog heartbeat (Section 10) ───────────────────
+        # Emit a JSON heartbeat to disk so that scripts/watchdog.py can
+        # detect and force-kill the process if the engine loop stalls.
+        # Defensive: writes are O(1) amortised and wrapped so that a
+        # broken heartbeat file never stops the trading loop.
+        try:
+            from core.stability_monitor import get_default_heartbeat
+
+            get_default_heartbeat().beat(status="alive", note="engine_loop")
+        except Exception:
+            pass
 
     def _touch_runtime_progress(self) -> None:
         self._mark_runtime_alive()

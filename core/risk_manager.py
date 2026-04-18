@@ -11,6 +11,7 @@ import atexit
 import csv
 import json
 import math
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -1530,6 +1531,29 @@ class RiskManager:
             return False, 0.0, "gate_bad_side"
         if not _is_finite(lot_val, entry, sl_val, tp_val) or lot_val <= 0.0:
             return False, 0.0, "gate_bad_values"
+
+        # ─── SECTION 9 — HARD BLOCK around high-impact events ─────────
+        # NFP / CPI / FOMC: no new entries in a ±window (default 45 min).
+        # Fail-CLOSED by default (institutional safety): if the calendar
+        # is missing/corrupt the gate blocks trading. Set
+        # NEWS_BLACKOUT_ALLOW_EMPTY_CALENDAR=1 to opt out in dev/CI.
+        try:
+            from core.news_blackout import get_default_blackout
+
+            _nbdec = get_default_blackout().check()
+            if bool(getattr(_nbdec, "blocked", False)):
+                return (
+                    False,
+                    0.0,
+                    f"news_blackout:{_nbdec.reason}:event={_nbdec.event_name}",
+                )
+        except Exception as _nb_exc:
+            # Defensive: a broken blackout module must not silently allow
+            # trades. We fail-CLOSED on any unexpected error here.
+            if str(
+                os.getenv("NEWS_BLACKOUT_FAIL_OPEN_ON_EXC", "0") or "0"
+            ).strip() not in ("1", "true", "True"):
+                return False, 0.0, f"news_blackout_exc:{_nb_exc}"
         hard_cap = float(getattr(self.sp, "hard_lot_cap", 0.0) or 0.0)
         if hard_cap > 0.0:
             tol = max(1e-8, hard_cap * 1e-6)
@@ -1683,10 +1707,26 @@ class RiskManager:
         adapt: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
-        Smart lot sizing (ATR-driven):
-          Lot = (Equity * Risk%) / (ATR * StopLoss_Multiplier)
+        Smart lot sizing (ATR + slippage-aware):
+          risk_usd = equity * risk_pct * dd_mult
+          effective_stop_dist = |entry - SL| + spread + expected_slippage
+          lot_raw = risk_usd / (effective_stop_dist * contract_size)
 
-        ATR is normalized by contract size and broker volume constraints.
+        CRITICAL DESIGN RULES:
+          1. SINGLE SOURCE OF TRUTH for phase multiplier:
+             Phase (A/B/C) reduction is applied EXCLUSIVELY by the execution
+             layer (Bot/Motor/execution.py::_enqueue_internal, and validated
+             by risk_manager.pre_order_gate dispatch stage). It is NOT
+             applied here — otherwise we would double-discount the lot.
+          2. DD multiplier IS applied here (per-asset risk concern).
+          3. Kelly is calibration-aware: if `confidence` is NOT a calibrated
+             probability (see Section 3), callers should pass a fixed
+             conservative value (default: self.cfg.max_risk_per_trade).
+             Until calibration is deployed, `pseudo_kelly_disabled` env can
+             force fixed risk-per-trade.
+          4. Effective stop distance INCLUDES spread + expected slippage —
+             this closes the "stop is tighter than it looks" gap between
+             backtest and live fills.
         """
         self._ensure_ready()
         eq = float(self._acc.equity or 0.0)
@@ -1694,21 +1734,44 @@ class RiskManager:
             log.warning("calculate_position_size: equity=%.2f <= 0, returning 0.0", eq)
             return 0.0
 
-        # Fractional Kelly risk percent (SAFE institutional sizing)
+        # ─── Risk percent resolution ────────────────────────────────────
         conf_raw = float(confidence or 0.0)
         if conf_raw > 1.0:
             conf_raw = conf_raw / 100.0
         conf01 = clamp01(conf_raw)
         rr = self._rr(entry_price, stop_loss, take_profit)
-        raw_kelly = 0.0
-        if rr > 0:
-            raw_kelly = (conf01 * rr - (1.0 - conf01)) / rr
 
-        risk_pct = max(0.0, raw_kelly) * 0.25
-        risk_cap = 0.02
         cfg_cap = float(self.cfg.max_risk_per_trade or 0.0)
-        if cfg_cap > 0:
-            risk_cap = min(risk_cap, cfg_cap)
+        risk_cap = min(0.02, cfg_cap) if cfg_cap > 0 else 0.02
+
+        # Pseudo-Kelly disable switch (used when probability is uncalibrated).
+        # Set KELLY_DISABLED=1 to force fixed risk-per-trade (= risk_cap).
+        # This is the institutional-safe default until a calibrated classifier
+        # replaces the raw score (see core/model_engine.py calibration).
+        try:
+            kelly_disabled = bool(int(os.getenv("KELLY_DISABLED", "1") or "1"))
+        except Exception:
+            kelly_disabled = True
+
+        if kelly_disabled:
+            # Fixed fractional risk scaled by score (monotone, not probability).
+            # risk_pct linearly scales from 0 (conf=0) up to risk_cap (conf=1),
+            # but we require a minimum score to take any trade.
+            min_score = float(os.getenv("KELLY_DISABLED_MIN_CONF", "0.60") or "0.60")
+            if conf01 < min_score:
+                risk_pct = 0.0
+            else:
+                # Scale from min_score..1.0 → 0.5*risk_cap..risk_cap
+                span = max(1e-9, 1.0 - min_score)
+                weight = (conf01 - min_score) / span
+                risk_pct = risk_cap * (0.5 + 0.5 * weight)
+        else:
+            # Legacy pseudo-Kelly path. KEEP for back-compat but WARN once.
+            raw_kelly = (
+                ((conf01 * rr - (1.0 - conf01)) / rr) if rr > 0 else 0.0
+            )
+            risk_pct = max(0.0, raw_kelly) * 0.25
+
         risk_pct = min(risk_pct, risk_cap)
         lot_floor = float(getattr(self.sp, "lot_min", 0.01) or 0.01)
         if risk_pct <= 0.0:
@@ -1729,31 +1792,62 @@ class RiskManager:
             atr = 0.0
 
         if atr <= 0 and entry_price > 0 and stop_loss > 0:
-            # Recover ATR from the computed stop distance when direct ATR is missing.
             atr = abs(float(entry_price) - float(stop_loss)) / sl_mult
 
         if atr <= 0:
             return 0.01
 
-        # Preserve daily phase and drawdown controls while keeping ATR-driven sizing.
+        # ─── DD multiplier (phase multiplier is NOT applied here) ──────
         with self._lock:
-            phase_snapshot = str(self.phase).upper()
             peak_eq = float(self._peak_equity or 0.0)
-        phase_mult = {"A": 1.0, "B": 0.75, "C": 0.5}.get(phase_snapshot, 1.0)
         dd_mult = 1.0
         if peak_eq > 0:
             dd_from_peak = (peak_eq - eq) / peak_eq
             if dd_from_peak >= float(self.cfg.protect_drawdown_from_peak_pct or 0.0):
                 dd_mult = 0.5
 
-        risk_usd = eq * risk_pct * phase_mult * dd_mult
+        risk_usd = eq * risk_pct * dd_mult
 
         if risk_usd <= 0:
             return 0.01
 
-        # Core formula requested by user:
-        # lot_raw = (Equity * Risk%) / (ATR * SL_mult)
-        lot_raw = risk_usd / (atr * sl_mult)
+        # ─── Slippage + spread budget (institutional fix) ──────────────
+        # Effective stop distance = nominal ATR*sl_mult + spread + E[slip].
+        # This ensures that the configured risk-per-trade is the MAXIMUM
+        # actual USD loss under realistic fill conditions, not an
+        # idealised no-friction value.
+        nominal_stop_dist = float(atr) * float(sl_mult)
+        try:
+            if adapt:
+                spread_price = float(adapt.get("spread", 0.0) or 0.0)
+                if spread_price <= 0.0 and entry_price > 0:
+                    spread_bps = float(adapt.get("spread_bps", 0.0) or 0.0)
+                    if spread_bps > 0:
+                        spread_price = spread_bps * float(entry_price) / 1e4
+            else:
+                spread_price = 0.0
+        except Exception:
+            spread_price = 0.0
+        try:
+            expected_slip_price = (
+                float(adapt.get("expected_slip", 0.0) or 0.0) if adapt else 0.0
+            )
+            if expected_slip_price <= 0.0 and atr > 0:
+                # Default slippage budget: 5% of ATR, a conservative fallback
+                # grounded in Exness's typical execution quality.
+                expected_slip_price = atr * float(
+                    os.getenv("SLIPPAGE_BUDGET_ATR_PCT", "0.05") or "0.05"
+                )
+        except Exception:
+            expected_slip_price = 0.0
+
+        effective_stop_dist = max(
+            1e-12,
+            nominal_stop_dist + float(spread_price) + float(expected_slip_price),
+        )
+
+        # lot_raw = risk_usd / (effective_stop_dist * contract_size-adjusted)
+        lot_raw = risk_usd / effective_stop_dist
 
         contract_size = float(getattr(self.sp, "contract_size", 1.0) or 1.0)
         lot_step = float(getattr(self.sp, "lot_step", 0.01) or 0.01)

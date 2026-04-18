@@ -438,13 +438,40 @@ class InferenceEngine:
                 conf_ref = max(threshold, 1e-12)
 
             mag = abs(pred_val)
-            if mag < threshold:
-                confidence = max(0.05, min(0.74, (mag / max(threshold, 1e-12)) * 0.74))
+            # ─── CALIBRATED PROBABILITY (Section 3) ─────────────────────
+            # Prefer a calibrated P(direction_correct | |pred|) built on the
+            # validation fold at training time. Falls back to the heuristic
+            # mag/threshold confidence only if the calibrator is missing or
+            # malformed — in that case `KELLY_DISABLED=1` (default) in the
+            # risk layer ensures fixed-risk sizing.
+            _calibrator = None
+            try:
+                _calibrator = alpha_cal.get("probability_calibrator") if isinstance(alpha_cal, dict) else None
+            except Exception:
+                _calibrator = None
+            _calibrated_p: Optional[float] = None
+            try:
+                from core.utils import calibrated_probability as _calib_fn
+
+                _calibrated_p = _calib_fn(pred_val, _calibrator)
+            except Exception:
+                _calibrated_p = None
+            if _calibrated_p is not None:
+                # Calibrated probability IS the confidence. We clamp to
+                # [0.0, 0.99] to preserve downstream expectations (never
+                # the perfect-confidence singular value).
+                confidence = max(0.0, min(0.99, float(_calibrated_p)))
             else:
-                rel = (mag - threshold) / conf_ref
-                rel = max(0.0, min(1.0, rel))
-                confidence = 0.75 + (0.24 * rel)
-            confidence = max(0.0, min(0.99, confidence))
+                # Legacy heuristic — only active when calibrator missing.
+                if mag < threshold:
+                    confidence = max(
+                        0.05, min(0.74, (mag / max(threshold, 1e-12)) * 0.74)
+                    )
+                else:
+                    rel = (mag - threshold) / conf_ref
+                    rel = max(0.0, min(1.0, rel))
+                    confidence = 0.75 + (0.24 * rel)
+                confidence = max(0.0, min(0.99, confidence))
 
             last_close = InferenceEngine._safe_float(df["Close"].iloc[-1])
 

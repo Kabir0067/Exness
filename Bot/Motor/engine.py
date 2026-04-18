@@ -682,6 +682,58 @@ class MultiAssetTradingEngine(
                 "ENGINE_START_MONITORING_UNSAFE_ACCOUNT_STATE | trading_disabled=True reason=%s",
                 unsafe_account_reason,
             )
+        # ─── Idempotency WAL reconciliation ───────────────────────────
+        # Before accepting any new order intents, reconcile any PENDING/SENT
+        # entries from a previous process against the broker's actual state.
+        # This closes the "crash between order_send and ACK" window: if the
+        # order actually executed, we mark it CONFIRMED; if the broker has
+        # no record and the TTL expired, we mark it FAILED so retries are
+        # permitted. Under no circumstances is a duplicate order sent.
+        if not self.dry_run:
+            try:
+                import MetaTrader5 as _mt5  # local import; mt5 already ensured above
+
+                from core.idempotency import (
+                    get_default_journal,
+                    reconcile_on_startup,
+                )
+
+                def _positions_getter():
+                    try:
+                        return _mt5.positions_get() or []
+                    except Exception:
+                        return []
+
+                def _history_getter(frm: float, to: float):
+                    try:
+                        from datetime import datetime
+
+                        return (
+                            _mt5.history_deals_get(
+                                datetime.fromtimestamp(frm),
+                                datetime.fromtimestamp(to),
+                            )
+                            or []
+                        )
+                    except Exception:
+                        return []
+
+                summary = reconcile_on_startup(
+                    get_default_journal(),
+                    positions_getter=_positions_getter,
+                    history_deals_getter=_history_getter,
+                )
+                log_health.info(
+                    "IDEMPOTENCY_RECONCILE | confirmed=%s failed=%s still_pending=%s",
+                    int(summary.get("confirmed", 0)),
+                    int(summary.get("failed", 0)),
+                    int(summary.get("still_pending", 0)),
+                )
+            except Exception as _rec_exc:
+                log_err.error(
+                    "IDEMPOTENCY_RECONCILE_FAIL | err=%s", _rec_exc
+                )
+
         self._restart_exec_worker()
         if _monitoring_only_mode():
             log_health.warning(

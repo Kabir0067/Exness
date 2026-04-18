@@ -30,6 +30,7 @@ from log_config import (
 from log_config import (
     attach_global_handler_to_loggers,
     configure_logging,
+    configure_module_logs,
     get_log_path,
     log_dir_stats,
 )
@@ -51,6 +52,26 @@ _FMT = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 _system_log_handler = configure_logging(
     level="INFO", system_log_name=None, console=True
 )
+
+# ─── Per-module dedicated log files ──────────────────────────────────────
+# Барои ҳар модули институтсионалӣ (idempotency WAL, news blackout,
+# stability monitor, MT5 клиент, ExnessAPI, order execution, model engine,
+# signal engine, data feeds …) file handler-и махсус илова мекунем. Registry
+# ва `configure_module_logs()` худашон дар `log_config.py` ҷойгиранд — яъне
+# як манбаи ягонаи ҳақиқат барои ҳамаи логҳои тамоми стек. Ин идемпотент
+# аст ва барои debug-и истеҳсолӣ critical аст: агар модул log-и худро
+# надошта бошад, хатогӣ дар массиви `stdout.log` гум мешавад.
+try:
+    _n_attached = configure_module_logs()
+    logging.getLogger("main").info(
+        "MODULE_LOGS_CONFIGURED | attached=%d", int(_n_attached)
+    )
+except Exception as _mod_log_exc:
+    # Қатъиян набояд boot-ро боз дорад: агар module-log wiring шикаст,
+    # engine бо root handler (stdout.log) кор мекунад.
+    logging.getLogger("main").error(
+        "MODULE_LOGS_FAILED | err=%s", _mod_log_exc
+    )
 
 # Network exception groups (used by supervisors and notifier)
 try:

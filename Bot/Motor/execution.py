@@ -169,6 +169,43 @@ class ExecutionWorker(threading.Thread):
                             retcode=-2,
                         )
                     dispatch_lot = float(gated_lot or dispatch_lot)
+
+                    # ─── SECTION 10 — AUTO-DEGRADE multiplier ────────────
+                    # Apply the current risk-governor multiplier (derived
+                    # from PSI/KS drift + CUSUM edge-monitor) to the lot
+                    # size. This is the institutional single-application
+                    # site: the governor is observational, execution
+                    # enforces. Defensive: any failure leaves dispatch_lot
+                    # untouched.
+                    try:
+                        from core.stability_monitor import get_default_governor
+
+                        _gov_state = get_default_governor().snapshot()
+                        _gov_mult = float(
+                            getattr(_gov_state, "last_multiplier", 1.0) or 1.0
+                        )
+                        # Clamp to [0, 1] — governor can only REDUCE size.
+                        _gov_mult = max(0.0, min(1.0, _gov_mult))
+                        if _gov_mult < 1.0:
+                            dispatch_lot = float(dispatch_lot) * _gov_mult
+                            log_health.info(
+                                "AUTO_DEGRADE_APPLIED | order_id=%s mult=%.4f"
+                                " reason=%s lot_after=%.4f",
+                                intent.order_id,
+                                _gov_mult,
+                                str(
+                                    getattr(_gov_state, "last_reason", "")
+                                    or ""
+                                ),
+                                dispatch_lot,
+                            )
+                    except Exception as _gov_exc:
+                        log_err.error(
+                            "AUTO_DEGRADE_ERROR | order_id=%s err=%s",
+                            intent.order_id,
+                            _gov_exc,
+                        )
+
                     if dispatch_lot <= 0.0:
                         return ExecutionResult(
                             order_id=str(intent.order_id),
@@ -184,6 +221,49 @@ class ExecutionWorker(threading.Thread):
                             retcode=-2,
                         )
 
+            # ─── Idempotency gate (WAL) ─────────────────────────────────
+            # Refuse to send if this idempotency_key is already in-flight or
+            # already confirmed in the journal. Embed the key's tail into
+            # the broker comment so that reconciliation after a crash can
+            # match history deals back to this logical order.
+            _idem_journal = None
+            _idem_key = str(
+                getattr(intent, "idempotency_key", "") or intent.order_id
+            )
+            _comment_base = str(
+                getattr(intent.cfg, "comment", "portfolio") or "portfolio"
+            )
+            _order_comment = _comment_base
+            try:
+                from core.idempotency import (
+                    get_default_journal,
+                    idem_key_to_comment,
+                )
+
+                _idem_journal = get_default_journal()
+                _ok_to_send, _idem_reason = _idem_journal.should_send(_idem_key)
+                if not _ok_to_send:
+                    return ExecutionResult(
+                        order_id=str(intent.order_id),
+                        signal_id=str(intent.signal_id),
+                        ok=False,
+                        reason=f"idempotency_refuse:{_idem_reason}",
+                        sent_ts=sent,
+                        fill_ts=sent,
+                        req_price=float(intent.price),
+                        exec_price=float(intent.price),
+                        volume=0.0,
+                        slippage=0.0,
+                        retcode=-3,
+                    )
+                _order_comment = idem_key_to_comment(_idem_key, base=_comment_base)
+            except Exception as _idem_exc:
+                log_err.error(
+                    "EXEC_IDEMPOTENCY_WARN | order_id=%s err=%s",
+                    intent.order_id,
+                    _idem_exc,
+                )
+
             req = OrderRequest(
                 symbol=str(intent.symbol),
                 signal=str(intent.signal),
@@ -195,12 +275,51 @@ class ExecutionWorker(threading.Thread):
                 signal_id=str(intent.signal_id),
                 enqueue_time=float(intent.enqueue_time),
                 magic=int(getattr(intent.cfg, "magic", 777001) or 777001),
-                comment=str(getattr(intent.cfg, "comment", "portfolio") or "portfolio"),
+                comment=str(_order_comment),
                 cfg=intent.cfg,  # Pass Config for Dry Run
             )
             ex = self._build_executor()
             hooks = self._get_telemetry_hooks(intent)
             r: ExecOrderResult = ex.send_market_order(req, telemetry_hooks=hooks)
+
+            # ─── Record outcome in WAL ──────────────────────────────────
+            if _idem_journal is not None:
+                try:
+                    _retcode = int(getattr(r, "retcode", 0) or 0)
+                    _ok = bool(getattr(r, "ok", False))
+                    if _ok:
+                        _idem_journal.record_sent(
+                            _idem_key,
+                            retcode=_retcode,
+                            order_ticket=int(getattr(r, "order_ticket", 0) or 0),
+                            deal_ticket=int(getattr(r, "deal_ticket", 0) or 0),
+                            position_ticket=int(
+                                getattr(r, "position_ticket", 0) or 0
+                            ),
+                            reason="ok",
+                        )
+                        pos_tk = int(getattr(r, "position_ticket", 0) or 0)
+                        if pos_tk > 0:
+                            _idem_journal.record_confirmed(
+                                _idem_key,
+                                position_ticket=pos_tk,
+                                deal_ticket=int(
+                                    getattr(r, "deal_ticket", 0) or 0
+                                ),
+                                reason="position_ticket_resolved",
+                            )
+                    else:
+                        _idem_journal.record_failed(
+                            _idem_key,
+                            reason=str(getattr(r, "reason", "") or "broker_fail"),
+                            retcode=_retcode,
+                        )
+                except Exception as _idem_rec_exc:  # DEFENSIVE
+                    log_err.error(
+                        "EXEC_IDEMPOTENCY_RECORD_FAIL | order_id=%s err=%s",
+                        intent.order_id,
+                        _idem_rec_exc,
+                    )
 
             filled = float(getattr(r, "fill_ts", 0.0) or time.time())
             ok = bool(getattr(r, "ok", False))
@@ -699,7 +818,45 @@ class ExecutionManager:
                     return False, None
 
         order_id = e._next_order_id(cand.asset)
-        idem = f"{cand.symbol}:{cand.signal_id}:{cand.signal}"
+        # Build a globally-unique idempotency key (UUID-suffixed) and register
+        # a PENDING entry in the write-ahead log BEFORE enqueueing. This is
+        # the institutional guarantee that NO duplicate order can be sent
+        # under any retry / crash / restart scenario.
+        try:
+            from core.idempotency import (
+                new_idempotency_key,
+                get_default_journal,
+            )
+
+            _idem_journal = get_default_journal()
+            idem = new_idempotency_key(
+                cand.symbol, str(cand.signal_id), str(cand.signal)
+            )
+            _ok_to_send, _idem_reason = _idem_journal.should_send(idem)
+            if not _ok_to_send:
+                log_health.info(
+                    "ENQUEUE_SKIP | asset=%s reason=idempotency_refuse:%s",
+                    cand.asset,
+                    _idem_reason,
+                )
+                return False, None
+            _idem_journal.record_pending(
+                idem,
+                symbol=str(cand.symbol),
+                side=str(cand.signal),
+                volume=float(lot_val),
+                price=float(price),
+                sl=float(sl_val),
+                tp=float(tp_val),
+                magic=0,
+            )
+        except Exception as _idem_exc:  # defensive: never break enqueue
+            idem = f"{cand.symbol}:{cand.signal_id}:{cand.signal}"
+            log_health.warning(
+                "ENQUEUE_IDEMPOTENCY_WARN | asset=%s err=%s",
+                cand.asset,
+                _idem_exc,
+            )
 
         intent = OrderIntent(
             asset=cand.asset,

@@ -60,7 +60,7 @@ HELPER_CALLBACK_PREFIX = "hlp:"
 HELPER_ORDER_COUNTS = (1,)
 
 GIT_README_URL = "https://github.com/Kabir0067/Exness/blob/main/README.md"
-GIT_README_TEXT = "🔗 Маълумоти система"
+GIT_README_TEXT = "📖 Маълумоти бештар дар бораи система"
 
 _NETWORK_EXC = (
     ReadTimeout,
@@ -475,13 +475,16 @@ def _humanize_ml_reason(raw: str) -> str:
     quantile = fields.get("model_q")
     if pred and thr:
         try:
-            relation = ">" if float(pred) >= float(thr) else "<"
+            relation = "баландтар аз" if float(pred) >= float(thr) else "поёнтар аз"
         except Exception:
-            relation = "vs"
-        tail = f" | q={_fmt_metric(quantile, 1)}" if quantile else ""
-        return f"CatBoost: pred {_fmt_metric(pred)} {relation} thr {_fmt_metric(thr)}{tail}"
+            relation = "дар муқоиса бо"
+        tail = f" | квантил: {_fmt_metric(quantile, 1)}" if quantile else ""
+        return (
+            f"Модели CatBoost: бақоид {_fmt_metric(pred)} "
+            f"{relation} сарҳад {_fmt_metric(thr)}{tail}"
+        )
     compact = str(raw or "").replace("|", " | ").strip()
-    return compact or "Тафсил дастрас нест"
+    return compact or "Тафсилот дастрас нест"
 
 
 def _humanize_signal_reason(reason: Any) -> str:
@@ -493,13 +496,13 @@ def _humanize_signal_reason(reason: Any) -> str:
         return text.replace("_", " ")
     value = value.strip()
     if key == "ml_provider" and value:
-        return f"Провайдери ML: {value}"
+        return f"Манбаи таҳлили AI: {value}"
     if key == "ml_model" and value:
-        return f"Модели ML: {value}"
+        return f"Модели истифодашаванда: {value}"
     if key == "ml_reason" and value:
         return _humanize_ml_reason(value)
     if key == "catboost_below_threshold" and value:
-        return f"CatBoost аз ҳадд поён аст: {value}"
+        return f"Боварии модел аз ҳадди муқарраршуда поён аст: {value}"
     return f"{key.replace('_', ' ')}: {value}" if value else key.replace("_", " ")
 
 
@@ -535,30 +538,30 @@ def _humanize_execution_reason(reason: Any, retcode: Any = 0) -> str:
     text = str(reason or "").strip()
     lower = text.lower()
     if lower.startswith("sync_timeout_no_broker_state"):
-        return "Брокер дар муҳлати интизорӣ иҷрои фармонро тасдиқ накард"
+        return "Брокер дар муҳлати муқарраршуда иҷрои амрро тасдиқ накард"
     if lower.startswith("order_send_none"):
-        return "MT5 фармонро қабул накард ё ҷавоби равшан надод"
+        return "MT5 амри кушодани ордерро қабул накард"
     if lower.startswith("retry_retcode_"):
-        return "Ирсоли фармон ба сабаби ҷавоби ноустувори MT5 тасдиқ нашуд"
+        return "Ҷавоби ноустувор аз MT5 — ордер тасдиқ нашуд"
     if lower.startswith("fail_retcode_"):
         code = text.rsplit("_", 1)[-1]
-        return f"Фармон аз тарафи брокер рад шуд (retcode={code})"
+        return f"Брокер ордерро қабул накард (коди ҷавоб: {code})"
     if lower.startswith("dispatch_gate:"):
         detail = text.split(":", 1)[1].replace("_", " ").strip()
-        return f"Қоидаи иҷро фармонро рад кард: {detail or '-'}"
+        return f"Филтри дохилӣ ордерро манъ кард: {detail or 'номаълум'}"
     if lower == "tick_none":
-        return "Нархи ҷорӣ аз MT5 гирифта нашуд"
+        return "Нархи ҷории бозор дастрас нашуд"
     if lower == "bad_req_price":
-        return "Нархи бозор барои ирсол نوдуруст буд"
+        return "Нархи дархостшуда нодуруст буд"
     if lower == "mt5_not_ready":
-        return "Пайвасти MT5 барои ирсол омода нест"
+        return "Терминали MT5 ҳоло омодаи кор нест"
     if lower == "symbol_meta_none":
-        return "Маълумоти символ барои ирсол дастрас нест"
+        return "Маълумоти символ ёфт нашуд"
     if lower.startswith("exception_"):
-        return "Ҳангоми ирсоли фармон хатои дохилӣ рух дод"
+        return "Ҳангоми кушодани ордер хатои дохилӣ рух дод"
     if int(retcode or 0):
-        return f"{text or 'Хатои иҷро'} (retcode={int(retcode)})"
-    return text.replace("_", " ") or "Хатои номаълум"
+        return f"{text or 'Хатогии иҷро'} (коди ҷавоб: {int(retcode)})"
+    return text.replace("_", " ") or "Хатогии номаълум"
 
 
 def _normalize_signal_value(signal: Any) -> str:
@@ -674,33 +677,37 @@ def _build_signal_message(asset: str, result: Any) -> str:
     order_id = str(_field("order_id", "") or "").strip()
     extra_lines: list[str] = []
     if lot > 0.0:
-        extra_lines.append(f"📦 Ҳаҷм: <b>{lot:.4f}</b>")
+        extra_lines.append(f"📦 Ҳаҷми ордер: <b>{lot:.4f}</b>")
     if order_id:
-        extra_lines.append(f"🧷 ID-и навбат: <code>{html.escape(order_id)}</code>")
+        extra_lines.append(f"🔖 Рақами ордер: <code>{html.escape(order_id)}</code>")
     if blocked_reason:
-        extra_lines.append(f"🚫 Манъ шуд: <b>{html.escape(blocked_reason)}</b>")
+        extra_lines.append(f"🚫 Сабаби манъ: <b>{html.escape(blocked_reason)}</b>")
     extra_block = "".join(f"{line}\n" for line in extra_lines)
-    title = "📡 <b>СИГНАЛ БА НАВБАТ ГУЗОШТА ШУД</b>"
-    footer = "<i>Дар навбати иҷрои broker/MT5...</i>"
+    title = "📡 <b>СИГНАЛИ НАВ ҚАБУЛ ГАРДИД</b>"
+    footer = "🕐 <i>Дар интизори иҷро аз ҷониби брокер...</i>"
     if blocked or phase == "C":
-        title = "⚠️ <b>СИГНАЛ ОМАД, ИҶРО МАНЪ ШУД</b>"
-        footer = "<i>Сигнал зинда аст; иҷро аз тарафи риск/мониторинг манъ шуд.</i>"
+        title = "⚠️ <b>СИГНАЛ ҚАБУЛ ШУД, АММО ИҶРО МАНЪ АСТ</b>"
+        footer = "🛡 <i>Системаи ҳифзи риск кушодани ордерро манъ намуд.</i>"
     elif analysis_only:
-        title = "📡 <b>СИГНАЛИ ЗИНДА</b>"
-        footer = "<i>Таҳлил сигнал дод; иҷро баъд аз risk gate санҷида мешавад.</i>"
+        title = "📡 <b>СИГНАЛИ ТАҲЛИЛӢ</b>"
+        footer = (
+            "🔎 <i>Таҳлили AI сигнал дод; қарори ниҳоӣ пас аз "
+            "санҷиши риск қабул мешавад.</i>"
+        )
     signal_label = _tajik_signal_label(sig)
     reasons_block = _format_reason_block(_field("reasons", []))
     return (
-        f"{title} | {direction_emoji} <b>{signal_label}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>{html.escape(str(asset))}</b>\n"
-        f"🧠 Боварӣ: <b>{conf * 100:.1f}%</b>\n"
-        f"🔍 Асос:\n"
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 Актив: <b>{html.escape(str(asset))}</b>\n"
+        f"🎯 Самт: {direction_emoji} <b>{signal_label}</b>\n"
+        f"🧠 Сатҳи боварӣ: <b>{conf * 100:.1f}%</b>\n"
+        f"📝 Асоси қарор:\n"
         f"{reasons_block}\n"
         f"{extra_block}"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{footer}\n"
-        f"{time_str}"
+        f"⏰ {time_str}"
     )
 
 
@@ -722,40 +729,44 @@ def _build_order_update_message(intent: Any, result: Any) -> str:
     )
     signal_label = _tajik_signal_label(getattr(intent, "signal", ""))
     time_str = _format_time_only()
-    id_line = f"🧷 ID-и фармон: <code>{order_id}</code>\n" if order_id else ""
+    id_line = f"🔖 Рақами ордер: <code>{order_id}</code>\n" if order_id else ""
     if ok:
         sltp = (
-            f"{_fmt_price(sl)} / {_fmt_price(tp)}" if (sl > 0.0 and tp > 0.0) else "-"
+            f"{_fmt_price(sl)} / {_fmt_price(tp)}"
+            if (sl > 0.0 and tp > 0.0)
+            else "таъин нашудааст"
         )
         note = ""
         if reason.startswith("sync_recovered_"):
-            note = "<i>Баъди санҷиши брокер тасдиқ шуд.</i>\n"
+            note = "🔄 <i>Пас аз санҷиши такрорӣ брокер ордерро тасдиқ кард.</i>\n"
         return (
-            f"✅ <b>ОРДЕР КУШОДА ШУД</b> | {direction_emoji} <b>{signal_label}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💎 <b>{asset}</b> | {symbol}\n"
+            f"✅ <b>ОРДЕР БО МУВАФФАҚИЯТ КУШОДА ШУД</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Актив: <b>{asset}</b> ({symbol})\n"
+            f"🎯 Самт: {direction_emoji} <b>{signal_label}</b>\n"
             f"📦 Ҳаҷм: <b>{lot:.4f}</b>\n"
             f"{id_line}"
-            f"🏷 Нарх: <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b>\n"
-            f"🛡 SL / 🎯 TP: <b>{sltp}</b>\n"
-            f"🧠 Боварӣ: <b>{conf_pct:.1f}%</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"{note}{time_str}"
+            f"🏷 Нархи иҷро: <b>{_fmt_price(getattr(result, 'exec_price', 0.0))}</b>\n"
+            f"🛡 Стоп-Лосс / 🎯 Тейк-Профит: <b>{sltp}</b>\n"
+            f"🧠 Сатҳи боварӣ: <b>{conf_pct:.1f}%</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{note}⏰ {time_str}"
         )
     retcode = int(getattr(result, "retcode", 0) or 0)
     fail_reason = html.escape(_humanize_execution_reason(reason, retcode))
-    code_line = f"📟 Retcode: <code>{retcode}</code>\n" if retcode else ""
+    code_line = f"📟 Коди ҷавоби брокер: <code>{retcode}</code>\n" if retcode else ""
     return (
-        f"❌ <b>ИҶРО НАШУД</b> | {direction_emoji} <b>{signal_label}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>{asset}</b> | {symbol}\n"
+        f"❌ <b>ОРДЕР КУШОДА НАШУД</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 Актив: <b>{asset}</b> ({symbol})\n"
+        f"🎯 Самт: {direction_emoji} <b>{signal_label}</b>\n"
         f"📦 Ҳаҷм: <b>{lot:.4f}</b>\n"
         f"{id_line}"
         f"🚫 Сабаб: <b>{fail_reason}</b>\n"
         f"{code_line}"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Сигнал омад, аммо брокер иҷрои онро тасдиқ накард.</i>\n"
-        f"{time_str}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"ℹ️ <i>Сигнал дуруст буд, вале брокер иҷрои ордерро қабул накард.</i>\n"
+        f"⏰ {time_str}"
     )
 
 
@@ -807,21 +818,27 @@ def _notify_order_skipped(candidate: Any) -> None:
 
         reasons_list = getattr(candidate, "reasons", []) or []
         reasons_str = (
-            ", ".join(reasons_list) if reasons_list else "Маҳдудияти сахт / филтр"
+            ", ".join(reasons_list)
+            if reasons_list
+            else "Филтри ҳифзи сармоя ордерро манъ кард"
         )
         direction_emoji = "🟢" if str(candidate.signal).lower() == "buy" else "🔴"
         signal_label = _tajik_signal_label(candidate.signal)
         time_str = _format_time_only()
         msg = (
-            f"⚠️ <b>СИГНАЛ МАНЪ ШУД</b> | {direction_emoji} <b>{signal_label}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💎 <b>{html.escape(str(candidate.asset))}</b> | {html.escape(str(candidate.symbol))}\n"
-            f"📦 Ҳаҷм: <b>{lot:.2f}</b> | 🧠 Боварӣ: <b>{conf*100:.1f}%</b>\n"
-            f"🛡 SL/TP: <b>{sltp}</b>\n"
+            f"⚠️ <b>СИГНАЛ БО БОВАРИИ БАЛАНД ОМАД, АММО МАНЪ ШУД</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Актив: <b>{html.escape(str(candidate.asset))}</b> "
+            f"({html.escape(str(candidate.symbol))})\n"
+            f"🎯 Самт: {direction_emoji} <b>{signal_label}</b>\n"
+            f"📦 Ҳаҷм: <b>{lot:.2f}</b>\n"
+            f"🧠 Сатҳи боварӣ: <b>{conf*100:.1f}%</b>\n"
+            f"🛡 Стоп-Лосс / 🎯 Тейк-Профит: <b>{sltp}</b>\n"
             f"🚫 Сабаб: <b>{html.escape(reasons_str)}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Барои иҷрои дастӣ метавонед аз меню истифода баред.</i>\n"
-            f"{time_str}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>Агар хоҳед, метавонед аз менюи «Ёвариҳо» "
+            f"ордерро ба таври дастӣ кушоед.</i>\n"
+            f"⏰ {time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
@@ -860,11 +877,16 @@ def _notify_phase_change(
     try:
         if not is_admin_chat(ADMIN):
             return
-        reason_line = f" | <b>{reason}</b>" if reason else ""
+        reason_line = f"\n💬 Тавзеҳ: <i>{html.escape(reason)}</i>" if reason else ""
         time_str = _format_time_only()
         msg = (
-            f"🔄 <b>{asset}</b>: <b>{old_phase}</b> → <b>{new_phase}</b>{reason_line}\n"
-            f"{time_str}"
+            f"🔄 <b>ТАҒЙИРИ МАРҲИЛАИ КОР</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Актив: <b>{html.escape(str(asset))}</b>\n"
+            f"📊 Марҳила: <b>{html.escape(str(old_phase))}</b> ➡️ "
+            f"<b>{html.escape(str(new_phase))}</b>"
+            f"{reason_line}\n"
+            f"⏰ {time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
@@ -875,12 +897,17 @@ def _notify_engine_stopped(asset: str, reason: str = "") -> None:
     try:
         if not is_admin_chat(ADMIN):
             return
-        reason_line = f" | <b>{reason}</b>" if reason else ""
+        reason_line = f"\n💬 Сабаб: <i>{html.escape(reason)}</i>" if reason else ""
         time_str = _format_time_only()
         msg = (
-            f"🛑 <b>{asset}</b> қатъ шуд{reason_line}\n"
-            f"✅ Барои оғоз: /buttons → «🚀 Оғози Тиҷорат»\n"
-            f"{time_str}"
+            f"🛑 <b>САВДО ҚАТЪ ГАРДИД</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Актив: <b>{html.escape(str(asset))}</b>"
+            f"{reason_line}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 Барои оғози дубора:\n"
+            f"   <code>/buttons</code> ➡️ «🚀 Оғози Тиҷорат»\n"
+            f"⏰ {time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
@@ -893,9 +920,12 @@ def _notify_daily_start(asset: str, day: str) -> None:
             return
         time_str = _format_time_only()
         msg = (
-            f"🌅 <b>{asset}</b> | Рӯзи нав: <b>{day}</b>\n"
-            f"✅ Лимитҳо ва омор аз нав ҳисоб шуданд\n"
-            f"{time_str}"
+            f"🌅 <b>РӮЗИ НАВИ САВДО ОҒОЗ ШУД</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💎 Актив: <b>{html.escape(str(asset))}</b>\n"
+            f"📅 Сана: <b>{html.escape(str(day))}</b>\n"
+            f"✅ Лимитҳои рӯзона ва омори савдо нав шуданд\n"
+            f"⏰ {time_str}"
         )
         notify_async(ADMIN, msg)
     except Exception:
@@ -911,12 +941,15 @@ def deny(message: types.Message) -> None:
         log.error("deny: bot instance not set")
         return
     msg = (
-        "🔒 <b>ДАСТРАСИИ ХУСУСӢ</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Ин бот танҳо барои соҳиби худ дастрас аст.\n"
-        "Дастрасӣ маҳдуд мебошад.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "👤 Соҳиб: @kabir_0067"
+        "🔒 <b>ДАСТРАСӢ МАҲДУД</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Ин боти савдои автоматӣ шахсӣ буда,\n"
+        "танҳо ба соҳиби худ дастрас аст.\n\n"
+        "🤝 Барои ҳамкорӣ ё маълумоти бештар\n"
+        "метавонед бо соҳиб тамос гиред:\n"
+        "👤 <b>@kabir_0067</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "ℹ️ Барои маълумоти система тугмаи поёнро пахш кунед."
     )
     _bot_ref.send_message(
         message.chat.id,
@@ -960,25 +993,25 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
     try:
         active_str = str(getattr(status, "active_asset", "NONE"))
         if active_str == "NONE" and getattr(status, "trading", False):
-            active_str = "ҶУСТУҶӮ"
+            active_str = "Дар ҷустуҷӯи имкон"
         segments: list[str] = [
-            f"DD {float(getattr(status, 'dd_pct', 0.0)) * 100:.1f}%",
-            f"P&L {float(getattr(status, 'today_pnl', 0.0)):+.2f}",
-            f"Ҳолат {active_str}",
-            f"XAU {int(getattr(status, 'open_trades_xau', 0))}",
-            f"BTC {int(getattr(status, 'open_trades_btc', 0))}",
+            f"📉 Коҳиш: {float(getattr(status, 'dd_pct', 0.0)) * 100:.1f}%",
+            f"💵 Фоидаи рӯз: {float(getattr(status, 'today_pnl', 0.0)):+.2f}$",
+            f"🧭 Актив: {active_str}",
+            f"🥇 XAU: {int(getattr(status, 'open_trades_xau', 0))}",
+            f"₿ BTC: {int(getattr(status, 'open_trades_btc', 0))}",
         ]
         last_xau = _tajik_signal_label(getattr(status, "last_signal_xau", "Neutral"))
         last_btc = _tajik_signal_label(getattr(status, "last_signal_btc", "Neutral"))
-        segments.append(f"Сигнал XAU:{last_xau} BTC:{last_btc}")
+        segments.append(f"📡 Сигналҳо: XAU={last_xau} | BTC={last_btc}")
 
         if not compact:
             corr = fetch_external_correlation(cfg)
             if corr is not None:
-                segments.append(f"Ҳамбастагии GOLD {corr:+.2f}")
-        ribbon = " | ".join(segments)
+                segments.append(f"🔗 Ҳамбастагии тилло: {corr:+.2f}")
+        ribbon = " • ".join(segments)
         prefix = "\n" if compact else ""
-        return f"{prefix}<b>🧭 Мониторинг:</b> {ribbon}"
+        return f"{prefix}🧭 <b>Мониторинги зинда:</b> {ribbon}"
     except Exception as exc:
         log.error("build_health_ribbon error: %s", exc)
         return ""
@@ -987,18 +1020,21 @@ def build_health_ribbon(status: Any, compact: bool = True) -> str:
 def _format_status_message(status: Any) -> str:
     active_label = str(getattr(status, "active_asset", "NONE"))
     if active_label == "NONE" and getattr(status, "trading", False):
-        active_label = "✅ Дар ҷустуҷӯ (XAU + BTC)"
+        active_label = "Дар ҷустуҷӯи имкон (XAU ва BTC)"
     runtime_alive = bool(getattr(status, "trading", False))
     manual_stop = bool(getattr(status, "manual_stop", False))
     active_icon = (
         "🟡" if (runtime_alive and manual_stop) else ("🟢" if runtime_alive else "🔴")
     )
-    trading_status = (
-        "МОНИТОРИНГ (савдо манъ)"
-        if (runtime_alive and manual_stop)
-        else ("ФАЪОЛ" if runtime_alive else "ХОМӮШ")
+    if runtime_alive and manual_stop:
+        trading_status = "👁 Мониторинг (савдо муваққатан манъ)"
+    elif runtime_alive:
+        trading_status = "✅ Фаъол (савдои худкор)"
+    else:
+        trading_status = "⏸ Хомӯш"
+    mt5_state = (
+        "🟢 Пайваст" if getattr(status, "connected", False) else "🔴 Қатъ шудааст"
     )
-    mt5_state = "ПАЙВАСТ" if getattr(status, "connected", False) else "ҶУДО"
     balance = float(getattr(status, "balance", 0.0))
     equity = float(getattr(status, "equity", 0.0))
     today_pnl = float(getattr(status, "today_pnl", 0.0))
@@ -1009,28 +1045,33 @@ def _format_status_message(status: Any) -> str:
     sig_btc = _tajik_signal_label(getattr(status, "last_signal_btc", "Neutral"))
     queue_size = int(getattr(status, "exec_queue_size", 0))
     lines = [
-        f"{active_icon} <b>Система</b> | Савдо: <b>{trading_status}</b> | MT5: <b>{mt5_state}</b>",
-        f"💰 Баланс: <b>{balance:.2f}$</b> | Эквити: <b>{equity:.2f}$</b>",
-        f"🧭 Ҳолати фаъол: <b>{active_label}</b>",
+        f"{active_icon} <b>ҲОЛАТИ СИСТЕМА</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⚙️ Ҳолати савдо: <b>{trading_status}</b>",
+        f"🔗 Терминали MT5: <b>{mt5_state}</b>",
+        f"🧭 Актив: <b>{html.escape(active_label)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Баланс: <b>{balance:.2f}$</b>",
+        f"📈 Сармоя (Equity): <b>{equity:.2f}$</b>",
     ]
     if today_pnl != 0:
-        lines[1] += f" | P&L-и рӯз: <b>{today_pnl:+.2f}$</b>"
+        pnl_icon = "🟢" if today_pnl >= 0 else "🔴"
+        lines.append(f"{pnl_icon} Фоидаи имрӯза: <b>{today_pnl:+.2f}$</b>")
     if dd_pct > 0:
-        lines[2] += f" | 📉 DD: <b>{dd_pct:.2%}</b>"
-    signal_line = (
-        f"🔹 XAU: <b>{open_xau}</b> | {sig_xau} | 🔸 BTC: <b>{open_btc}</b> | {sig_btc}"
-    )
+        lines.append(f"📉 Коҳиши сармоя (DD): <b>{dd_pct:.2%}</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🥇 <b>XAU:</b> {open_xau} ордер | сигнал: {sig_xau}")
+    lines.append(f"₿ <b>BTC:</b> {open_btc} ордер | сигнал: {sig_btc}")
     if queue_size > 0:
-        signal_line += f" | 📥 Навбат: <b>{queue_size}</b>"
-    lines.append(signal_line)
+        lines.append(f"📥 Навбати иҷро: <b>{queue_size}</b>")
     return "\n".join(lines) + "\n"
 
 
 def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
     text = (
-        "📜 <b>Хулосаи савдои рӯзона</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Сана: <b>{summary.get('date', '-')}</b>\n"
+        "📜 <b>ХУЛОСАИ САВДОИ РӮЗОНА</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 Сана: <b>{html.escape(str(summary.get('date', '—')))}</b>\n"
     )
     total_closed = int(summary.get("total_closed", 0) or 0)
     total_open = int(summary.get("total_open", 0) or 0)
@@ -1043,17 +1084,28 @@ def _build_daily_summary_text(summary: Dict[str, Any]) -> str:
         win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
         pnl_emoji = "🟢" if net >= 0 else "🔴"
         text += (
-            f"\n{pnl_emoji} <b>P&L: {net:+.2f}$</b>\n"
-            f"📊 Бурд: <b>{wins}</b> | Бохт: <b>{losses}</b> | WR: <b>{win_rate:.1f}%</b>\n"
-            f"💹 Фоида: +{profit:.2f}$ | 📉 Зиён: -{loss:.2f}$\n"
+            f"\n{pnl_emoji} <b>Натиҷаи умумӣ: {net:+.2f}$</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Ордерҳои бурда: <b>{wins}</b>\n"
+            f"❌ Ордерҳои бохта: <b>{losses}</b>\n"
+            f"🎯 Сатҳи муваффақият: <b>{win_rate:.1f}%</b>\n"
+            f"💹 Фоидаи ҷамъшуда: <b>+{profit:.2f}$</b>\n"
+            f"📉 Зиёни ҷамъшуда: <b>-{loss:.2f}$</b>\n"
         )
     else:
-        text += "\n🚫 Ордерҳои басташуда: 0\n"
+        text += "\nℹ️ Имрӯз ягон ордер баста нашудааст\n"
     if total_open > 0:
         unrealized = float(summary.get("unrealized_pnl", 0.0) or 0.0)
-        text += f"🕒 Ордерҳои кушода: <b>{total_open}</b> | P&L: <b>{unrealized:+.2f}$</b>\n"
+        text += (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 Ордерҳои ҳоло кушода: <b>{total_open}</b>\n"
+            f"📊 Фоидаи ҷорӣ: <b>{unrealized:+.2f}$</b>\n"
+        )
     balance = float(summary.get("balance", 0.0) or 0.0)
-    text += f"\n💰 Баланс: <b>{balance:.2f}$</b>\n"
+    text += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Баланси ҷорӣ: <b>{balance:.2f}$</b>\n"
+    )
     return text
 
 
@@ -1069,7 +1121,7 @@ def _build_tp_usd_keyboard(
     )
     kb.add(
         InlineKeyboardButton(
-            text="❌ Бекор", callback_data=f"{TP_CALLBACK_PREFIX}cancel"
+            text="✖️ Бекор кардан", callback_data=f"{TP_CALLBACK_PREFIX}cancel"
         )
     )
     return kb
@@ -1082,14 +1134,22 @@ def _format_sltp_update_result(typ: str, usd: float, res: dict) -> str:
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
     status_emoji = "✅" if ok else "⚠️"
+    title_map = {
+        "TP": "🎯 ТЕЙК-ПРОФИТ",
+        "SL": "🛡 СТОП-ЛОСС",
+    }
+    header = title_map.get(typ, typ)
     lines = [
-        f"{status_emoji} <b>{typ}: {usd:.0f}$</b> | Навсозӣ: <b>{updated}/{total}</b>"
+        f"{status_emoji} <b>{header} ТАНЗИМ ШУД</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💵 Маблағ: <b>{usd:.0f}$</b>",
+        f"📊 Навсозӣ: <b>{updated}</b> аз <b>{total}</b> позиция",
     ]
     if skipped > 0:
-        lines.append(f"⏭️ Гузаронда шуд: <b>{skipped}</b>")
+        lines.append(f"⏭ Гузаронда шуд: <b>{skipped}</b> позиция")
     if errors:
-        preview = " | ".join(html.escape(str(e))[:30] for e in errors[:3])
-        lines.append(f"⚠️ <code>{preview}</code>")
+        preview = " • ".join(html.escape(str(e))[:30] for e in errors[:3])
+        lines.append(f"⚠️ Огоҳиҳо: <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -1113,7 +1173,7 @@ def _build_sl_usd_keyboard(
     )
     kb.add(
         InlineKeyboardButton(
-            text="❌ Бекор", callback_data=f"{SL_CALLBACK_PREFIX}cancel"
+            text="✖️ Бекор кардан", callback_data=f"{SL_CALLBACK_PREFIX}cancel"
         )
     )
     return kb
@@ -1123,18 +1183,22 @@ def build_ai_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
         InlineKeyboardButton(
-            text="🥇 AI XAU", callback_data=f"{AI_CALLBACK_PREFIX}xau_scalp"
+            text="🥇 Тилло — Скалп",
+            callback_data=f"{AI_CALLBACK_PREFIX}xau_scalp",
         ),
         InlineKeyboardButton(
-            text="₿ AI BTC", callback_data=f"{AI_CALLBACK_PREFIX}btc_scalp"
+            text="₿ Биткоин — Скалп",
+            callback_data=f"{AI_CALLBACK_PREFIX}btc_scalp",
         ),
     )
     kb.row(
         InlineKeyboardButton(
-            text="📈 XAU рӯзона", callback_data=f"{AI_CALLBACK_PREFIX}xau_intraday"
+            text="🥇 Тилло — Рӯзона",
+            callback_data=f"{AI_CALLBACK_PREFIX}xau_intraday",
         ),
         InlineKeyboardButton(
-            text="📉 BTC рӯзона", callback_data=f"{AI_CALLBACK_PREFIX}btc_intraday"
+            text="₿ Биткоин — Рӯзона",
+            callback_data=f"{AI_CALLBACK_PREFIX}btc_intraday",
         ),
     )
     return kb
@@ -1144,26 +1208,32 @@ def build_helpers_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
         InlineKeyboardButton(
-            text="📈 Тейк-профит", callback_data=f"{HELPER_CALLBACK_PREFIX}tp"
+            text="🎯 Тейк-Профит",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}tp",
         ),
         InlineKeyboardButton(
-            text="🛡 Стоп-лосс", callback_data=f"{HELPER_CALLBACK_PREFIX}sl"
-        ),
-    )
-    kb.row(
-        InlineKeyboardButton(
-            text="🟢 BTC ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_btc"
-        ),
-        InlineKeyboardButton(
-            text="🔴 BTC ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_btc"
+            text="🛡 Стоп-Лосс",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}sl",
         ),
     )
     kb.row(
         InlineKeyboardButton(
-            text="🟢 XAU ↑ Харид", callback_data=f"{HELPER_CALLBACK_PREFIX}buy_xau"
+            text="🟢 Хариди BTC",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}buy_btc",
         ),
         InlineKeyboardButton(
-            text="🔴 XAU ↓ Фурӯш", callback_data=f"{HELPER_CALLBACK_PREFIX}sell_xau"
+            text="🔴 Фурӯши BTC",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}sell_btc",
+        ),
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="🟢 Хариди XAU",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}buy_xau",
+        ),
+        InlineKeyboardButton(
+            text="🔴 Фурӯши XAU",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}sell_xau",
         ),
     )
     return kb
@@ -1181,7 +1251,8 @@ def build_helper_order_count_keyboard(action: str) -> InlineKeyboardMarkup:
     )
     kb.add(
         InlineKeyboardButton(
-            text="❌ Бекор", callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel"
+            text="✖️ Бекор кардан",
+            callback_data=f"{HELPER_CALLBACK_PREFIX}{action}:cancel",
         )
     )
     return kb
@@ -1192,10 +1263,16 @@ def format_close_by_profit_result(res: Dict[str, Any]) -> str:
     ok = bool(res.get("ok", False))
     errors = res.get("errors") or []
     status_emoji = "✅" if ok else "⚠️"
-    lines = [f"{status_emoji} <b>Фоидадорҳои баста:</b> <b>{closed}</b>"]
+    lines = [
+        f"{status_emoji} <b>БАСТАНИ ОРДЕРҲОИ ФОИДАДОР</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Баста шуд: <b>{closed}</b> ордер",
+    ]
+    if closed == 0 and ok:
+        lines.append("ℹ️ Ҳоло ягон ордери фоидадор ёфт нашуд")
     if errors:
-        preview = " | ".join(html.escape(str(e))[:25] for e in errors[:2])
-        lines.append(f"⚠️ <code>{preview}</code>")
+        preview = " • ".join(html.escape(str(e))[:25] for e in errors[:2])
+        lines.append(f"⚠️ Огоҳӣ: <code>{preview}</code>")
     return "\n".join(lines)
 
 
@@ -1209,32 +1286,35 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
             date_from = datetime.now().strftime("%Y-%m-%d 00:00:00")
             date_to = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         period_map = {
-            "Имрӯза": "📊 ИМРӮЗА",
-            "Ҳафтаина": "📊 ҲАФТАИНА",
-            "Моҳона": "📊 МОҲОНА",
-            "Пурра (Аз ибтидо)": "📊 АЗ ОҒОЗ",
+            "Имрӯза": "📈 ҲИСОБОТИ ИМРӮЗА",
+            "Ҳафтаина": "📊 ҲИСОБОТИ ҲАФТАИНА",
+            "Моҳона": "💹 ҲИСОБОТИ МОҲОНА",
+            "Пурра (Аз ибтидо)": "📜 ҲИСОБОТИ ПУРРА (АЗ ОҒОЗ)",
         }
-        title = period_map.get(period_name, f"📊 {period_name.upper()}")
-        text = f"<b>{title}</b>\n"
+        title = period_map.get(period_name, f"📊 ҲИСОБОТИ {period_name.upper()}")
+        text = f"<b>{title}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         if date_from and date_to:
             try:
                 if period_name == "Пурра (Аз ибтидо)":
                     df = date_from.split()[0] if " " in date_from else date_from
                     dt = date_to.split()[0] if " " in date_to else date_to
-                    text += f"<b>{df}</b> → <b>{dt}</b>\n"
+                    text += f"📅 Давра: <b>{df}</b> ➡️ <b>{dt}</b>\n"
                 else:
                     df = date_from.split()[0] if " " in date_from else date_from
                     dt_time = date_to.split()[1] if " " in date_to else ""
                     dt_date = date_to.split()[0] if " " in date_to else date_to
                     if dt_time:
                         df_time = date_from.split()[1] if " " in date_from else ""
-                        text += f"<b>{df}</b> <code>{df_time}</code> → <b>{dt_date}</b> <code>{dt_time}</code>\n"
+                        text += (
+                            f"📅 Давра: <b>{df}</b> <code>{df_time}</code> ➡️ "
+                            f"<b>{dt_date}</b> <code>{dt_time}</code>\n"
+                        )
                     else:
-                        text += f"<b>{df}</b> → <b>{dt_date}</b>\n"
+                        text += f"📅 Давра: <b>{df}</b> ➡️ <b>{dt_date}</b>\n"
             except Exception:
-                text += f"<b>{date_from}</b> → <b>{date_to}</b>\n"
+                text += f"📅 Давра: <b>{date_from}</b> ➡️ <b>{date_to}</b>\n"
         elif date_str:
-            text += f"<b>{date_str}</b>\n"
+            text += f"📅 Сана: <b>{date_str}</b>\n"
         total_closed = int(report.get("total_closed", 0) or 0)
         total_open = int(report.get("total_open", 0) or 0)
         wins = int(report.get("wins", 0) or 0)
@@ -1250,33 +1330,56 @@ def _format_full_report(report: Dict[str, Any], period_name: str) -> str:
                 profit / loss if loss > 0 else (profit if profit > 0 else 0.0)
             )
             text += (
-                f"\n{pnl_emoji} <b>P&L: {net_pnl:+.2f}$</b>\n"
-                f"📊 Бурд: <b>{wins}</b> | Бохт: <b>{losses}</b> | WR: <b>{win_rate:.1f}%</b>"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{pnl_emoji} <b>Натиҷаи умумӣ: {net_pnl:+.2f}$</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ Ордерҳои бурда: <b>{wins}</b>\n"
+                f"❌ Ордерҳои бохта: <b>{losses}</b>\n"
+                f"🎯 Сатҳи муваффақият: <b>{win_rate:.1f}%</b>"
             )
             if profit_factor > 0:
-                text += f" | PF: <b>{profit_factor:.2f}</b>"
-            text += f"\n💹 Фоида: +{profit:.2f}$ | 📉 Зиён: -{loss:.2f}$\n"
+                text += f" | 📐 Омили фоида: <b>{profit_factor:.2f}</b>"
+            text += (
+                f"\n💹 Фоидаи ҷамъшуда: <b>+{profit:.2f}$</b>\n"
+                f"📉 Зиёни ҷамъшуда: <b>-{loss:.2f}$</b>\n"
+            )
         else:
-            text += "\n🚫 Ордерҳои басташуда: 0\n"
+            text += (
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "ℹ️ Дар ин давра ягон ордер баста нашудааст\n"
+            )
         if total_open > 0:
-            text += f"🔓 Ордерҳои кушода: <b>{total_open}</b> | P&L: <b>{unrealized_pnl:+.2f}$</b>\n"
+            text += (
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔓 Ордерҳои ҳоло кушода: <b>{total_open}</b>\n"
+                f"📊 Фоидаи ҷорӣ: <b>{unrealized_pnl:+.2f}$</b>\n"
+            )
         return text
     except Exception as exc:
-        return f"⚠️ <code>{exc}</code>"
+        return (
+            "⚠️ <b>Ҳангоми сохтани ҳисобот хатогӣ рух дод</b>\n"
+            f"💬 Тафсилот: <code>{html.escape(str(exc))}</code>"
+        )
 
 
 def format_order(order_data: Dict[str, Any]) -> str:
     direction_emoji = "🟢" if order_data.get("type") == "BUY" else "🔴"
     direction_text = "ХАРИД" if order_data.get("type") == "BUY" else "ФУРӮШ"
-    ticket = order_data.get("ticket", "-")
-    symbol = order_data.get("symbol", "-")
+    ticket = order_data.get("ticket", "—")
+    symbol = order_data.get("symbol", "—")
     volume = float(order_data.get("volume", 0.0) or 0.0)
     price = float(order_data.get("price", 0.0) or 0.0)
     profit = float(order_data.get("profit", 0.0) or 0.0)
     profit_emoji = "🟢" if profit >= 0 else "🔴"
     return (
-        f"{direction_emoji} <b>{direction_text}</b> | <b>{html.escape(str(symbol))}</b> | #{ticket}\n"
-        f"📦 Ҳаҷм: <b>{volume:.2f}</b> | 🏷 Нарх: <b>{price:.5f}</b> | {profit_emoji} <b>{profit:+.2f}$</b>"
+        f"📋 <b>МАЪЛУМОТИ ОРДЕР</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Самт: {direction_emoji} <b>{direction_text}</b>\n"
+        f"💎 Актив: <b>{html.escape(str(symbol))}</b>\n"
+        f"🔖 Рақами ордер: <code>#{ticket}</code>\n"
+        f"📦 Ҳаҷм: <b>{volume:.2f}</b>\n"
+        f"🏷 Нархи кушодан: <b>{price:.5f}</b>\n"
+        f"{profit_emoji} Фоидаи ҷорӣ: <b>{profit:+.2f}$</b>"
     )
 
 
@@ -1289,12 +1392,12 @@ def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
     row: list[InlineKeyboardButton] = []
     if index > 0:
         row.append(
-            InlineKeyboardButton("⬅️ Пеш", callback_data=f"orders:nav:{index-1}")
+            InlineKeyboardButton("⬅️ Қаблӣ", callback_data=f"orders:nav:{index-1}")
         )
-    row.append(InlineKeyboardButton(f"{index+1}/{total}", callback_data="noop"))
+    row.append(InlineKeyboardButton(f"📄 {index+1} / {total}", callback_data="noop"))
     if index < total - 1:
         row.append(
-            InlineKeyboardButton("Баъд ➡️", callback_data=f"orders:nav:{index+1}")
+            InlineKeyboardButton("Навбатӣ ➡️", callback_data=f"orders:nav:{index+1}")
         )
     if row:
         kb.row(*row)
@@ -1303,7 +1406,7 @@ def order_keyboard(index: int, total: int, ticket: int) -> InlineKeyboardMarkup:
             "❌ Бастани ин ордер", callback_data=f"orders:close:{ticket}:{index}"
         )
     )
-    kb.row(InlineKeyboardButton("🔒 Пӯшидан", callback_data="orders:close_view"))
+    kb.row(InlineKeyboardButton("🔒 Пӯшидани намоиш", callback_data="orders:close_view"))
     _orders_kb_cache.set(key, kb)
     return kb
 
@@ -1317,17 +1420,17 @@ def build_git_readme_keyboard() -> InlineKeyboardMarkup:
 def check_full_program() -> tuple[bool, str]:
     issues: list[str] = []
     ok_mt5, last_reason = mt5_status()
-    reason_s = str(last_reason or "номаълум")
+    reason_s = str(last_reason or "сабаб номаълум")
     if ok_mt5:
         try:
             with MT5_LOCK:
                 acc = mt5.account_info()
             if not acc:
-                issues.append("Маълумоти ҳисоби MT5 дастрас нест.")
+                issues.append("Маълумоти ҳисоби MT5 ҳоло дастрас нест")
         except Exception as exc:
             issues.append(f"Пайвастшавӣ ба MT5 ноком шуд: {exc}")
     else:
-        issues.append(f"Пайвастшавӣ ба MT5 ноком шуд: {reason_s}")
+        issues.append(f"Пайваст ба MT5 барқарор нашуд: {reason_s}")
 
     xau_pipe = getattr(engine, "_xau", None)
     btc_pipe = getattr(engine, "_btc", None)
@@ -1358,42 +1461,60 @@ def check_full_program() -> tuple[bool, str]:
     if not bool(getattr(engine, "_model_loaded", False)) or not bool(
         getattr(engine, "_backtest_passed", False)
     ):
-        issues.append(f"Gatekeeper live-ready нест: {gate_reason or 'unknown'}")
+        issues.append(
+            "Системаи тафтиши модел барои савдои зинда омода нест "
+            f"({gate_reason or 'сабаб номаълум'})"
+        )
     if blocked_assets:
-        issues.append(f"Asset gate block: {', '.join(blocked_assets)}")
+        issues.append(f"Савдо барои активҳо манъ шудааст: {', '.join(blocked_assets)}")
     if pending_count > 25:
-        issues.append(f"Навбати order sync калон аст: pending={pending_count}")
+        issues.append(
+            f"Навбати ҳамоҳангсозии ордерҳо ҳадди аз меъёр зиёд аст ({pending_count})"
+        )
     if queue_backlog > 20:
-        issues.append(f"Навбати execution калон аст: queue={queue_backlog}")
+        issues.append(f"Навбати иҷрои ордерҳо ҳадди зиёд аст ({queue_backlog})")
     if not xau_pipe or not btc_pipe:
-        issues.append("Модулҳои портфели XAU/BTC ҳанӯз оғоз нашудаанд.")
+        issues.append("Модулҳои портфели XAU/BTC ҳанӯз пурра бор нашудаанд")
     else:
         if not xau_pipe.last_market_ok:
             if market_is_open("XAU"):
                 reason = str(xau_pipe.last_market_reason or "")
-                issues.append(f"Хатои маълумоти бозори XAU: {reason}")
+                issues.append(f"Маълумоти бозори XAU гирифта намешавад: {reason}")
         if not btc_pipe.last_market_ok:
-            issues.append(f"Хатои маълумоти бозори BTC: {btc_pipe.last_market_reason}")
+            issues.append(
+                f"Маълумоти бозори BTC гирифта намешавад: {btc_pipe.last_market_reason}"
+            )
         try:
             if xau_pipe.risk:
                 xau_pipe.risk.evaluate_account_state()
         except Exception as e:
-            issues.append(f"Хатои ҳисобкунии риск барои XAU: {e}")
+            issues.append(f"Ҳисобкунии риск барои XAU ноком шуд: {e}")
         try:
             if btc_pipe.risk:
                 btc_pipe.risk.evaluate_account_state()
         except Exception as e:
-            issues.append(f"Хатои ҳисобкунии риск барои BTC: {e}")
+            issues.append(f"Ҳисобкунии риск барои BTC ноком шуд: {e}")
     telemetry = ""
     try:
         telemetry = build_health_ribbon(engine.status(), compact=False)
     except Exception:
         telemetry = ""
     if issues:
-        summary = "⚠️ <b>Мушкилот ёфт шуд</b>:\n" + "\n".join(f"• {i}" for i in issues)
-        return False, summary + ("\n" + telemetry if telemetry else "")
-    ok_note = "✅ <b>Санҷиш анҷом ёфт</b>\nҲамаи модулҳо (XAU + BTC) дуруст фаъоланд."
-    return True, ok_note + ("\n" + telemetry if telemetry else "")
+        summary = (
+            "⚠️ <b>САНҶИШИ СИСТЕМА — МУШКИЛОТ ЁФТ ШУД</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(f"• {html.escape(i)}" for i in issues)
+        )
+        return False, summary + ("\n\n" + telemetry if telemetry else "")
+    ok_note = (
+        "✅ <b>САНҶИШИ ПУРРА БО МУВАФФАҚИЯТ АНҶОМ ЁФТ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟢 Пайвасти MT5 устувор аст\n"
+        "🟢 Модулҳои XAU ва BTC фаъоланд\n"
+        "🟢 Ҳисобкунии риск дуруст кор мекунад\n"
+        "🟢 Маълумоти бозор дастрас аст"
+    )
+    return True, ok_note + ("\n\n" + telemetry if telemetry else "")
 
 
 # =============================================================================
