@@ -1,9 +1,8 @@
 """
-Bot/Motor/engine.py - Core Engine entry point and management.
+Core engine entry points and runtime coordination helpers.
 
-Ин модул қисми асосии системаи савдо (MultiAssetTradingEngine)-ро дорад,
-ки ҳамаи зермодулҳоро (inference, pipeline, fsm, execution) пайваст мекунад
-ва даври асосии системаро (loop) ба кор медарорад.
+Wires the multi-asset engine with inference, scheduling, execution,
+and finite-state orchestration services.
 """
 
 from __future__ import annotations
@@ -16,16 +15,10 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from core.config import (
+    BTCEngineConfig as BtcConfig,
     MIN_GATE_SHARPE,
     MIN_GATE_WIN_RATE,
-)
-from core.config import (
-    BTCEngineConfig as BtcConfig,
-)
-from core.config import (
     XAUEngineConfig as XauConfig,
-)
-from core.config import (
     get_config_from_env as _get_core_config,
 )
 from core.feature_engine import FeatureEngine
@@ -55,10 +48,7 @@ from .pipeline import (
     _AssetPipeline,
 )
 
-# SAFE IMPROVEMENT: All imports consolidated at the top, deduplicated,
-# sorted strictly per PEP 8 (stdlib → third-party → local/application).
-# Removed all scattered/repeated imports that were violating PEP 8.
-# No behavior or public API changed.
+# Imports are grouped once at the module top to keep startup predictable.
 
 
 def get_xau_config():

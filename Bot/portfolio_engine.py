@@ -1,9 +1,8 @@
 """
-Bot/portfolio_engine.py — Backward-compatible re-export facade.
+Backward-compatible facade for the portfolio engine exports.
 
-This file is maintained for backward compatibility.
-Public imports remain stable:
-    from portfolio_engine import engine, MultiAssetTradingEngine
+Keeps public imports stable while re-exporting the motor entry points
+and core runtime types.
 """
 
 from __future__ import annotations

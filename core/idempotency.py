@@ -1,42 +1,5 @@
 """
-core/idempotency.py — Institutional-grade idempotency & write-ahead log (WAL)
-for order execution.
-
-DESIGN GOAL
------------
-Guarantee that NO order is ever sent twice, under any combination of:
-  * retry loops,
-  * transient MT5 disconnects,
-  * process crashes between `order_send` and the ACK,
-  * operator restarts.
-
-This is achieved via a simple, audit-friendly append-only JSONL journal
-plus an in-memory dedupe set loaded from that journal on startup.
-
-WAL LIFECYCLE (per order)
--------------------------
-  1. PENDING   — intent recorded BEFORE the network call.
-  2. SENT      — broker ACK received (ok=True|False with retcode).
-  3. CONFIRMED — position/deal reconciled against broker state.
-  4. FAILED    — broker explicitly rejected or a non-retryable error.
-
-A new order_send is ONLY allowed when no PENDING/SENT/CONFIRMED record
-exists for the given idempotency_key.
-
-On recovery (startup), any PENDING entries older than a configurable
-TTL are reconciled against `positions_get`/`history_deals_get`; if no
-evidence of execution is found within the TTL, the entry is marked
-FAILED and may be retried.
-
-Thread-safety
--------------
-All mutating methods hold a single `threading.Lock`. WAL writes use an
-atomic os.replace for rotation and are fsync'd on every append.
-
-Backward-compatibility
-----------------------
-If `IDEMPOTENCY_ENABLED=0` the store becomes a no-op (allows every
-call). This is ONLY for emergency rollback, never in production.
+Idempotency and write-ahead logging helpers for order execution.
 """
 
 from __future__ import annotations
@@ -59,19 +22,9 @@ except Exception:
     _WAL_DEFAULT = os.path.join(os.getcwd(), "order_wal.jsonl")
 
 
-# ─── Dedicated module logger ──────────────────────────────────────────────
-# File handler-и ин logger-ро `log_config.configure_module_logs()` ҳангоми
-# boot ба `Logs/idempotency_wal.log` ҳамроҳ мекунад (ба registry дар
-# `log_config.py::_MODULE_LOG_REGISTRY` нигаред). Ҳар ҳодисаи критикии WAL
-# (corrupt record, reconcile mismatch, send-failure-retries) дар ин ҷо log
-# мешавад ва дар як файли мустақил дастрас аст.
-log = logging.getLogger("core.idempotency")
-
-
 # =============================================================================
-# Constants
+# Global Constants
 # =============================================================================
-
 STATUS_PENDING = "PENDING"
 STATUS_SENT = "SENT"
 STATUS_CONFIRMED = "CONFIRMED"
@@ -79,27 +32,32 @@ STATUS_FAILED = "FAILED"
 
 _TERMINAL_STATUSES = frozenset({STATUS_CONFIRMED, STATUS_FAILED})
 _ACTIVE_STATUSES = frozenset({STATUS_PENDING, STATUS_SENT, STATUS_CONFIRMED})
-
-# Default reconcile TTL: if a PENDING entry is older than this and no
-# evidence of the order is found, treat it as FAILED and allow retry.
-_RECONCILE_TTL_SEC = float(os.getenv("IDEMPOTENCY_RECONCILE_TTL_SEC", "120") or "120")
-
-
-def _enabled() -> bool:
-    return str(os.getenv("IDEMPOTENCY_ENABLED", "1")).strip() in ("1", "true", "True")
+_RECONCILE_TTL_SEC = float(
+    os.getenv("IDEMPOTENCY_RECONCILE_TTL_SEC", "120") or "120"
+)
+_WAL_COMPACT_BYTES = int(
+    os.getenv("IDEMPOTENCY_WAL_COMPACT_BYTES", str(2 * 1024 * 1024))
+    or str(2 * 1024 * 1024)
+)
+_WAL_COMPACT_MIN_KEYS = int(
+    os.getenv("IDEMPOTENCY_WAL_COMPACT_MIN_KEYS", "512") or "512"
+)
 
 
 # =============================================================================
-# Data classes
+# Logging Setup
 # =============================================================================
+log_idempotency = logging.getLogger("core.idempotency")
 
 
+# =============================================================================
+# Data Classes
+# =============================================================================
 @dataclass
 class WALEntry:
     key: str
     status: str
     ts: float = field(default_factory=time.time)
-    # Envelope (snapshot of the request that produced this key).
     symbol: str = ""
     side: str = ""
     volume: float = 0.0
@@ -107,7 +65,6 @@ class WALEntry:
     sl: float = 0.0
     tp: float = 0.0
     magic: int = 0
-    # Post-send fields.
     retcode: int = 0
     order_ticket: int = 0
     deal_ticket: int = 0
@@ -115,6 +72,7 @@ class WALEntry:
     reason: str = ""
 
     def to_json(self) -> str:
+        """Serialize the WAL entry to compact JSON."""
         return json.dumps(
             {
                 "key": self.key,
@@ -139,98 +97,85 @@ class WALEntry:
 
     @classmethod
     def from_json(cls, line: str) -> Optional["WALEntry"]:
+        """Parse a WAL entry from a JSON line."""
         try:
-            d = json.loads(line)
+            payload = json.loads(line)
         except Exception:
             return None
-        if not isinstance(d, dict) or "key" not in d or "status" not in d:
+
+        if not isinstance(payload, dict):
             return None
+
+        if "key" not in payload or "status" not in payload:
+            return None
+
         return cls(
-            key=str(d.get("key", "")),
-            status=str(d.get("status", STATUS_PENDING)),
-            ts=float(d.get("ts", 0.0) or 0.0),
-            symbol=str(d.get("symbol", "")),
-            side=str(d.get("side", "")),
-            volume=float(d.get("volume", 0.0) or 0.0),
-            price=float(d.get("price", 0.0) or 0.0),
-            sl=float(d.get("sl", 0.0) or 0.0),
-            tp=float(d.get("tp", 0.0) or 0.0),
-            magic=int(d.get("magic", 0) or 0),
-            retcode=int(d.get("retcode", 0) or 0),
-            order_ticket=int(d.get("order_ticket", 0) or 0),
-            deal_ticket=int(d.get("deal_ticket", 0) or 0),
-            position_ticket=int(d.get("position_ticket", 0) or 0),
-            reason=str(d.get("reason", "")),
+            key=str(payload.get("key", "")),
+            status=str(payload.get("status", STATUS_PENDING)),
+            ts=float(payload.get("ts", 0.0) or 0.0),
+            symbol=str(payload.get("symbol", "")),
+            side=str(payload.get("side", "")),
+            volume=float(payload.get("volume", 0.0) or 0.0),
+            price=float(payload.get("price", 0.0) or 0.0),
+            sl=float(payload.get("sl", 0.0) or 0.0),
+            tp=float(payload.get("tp", 0.0) or 0.0),
+            magic=int(payload.get("magic", 0) or 0),
+            retcode=int(payload.get("retcode", 0) or 0),
+            order_ticket=int(payload.get("order_ticket", 0) or 0),
+            deal_ticket=int(payload.get("deal_ticket", 0) or 0),
+            position_ticket=int(payload.get("position_ticket", 0) or 0),
+            reason=str(payload.get("reason", "")),
         )
 
 
 # =============================================================================
-# UUID helpers (public API)
+# Public API
 # =============================================================================
-
-
 def new_idempotency_key(symbol: str, signal_id: str, side: str) -> str:
-    """
-    Build a globally-unique idempotency key.
-
-    Format: "SYM:SIG:SIDE:UUID8"
-
-    The UUID8 is a deterministic-free suffix so that even if the same
-    (symbol, signal_id, side) triple is enqueued twice (operator error),
-    they get distinct keys and neither is silently swallowed.
-    """
-    sym = str(symbol or "").upper().strip()
-    sid = str(signal_id or "").strip()
-    sd = str(side or "").strip()
-    uid = uuid.uuid4().hex[:8]
-    return f"{sym}:{sid}:{sd}:{uid}"
+    """Build a unique idempotency key for an order request."""
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_signal_id = str(signal_id or "").strip()
+    normalized_side = str(side or "").strip()
+    unique_suffix = uuid.uuid4().hex[:8]
+    return (
+        f"{normalized_symbol}:{normalized_signal_id}:{normalized_side}:"
+        f"{unique_suffix}"
+    )
 
 
 def idem_key_to_comment(key: str, *, base: str = "") -> str:
-    """
-    Squeeze an idempotency key into an MT5 `comment` field (≤31 chars).
-
-    Strategy: keep a short tag `base`, then append the LAST 16 chars of
-    the key (which includes the UUID8 suffix plus some of the signal id).
-    That 16-char tail is unique enough to be looked up in history.
-    """
-    k = str(key or "")
-    if not k:
+    """Fit an idempotency key into the MT5 comment field."""
+    normalized_key = str(key or "")
+    if not normalized_key:
         return str(base or "")[:31]
-    tail = k[-16:]
-    tag = (str(base or "")[:12]).strip()
-    if tag:
-        out = f"{tag}|{tail}"
+
+    tail = normalized_key[-16:]
+    base_tag = (str(base or "")[:12]).strip()
+
+    if base_tag:
+        comment = f"{base_tag}|{tail}"
     else:
-        out = tail
-    return out[:31]
+        comment = tail
+
+    return comment[:31]
 
 
 def extract_idem_tail(comment: str) -> str:
-    """Inverse of idem_key_to_comment (best-effort tail extraction)."""
-    c = str(comment or "")
-    if "|" in c:
-        return c.split("|", 1)[1][:16]
-    return c[-16:]
-
-
-# =============================================================================
-# Journal (WAL)
-# =============================================================================
+    """Return the lookup tail from an MT5 comment."""
+    normalized_comment = str(comment or "")
+    if "|" in normalized_comment:
+        return normalized_comment.split("|", 1)[1][:16]
+    return normalized_comment[-16:]
 
 
 class OrderJournal:
-    """
-    Append-only JSONL journal with in-memory index.
+    """Append-only JSONL journal with an in-memory latest-state index."""
 
-    File format: one `WALEntry.to_json()` per line. Entries are immutable
-    once written; state transitions are expressed as new entries with the
-    same `key`. The in-memory index keeps only the LATEST status per key.
-    """
-
-    def __init__(self, path: Optional[str] = None):
+    def __init__(self, path: Optional[str] = None) -> None:
         self._lock = threading.RLock()
-        self._path = str(path or os.getenv("IDEMPOTENCY_WAL_PATH", "") or _WAL_DEFAULT)
+        self._path = str(
+            path or os.getenv("IDEMPOTENCY_WAL_PATH", "") or _WAL_DEFAULT
+        )
         self._index: Dict[str, WALEntry] = {}
         self._enabled = _enabled()
         self._ensure_parent()
@@ -240,53 +185,8 @@ class OrderJournal:
     def path(self) -> str:
         return self._path
 
-    def _ensure_parent(self) -> None:
-        try:
-            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-    def _load(self) -> None:
-        if not os.path.exists(self._path):
-            return
-        try:
-            with open(self._path, "r", encoding="utf-8") as fh:
-                for raw in fh:
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    entry = WALEntry.from_json(raw)
-                    if entry is None:
-                        continue
-                    # Keep latest by timestamp (replay order is append-only
-                    # so a later line always reflects a later state).
-                    self._index[entry.key] = entry
-        except Exception:
-            # A corrupt journal is catastrophic — preserve the file for
-            # forensic analysis and start fresh in memory. Operator must
-            # investigate before resuming trading.
-            try:
-                bad = f"{self._path}.corrupt.{int(time.time())}"
-                os.replace(self._path, bad)
-            except Exception:
-                pass
-            self._index = {}
-
-    def _append(self, entry: WALEntry) -> None:
-        if not self._enabled:
-            return
-        line = entry.to_json() + "\n"
-        with self._lock:
-            with open(self._path, "a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except Exception:
-                    pass
-            self._index[entry.key] = entry
-
     def get(self, key: str) -> Optional[WALEntry]:
+        """Return the latest WAL entry for the key."""
         with self._lock:
             return self._index.get(str(key))
 
@@ -302,6 +202,7 @@ class OrderJournal:
         tp: float,
         magic: int,
     ) -> WALEntry:
+        """Record a pending order intent."""
         entry = WALEntry(
             key=str(key),
             status=STATUS_PENDING,
@@ -327,19 +228,25 @@ class OrderJournal:
         position_ticket: int = 0,
         reason: str = "",
     ) -> None:
-        prev = self.get(key)
-        base = prev if prev is not None else WALEntry(key=str(key), status=STATUS_PENDING)
+        """Record a broker acknowledgement."""
+        previous_entry = self.get(key)
+        base_entry = (
+            previous_entry
+            if previous_entry is not None
+            else WALEntry(key=str(key), status=STATUS_PENDING)
+        )
+
         entry = WALEntry(
             key=str(key),
             status=STATUS_SENT,
             ts=time.time(),
-            symbol=base.symbol,
-            side=base.side,
-            volume=base.volume,
-            price=base.price,
-            sl=base.sl,
-            tp=base.tp,
-            magic=base.magic,
+            symbol=base_entry.symbol,
+            side=base_entry.side,
+            volume=base_entry.volume,
+            price=base_entry.price,
+            sl=base_entry.sl,
+            tp=base_entry.tp,
+            magic=base_entry.magic,
             retcode=int(retcode),
             order_ticket=int(order_ticket),
             deal_ticket=int(deal_ticket),
@@ -356,100 +263,210 @@ class OrderJournal:
         deal_ticket: int = 0,
         reason: str = "",
     ) -> None:
-        prev = self.get(key) or WALEntry(key=str(key), status=STATUS_PENDING)
+        """Record a confirmed broker execution."""
+        previous_entry = self.get(key) or WALEntry(
+            key=str(key),
+            status=STATUS_PENDING,
+        )
+
         entry = WALEntry(
             key=str(key),
             status=STATUS_CONFIRMED,
             ts=time.time(),
-            symbol=prev.symbol,
-            side=prev.side,
-            volume=prev.volume,
-            price=prev.price,
-            sl=prev.sl,
-            tp=prev.tp,
-            magic=prev.magic,
-            retcode=prev.retcode,
-            order_ticket=prev.order_ticket,
-            deal_ticket=int(deal_ticket or prev.deal_ticket),
-            position_ticket=int(position_ticket or prev.position_ticket),
-            reason=reason or prev.reason,
+            symbol=previous_entry.symbol,
+            side=previous_entry.side,
+            volume=previous_entry.volume,
+            price=previous_entry.price,
+            sl=previous_entry.sl,
+            tp=previous_entry.tp,
+            magic=previous_entry.magic,
+            retcode=previous_entry.retcode,
+            order_ticket=previous_entry.order_ticket,
+            deal_ticket=int(deal_ticket or previous_entry.deal_ticket),
+            position_ticket=int(position_ticket or previous_entry.position_ticket),
+            reason=reason or previous_entry.reason,
         )
         self._append(entry)
 
     def record_failed(self, key: str, *, reason: str, retcode: int = 0) -> None:
-        prev = self.get(key) or WALEntry(key=str(key), status=STATUS_PENDING)
+        """Record a failed order attempt."""
+        previous_entry = self.get(key) or WALEntry(
+            key=str(key),
+            status=STATUS_PENDING,
+        )
+
         entry = WALEntry(
             key=str(key),
             status=STATUS_FAILED,
             ts=time.time(),
-            symbol=prev.symbol,
-            side=prev.side,
-            volume=prev.volume,
-            price=prev.price,
-            sl=prev.sl,
-            tp=prev.tp,
-            magic=prev.magic,
+            symbol=previous_entry.symbol,
+            side=previous_entry.side,
+            volume=previous_entry.volume,
+            price=previous_entry.price,
+            sl=previous_entry.sl,
+            tp=previous_entry.tp,
+            magic=previous_entry.magic,
             retcode=int(retcode),
-            order_ticket=prev.order_ticket,
-            deal_ticket=prev.deal_ticket,
-            position_ticket=prev.position_ticket,
+            order_ticket=previous_entry.order_ticket,
+            deal_ticket=previous_entry.deal_ticket,
+            position_ticket=previous_entry.position_ticket,
             reason=reason,
         )
         self._append(entry)
 
-    # ---- High-level gate -------------------------------------------------
-
     def should_send(self, key: str) -> Tuple[bool, str]:
-        """
-        Return (ok_to_send, reason).
-
-        If ANY active (PENDING/SENT/CONFIRMED) record exists for `key`
-        within the reconcile TTL, refuse to send again — the caller must
-        either reconcile or expire the entry first.
-        """
+        """Return whether the order key is eligible to be sent."""
         if not self._enabled:
             return True, "disabled"
-        prev = self.get(key)
-        if prev is None:
+
+        previous_entry = self.get(key)
+        if previous_entry is None:
             return True, "new"
-        if prev.status in _TERMINAL_STATUSES and prev.status == STATUS_CONFIRMED:
-            return False, f"already_confirmed:ticket={prev.position_ticket}"
-        if prev.status == STATUS_FAILED:
+
+        if (
+            previous_entry.status in _TERMINAL_STATUSES
+            and previous_entry.status == STATUS_CONFIRMED
+        ):
+            return False, (
+                f"already_confirmed:ticket={previous_entry.position_ticket}"
+            )
+
+        if previous_entry.status == STATUS_FAILED:
             return True, "previous_failed_retry_allowed"
-        if prev.status in (STATUS_PENDING, STATUS_SENT):
-            age = time.time() - float(prev.ts or 0.0)
-            if age < _RECONCILE_TTL_SEC:
-                return False, f"in_flight:{prev.status}:age={age:.1f}s"
-            # Stale in-flight entry — caller should reconcile FIRST.
-            return False, f"stale_in_flight:{prev.status}:age={age:.1f}s"
+
+        if previous_entry.status in (STATUS_PENDING, STATUS_SENT):
+            age_seconds = time.time() - float(previous_entry.ts or 0.0)
+            if age_seconds < _RECONCILE_TTL_SEC:
+                return False, (
+                    f"in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
+                )
+
+            return False, (
+                f"stale_in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
+            )
+
         return True, "unknown_status"
 
     def pending_keys(self) -> Iterable[WALEntry]:
+        """Return active WAL entries."""
         with self._lock:
             return list(
-                e for e in self._index.values() if e.status in (STATUS_PENDING, STATUS_SENT)
+                entry
+                for entry in self._index.values()
+                if entry.status in (STATUS_PENDING, STATUS_SENT)
             )
 
+    def _ensure_parent(self) -> None:
+        try:
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-# =============================================================================
-# Global default journal (lazy singleton)
-# =============================================================================
+    def _fsync_parent_dir(self) -> None:
+        try:
+            dir_fd = os.open(str(Path(self._path).parent), os.O_RDONLY)
+        except Exception:
+            return
 
-_DEFAULT_JOURNAL: Optional[OrderJournal] = None
-_DEFAULT_JOURNAL_LOCK = threading.Lock()
+        try:
+            os.fsync(dir_fd)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(dir_fd)
+            except Exception:
+                pass
 
+    def _should_compact_locked(self) -> bool:
+        if len(self._index) < max(1, _WAL_COMPACT_MIN_KEYS):
+            return False
+        try:
+            return os.path.getsize(self._path) >= max(1024, _WAL_COMPACT_BYTES)
+        except Exception:
+            return False
 
-def get_default_journal() -> OrderJournal:
-    global _DEFAULT_JOURNAL
-    with _DEFAULT_JOURNAL_LOCK:
-        if _DEFAULT_JOURNAL is None:
-            _DEFAULT_JOURNAL = OrderJournal()
-        return _DEFAULT_JOURNAL
+    def _compact_locked(self) -> None:
+        tmp_path = f"{self._path}.tmp"
+        entries = sorted(
+            self._index.values(),
+            key=lambda entry: (float(entry.ts or 0.0), str(entry.key)),
+        )
 
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as file_handle:
+                for entry in entries:
+                    file_handle.write(entry.to_json() + "\n")
+                file_handle.flush()
+                try:
+                    os.fsync(file_handle.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_path, self._path)
+            self._fsync_parent_dir()
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
-# =============================================================================
-# safe_order_send wrapper
-# =============================================================================
+    def _load(self) -> None:
+        if not os.path.exists(self._path):
+            return
+
+        try:
+            corrupt_lines = 0
+            with open(self._path, "r", encoding="utf-8") as file_handle:
+                for raw_line in file_handle:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+
+                    entry = WALEntry.from_json(raw_line)
+                    if entry is None:
+                        corrupt_lines += 1
+                        continue
+
+                    self._index[entry.key] = entry
+            if corrupt_lines > 0:
+                try:
+                    log_idempotency.warning(
+                        "WAL_LOAD_SKIPPED_LINES | path=%s corrupt_lines=%s",
+                        self._path,
+                        corrupt_lines,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                corrupt_path = f"{self._path}.corrupt.{int(time.time())}"
+                os.replace(self._path, corrupt_path)
+            except Exception:
+                pass
+
+            self._index = {}
+
+    def _append(self, entry: WALEntry) -> None:
+        if not self._enabled:
+            return
+
+        line = entry.to_json() + "\n"
+
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as file_handle:
+                file_handle.write(line)
+                file_handle.flush()
+
+                try:
+                    os.fsync(file_handle.fileno())
+                except Exception:
+                    pass
+
+            self._fsync_parent_dir()
+            self._index[entry.key] = entry
+            if self._should_compact_locked():
+                self._compact_locked()
 
 
 def safe_order_send(
@@ -467,21 +484,13 @@ def safe_order_send(
     send_args: Tuple = (),
     send_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Any, str]:
-    """
-    Idempotent wrapper around a broker order-send function.
+    """Wrap an order-send call with WAL-backed idempotency."""
+    active_journal = journal if journal is not None else get_default_journal()
+    ok_to_send, reason = active_journal.should_send(key)
 
-    Returns `(ok, raw_result, reason)`:
-      * ok=True: order was (or had been) successfully placed.
-      * ok=False: send was refused OR the broker rejected it.
-
-    On a refusal due to an active in-flight entry, the caller MUST NOT
-    retry until reconciliation clears the WAL.
-    """
-    j = journal if journal is not None else get_default_journal()
-    ok_to_send, reason = j.should_send(key)
     if not ok_to_send:
         try:
-            log.warning(
+            log_idempotency.warning(
                 "WAL_SEND_REFUSED | key=%s reason=%s symbol=%s side=%s vol=%.4f",
                 key,
                 reason,
@@ -491,9 +500,10 @@ def safe_order_send(
             )
         except Exception:
             pass
+
         return False, None, f"idempotency_refuse:{reason}"
 
-    j.record_pending(
+    active_journal.record_pending(
         key,
         symbol=symbol,
         side=side,
@@ -503,10 +513,11 @@ def safe_order_send(
         tp=tp,
         magic=magic,
     )
+
     try:
-        log.info(
-            "WAL_SEND_PENDING | key=%s symbol=%s side=%s vol=%.4f price=%.5f "
-            "sl=%.5f tp=%.5f magic=%d",
+        log_idempotency.info(
+            "WAL_SEND_PENDING | key=%s symbol=%s side=%s vol=%.4f "
+            "price=%.5f sl=%.5f tp=%.5f magic=%d",
             key,
             symbol,
             side,
@@ -521,10 +532,14 @@ def safe_order_send(
 
     try:
         result = send_fn(*(send_args or ()), **(send_kwargs or {}))
-    except Exception as exc:  # pragma: no cover — safety net
-        j.record_failed(key, reason=f"send_exception:{type(exc).__name__}:{exc}")
+    except Exception as exc:  # pragma: no cover
+        active_journal.record_failed(
+            key,
+            reason=f"send_exception:{type(exc).__name__}:{exc}",
+        )
+
         try:
-            log.error(
+            log_idempotency.error(
                 "WAL_SEND_EXCEPTION | key=%s err=%s:%s",
                 key,
                 type(exc).__name__,
@@ -532,35 +547,37 @@ def safe_order_send(
             )
         except Exception:
             pass
+
         return False, None, f"send_exception:{exc}"
 
-    # Extract retcode / tickets best-effort. MT5 result is a
-    # TradeRequestResult-like object with attributes.
     try:
         retcode = int(getattr(result, "retcode", 0) or 0)
     except Exception:
         retcode = 0
+
     try:
         order_ticket = int(getattr(result, "order", 0) or 0)
     except Exception:
         order_ticket = 0
+
     try:
         deal_ticket = int(getattr(result, "deal", 0) or 0)
     except Exception:
         deal_ticket = 0
 
-    # 10009 = TRADE_RETCODE_DONE, 10010 = DONE_PARTIAL (vendor-specific).
     ok = retcode in (10009, 10010)
+
     if ok:
-        j.record_sent(
+        active_journal.record_sent(
             key,
             retcode=retcode,
             order_ticket=order_ticket,
             deal_ticket=deal_ticket,
             reason="ok",
         )
+
         try:
-            log.info(
+            log_idempotency.info(
                 "WAL_SEND_OK | key=%s retcode=%d order=%d deal=%d",
                 key,
                 retcode,
@@ -569,15 +586,17 @@ def safe_order_send(
             )
         except Exception:
             pass
+
         return True, result, "ok"
 
-    j.record_failed(
+    active_journal.record_failed(
         key,
         reason=f"broker_reject:retcode={retcode}",
         retcode=retcode,
     )
+
     try:
-        log.error(
+        log_idempotency.error(
             "WAL_SEND_REJECTED | key=%s retcode=%d order=%d deal=%d",
             key,
             retcode,
@@ -586,12 +605,8 @@ def safe_order_send(
         )
     except Exception:
         pass
+
     return False, result, f"broker_reject:retcode={retcode}"
-
-
-# =============================================================================
-# Startup reconciliation
-# =============================================================================
 
 
 def reconcile_on_startup(
@@ -600,23 +615,8 @@ def reconcile_on_startup(
     positions_getter: Optional[Callable[[], Iterable[Any]]] = None,
     history_deals_getter: Optional[Callable[[float, float], Iterable[Any]]] = None,
 ) -> Dict[str, int]:
-    """
-    Reconcile PENDING/SENT WAL entries against the broker's current state.
-
-    * `positions_getter`: returns `mt5.positions_get()` or equivalent.
-    * `history_deals_getter(from_ts, to_ts)`: returns deals for a window.
-
-    For each active entry:
-      1. Try to find a matching open position by (magic, side, volume).
-         If found → mark CONFIRMED.
-      2. Else try to find a matching filled deal in the last hour.
-         If found → mark CONFIRMED (position may have closed already).
-      3. Else, if age > TTL → mark FAILED (broker never executed).
-      4. Else leave as-is (caller may retry later).
-
-    Returns a summary dict with counts.
-    """
-    j = journal if journal is not None else get_default_journal()
+    """Reconcile active WAL entries against broker state."""
+    active_journal = journal if journal is not None else get_default_journal()
     counts = {"confirmed": 0, "failed": 0, "still_pending": 0}
 
     try:
@@ -624,87 +624,107 @@ def reconcile_on_startup(
     except Exception:
         positions = []
 
-    pos_index: Dict[Tuple[str, int, float], int] = {}
-    for p in positions:
+    position_index: Dict[Tuple[str, int, float], int] = {}
+
+    for position in positions:
         try:
-            sym = str(getattr(p, "symbol", "") or "").upper()
-            magic = int(getattr(p, "magic", 0) or 0)
-            vol = float(getattr(p, "volume", 0.0) or 0.0)
-            tk = int(getattr(p, "ticket", 0) or 0)
+            symbol = str(getattr(position, "symbol", "") or "").upper()
+            magic = int(getattr(position, "magic", 0) or 0)
+            volume = float(getattr(position, "volume", 0.0) or 0.0)
+            ticket = int(getattr(position, "ticket", 0) or 0)
         except Exception:
             continue
-        pos_index[(sym, magic, round(vol, 8))] = tk
+
+        position_index[(symbol, magic, round(volume, 8))] = ticket
 
     now = time.time()
-    for entry in list(j.pending_keys()):
-        age = now - float(entry.ts or 0.0)
-        # (a) match on open positions
-        sym_u = str(entry.symbol or "").upper()
-        key_tuple = (sym_u, int(entry.magic), round(float(entry.volume), 8))
-        tk = pos_index.get(key_tuple, 0)
-        if tk > 0:
-            j.record_confirmed(entry.key, position_ticket=tk, reason="reconcile_open_pos")
+
+    for entry in list(active_journal.pending_keys()):
+        age_seconds = now - float(entry.ts or 0.0)
+        normalized_symbol = str(entry.symbol or "").upper()
+        position_key = (
+            normalized_symbol,
+            int(entry.magic),
+            round(float(entry.volume), 8),
+        )
+        ticket = position_index.get(position_key, 0)
+
+        if ticket > 0:
+            active_journal.record_confirmed(
+                entry.key,
+                position_ticket=ticket,
+                reason="reconcile_open_pos",
+            )
             counts["confirmed"] += 1
             continue
 
-        # (b) match on recent deals
         matched = False
+
         if history_deals_getter is not None:
             try:
                 since = max(now - 3600.0, float(entry.ts or 0.0) - 60.0)
                 deals = list(history_deals_getter(since, now) or [])
             except Exception:
                 deals = []
-            for d in deals:
+
+            for deal in deals:
                 try:
-                    d_sym = str(getattr(d, "symbol", "") or "").upper()
-                    d_magic = int(getattr(d, "magic", 0) or 0)
-                    d_vol = float(getattr(d, "volume", 0.0) or 0.0)
-                    d_comment = str(getattr(d, "comment", "") or "")
+                    deal_symbol = str(getattr(deal, "symbol", "") or "").upper()
+                    deal_magic = int(getattr(deal, "magic", 0) or 0)
+                    deal_volume = float(getattr(deal, "volume", 0.0) or 0.0)
+                    deal_comment = str(getattr(deal, "comment", "") or "")
                 except Exception:
                     continue
-                tail = extract_idem_tail(d_comment)
+
+                tail = extract_idem_tail(deal_comment)
+
                 if tail and tail == entry.key[-16:]:
-                    j.record_confirmed(
+                    active_journal.record_confirmed(
                         entry.key,
-                        position_ticket=int(getattr(d, "position_id", 0) or 0),
-                        deal_ticket=int(getattr(d, "ticket", 0) or 0),
+                        position_ticket=int(
+                            getattr(deal, "position_id", 0) or 0
+                        ),
+                        deal_ticket=int(getattr(deal, "ticket", 0) or 0),
                         reason="reconcile_history_deal",
                     )
                     counts["confirmed"] += 1
                     matched = True
                     break
+
                 if (
-                    d_sym == sym_u
-                    and d_magic == int(entry.magic)
-                    and abs(d_vol - float(entry.volume)) < 1e-8
+                    deal_symbol == normalized_symbol
+                    and deal_magic == int(entry.magic)
+                    and abs(deal_volume - float(entry.volume)) < 1e-8
                 ):
-                    j.record_confirmed(
+                    active_journal.record_confirmed(
                         entry.key,
-                        position_ticket=int(getattr(d, "position_id", 0) or 0),
-                        deal_ticket=int(getattr(d, "ticket", 0) or 0),
+                        position_ticket=int(
+                            getattr(deal, "position_id", 0) or 0
+                        ),
+                        deal_ticket=int(getattr(deal, "ticket", 0) or 0),
                         reason="reconcile_history_heuristic",
                     )
                     counts["confirmed"] += 1
                     matched = True
                     break
+
             if matched:
                 continue
 
-        # (c) expired → mark FAILED (safe: allows retry; broker has no trace)
-        if age > _RECONCILE_TTL_SEC:
-            j.record_failed(
+        if age_seconds > _RECONCILE_TTL_SEC:
+            active_journal.record_failed(
                 entry.key,
-                reason=f"reconcile_expired_age={age:.1f}s",
+                reason=f"reconcile_expired_age={age_seconds:.1f}s",
                 retcode=0,
             )
             counts["failed"] += 1
+
             try:
-                log.warning(
+                log_idempotency.warning(
                     "WAL_RECONCILE_EXPIRED | key=%s symbol=%s age=%.1fs",
                     entry.key,
                     entry.symbol,
-                    age,
+                    age_seconds,
                 )
             except Exception:
                 pass
@@ -712,7 +732,7 @@ def reconcile_on_startup(
             counts["still_pending"] += 1
 
     try:
-        log.info(
+        log_idempotency.info(
             "WAL_RECONCILE_SUMMARY | confirmed=%d failed=%d still_pending=%d",
             counts["confirmed"],
             counts["failed"],
@@ -724,6 +744,39 @@ def reconcile_on_startup(
     return counts
 
 
+# =============================================================================
+# Private Helpers
+# =============================================================================
+def _enabled() -> bool:
+    """Return whether idempotency is enabled."""
+    return str(os.getenv("IDEMPOTENCY_ENABLED", "1")).strip() in (
+        "1",
+        "true",
+        "True",
+    )
+
+
+# =============================================================================
+# Module State
+# =============================================================================
+_DEFAULT_JOURNAL: Optional[OrderJournal] = None
+_DEFAULT_JOURNAL_LOCK = threading.Lock()
+
+
+def get_default_journal() -> OrderJournal:
+    """Return the module-level default journal."""
+    global _DEFAULT_JOURNAL
+
+    with _DEFAULT_JOURNAL_LOCK:
+        if _DEFAULT_JOURNAL is None:
+            _DEFAULT_JOURNAL = OrderJournal()
+
+    return _DEFAULT_JOURNAL
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
 __all__ = [
     "STATUS_PENDING",
     "STATUS_SENT",

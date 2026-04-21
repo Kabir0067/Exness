@@ -1,9 +1,8 @@
 """
-runmain/supervisors.py — Thread supervisors and notification dispatch.
+Thread supervisors and notification dispatch helpers.
 
-Provides the engine supervisor (monitoring runtime health and model gates),
-the Telegram supervisor (polling), and the asynchronous notification worker.
-These loops are robust to network failures with exponential backoffs.
+Provides the engine supervisor, Telegram supervisor, and background
+notification worker with bounded retry behavior.
 """
 
 from __future__ import annotations

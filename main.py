@@ -1,18 +1,8 @@
 """
-main.py — Production entry point for the XAUUSDm Institutional Trading System.
+Production entry point for the institutional trading runtime.
 
-Responsibilities
-----------------
-1. Parse CLI arguments
-2. Enforce single-instance lock
-3. Call bootstrap_runtime() to wire all components
-4. Run startup model checks / auto-training
-5. Spawn and supervise engine + Telegram threads
-6. Handle graceful shutdown
-
-Usage
------
-    python main.py  # full live stack: engine + analytics + Telegram
+Coordinates startup checks, runtime bootstrap, thread supervision,
+and graceful shutdown for the live stack.
 """
 
 from __future__ import annotations
@@ -22,9 +12,9 @@ import sys
 import time
 import traceback
 from threading import Thread
-from typing import Optional
+from typing import Callable, Optional
 
-# Bootstrap must be imported first — it redirects stdout and installs exception hooks.
+# Bootstrap must be imported first. It redirects stdout and installs hooks.
 from runmain.bootstrap import (
     _REAL_STDERR,
     _REAL_STDOUT,
@@ -103,7 +93,7 @@ def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         description="XAUUSDm Institutional Scalping System — Production Runner"
     )
 
-    # Use real stdio to avoid redirected streams
+    # Use real stdio while parsing CLI help and errors.
     old_out, old_err = sys.stdout, sys.stderr
     try:
         sys.stdout = _REAL_STDOUT
@@ -112,6 +102,8 @@ def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     finally:
         sys.stdout = old_out
         sys.stderr = old_err
+
+
 # =============================================================================
 # Thread Factories
 # =============================================================================
@@ -150,7 +142,7 @@ def _spawn_notify_worker(stop_event) -> Thread:
 # =============================================================================
 def _restart_thread_if_dead(
     thread: Optional[Thread],
-    spawn_func: callable,
+    spawn_func: Callable[..., Thread],
     stop_event,
     notifier: NotifierLike,
     last_restart_ts: float,

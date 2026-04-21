@@ -1,9 +1,8 @@
 """
-Bot/Motor/models.py - Core data structures and engine types.
+Core data structures and shared engine model types.
 
-Ин модул тамоми типизатсияи маълумотро (dataclass, enum) барои
-мотори савдо дар бар мегирад. Ҳеҷ гуна логикаи мураккаб надорад,
-танҳо таърифи структураҳо ва ёрирасонҳои хурд.
+Defines dataclasses, enums, logger setup, and serialization helpers
+used across the trading motor.
 """
 
 from __future__ import annotations
@@ -16,14 +15,14 @@ import sys
 import traceback
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date as _date_type
-from datetime import datetime, timezone
 from datetime import datetime as _dt_type
+from datetime import datetime, timezone
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path as _Path_type
 from typing import Any, Dict, Optional, Tuple
 
-# DEFENSIVE CODE: Evaluate numpy existence safely.
+# Resolve optional numpy types once at import time.
 try:
     import numpy as _np  # type: ignore
 
@@ -31,13 +30,13 @@ try:
 except ImportError:
     _NUMPY_TYPES = ()
 
-# DEFENSIVE CODE: MT5 import wrapped.
+# Keep MT5 optional so shared types can import without terminal access.
 try:
     import MetaTrader5 as mt5
 except ImportError:
     mt5 = None
 
-# External imports
+# Local imports
 from core.ml_router import MLSignal
 
 try:

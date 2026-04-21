@@ -1,9 +1,8 @@
 """
-runmain/bootstrap.py — Application state, logging, and environment bootstrapping.
+Runtime bootstrap, logging, and shared application state helpers.
 
-This module initializes the core telemetry (stdout redirection, exception hooks,
-rolling logs) and lazily resolves the runtime (`AppState`) while mitigating
-circular dependencies across the stack.
+Initializes process-level telemetry, stdout redirection, exception hooks,
+and lazy runtime wiring for the live controller stack.
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ import urllib3
 
 from log_config import (
     LOG_DIR as LOG_ROOT,
-)
-from log_config import (
     attach_global_handler_to_loggers,
     configure_logging,
     configure_module_logs,
@@ -53,22 +50,14 @@ _system_log_handler = configure_logging(
     level="INFO", system_log_name=None, console=True
 )
 
-# ─── Per-module dedicated log files ──────────────────────────────────────
-# Барои ҳар модули институтсионалӣ (idempotency WAL, news blackout,
-# stability monitor, MT5 клиент, ExnessAPI, order execution, model engine,
-# signal engine, data feeds …) file handler-и махсус илова мекунем. Registry
-# ва `configure_module_logs()` худашон дар `log_config.py` ҷойгиранд — яъне
-# як манбаи ягонаи ҳақиқат барои ҳамаи логҳои тамоми стек. Ин идемпотент
-# аст ва барои debug-и истеҳсолӣ critical аст: агар модул log-и худро
-# надошта бошад, хатогӣ дар массиви `stdout.log` гум мешавад.
+# Attach dedicated file handlers for modules that keep separate logs.
 try:
     _n_attached = configure_module_logs()
     logging.getLogger("main").info(
         "MODULE_LOGS_CONFIGURED | attached=%d", int(_n_attached)
     )
 except Exception as _mod_log_exc:
-    # Қатъиян набояд boot-ро боз дорад: агар module-log wiring шикаст,
-    # engine бо root handler (stdout.log) кор мекунад.
+    # Keep boot alive even if per-module log wiring fails.
     logging.getLogger("main").error(
         "MODULE_LOGS_FAILED | err=%s", _mod_log_exc
     )
@@ -551,8 +540,11 @@ def bootstrap_runtime(*, allow_telegram: bool = True) -> bool:
             return False
 
         if state.tg_available:
-            token = os.environ.get("TG_TOKEN") or os.environ.get("BOT_TOKEN")
-            admin = os.environ.get("TG_ADMIN_ID") or os.environ.get("ADMIN_ID")
+            from core.config import get_config_from_env as _get_runtime_config
+
+            runtime_cfg = _get_runtime_config("XAU")
+            token = str(getattr(runtime_cfg, "telegram_token", "") or "").strip()
+            admin = int(getattr(runtime_cfg, "admin_id", 0) or 0)
             if not (token and admin):
                 raise RuntimeError("Telegram credentials missing")
 

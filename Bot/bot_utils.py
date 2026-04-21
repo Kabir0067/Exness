@@ -1,13 +1,8 @@
 """
-Bot/bot_utils.py - Telegram control plane utilities and formatters.
+Telegram utility helpers for the trading control plane.
 
-Ин файл UI/Control қисми система мебошад.
-- Танҳо ADMIN истифода мебарад.
-- Engine/Strategy-ро идора мекунад (start/stop/status)
-- Амалҳои идоракунӣ: close_all, TP/SL (USD) барои ҳамаи позицияҳо
-
-Логикаи тиҷорат дар portfolio_engine ва Strategies аст.
-Ин ҷо танҳо Telegram ва даъватҳо ба ExnessAPI/orders.py.
+Provides shared formatters, notification helpers, and Telegram-specific
+request utilities used by the bot interface.
 """
 
 from __future__ import annotations

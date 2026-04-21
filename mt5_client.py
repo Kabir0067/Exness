@@ -1,13 +1,8 @@
 """
-mt5_client.py — Terminal management and thread-safe async MT5 dispatch.
+Terminal management and thread-safe MT5 dispatch helpers.
 
-Provides a robust abstraction over the MetaTrader 5 terminal:
-  - Idempotent order execution to prevent "ghost fills" after IPC failure.
-  - Asynchronous sub-millisecond dispatch loop using Condition variables.
-  - Windows-native psutil health-checking and process management.
-  - Automatic restart/recovery with exponential backoffs.
-
-Strict lock ordering: _INIT_LOCK is ALWAYS acquired BEFORE MT5_LOCK.
+Wraps MetaTrader 5 connectivity, async dispatch, recovery logic,
+and idempotent order submission for the live runtime.
 """
 
 from __future__ import annotations
@@ -71,6 +66,9 @@ _auth_block_until_mono: float = 0.0
 _auth_block_reason: str = ""
 _non_retriable_block_until_mono: float = 0.0
 _non_retriable_block_reason: str = ""
+_transport_state_lock = threading.Lock()
+_transport_error_streak: int = 0
+_transport_timeout_scale: float = 1.0
 
 _terminal_pid: Optional[int] = None
 _terminal_pid_lock = threading.Lock()
@@ -276,6 +274,45 @@ def _looks_like_transport_error(exc: Exception) -> bool:
             "mt5_async_queue",
         )
     )
+
+
+def _update_transport_health(
+    *,
+    ok: bool,
+    exc: Optional[Exception] = None,
+) -> None:
+    """Track recent transport instability to adapt timeouts under jitter."""
+    global _transport_error_streak, _transport_timeout_scale
+
+    with _transport_state_lock:
+        if ok:
+            _transport_error_streak = max(0, _transport_error_streak - 1)
+            _transport_timeout_scale = max(1.0, _transport_timeout_scale * 0.85)
+            return
+
+        if exc is not None and not _looks_like_transport_error(exc):
+            return
+
+        _transport_error_streak = min(8, _transport_error_streak + 1)
+        _transport_timeout_scale = min(3.0, 1.0 + (0.30 * _transport_error_streak))
+
+
+def _adaptive_transport_timeout(timeout: float, attempt: int) -> float:
+    """Expand request timeouts while the transport layer remains unstable."""
+    with _transport_state_lock:
+        scale = max(1.0, float(_transport_timeout_scale))
+
+    effective = max(0.01, float(timeout)) * scale * (1.0 + (0.35 * max(0, attempt)))
+    return min(max(effective, 0.05), 60.0)
+
+
+def _adaptive_retry_pause(attempt: int) -> None:
+    """Small pacing delay to absorb bursty latency spikes before retrying."""
+    with _transport_state_lock:
+        scale = max(1.0, float(_transport_timeout_scale))
+
+    delay = min(3.0, (0.15 * scale) + (0.20 * max(0, attempt)))
+    time.sleep(delay)
 
 
 def _mt5_shutdown_silent() -> None:
@@ -1038,36 +1075,49 @@ def mt5_async_call(
     **kwargs,
 ) -> Any:
     """Synchronous wait wrapper around mt5_async_submit."""
-    wait_s = max(0.01, float(timeout))
     attempts = max(1, int(retries) + 1)
     last_exc: Optional[Exception] = None
 
     for attempt in range(attempts):
+        wait_s = _adaptive_transport_timeout(timeout, attempt)
         try:
             fut = mt5_async_submit(
                 method_name, *args, ensure_ready=ensure_ready, **kwargs
             )
-            return fut.result(timeout=wait_s)
+            result = fut.result(timeout=wait_s)
+            _update_transport_health(ok=True)
+            return result
         except concurrent.futures.TimeoutError as exc:
             last_exc = exc
+            _update_transport_health(ok=False, exc=exc)
             if repair_on_transport_error:
                 _repair_mt5_once()
             if attempt < attempts - 1:
+                _adaptive_retry_pause(attempt)
                 continue
             if direct_fallback:
                 try:
-                    return _mt5_direct_call(method_name, *args, **kwargs)
+                    result = _mt5_direct_call(method_name, *args, **kwargs)
+                    _update_transport_health(ok=True)
+                    return result
                 except Exception as exc2:
                     last_exc = exc2
         except Exception as exc:
             last_exc = exc
             if repair_on_transport_error and _looks_like_transport_error(exc):
+                _update_transport_health(ok=False, exc=exc)
                 _repair_mt5_once()
+            elif _looks_like_transport_error(exc):
+                _update_transport_health(ok=False, exc=exc)
             if attempt < attempts - 1:
+                if _looks_like_transport_error(exc):
+                    _adaptive_retry_pause(attempt)
                 continue
             if direct_fallback:
                 try:
-                    return _mt5_direct_call(method_name, *args, **kwargs)
+                    result = _mt5_direct_call(method_name, *args, **kwargs)
+                    _update_transport_health(ok=True)
+                    return result
                 except Exception as exc2:
                     last_exc = exc2
 
@@ -1097,10 +1147,11 @@ def safe_order_send(
 
     for attempt in range(max(1, int(max_attempts))):
         try:
+            effective_timeout = _adaptive_transport_timeout(order_timeout, attempt)
             result = mt5_async_call(
                 "order_send",
                 tagged_request,
-                timeout=float(order_timeout),
+                timeout=effective_timeout,
                 raise_on_error=True,
             )
             return result
@@ -1118,7 +1169,7 @@ def safe_order_send(
             if not is_transport:
                 raise
 
-            _repair_mt5_once(throttle_sec=1.0)
+            _repair_mt5_once(throttle_sec=min(2.5, 1.0 + (0.40 * attempt)))
             ghost = _check_ghost_fill(idem_key_str, cfg)
             if ghost:
                 raise MT5GhostFillDetected(
@@ -1131,6 +1182,7 @@ def safe_order_send(
                     "safe_order_send: no ghost fill found — retrying key=%s",
                     idem_key_str,
                 )
+                _adaptive_retry_pause(attempt)
                 continue
 
             raise RuntimeError(

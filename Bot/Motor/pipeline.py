@@ -1,8 +1,8 @@
 """
-Bot/Motor/pipeline.py - Portfolio engine pipeline utilities and scheduling.
+Scheduling and pipeline helpers for the portfolio engine.
 
-Ин модул мантиқи вақтбандии бозор, назорати зичии сигналҳо,
-ва Pipeline-и дохилии як активро (AssetPipeline) дар бар мегирад.
+Coordinates market timing, per-asset pipeline state, and runtime
+feed checks used by the engine loop.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import MetaTrader5 as mt5
 from core.config import get_config_from_env as _get_core_config
 from core.feature_engine import FeatureEngine
 from core.risk_manager import RiskManager
+from core.session_manager import session_state as _session_state
 from core.signal_engine import SignalEngine
 from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
 from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
@@ -56,14 +57,18 @@ class UTCScheduler:
 
     @staticmethod
     def is_weekend() -> bool:
-        # 5=Sat, 6=Sun
-        return UTCScheduler.now_utc().weekday() >= 5
+        try:
+            return not bool(_session_state("XAU").is_open)
+        except Exception:
+            return UTCScheduler.now_utc().weekday() >= 5
 
     @staticmethod
     def get_active_assets() -> Tuple[str, ...]:
-        if UTCScheduler.is_weekend():
-            return ("BTC",)
-        return ("XAU", "BTC")
+        assets: List[str] = []
+        for asset in ("XAU", "BTC"):
+            if UTCScheduler.market_status(asset):
+                assets.append(asset)
+        return tuple(assets or ["BTC"])
 
     @staticmethod
     def market_status(asset: str) -> bool:
@@ -72,11 +77,15 @@ class UTCScheduler:
         BTC: always open (24/7).
         XAU: weekdays only (hours logic guarded elsewhere by MT5/market feed).
         """
-        if asset == "BTC":
-            return True
-        if asset == "XAU":
-            return not UTCScheduler.is_weekend()
-        return False
+        asset_u = str(asset or "").upper().strip()
+        try:
+            return bool(_session_state(asset_u).is_open)
+        except Exception:
+            if asset_u == "BTC":
+                return True
+            if asset_u == "XAU":
+                return UTCScheduler.now_utc().weekday() < 5
+            return False
 
 
 class EngineScheduleManager:
@@ -452,6 +461,77 @@ class _AssetPipeline:
         self._last_computed_ts = 0.0
         self._cache_ttl_sec = 0.3
         self._cached_candidate: Optional[AssetCandidate] = None
+        self._session_open: Optional[bool] = None
+        self._session_reason: str = "init"
+        self._session_transition_ts: float = 0.0
+
+    def _reset_runtime_state(self, reason: str) -> None:
+        self._baseline_ready_bars = 0
+        self._baseline_last_key = None
+        self._baseline_last_dt = None
+        self._cached_candidate = None
+        self._last_computed_close = 0.0
+        self._last_computed_ts = 0.0
+        self._last_tick_ts = 0.0
+        self.last_tick_age_sec = 0.0
+        self.last_bar_age_sec = 0.0
+        self.last_market_rows = 0
+        self.last_market_close = 0.0
+        self.last_market_volume = 0.0
+        self.last_market_ts = "-"
+        self.last_market_ok = False
+        self.last_market_reason = str(reason or "session_reset")
+        self._last_market_ok_ts = 0.0
+
+    def sync_session_state(self) -> Tuple[bool, str, bool]:
+        try:
+            snapshot = _session_state(self.asset)
+            is_open = bool(snapshot.is_open)
+            reason = str(snapshot.reason or "session_unknown")
+            in_cooldown = bool(snapshot.is_post_gap_cooldown)
+        except Exception:
+            is_open = bool(UTCScheduler.market_status(self.asset))
+            reason = "session_fallback"
+            in_cooldown = False
+
+        previous = self._session_open
+        self._session_open = is_open
+        self._session_reason = reason
+
+        if previous is None:
+            if not is_open:
+                self._reset_runtime_state(f"session_closed:{reason}")
+            return is_open, reason, in_cooldown
+
+        if previous == is_open:
+            return is_open, reason, in_cooldown
+
+        self._session_transition_ts = time.time()
+        if not is_open:
+            self._reset_runtime_state(f"session_closed:{reason}")
+            try:
+                self.reconcile_positions(force=True)
+            except Exception:
+                pass
+            log_health.info(
+                "SESSION_TRANSITION | asset=%s state=closed reason=%s",
+                self.asset,
+                reason,
+            )
+            return is_open, reason, in_cooldown
+
+        self._reset_runtime_state("session_reopened")
+        try:
+            self.reconcile_positions(force=True)
+        except Exception:
+            pass
+        log_health.info(
+            "SESSION_TRANSITION | asset=%s state=open reason=%s cooldown=%s",
+            self.asset,
+            reason,
+            in_cooldown,
+        )
+        return is_open, reason, in_cooldown
 
     def _baseline_gate(self, bar_key: str) -> Tuple[bool, str]:
         dt = parse_bar_key(bar_key)
@@ -576,6 +656,13 @@ class _AssetPipeline:
         if (now - self._last_market_ok_ts) < self._market_validate_every:
             return bool(self.last_market_ok)
 
+        session_open, session_reason, _in_cooldown = self.sync_session_state()
+        if not session_open:
+            self.last_market_ok = False
+            self.last_market_reason = f"session_closed:{session_reason}"
+            self._last_market_ok_ts = now
+            return False
+
         self._last_market_ok_ts = now
 
         try:
@@ -693,9 +780,9 @@ class _AssetPipeline:
             )
             return False
 
-    def reconcile_positions(self) -> None:
+    def reconcile_positions(self, force: bool = False) -> None:
         now = time.time()
-        if (now - self._last_reconcile_ts) < self._reconcile_interval:
+        if not force and (now - self._last_reconcile_ts) < self._reconcile_interval:
             return
         self._last_reconcile_ts = now
 

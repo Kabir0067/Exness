@@ -1,1 +1,1 @@
-"""Bot package — Telegram bot and portfolio engine integration."""
+"""Bot package for Telegram and portfolio engine integration."""

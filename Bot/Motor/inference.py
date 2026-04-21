@@ -1,8 +1,8 @@
 """
-Bot/Motor/inference.py - CatBoost inference decoupling.
+CatBoost inference helpers for the trading motor.
 
-Ин модул интерфейси InferenceEngine ва EngineModelMixin-ро
-фароҳам меорад, ки мантиқи пешгӯӣ бо CatBoost-ро идора мекунанд.
+Runs live feature preparation, model inference, and payload validation
+for the engine decision pipeline.
 """
 
 from __future__ import annotations
@@ -59,8 +59,7 @@ class InferenceEngine:
     def __init__(self, engine: "MultiAssetTradingEngine") -> None:
         self._e = engine
 
-    # SAFE IMPROVEMENT + DEFENSIVE CODE: private helper to eliminate dozens of duplicated
-    # "float( ... or 0.0)" patterns and make every float conversion explicitly safe
+    # Keep float conversion in one safe helper.
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         if value is None:
@@ -70,7 +69,7 @@ class InferenceEngine:
         except (TypeError, ValueError, OverflowError):
             return default
 
-    # SAFE IMPROVEMENT + DEFENSIVE CODE: private helper to eliminate duplicated int/float parsing
+    # Keep integer conversion in one safe helper.
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
         try:
@@ -256,6 +255,90 @@ class InferenceEngine:
             return float(max(-1.0, min(1.0, raw_bias * strength))), metrics
         except Exception:
             return 0.0, metrics
+
+    def _model_regime_filter_reason(
+        self,
+        regime_filter: Optional[Dict[str, Any]],
+        df: pd.DataFrame,
+        regime_metrics: Dict[str, float],
+        *,
+        pred_margin: float,
+        combined_bias: float,
+    ) -> str:
+        """Return a blocking reason when live conditions leave the trained regime band."""
+        if not isinstance(regime_filter, dict) or not regime_filter.get("enabled", False):
+            return ""
+        if df is None or len(df) < 32 or "Close" not in df.columns:
+            return ""
+
+        try:
+            vol_window = max(10, self._safe_int(regime_filter.get("vol_window"), 20))
+            close = pd.to_numeric(df["Close"], errors="coerce")
+            live_vol = float(
+                close.pct_change()
+                .rolling(vol_window, min_periods=max(5, vol_window // 2))
+                .std()
+                .iloc[-1]
+            )
+        except Exception:
+            live_vol = float("nan")
+
+        adx = self._safe_float(regime_metrics.get("adx"))
+        slope = self._safe_float(regime_metrics.get("slope"))
+        current_regime = "RANGE"
+        if np.isfinite(live_vol) and live_vol >= self._safe_float(
+            regime_filter.get("vol_high")
+        ):
+            current_regime = "HIGH_VOL"
+        elif slope >= 0.25 and combined_bias >= 0.0 and adx >= 20.0:
+            current_regime = "TREND_UP"
+        elif slope <= -0.25 and combined_bias <= 0.0 and adx >= 20.0:
+            current_regime = "TREND_DOWN"
+
+        allowed_regimes = {
+            str(name)
+            for name in regime_filter.get("allowed_regimes", [])
+            if str(name)
+        }
+        min_conf_unknown = self._safe_float(
+            regime_filter.get("min_confidence_unknown_regime"),
+            1.35,
+        )
+        min_conf_outside = self._safe_float(
+            regime_filter.get("min_confidence_outside_band"),
+            1.25,
+        )
+        vol_low = self._safe_float(regime_filter.get("vol_low"))
+        vol_high_soft_cap = self._safe_float(regime_filter.get("vol_high_soft_cap"))
+
+        if allowed_regimes and current_regime not in allowed_regimes:
+            if pred_margin < min_conf_unknown:
+                return (
+                    f"catboost_regime_filter:regime={current_regime}|"
+                    f"margin={pred_margin:.3f}|vol={live_vol:.6f}"
+                )
+
+        if np.isfinite(live_vol):
+            if (
+                vol_low > 0.0
+                and live_vol < (vol_low * 0.50)
+                and pred_margin < min_conf_outside
+            ):
+                return (
+                    f"catboost_regime_filter:low_vol|margin={pred_margin:.3f}|"
+                    f"vol={live_vol:.6f}|min={vol_low:.6f}"
+                )
+            if (
+                vol_high_soft_cap > 0.0
+                and live_vol > vol_high_soft_cap
+                and pred_margin < min_conf_outside
+            ):
+                return (
+                    f"catboost_regime_filter:high_vol|margin={pred_margin:.3f}|"
+                    f"vol={live_vol:.6f}|cap={vol_high_soft_cap:.6f}"
+                )
+
+        return ""
 
     def infer_catboost(
         self,
@@ -635,6 +718,32 @@ class InferenceEngine:
                         f"plus_di={float(regime_metrics.get('plus_di', 0.0) or 0.0):.2f}|"
                         f"minus_di={float(regime_metrics.get('minus_di', 0.0) or 0.0):.2f}"
                     ),
+                    provider="catboost",
+                    model="catboost_trained",
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    scalp_payload=scalp_payload,
+                    intraday_payload=intraday_payload,
+                )
+                if payload_ts_bar > 0:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                return out
+
+            regime_filter_reason = self._model_regime_filter_reason(
+                payload.get("regime_filter", {}) if isinstance(payload, dict) else None,
+                df,
+                regime_metrics,
+                pred_margin=pred_margin,
+                combined_bias=combined_bias,
+            )
+            if regime_filter_reason:
+                out = MLSignal(
+                    asset=asset,
+                    signal="HOLD",
+                    side="Neutral",
+                    confidence=max(0.05, min(confidence, 0.74)),
+                    reason=regime_filter_reason,
                     provider="catboost",
                     model="catboost_trained",
                     entry=None,

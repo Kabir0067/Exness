@@ -1,8 +1,8 @@
 """
 Bot/Motor/fsm.py - Deterministic FSM orchestrator.
 
-Ин модул як мошини ҳолатҳои ягонаро (FSM) нишон медиҳад,
-ки тартиби кори системаро (sync -> infer -> risk -> execute) таъмин мекунад.
+This module provides a single-state machine (FSM) that enforces
+the runtime flow: sync -> infer -> risk -> execute.
 """
 
 from __future__ import annotations
@@ -331,15 +331,58 @@ class EngineFSMStageServices(IFSMEnginePorts):
             )
 
         payloads: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
-        active_assets = self._ordered_active_assets(UTCScheduler.get_active_assets())
+        active_assets = self._ordered_active_assets(list(UTCScheduler.get_active_assets()))
+        monitored_assets = self._ordered_active_assets(["XAU", "BTC"])
         data_sync_ok = True
         data_sync_reason = ""
 
-        for asset in active_assets:
+        try:
+            from core.session_manager import session_state as _sess_state  # local import
+        except Exception:
+            _sess_state = None  # type: ignore[assignment]
+
+        for asset in monitored_assets:
             self._e._touch_runtime_progress()
+            pipe = self._asset_pipe(asset)
+            if pipe is not None:
+                try:
+                    sync_session = getattr(pipe, "sync_session_state", None)
+                    if callable(sync_session):
+                        sync_session()
+                except Exception:
+                    pass
+
+            if asset not in active_assets:
+                if pipe is not None:
+                    try:
+                        pipe.reconcile_positions(force=True)
+                    except Exception:
+                        pass
+                try:
+                    self._e._sync_pending_orders()
+                except Exception:
+                    pass
+                continue
+
             if self._e._is_asset_blocked(asset):
                 self._e._log_blocked_asset_skip(asset, "data_sync")
                 continue
+
+            # Skip data sync for assets whose session is currently closed.
+            # This prevents spamming "no_rates" during the weekend gap and
+            # allows the engine to idle cleanly until market re-open.
+            if _sess_state is not None:
+                try:
+                    _ss = _sess_state(asset)
+                    if not _ss.is_open:
+                        data_sync_ok = False
+                        mins_left = int(_ss.seconds_until_open // 60)
+                        data_sync_reason = (
+                            f"{asset}_session_closed:{_ss.reason}:reopen_in_{mins_left}m"
+                        )
+                        continue
+                except Exception:
+                    pass
 
             market_ok, market_reason = self._refresh_market_validation(asset)
             if not market_ok:
@@ -529,18 +572,8 @@ class EngineFSMStageServices(IFSMEnginePorts):
                 )
 
             self._log_ml_signal(asset, sig)
-            # NOTE (truthful-signal fix):
-            # The Telegram "analysis signal" notifier used to fire HERE — right
-            # after the ML inference but BEFORE the pipeline confluence check.
-            # That produced the "СИГНАЛИ ТАҲЛИЛӢ" messages for signals that
-            # were later silently rejected by the pipeline (e.g. tm=-1.00,
-            # baseline_warmup, struct<thr, mr-contradiction). From the user's
-            # perspective this looked like a stream of false/ghost signals.
-            #
-            # Fix: defer notification to `step_risk_calc`, and emit ONLY when
-            # `_build_ml_candidate` returns a non-None candidate — i.e. the
-            # pipeline confluence gate has already accepted the trade. See
-            # `step_risk_calc` below.
+            # Defer notifications until the pipeline confirms the trade.
+            # This avoids analysis messages for signals that never execute.
             signals[asset] = sig
 
         ctx.ml_signals = signals
@@ -1530,11 +1563,24 @@ class EngineRuntimeMixin:
                 "detail": str(detail or ""),
             }
 
-        _record(
-            "MT5 disconnect",
-            bool(self.dry_run or self._mt5_ready),
-            "ready" if (self.dry_run or self._mt5_ready) else "mt5_not_ready",
+        # During the first ~30 seconds of boot MT5 init may still be
+        # running. Treat this as a warmup grace window rather than a
+        # false-positive disconnect alarm.
+        uptime_for_mt5 = max(0.0, now - float(self._boot_ts or now))
+        mt5_warmup_active = uptime_for_mt5 < 30.0
+        mt5_ready_or_warmup = bool(
+            self.dry_run or self._mt5_ready or mt5_warmup_active
         )
+        mt5_detail = (
+            "ready"
+            if (self.dry_run or self._mt5_ready)
+            else (
+                f"warmup:{uptime_for_mt5:.1f}/30.0s"
+                if mt5_warmup_active
+                else "mt5_not_ready"
+            )
+        )
+        _record("MT5 disconnect", mt5_ready_or_warmup, mt5_detail)
         _record(
             "internet delay",
             _p95(self._exec_latency_ms_hist)

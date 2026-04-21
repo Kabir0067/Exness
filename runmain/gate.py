@@ -1,9 +1,8 @@
 """
-runmain/gate.py — System readiness and model gating logic.
+Model gate and system readiness helpers.
 
-This module controls the live-trading go/no-go mechanism by verifying model
-staleness, backtest performance, and payload health. It coordinates partial
-asset gating and automated retraining workflows.
+Evaluates artifact health, gate status, and automated retraining flows
+for the live trading runtime.
 """
 
 from __future__ import annotations
@@ -615,6 +614,21 @@ def auto_train_models_strict() -> bool:  # noqa: C901
     passed_assets: list[str] = []
     failed_assets: list[str] = []
     for asset in assets:
+        try:
+            det = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
+            ast = (det.get("assets", {}) or {}).get(asset, {})
+            if isinstance(ast, dict) and bool(ast.get("ok", False)):
+                failures.pop(asset, None)
+                _log.info(
+                    "Auto-train(strict) SKIP | asset=%s reason=gate_already_ok sharpe=%.3f",
+                    asset,
+                    float(ast.get("sharpe", 0.0) or 0.0),
+                )
+                passed_assets.append(asset)
+                continue
+        except Exception:
+            pass
+
         if failure_cooldown_hours > 0:
             rec = failures.get(asset, {})
             ts = float(rec.get("ts", 0.0) or 0.0) if isinstance(rec, dict) else 0.0
@@ -665,20 +679,6 @@ def auto_train_models_strict() -> bool:  # noqa: C901
                         )
             except Exception:
                 pass
-
-        try:
-            det = gate_details(required_assets=(asset,), allow_legacy_fallback=True)
-            ast = (det.get("assets", {}) or {}).get(asset, {})
-            if isinstance(ast, dict) and bool(ast.get("ok", False)):
-                _log.info(
-                    "Auto-train(strict) SKIP | asset=%s reason=gate_already_ok sharpe=%.3f",
-                    asset,
-                    float(ast.get("sharpe", 0.0) or 0.0),
-                )
-                passed_assets.append(asset)
-                continue
-        except Exception:
-            pass
 
         force_retrain = False
         force_retrain_reason = ""

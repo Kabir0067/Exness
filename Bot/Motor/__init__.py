@@ -1,7 +1,8 @@
 """
-Bot/Motor/__init__.py - Module initialization for portfolio multi-asset engine.
+Public package exports for the multi-asset trading motor.
 
-Ин модул интерфейсҳои асосии моторро берун меорад.
+Re-exports the engine, runtime types, and helper modules used across
+the portfolio controller stack.
 """
 
 from __future__ import annotations

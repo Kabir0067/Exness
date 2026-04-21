@@ -23,6 +23,12 @@ except ImportError:
     mt5 = None
 
 try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:
+    Fernet = None  # type: ignore[assignment]
+    InvalidToken = Exception  # type: ignore[assignment]
+
+try:
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -44,6 +50,11 @@ WFA_MIN_PASS_RATE: float = 0.60
 
 _BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
 _BOOL_FALSE = frozenset({"0", "false", "no", "n", "off"})
+_SECRET_KEY_ENV_NAMES: Tuple[str, ...] = (
+    "CONFIG_SECRET_KEY",
+    "CREDENTIALS_MASTER_KEY",
+    "EXNESS_SECRET_KEY",
+)
 
 _REQUIRED_ENV_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("EXNESS_LOGIN",),
@@ -59,12 +70,17 @@ _ENV_TEMPLATE = """# ==========================================
 EXNESS_LOGIN=
 EXNESS_PASSWORD=
 EXNESS_SERVER=MT5Real
+# Optional encrypted secret support:
+# CONFIG_SECRET_KEY=
+# EXNESS_PASSWORD_ENC=
 
 # ==========================================
 # TELEGRAM NOTIFICATIONS
 # ==========================================
 TG_TOKEN=
 TG_ADMIN_ID=
+# Optional encrypted secret support:
+# TG_TOKEN_ENC=
 """
 
 _ENV_HINT_SHOWN = False
@@ -98,9 +114,15 @@ def _env_path() -> Path:
 
 def _env_first(*names: str) -> str:
     for name in names:
-        v = os.environ.get(name, "").strip()
-        if v:
-            return v
+        for candidate in (
+            name,
+            f"{name}_FILE",
+            f"{name}_ENC",
+            f"{name}_ENC_FILE",
+        ):
+            value = os.environ.get(candidate, "").strip()
+            if value:
+                return value
     return ""
 
 
@@ -153,7 +175,13 @@ def _ensure_env_template(path: Path) -> bool:
     existing = _existing_env_keys(path)
     missing_keys: List[str] = []
     for aliases in _REQUIRED_ENV_GROUPS:
-        if any(a in existing for a in aliases):
+        if any(
+            a in existing
+            or f"{a}_FILE" in existing
+            or f"{a}_ENC" in existing
+            or f"{a}_ENC_FILE" in existing
+            for a in aliases
+        ):
             continue
         missing_keys.append(aliases[0])
 
@@ -218,11 +246,94 @@ def _fail_missing_env(name: str) -> None:
     raise OSError(f"Missing required env var: {name}")
 
 
+def _read_secret_file(path_raw: str) -> str:
+    path_s = str(path_raw or "").strip()
+    if not path_s:
+        return ""
+    path = Path(path_s)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        raise OSError(f"Failed to read secret file: {path}") from exc
+
+
+def _secret_key_value() -> str:
+    for name in _SECRET_KEY_ENV_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+
+    key_file = os.environ.get("CONFIG_SECRET_KEY_FILE", "").strip()
+    if key_file:
+        return _read_secret_file(key_file)
+
+    return ""
+
+
+def _decrypt_secret_value(token: str, source_name: str) -> str:
+    token_s = str(token or "").strip()
+    if not token_s:
+        return ""
+
+    secret_key = _secret_key_value()
+    if not secret_key:
+        raise OSError(
+            f"Encrypted credential set for {source_name}, but CONFIG_SECRET_KEY is missing"
+        )
+
+    if Fernet is None:
+        raise OSError(
+            "Encrypted credentials require the 'cryptography' package to be installed"
+        )
+
+    try:
+        return (
+            Fernet(secret_key.encode("utf-8"))
+            .decrypt(token_s.encode("utf-8"))
+            .decode("utf-8")
+            .strip()
+        )
+    except InvalidToken as exc:
+        raise OSError(
+            f"Encrypted credential for {source_name} could not be decrypted"
+        ) from exc
+
+
+def _env_secret_value(name: str, alias: Optional[str] = None) -> str:
+    candidates = [str(name or "").strip()]
+    if alias:
+        candidates.append(str(alias).strip())
+
+    for candidate in candidates:
+        value = os.environ.get(candidate, "").strip()
+        if value:
+            return value
+
+    for candidate in candidates:
+        file_path = os.environ.get(f"{candidate}_FILE", "").strip()
+        if file_path:
+            value = _read_secret_file(file_path)
+            if value:
+                return value
+
+    for candidate in candidates:
+        token = os.environ.get(f"{candidate}_ENC", "").strip()
+        if token:
+            return _decrypt_secret_value(token, f"{candidate}_ENC")
+
+    for candidate in candidates:
+        token_file = os.environ.get(f"{candidate}_ENC_FILE", "").strip()
+        if token_file:
+            token = _read_secret_file(token_file)
+            if token:
+                return _decrypt_secret_value(token, f"{candidate}_ENC_FILE")
+
+    return ""
+
+
 def _env_required(name: str, alias: Optional[str] = None) -> str:
     """Require an env var to be set for live startup."""
-    v = os.environ.get(name, "").strip()
-    if not v and alias:
-        v = os.environ.get(alias, "").strip()
+    v = _env_secret_value(name, alias=alias)
 
     if not v:
         if _allow_missing_tg() and name in (

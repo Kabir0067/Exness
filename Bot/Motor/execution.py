@@ -1,9 +1,8 @@
 """
-Bot/Motor/execution.py - Engine execution worker, order queue and MT5 integration.
+Execution workers and MT5 order-dispatch helpers.
 
-Ин модул мантиқи иҷрои фармоишҳоро дарбар мегирад (ExecutionWorker),
-ки дар риштаҳои алоҳида (threads) бо истифода аз навбатҳо (Queues)
-фармоишҳоро ба MT5 мефиристанд.
+Processes execution intents, integrates with MT5, and records
+order outcomes for the engine runtime.
 """
 
 from __future__ import annotations
@@ -102,6 +101,91 @@ class ExecutionWorker(threading.Thread):
                 symbol_cache_ttl=30.0,
             )
         return self._executor
+
+    def _resolve_position_ticket(
+        self,
+        intent: OrderIntent,
+        result: ExecOrderResult,
+        sent_ts: float,
+    ) -> int:
+        """Resolve a broker position ticket when the immediate response omits it."""
+        try:
+            position_ticket = int(getattr(result, "position_ticket", 0) or 0)
+        except Exception:
+            position_ticket = 0
+        if position_ticket > 0:
+            return position_ticket
+
+        try:
+            deal_ticket = int(getattr(result, "deal_ticket", 0) or 0)
+        except Exception:
+            deal_ticket = 0
+
+        symbol = str(getattr(intent, "symbol", "") or "")
+        if not symbol:
+            return 0
+
+        try:
+            magic = int(getattr(intent.cfg, "magic", 777001) or 777001)
+        except Exception:
+            magic = 777001
+
+        want_type = (
+            mt5.POSITION_TYPE_BUY
+            if str(getattr(intent, "signal", "") or "").lower().startswith("b")
+            else mt5.POSITION_TYPE_SELL
+        )
+
+        for attempt in range(4):
+            if attempt > 0:
+                time.sleep(min(0.25 * float(attempt), 0.75))
+
+            if deal_ticket > 0:
+                try:
+                    start_dt = datetime.fromtimestamp(max(0.0, float(sent_ts) - 10.0))
+                    end_dt = datetime.fromtimestamp(time.time() + 2.0)
+                    with MT5_LOCK:
+                        deals = mt5.history_deals_get(start_dt, end_dt) or []
+                    for deal in deals:
+                        try:
+                            if int(getattr(deal, "ticket", 0) or 0) != deal_ticket:
+                                continue
+                            position_id = int(getattr(deal, "position_id", 0) or 0)
+                            if position_id > 0:
+                                return position_id
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            try:
+                with MT5_LOCK:
+                    positions = mt5.positions_get(symbol=symbol) or []
+            except Exception:
+                positions = []
+
+            best_ticket = 0
+            best_time = 0.0
+            for position in positions:
+                try:
+                    if int(getattr(position, "magic", 0) or 0) != int(magic):
+                        continue
+                    if int(getattr(position, "type", -1) or -1) != int(want_type):
+                        continue
+                    pos_time = float(getattr(position, "time", 0.0) or 0.0)
+                    if pos_time + 5.0 < float(sent_ts):
+                        continue
+                    ticket = int(getattr(position, "ticket", 0) or 0)
+                    if ticket > 0 and pos_time >= best_time:
+                        best_time = pos_time
+                        best_ticket = ticket
+                except Exception:
+                    continue
+
+            if best_ticket > 0:
+                return int(best_ticket)
+
+        return 0
 
     def _process(self, intent: OrderIntent) -> ExecutionResult:
         sent = time.time()
@@ -236,26 +320,32 @@ class ExecutionWorker(threading.Thread):
             _order_comment = _comment_base
             try:
                 from core.idempotency import (
+                    STATUS_PENDING,
                     get_default_journal,
                     idem_key_to_comment,
                 )
 
                 _idem_journal = get_default_journal()
-                _ok_to_send, _idem_reason = _idem_journal.should_send(_idem_key)
-                if not _ok_to_send:
-                    return ExecutionResult(
-                        order_id=str(intent.order_id),
-                        signal_id=str(intent.signal_id),
-                        ok=False,
-                        reason=f"idempotency_refuse:{_idem_reason}",
-                        sent_ts=sent,
-                        fill_ts=sent,
-                        req_price=float(intent.price),
-                        exec_price=float(intent.price),
-                        volume=0.0,
-                        slippage=0.0,
-                        retcode=-3,
-                    )
+                _existing = _idem_journal.get(_idem_key)
+                _queue_owned_pending = bool(
+                    _existing is not None and _existing.status == STATUS_PENDING
+                )
+                if not _queue_owned_pending:
+                    _ok_to_send, _idem_reason = _idem_journal.should_send(_idem_key)
+                    if not _ok_to_send:
+                        return ExecutionResult(
+                            order_id=str(intent.order_id),
+                            signal_id=str(intent.signal_id),
+                            ok=False,
+                            reason=f"idempotency_refuse:{_idem_reason}",
+                            sent_ts=sent,
+                            fill_ts=sent,
+                            req_price=float(intent.price),
+                            exec_price=float(intent.price),
+                            volume=0.0,
+                            slippage=0.0,
+                            retcode=-3,
+                        )
                 _order_comment = idem_key_to_comment(_idem_key, base=_comment_base)
             except Exception as _idem_exc:
                 log_err.error(
@@ -287,26 +377,27 @@ class ExecutionWorker(threading.Thread):
                 try:
                     _retcode = int(getattr(r, "retcode", 0) or 0)
                     _ok = bool(getattr(r, "ok", False))
+                    _pos_tk = self._resolve_position_ticket(intent, r, sent) if _ok else 0
+                    _deal_tk = int(getattr(r, "deal_ticket", 0) or 0)
                     if _ok:
                         _idem_journal.record_sent(
                             _idem_key,
                             retcode=_retcode,
                             order_ticket=int(getattr(r, "order_ticket", 0) or 0),
-                            deal_ticket=int(getattr(r, "deal_ticket", 0) or 0),
-                            position_ticket=int(
-                                getattr(r, "position_ticket", 0) or 0
-                            ),
+                            deal_ticket=int(_deal_tk),
+                            position_ticket=int(_pos_tk),
                             reason="ok",
                         )
-                        pos_tk = int(getattr(r, "position_ticket", 0) or 0)
-                        if pos_tk > 0:
+                        if _pos_tk > 0 or _deal_tk > 0:
                             _idem_journal.record_confirmed(
                                 _idem_key,
-                                position_ticket=pos_tk,
-                                deal_ticket=int(
-                                    getattr(r, "deal_ticket", 0) or 0
+                                position_ticket=int(_pos_tk),
+                                deal_ticket=int(_deal_tk),
+                                reason=(
+                                    "position_ticket_resolved"
+                                    if _pos_tk > 0
+                                    else "deal_ticket_confirmed"
                                 ),
-                                reason="position_ticket_resolved",
                             )
                     else:
                         _idem_journal.record_failed(
@@ -325,6 +416,7 @@ class ExecutionWorker(threading.Thread):
             ok = bool(getattr(r, "ok", False))
             reason = str(getattr(r, "reason", "") or "")
             retcode = int(getattr(r, "retcode", 0) or 0)
+            position_ticket = self._resolve_position_ticket(intent, r, sent) if ok else 0
 
             return ExecutionResult(
                 order_id=str(intent.order_id),
@@ -342,7 +434,7 @@ class ExecutionWorker(threading.Thread):
                 retcode=retcode,
                 order_ticket=int(getattr(r, "order_ticket", 0) or 0),
                 deal_ticket=int(getattr(r, "deal_ticket", 0) or 0),
-                position_ticket=int(getattr(r, "position_ticket", 0) or 0),
+                position_ticket=int(position_ticket),
             )
         except Exception as exc:
             log_err.error(

@@ -1554,6 +1554,24 @@ class RiskManager:
                 os.getenv("NEWS_BLACKOUT_FAIL_OPEN_ON_EXC", "0") or "0"
             ).strip() not in ("1", "true", "True"):
                 return False, 0.0, f"news_blackout_exc:{_nb_exc}"
+
+        # ─── SESSION GAP + POST-GAP COOLDOWN ─────────────────────────
+        # Weekend / session transition protection for XAU. Prevents
+        # orders during market-closed windows and during the first
+        # N minutes after re-open (toxic spreads, extreme volatility).
+        try:
+            from core.session_manager import can_trade as _sess_can_trade
+
+            asset_hint = "BTC" if bool(getattr(self.sp, "is_24_7", False)) else "XAU"
+            ok_sess, reason_sess = _sess_can_trade(asset_hint)
+            if not ok_sess:
+                return False, 0.0, f"session_gate:{reason_sess}"
+        except Exception as _sess_exc:
+            # Fail-closed: if session logic is broken, block rather than trade.
+            if str(
+                os.getenv("SESSION_GATE_FAIL_OPEN_ON_EXC", "0") or "0"
+            ).strip() not in ("1", "true", "True"):
+                return False, 0.0, f"session_gate_exc:{_sess_exc}"
         hard_cap = float(getattr(self.sp, "hard_lot_cap", 0.0) or 0.0)
         if hard_cap > 0.0:
             tol = max(1e-8, hard_cap * 1e-6)

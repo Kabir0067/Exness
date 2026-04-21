@@ -311,9 +311,14 @@ class InstitutionalTrainConfig:
     regressor_params: Dict[str, Any] = field(
         default_factory=lambda: {
             "iterations": 2000,
-            "learning_rate": 0.03,
-            "depth": 7,
-            "l2_leaf_reg": 3.0,
+            "learning_rate": 0.025,
+            "depth": 6,
+            "l2_leaf_reg": 8.0,
+            "min_data_in_leaf": 64,
+            "random_strength": 1.5,
+            "bootstrap_type": "Bernoulli",
+            "subsample": 0.85,
+            "rsm": 0.85,
             "random_seed": 42,
             "verbose": 0,
             "task_type": "CPU",
@@ -339,6 +344,23 @@ class InstitutionalTrainConfig:
     feature_importance_keep_ratio: float = 0.70
     feature_importance_min_ratio: float = 0.05
     feature_importance_min_features: int = 14
+    feature_correlation_threshold: float = 0.985
+    feature_family_caps: Dict[str, int] = field(
+        default_factory=lambda: {
+            "moving_average": 4,
+            "trend_oscillator": 3,
+            "momentum": 3,
+            "volatility_band": 3,
+            "volume_smoother": 2,
+        }
+    )
+
+    # Regime filter metadata for live and walk-forward safety.
+    regime_filter_vol_window: int = 20
+    regime_filter_vol_quantile_low: float = 0.05
+    regime_filter_vol_quantile_high: float = 0.95
+    regime_filter_min_regime_share: float = 0.10
+    regime_filter_outlier_tolerance: float = 1.15
 
     # Splits — train / val / test / holdout
     train_split: float = 0.60
@@ -1324,7 +1346,8 @@ class Pipeline:
             elif feat == "volume_acceleration":
                 df[feat] = volume.pct_change().diff()
 
-        df.dropna(inplace=True)
+        required_columns = list(dict.fromkeys(self.cfg.training_features))
+        df.dropna(subset=required_columns, inplace=True)
         return df
 
     # ------------------------------------------------------------------ #
@@ -1467,12 +1490,12 @@ class Pipeline:
         if n == 0:
             raise RuntimeError("train_windows_empty")
 
-        train_end = dates[int(n * self.cfg.train_split)]
-        val_end = dates[int(n * self.cfg.val_split)]
-        test_end = dates[int(n * self.cfg.test_split)]
+        train_end = int(n * self.cfg.train_split)
+        val_end = int(n * self.cfg.val_split)
+        test_end = int(n * self.cfg.test_split)
 
-        def _slice(key: str, start, end) -> pd.Series:
-            return Xy[key][start:end]
+        def _slice(key: str, start: Optional[int], end: Optional[int]) -> pd.Series:
+            return Xy[key].iloc[start:end]
 
         return {
             "train": {
@@ -2079,9 +2102,144 @@ def _aggregate_feature_importance(
     return ranked
 
 
+_CORRELATION_PRUNE_FAMILIES = frozenset(
+    {
+        "moving_average",
+        "trend_oscillator",
+        "momentum",
+        "volatility_band",
+        "volume_smoother",
+    }
+)
+
+
+def _feature_family(feature: str) -> Optional[str]:
+    """Classify an indicator into a coarse redundancy family."""
+    feat = str(feature or "").strip().lower()
+    if not feat:
+        return None
+    if feat.startswith("ma") or feat.startswith("ema"):
+        return "moving_average"
+    if feat.startswith("macd") or feat.startswith("ppo"):
+        return "trend_oscillator"
+    if feat.startswith("momentum_") or feat in {"mom", "roc"}:
+        return "momentum"
+    if feat.startswith("historical_vol_") or feat in {
+        "atr_14",
+        "bbands_width",
+        "keltner_width",
+    }:
+        return "volatility_band"
+    if feat.startswith("volume_sma_"):
+        return "volume_smoother"
+    return None
+
+
+def _pairwise_abs_corr(left: pd.Series, right: pd.Series) -> float:
+    """Return a finite absolute correlation for two feature series."""
+    try:
+        joined = pd.concat(
+            [
+                pd.to_numeric(left, errors="coerce"),
+                pd.to_numeric(right, errors="coerce"),
+            ],
+            axis=1,
+        ).dropna()
+        if len(joined) < 32:
+            return 0.0
+        corr = joined.iloc[:, 0].corr(joined.iloc[:, 1])
+        if not np.isfinite(corr):
+            return 0.0
+        return abs(float(corr))
+    except Exception:
+        return 0.0
+
+
+def _prune_correlated_alpha_features(
+    cfg: InstitutionalTrainConfig,
+    selected_ranked: List[str],
+    source_df: Optional[pd.DataFrame],
+) -> List[str]:
+    """Drop highly collinear indicators while keeping the top-ranked member."""
+    if not selected_ranked or source_df is None or source_df.empty:
+        return list(selected_ranked)
+
+    corr_threshold = max(
+        0.90,
+        min(0.9995, float(getattr(cfg, "feature_correlation_threshold", 0.985))),
+    )
+    keep_min = max(
+        4,
+        min(len(selected_ranked), int(cfg.feature_importance_min_features)),
+    )
+    kept: List[str] = []
+
+    for idx, feature in enumerate(selected_ranked):
+        if feature not in source_df.columns:
+            kept.append(feature)
+            continue
+
+        family = _feature_family(feature)
+        drop_feature = False
+        if family in _CORRELATION_PRUNE_FAMILIES:
+            for previous in kept:
+                if _feature_family(previous) != family:
+                    continue
+                corr = _pairwise_abs_corr(source_df[feature], source_df[previous])
+                if corr >= corr_threshold:
+                    drop_feature = True
+                    break
+
+        remaining = len(selected_ranked) - idx - 1
+        if drop_feature and (len(kept) + remaining) < keep_min:
+            drop_feature = False
+
+        if not drop_feature:
+            kept.append(feature)
+
+    return kept if kept else list(selected_ranked)
+
+
+def _apply_feature_family_caps(
+    cfg: InstitutionalTrainConfig,
+    selected_ranked: List[str],
+) -> List[str]:
+    """Cap redundant ladders without dropping below the configured feature floor."""
+    if not selected_ranked:
+        return []
+
+    caps = dict(getattr(cfg, "feature_family_caps", {}) or {})
+    if not caps:
+        return list(selected_ranked)
+
+    keep_min = max(
+        4,
+        min(len(selected_ranked), int(cfg.feature_importance_min_features)),
+    )
+    kept: List[str] = []
+    counts: Dict[str, int] = {}
+
+    for idx, feature in enumerate(selected_ranked):
+        family = _feature_family(feature)
+        cap = int(caps.get(family, 0) or 0) if family is not None else 0
+        remaining = len(selected_ranked) - idx - 1
+
+        if cap > 0 and counts.get(family, 0) >= cap:
+            if (len(kept) + remaining) >= keep_min:
+                continue
+
+        kept.append(feature)
+        if family is not None:
+            counts[family] = counts.get(family, 0) + 1
+
+    return kept if kept else list(selected_ranked)
+
+
 def _select_alpha_features(
     cfg: InstitutionalTrainConfig,
     ranked_importance: List[tuple[str, float]],
+    *,
+    source_df: Optional[pd.DataFrame] = None,
 ) -> List[str]:
     """
     Keep a deterministic, high-signal subset while preserving original order.
@@ -2102,7 +2260,15 @@ def _select_alpha_features(
         selected = [f for f, _ in ranked_importance[:keep_n]]
 
     selected_set = set(selected)
-    ordered = [f for f in cfg.training_features if f in selected_set]
+    selected_ranked = [f for f, _ in ranked_importance if f in selected_set]
+    selected_ranked = _prune_correlated_alpha_features(
+        cfg,
+        selected_ranked,
+        source_df,
+    )
+    selected_ranked = _apply_feature_family_caps(cfg, selected_ranked)
+    ordered_set = set(selected_ranked)
+    ordered = [f for f in cfg.training_features if f in ordered_set]
     return ordered if ordered else list(cfg.training_features)
 
 
@@ -2481,6 +2647,122 @@ def _regime_dependency_profile(pred: np.ndarray, y: np.ndarray) -> Dict[str, Any
     }
 
 
+def _label_training_regimes(
+    source_df: pd.DataFrame,
+    *,
+    vol_window: int,
+) -> pd.Series:
+    """Build coarse regime labels from realized volatility and short trend."""
+    if source_df is None or source_df.empty or "Close" not in source_df.columns:
+        return pd.Series(dtype="object")
+
+    close = pd.to_numeric(source_df["Close"], errors="coerce")
+    ret = close.pct_change()
+    vol = ret.rolling(vol_window, min_periods=max(5, vol_window // 2)).std()
+    trend_lb = max(5, vol_window // 2)
+    trend = close.pct_change(trend_lb)
+
+    if np.isfinite(vol).any():
+        vol_q = float(np.nanquantile(vol, 0.85))
+    else:
+        vol_q = 0.0
+    if np.isfinite(trend).any():
+        trend_q = float(np.nanquantile(np.abs(trend), 0.60))
+    else:
+        trend_q = 0.0
+    trend_q = max(trend_q, 1e-6)
+
+    labels = np.full(len(source_df), "RANGE", dtype=object)
+    high_vol_mask = (
+        np.isfinite(vol) & (vol >= vol_q)
+        if vol_q > 0.0
+        else np.zeros(len(source_df), dtype=bool)
+    )
+    labels[np.isfinite(trend) & (trend >= trend_q)] = "TREND_UP"
+    labels[np.isfinite(trend) & (trend <= -trend_q)] = "TREND_DOWN"
+    labels[high_vol_mask] = "HIGH_VOL"
+    return pd.Series(labels, index=source_df.index, dtype="object")
+
+
+def _build_regime_filter_payload(
+    cfg: InstitutionalTrainConfig,
+    source_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Persist the training-time volatility envelope used for live guarding."""
+    vol_window = max(10, int(getattr(cfg, "regime_filter_vol_window", 20) or 20))
+    low_q = max(
+        0.0,
+        min(
+            0.49,
+            float(getattr(cfg, "regime_filter_vol_quantile_low", 0.05) or 0.05),
+        ),
+    )
+    high_q = min(
+        0.995,
+        max(
+            low_q + 0.05,
+            float(getattr(cfg, "regime_filter_vol_quantile_high", 0.95) or 0.95),
+        ),
+    )
+    outlier_tolerance = max(
+        1.0,
+        float(getattr(cfg, "regime_filter_outlier_tolerance", 1.15) or 1.15),
+    )
+
+    if source_df is None or source_df.empty or "Close" not in source_df.columns:
+        return {"enabled": False, "vol_window": vol_window}
+
+    close = pd.to_numeric(source_df["Close"], errors="coerce")
+    ret = close.pct_change()
+    realized_vol = ret.rolling(
+        vol_window,
+        min_periods=max(5, vol_window // 2),
+    ).std()
+    realized_vol = realized_vol.replace([np.inf, -np.inf], np.nan).dropna()
+    if realized_vol.empty:
+        return {"enabled": False, "vol_window": vol_window}
+
+    vol_low = float(np.quantile(realized_vol, low_q))
+    vol_high = float(np.quantile(realized_vol, high_q))
+    regime_labels = _label_training_regimes(source_df, vol_window=vol_window)
+    regime_share: Dict[str, float] = {}
+    allowed_regimes: List[str] = []
+
+    if not regime_labels.empty:
+        regime_counts = regime_labels.value_counts(normalize=True)
+        regime_share = {
+            str(name): float(value) for name, value in regime_counts.items()
+        }
+        min_share = max(
+            0.0,
+            min(
+                0.50,
+                float(getattr(cfg, "regime_filter_min_regime_share", 0.10) or 0.10),
+            ),
+        )
+        allowed_regimes = [
+            str(name)
+            for name, value in regime_counts.items()
+            if float(value) >= min_share
+        ]
+
+    if not allowed_regimes:
+        allowed_regimes = ["RANGE", "TREND_UP", "TREND_DOWN"]
+
+    is_xau = "XAU" in str(getattr(cfg, "symbol", "")).upper()
+    return {
+        "enabled": True,
+        "vol_window": vol_window,
+        "vol_low": vol_low,
+        "vol_high": vol_high,
+        "vol_high_soft_cap": max(vol_high, vol_high * outlier_tolerance),
+        "allowed_regimes": allowed_regimes,
+        "regime_share": regime_share,
+        "min_confidence_outside_band": 1.35 if is_xau else 1.25,
+        "min_confidence_unknown_regime": 1.50 if is_xau else 1.35,
+    }
+
+
 def _build_training_audit_report(
     *,
     cfg: InstitutionalTrainConfig,
@@ -2699,6 +2981,11 @@ def train(
         )
     model.train(splits)
 
+    raw_cfg = replace(cfg_effective, normalize_data=False)
+    raw_pipe = Pipeline(raw_cfg)
+    raw_df = raw_pipe.add_indicators(df.copy())
+    raw_df = raw_pipe.add_target_no_lookahead(raw_df)
+
     # Feature-importance filtering pass (keeps strategy math unchanged, removes noise).
     flat_imp = _extract_flat_feature_importance(model.model)
     ranked_imp = _aggregate_feature_importance(
@@ -2706,7 +2993,11 @@ def train(
         list(cfg_effective.training_features),
         window_size=int(cfg_effective.window_size),
     )
-    selected_features = _select_alpha_features(cfg_effective, ranked_imp)
+    selected_features = _select_alpha_features(
+        cfg_effective,
+        ranked_imp,
+        source_df=raw_df,
+    )
     feature_importance = {k: float(v) for k, v in ranked_imp}
     if (
         selected_features
@@ -2863,6 +3154,7 @@ def train(
         anti_overfit=anti_overfit,
         source_df=raw_df,
     )
+    regime_filter = _build_regime_filter_payload(cfg_effective, raw_df)
     _console(
         "   Training Audit: "
         f"{'PASS' if training_audit.get('passed', False) else 'FAIL'} | "
@@ -2937,6 +3229,7 @@ def train(
         "anti_overfit": anti_overfit,
         "anti_overfit_passed": anti_overfit_ok,
         "training_audit": training_audit,
+        "regime_filter": regime_filter,
         "institutional_grade": institutional_ok,
     }
 
@@ -3008,6 +3301,7 @@ def train(
         "training_audit": training_audit,
         "training_features": list(cfg_effective.training_features),
         "feature_importance": feature_importance,
+        "regime_filter": regime_filter,
         "institutional_grade": institutional_ok,
     }
 

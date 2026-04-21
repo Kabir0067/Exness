@@ -1,49 +1,36 @@
 {
     "version": "1.0_btc_institutional",
-    "timestamp": "2026-04-07T08:15:18.289377",
+    "timestamp": "2026-04-20T09:00:03.883961",
     "sharpe": 0.0,
     "win_rate": 0.0,
     "author": "quantum_trainer",
     "status": "VERIFIED",
-    "backtest_sharpe": 7.569744516801612,
-    "backtest_win_rate": 0.6918604651162791,
-    "max_drawdown_pct": 0.0021504715733058817,
+    "backtest_sharpe": 13.115094573674035,
+    "backtest_win_rate": 0.8055555555555556,
+    "max_drawdown_pct": 0.00289595597990872,
     "real_backtest": true,
     "training_features": [
-        "ofi_proxy",
-        "volume_delta",
+        "tick_momentum_8",
         "mtf_h1_slope",
         "mtf_h4_slope",
         "mtf_h1_flow_proxy",
         "mtf_h4_flow_proxy",
-        "ob_pretouch_bias",
-        "ma4",
-        "ma9",
-        "ma13",
-        "ma21",
-        "ma50",
-        "ma100",
+        "ob_touch_proximity",
+        "xau_dxy_corr_rolling",
         "ema5",
-        "ema12",
-        "ema26",
-        "ema50",
-        "ema100",
         "macd",
         "macd_signal",
-        "macd_hist",
         "rsi13",
         "rsi21",
         "ppo13_5",
         "ppo27_7",
         "ppo48_12",
+        "momentum_10",
         "momentum_20",
-        "mom",
         "roc",
         "cci",
         "stoch_k",
         "stoch_d",
-        "atr_14",
-        "bbands_width",
         "keltner_width",
         "historical_vol_20",
         "historical_vol_50",
@@ -55,42 +42,116 @@
     "source": "Backtest.model_train_institutional",
     "anti_overfit_passed": true,
     "tscv_folds": 3,
-    "tscv_mean_active_direction_accuracy": 0.5724604642976664,
+    "tscv_mean_active_direction_accuracy": 0.6579869460666438,
     "wfa_passed": true,
     "wfa_total_windows": 5,
-    "wfa_failed_windows": 0,
+    "wfa_failed_windows": 2,
+    "training_audit": {
+        "passed": true,
+        "feature_leakage": {
+            "detected": false,
+            "suspicious_features": []
+        },
+        "target_leakage": {
+            "detected": false,
+            "chronology_ok": true,
+            "feature_target_corr_max": 0.3700518595174529
+        },
+        "class_imbalance": {
+            "positive": 989,
+            "negative": 1002,
+            "flat": 0,
+            "dominant_ratio": 0.5032646911099949,
+            "imbalanced": false
+        },
+        "overfitting": {
+            "detected": false,
+            "train_direction_accuracy": 0.6775219757220594,
+            "holdout_direction_accuracy": 0.5896534404821697,
+            "gap": 0.08786853523988969
+        },
+        "regime_dependency": {
+            "low_vol_accuracy": 0.5481927710843374,
+            "high_vol_accuracy": 0.6285140562248996,
+            "dependency_delta": 0.08032128514056225,
+            "dependent": false
+        },
+        "asset_specific_quality": {
+            "passed": true,
+            "target_active_accuracy": 0.56,
+            "holdout_active_accuracy": 0.6877510040160643,
+            "holdout_active_coverage": 0.5002511300853842
+        },
+        "calibration_quality": {
+            "passed": true,
+            "val_active_accuracy": 0.6945746818486269,
+            "holdout_active_accuracy": 0.6877510040160643,
+            "gap": 0.006823677832562658
+        },
+        "threshold_stability": {
+            "passed": true,
+            "validation_threshold": 0.0003756692049981832,
+            "holdout_threshold": 0.0003209508465993871,
+            "ratio": 0.8543443069839575
+        },
+        "retraining_cadence": {
+            "recommended_hours": 168.0,
+            "stale_age_hours": 1.2510788780555557
+        },
+        "stale_model_detection": {
+            "detected": false,
+            "stale_age_hours": 1.2510788780555557,
+            "limit_hours": 168.0
+        },
+        "out_of_sample_degradation": {
+            "detected": false,
+            "gap": 0.08786853523988969
+        }
+    },
     "asset": "BTC",
     "risk_of_ruin": 0.0,
     "monte_carlo_runs": 10000,
-    "mc_confidence_95": 102803.21877685237,
-    "mc_worst_case": 101450.17371271094,
-    "wfa_pass_rate": 1.0,
+    "mc_confidence_95": 107607.84082261531,
+    "mc_worst_case": 107097.08390341542,
+    "wfa_pass_rate": 0.6,
     "wfa_required_windows": 3,
     "wfa_skipped": false,
     "stress_test_passed": true,
     "stress_scenarios": [
         {
             "name": "flash_crash",
-            "impact": -4131.858923134499,
-            "drawdown": 0.04131858923134499,
-            "peak_notional": 20659.294615672494,
+            "impact": -4332.1500783344,
+            "drawdown": 0.043321500783344,
+            "peak_notional": 21660.750391671998,
             "passed": true
         },
         {
             "name": "volatility_spike",
-            "impact": -51.268736692463094,
-            "cost_pct": 0.0005126873669246309,
+            "impact": -82.95733841856219,
+            "cost_pct": 0.0008295733841856219,
             "affected_trades": 5,
             "passed": true
         }
     ],
-    "institutional_grade": true,
+    "backtest_audit": {
+        "commission_included": true,
+        "spread_included": true,
+        "slippage_included": true,
+        "session_restrictions_enabled": true,
+        "stop_distance_rules_enabled": true,
+        "chronological_data": true,
+        "next_bar_execution_only": true,
+        "walk_forward_enabled": true,
+        "train_test_separation": true,
+        "passed": true
+    },
+    "institutional_grade": false,
     "unsafe": false,
     "sample_quality_passed": true,
     "sample_quality_issues": [],
-    "total_trades": 172,
-    "winning_trades": 119,
-    "losing_trades": 53,
-    "backtested_at_utc": "2026-04-07T08:19:43.168174+00:00",
+    "total_trades": 180,
+    "winning_trades": 145,
+    "losing_trades": 35,
+    "backtested_at_utc": "2026-04-20T09:05:10.834673+00:00",
     "suspicious_sharpe": true
 }

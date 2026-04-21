@@ -1,104 +1,104 @@
 ================================================================================
   🏛️  INSTITUTIONAL BACKTEST REPORT — BTC (M1)
-  Period: 2026-02-24 17:57:00+00:00 → 2026-04-07 08:03:00+00:00
+  Period: 2026-03-09 17:41:00+00:00 → 2026-04-20 08:47:00+00:00
 ================================================================================
 
   ══════════════════════════════════════════════════════════════════════════
   RETURNS & PERFORMANCE
   ──────────────────────────────────────────────────────────────────────────
     Initial Capital:        $100,000.00
-    Final Capital:          $104,186.43
-    Total Return:           +4.19%
-    Annualized Return:      +27.76%
-    CAGR:                   +43.36%
+    Final Capital:          $108,446.76
+    Total Return:           +8.45%
+    Annualized Return:      +53.91%
+    CAGR:                   +103.70%
 
   ══════════════════════════════════════════════════════════════════════════
   RISK-ADJUSTED METRICS (Institutional Standard)
   ──────────────────────────────────────────────────────────────────────────
-    Sharpe Ratio:           7.570  ✅ (Target: >= 2.0)
-    Sortino Ratio:          47.685
-    Calmar Ratio:           129.100
-    Omega Ratio:            12.224
-    Information Ratio:      -4.253
+    Sharpe Ratio:           13.115  ✅ (Target: >= 2.0)
+    Sortino Ratio:          42.229
+    Calmar Ratio:           186.171
+    Omega Ratio:            30.568
+    Information Ratio:      -12.110
 
   ══════════════════════════════════════════════════════════════════════════
   RISK MEASURES
   ──────────────────────────────────────────────────────────────────────────
-    Max Drawdown:           0.22%  ✅ (Max: 20%)
-    Average Drawdown:       0.06%
-    DD Duration (bars):     24
-    Recovery Factor:        19.47
-    Annualized Vol:         3.67%
-    Downside Deviation:     0.04%
-    Value at Risk (95%):    $-55.53
-    CVaR/ES (95%):          $-71.52
+    Max Drawdown:           0.29%  ✅ (Max: 20%)
+    Average Drawdown:       0.07%
+    DD Duration (bars):     8
+    Recovery Factor:        29.17
+    Annualized Vol:         4.11%
+    Downside Deviation:     0.08%
+    Value at Risk (95%):    $-85.71
+    CVaR/ES (95%):          $-125.33
 
   ══════════════════════════════════════════════════════════════════════════
   ROBUSTNESS & STRESS TESTS
   ──────────────────────────────────────────────────────────────────────────
     Risk of Ruin:           0.00%  ✅ (Max: 1.0%)
     MC Runs:                10,000
-    MC 95% Confidence:      $102,803.22
-    MC Worst Case:          $101,450.17
-    MC Best Case:           $106,836.03
+    MC 95% Confidence:      $107,607.84
+    MC Worst Case:          $107,097.08
+    MC Best Case:           $108,309.45
 
-    Walk-Forward:           ✅ PASS (0/5 windows failed)
-    WFA Avg Sharpe:         8.19
-    WFA Min Sharpe:         4.76
+    Walk-Forward:           ✅ PASS (2/5 windows failed)
+    WFA Avg Sharpe:         1.31
+    WFA Min Sharpe:         -35.38
 
     Stress Test:            ✅ PASS
     Scenarios:
-      ✅ flash_crash: Impact=-4131.86
-      ✅ volatility_spike: Impact=-51.27
+      ✅ flash_crash: Impact=-4332.15
+      ✅ volatility_spike: Impact=-82.96
 
   ══════════════════════════════════════════════════════════════════════════
   TRADE STATISTICS
   ──────────────────────────────────────────────────────────────────────────
-    Total Trades:           172
-    Win Rate:               69.2%  ✅ (Target: >= 58%)
-    Profit Factor:          3.58
-    Expectancy:             $24.34
-    Expectancy Ratio:       0.79
+    Total Trades:           180
+    Win Rate:               80.6%  ✅ (Target: >= 58%)
+    Profit Factor:          4.86
+    Expectancy:             $46.93
+    Expectancy Ratio:       0.75
 
-    Avg Win:                $48.84
-    Avg Loss:               $-30.67
-    Win/Loss Ratio:         1.59
-    Largest Win:            $174.29
-    Largest Loss:           $-94.85
+    Avg Win:                $73.35
+    Avg Loss:               $-62.55
+    Win/Loss Ratio:         1.17
+    Largest Win:            $204.55
+    Largest Loss:           $-152.77
 
-    Max Consecutive Wins:   4
-    Max Consecutive Losses: 25
-    Avg Consecutive Wins:   1.4
-    Avg Consecutive Losses: 3.2
+    Max Consecutive Wins:   3
+    Max Consecutive Losses: 32
+    Avg Consecutive Wins:   1.3
+    Avg Consecutive Losses: 5.2
 
-    Avg Duration (min):     40.9
-    Median Duration (min):  30.0
+    Avg Duration (min):     34.0
+    Median Duration (min):  24.0
 
   ══════════════════════════════════════════════════════════════════════════
   TIME-BASED ANALYSIS
   ──────────────────────────────────────────────────────────────────────────
     Total Calendar Days:    42
     Est. Trading Days:      42
-    Avg Trades / Day:       4.13
-    Best Day Return:        +1.2190%
-    Worst Day Return:       -0.1050%
+    Avg Trades / Day:       4.33
+    Best Day Return:        +1.2074%
+    Worst Day Return:       -0.1834%
 
   ══════════════════════════════════════════════════════════════════════════
   TRANSACTION COSTS (Reality Check)
   ──────────────────────────────────────────────────────────────────────────
-    Spread Cost:            $948.62  ($5.52/trade)
-    Slippage Cost:          $587.88  ($3.42/trade)
-    Commission:             $158.10
-    Swap/Funding:           $5.69
-    Total Fees:             $1700.29
-    Fee Impact:             1.70%
+    Spread Cost:            $1771.34  ($9.84/trade)
+    Slippage Cost:          $995.49  ($5.53/trade)
+    Commission:             $295.22
+    Swap/Funding:           $9.22
+    Total Fees:             $3071.27
+    Fee Impact:             3.07%
 
   ══════════════════════════════════════════════════════════════════════════
   POSITION MANAGEMENT
   ──────────────────────────────────────────────────────────────────────────
-    Avg Position Size:      9.0%
+    Avg Position Size:      15.8%
     Max Position Size:      20.0%
-    Kelly Optimal:          49.8%
+    Kelly Optimal:          64.0%
 
 ================================================================================
 

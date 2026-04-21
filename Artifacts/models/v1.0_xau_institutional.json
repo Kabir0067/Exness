@@ -1,31 +1,23 @@
 {
     "version": "1.0_xau_institutional",
-    "timestamp": "2026-04-07T07:58:24.995032",
+    "timestamp": "2026-04-20T14:16:05.496797",
     "sharpe": 0.0,
     "win_rate": 0.0,
     "author": "quantum_trainer",
     "status": "VERIFIED",
-    "backtest_sharpe": 8.927946581118642,
-    "backtest_win_rate": 0.7711864406779662,
-    "max_drawdown_pct": 0.0023165040210026654,
+    "backtest_sharpe": 9.005072219510424,
+    "backtest_win_rate": 0.7144535840188014,
+    "max_drawdown_pct": 0.001977547877427783,
     "real_backtest": true,
     "training_features": [
-        "tick_momentum_8",
         "mtf_h1_slope",
         "mtf_h4_slope",
         "mtf_h1_flow_proxy",
         "mtf_h4_flow_proxy",
         "ob_pretouch_bias",
+        "dxy_ret_1",
         "xau_dxy_corr_rolling",
-        "ma4",
-        "ma9",
-        "ma13",
-        "ma21",
-        "ma50",
-        "ema5",
         "ema12",
-        "ema26",
-        "ema50",
         "macd",
         "macd_signal",
         "macd_hist",
@@ -33,14 +25,11 @@
         "rsi21",
         "ppo13_5",
         "ppo27_7",
-        "momentum_10",
         "momentum_20",
-        "mom",
         "roc",
         "cci",
         "stoch_k",
         "stoch_d",
-        "atr_14",
         "bbands_width",
         "keltner_width",
         "historical_vol_20",
@@ -50,16 +39,78 @@
     ],
     "source": "Backtest.model_train_institutional",
     "anti_overfit_passed": true,
-    "tscv_folds": 3,
-    "tscv_mean_active_direction_accuracy": 0.5526401455311408,
+    "tscv_folds": 4,
+    "tscv_mean_active_direction_accuracy": 0.7674213430090959,
     "wfa_passed": true,
     "wfa_total_windows": 5,
     "wfa_failed_windows": 0,
+    "training_audit": {
+        "passed": true,
+        "feature_leakage": {
+            "detected": false,
+            "suspicious_features": []
+        },
+        "target_leakage": {
+            "detected": false,
+            "chronology_ok": true,
+            "feature_target_corr_max": 0.32767493415985194
+        },
+        "class_imbalance": {
+            "positive": 2472,
+            "negative": 2521,
+            "flat": 1,
+            "dominant_ratio": 0.5048057669203043,
+            "imbalanced": false
+        },
+        "overfitting": {
+            "detected": false,
+            "train_direction_accuracy": 0.6877399112119897,
+            "holdout_direction_accuracy": 0.644973968762515,
+            "gap": 0.042765942449474736
+        },
+        "regime_dependency": {
+            "low_vol_accuracy": 0.5604483586869495,
+            "high_vol_accuracy": 0.7469975980784628,
+            "dependency_delta": 0.18654923939151324,
+            "dependent": false
+        },
+        "asset_specific_quality": {
+            "passed": true,
+            "target_active_accuracy": 0.55,
+            "holdout_active_accuracy": 0.7216659991990388,
+            "holdout_active_coverage": 0.5
+        },
+        "calibration_quality": {
+            "passed": true,
+            "val_active_accuracy": 0.7174899866488652,
+            "holdout_active_accuracy": 0.7216659991990388,
+            "gap": 0.004176012550173636
+        },
+        "threshold_stability": {
+            "passed": true,
+            "validation_threshold": 0.0005878736842967961,
+            "holdout_threshold": 0.0005035135434632356,
+            "ratio": 0.8564995455878066
+        },
+        "retraining_cadence": {
+            "recommended_hours": 336.0,
+            "stale_age_hours": 5.318187440833333
+        },
+        "stale_model_detection": {
+            "detected": false,
+            "stale_age_hours": 5.318187440833333,
+            "limit_hours": 336.0
+        },
+        "out_of_sample_degradation": {
+            "detected": false,
+            "gap": 0.042765942449474736
+        }
+    },
     "asset": "XAU",
     "risk_of_ruin": 0.0,
     "monte_carlo_runs": 10000,
-    "mc_confidence_95": 127081.52286611134,
-    "mc_worst_case": 122518.3349420519,
+    "mc_confidence_95": 118316.61602135423,
+    "mc_worst_case": 117530.81203348374,
     "wfa_pass_rate": 1.0,
     "wfa_required_windows": 3,
     "wfa_skipped": false,
@@ -67,26 +118,38 @@
     "stress_scenarios": [
         {
             "name": "flash_crash",
-            "impact": -5292.128894289115,
-            "drawdown": 0.05292128894289115,
-            "peak_notional": 26460.644471445576,
+            "impact": -4793.280891558872,
+            "drawdown": 0.04793280891558872,
+            "peak_notional": 23966.40445779436,
             "passed": true
         },
         {
             "name": "volatility_spike",
-            "impact": -39.639331972565735,
-            "cost_pct": 0.00039639331972565734,
+            "impact": -29.391224009481014,
+            "cost_pct": 0.00029391224009481015,
             "affected_trades": 5,
             "passed": true
         }
     ],
-    "institutional_grade": true,
+    "backtest_audit": {
+        "commission_included": true,
+        "spread_included": true,
+        "slippage_included": true,
+        "session_restrictions_enabled": true,
+        "stop_distance_rules_enabled": true,
+        "chronological_data": true,
+        "next_bar_execution_only": true,
+        "walk_forward_enabled": true,
+        "train_test_separation": true,
+        "passed": true
+    },
+    "institutional_grade": false,
     "unsafe": false,
     "sample_quality_passed": true,
     "sample_quality_issues": [],
-    "total_trades": 826,
-    "winning_trades": 637,
-    "losing_trades": 189,
-    "backtested_at_utc": "2026-04-07T08:00:54.547632+00:00",
+    "total_trades": 851,
+    "winning_trades": 608,
+    "losing_trades": 243,
+    "backtested_at_utc": "2026-04-20T14:18:26.553248+00:00",
     "suspicious_sharpe": true
 }

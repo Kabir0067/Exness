@@ -1,13 +1,8 @@
 """
-Bot/bot.py - Telegram control plane (Exness Portfolio Bot)
+Telegram control plane for the trading system.
 
-Ин файл UI/Control қисми система мебошад.
-- Танҳо ADMIN истифода мебарад.
-- Engine/Strategy-ро идора мекунад (start/stop/status)
-- Амалҳои идоракунӣ: close_all, TP/SL (USD) барои ҳамаи позицияҳо
-
-Логикаи тиҷорат дар portfolio_engine ва Strategies аст.
-Ин ҷо танҳо Telegram ва даъватҳо ба ExnessAPI/orders.py.
+Exposes the administrator bot interface for runtime controls, status
+inspection, and order-management actions.
 """
 
 from __future__ import annotations
@@ -275,6 +270,42 @@ engine.set_skip_notifier(_notify_order_skipped)
 engine.set_phase_notifier(_notify_phase_change)
 engine.set_engine_stop_notifier(_notify_engine_stopped)
 engine.set_daily_start_notifier(_notify_daily_start)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# GUARDIAN — autonomous watchtower (heartbeats, trade alerts, disconnects)
+# ═════════════════════════════════════════════════════════════════════════
+try:
+    from Bot.guardian import install_guardian as _install_guardian
+
+    def _guardian_notify(text: str) -> None:
+        try:
+            if not ADMIN:
+                return
+            bot.send_message(int(ADMIN), text, parse_mode="HTML")
+        except Exception as _gn_exc:  # pragma: no cover — best-effort
+            log.warning("GUARDIAN_SEND_FAILED | err=%s", _gn_exc)
+
+    _guardian = _install_guardian(
+        engine_provider=lambda: engine,
+        notify=_guardian_notify,
+    )
+
+    _orig_order_notifier = _notify_order_update
+
+    def _notify_order_update_with_guardian(intent: Any, result: Any) -> None:
+        try:
+            _orig_order_notifier(intent, result)
+        except Exception:
+            pass
+        try:
+            _guardian.on_trade_result(intent, result)
+        except Exception:
+            pass
+
+    engine.set_order_notifier(_notify_order_update_with_guardian)
+except Exception as _g_exc:  # pragma: no cover — guardian is optional
+    log.warning("GUARDIAN_INSTALL_FAILED | err=%s", _g_exc)
 
 
 # =============================================================================

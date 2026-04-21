@@ -18,8 +18,8 @@
 from __future__ import annotations
 
 import json
-import math
 import logging
+import math
 import os
 import pickle
 import sys
@@ -833,6 +833,101 @@ class InstitutionalBacktestEngine:
             reference_pred=reference_pred,
         )
 
+    def _build_regime_filter_from_prices(
+        self,
+        df: pd.DataFrame,
+        payload_filter: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a normalized regime filter for live backtests and WFA windows."""
+        if isinstance(payload_filter, dict) and payload_filter.get("enabled", False):
+            normalized = dict(payload_filter)
+            normalized["allowed_regimes"] = [
+                str(name)
+                for name in payload_filter.get("allowed_regimes", [])
+                if str(name)
+            ]
+            return normalized
+
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        returns = close.pct_change()
+        vol_window = 20
+        realized_vol = returns.rolling(
+            vol_window,
+            min_periods=max(5, vol_window // 2),
+        ).std()
+        clean_vol = realized_vol.replace([np.inf, -np.inf], np.nan).dropna()
+        if clean_vol.empty:
+            return None
+
+        close_arr = close.to_numpy(dtype=np.float64, copy=False)
+        regimes = self.regime_detector.detect_all(close_arr)
+        regime_counts = pd.Series(regimes).value_counts(normalize=True)
+        allowed_regimes = [
+            str(name) for name, value in regime_counts.items() if float(value) >= 0.10
+        ]
+        if not allowed_regimes:
+            allowed_regimes = ["RANGE", "TREND_UP", "TREND_DOWN"]
+
+        is_xau = self.asset in ("XAU", "XAUUSD", "XAUUSDM")
+        vol_high = float(np.quantile(clean_vol, 0.95))
+        return {
+            "enabled": True,
+            "vol_window": vol_window,
+            "vol_low": float(np.quantile(clean_vol, 0.05)),
+            "vol_high": vol_high,
+            "vol_high_soft_cap": max(vol_high, vol_high * 1.15),
+            "allowed_regimes": allowed_regimes,
+            "regime_share": {
+                str(name): float(value) for name, value in regime_counts.items()
+            },
+            "min_confidence_outside_band": 1.35 if is_xau else 1.25,
+            "min_confidence_unknown_regime": 1.50 if is_xau else 1.35,
+        }
+
+    def _regime_filter_allows_trade(
+        self,
+        regime_filter: Optional[Dict[str, Any]],
+        *,
+        regime: str,
+        confidence: float,
+        recent_vol: float,
+    ) -> bool:
+        """Check whether the current regime stays inside the trained envelope."""
+        if not isinstance(regime_filter, dict) or not regime_filter.get("enabled", False):
+            return True
+
+        allowed_regimes = {
+            str(name)
+            for name in regime_filter.get("allowed_regimes", [])
+            if str(name)
+        }
+        if allowed_regimes and str(regime) not in allowed_regimes:
+            min_conf = float(
+                regime_filter.get("min_confidence_unknown_regime", 1.35) or 1.35
+            )
+            return confidence >= min_conf
+
+        if not np.isfinite(recent_vol):
+            return True
+
+        vol_low = max(0.0, float(regime_filter.get("vol_low", 0.0) or 0.0))
+        vol_high_soft_cap = max(
+            0.0,
+            float(regime_filter.get("vol_high_soft_cap", 0.0) or 0.0),
+        )
+        min_conf = float(
+            regime_filter.get("min_confidence_outside_band", 1.25) or 1.25
+        )
+
+        if vol_low > 0.0 and recent_vol < (vol_low * 0.50):
+            return confidence >= min_conf
+        if vol_high_soft_cap > 0.0 and recent_vol > vol_high_soft_cap:
+            return confidence >= min_conf
+        return True
+
     # ------------------------------------------------------------------ #
     # Trade simulation                                                      #
     # ------------------------------------------------------------------ #
@@ -847,6 +942,7 @@ class InstitutionalBacktestEngine:
         initial_capital: float,
         rng: Optional[np.random.Generator],
         pre_regimes: Optional[np.ndarray] = None,
+        regime_filter: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[float], List[Dict[str, Any]], Dict[str, float]]:
         """
         Institutional trade simulation with step-by-step exits.
@@ -863,6 +959,18 @@ class InstitutionalBacktestEngine:
         high_px = df["High"].values if "High" in df.columns else df["Close"].values
         low_px = df["Low"].values if "Low" in df.columns else df["Close"].values
         close_px = df["Close"].values
+        regime_vol = None
+        regime_filter_skips = 0
+
+        if isinstance(regime_filter, dict) and regime_filter.get("enabled", False):
+            vol_window = max(10, int(regime_filter.get("vol_window", 20) or 20))
+            regime_vol = (
+                pd.Series(close_px)
+                .pct_change()
+                .rolling(vol_window, min_periods=max(5, vol_window // 2))
+                .std()
+                .to_numpy(dtype=np.float64)
+            )
 
         daily_pnl = 0.0
         last_date = None
@@ -933,6 +1041,21 @@ class InstitutionalBacktestEngine:
                 continue
 
             confidence = min(abs(p) / max(threshold, 1e-12), 2.0)
+            recent_vol = (
+                float(regime_vol[i])
+                if regime_vol is not None and i < len(regime_vol) and np.isfinite(regime_vol[i])
+                else float("nan")
+            )
+            if not self._regime_filter_allows_trade(
+                regime_filter,
+                regime=regime,
+                confidence=confidence,
+                recent_vol=recent_vol,
+            ):
+                regime_filter_skips += 1
+                i += 1
+                continue
+
             position_size_pct = self.position_sizer.calculate(
                 win_rate=win_rate_rolling,
                 avg_win=avg_win_rolling,
@@ -1171,6 +1294,12 @@ class InstitutionalBacktestEngine:
                 floor_used_count,
                 min_pos_floor,
                 min_pos_conf,
+            )
+        if regime_filter_skips > 0:
+            log.info(
+                "BACKTEST_REGIME_FILTER_SKIPS | asset=%s count=%s",
+                self.asset,
+                regime_filter_skips,
             )
 
         return pnl_series, trades, total_costs
@@ -1529,6 +1658,7 @@ class InstitutionalBacktestEngine:
                 reference_pred=reference_pred,
             )
             rng_wfa = np.random.default_rng(self.run_cfg.monte_carlo_seed)
+            regime_filter = self._build_regime_filter_from_prices(df_train)
 
             pnls, _, costs = self._simulate_trades_institutional(
                 sim_df,
@@ -1537,6 +1667,7 @@ class InstitutionalBacktestEngine:
                 threshold=threshold,
                 initial_capital=self.run_cfg.initial_capital,
                 rng=rng_wfa,
+                regime_filter=regime_filter,
             )
 
             if not pnls:
@@ -1750,6 +1881,10 @@ class InstitutionalBacktestEngine:
         configured_threshold = max(
             float(getattr(pipeline.cfg, "percent_increase", 0.0) or 0.0), 1e-12
         )
+        regime_filter = self._build_regime_filter_from_prices(
+            df,
+            payload.get("regime_filter", {}) if isinstance(payload, dict) else None,
+        )
         threshold = self._effective_signal_threshold(
             configured_threshold,
             pred,
@@ -1803,6 +1938,7 @@ class InstitutionalBacktestEngine:
             initial_capital=self.run_cfg.initial_capital,
             rng=rng,
             pre_regimes=sim_regimes,  # pass pre-computed regimes
+            regime_filter=regime_filter,
         )
 
         if not pnl_series:
@@ -2023,7 +2159,9 @@ class InstitutionalBacktestEngine:
                     "stress_test_passed": stress["passed"],
                     "stress_scenarios": stress["scenarios"],
                     "backtest_audit": dict(self._backtest_audit),
-                    "institutional_grade": bool(self._last_verified and not unsafe),
+                    "institutional_grade": bool(
+                        getattr(metrics, "institutional_grade", False)
+                    ),
                     "real_backtest": True,
                     "unsafe": unsafe,
                     "sample_quality_passed": bool(self._sample_quality_passed),
@@ -2067,7 +2205,9 @@ class InstitutionalBacktestEngine:
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "status": status,
             "verified": self._last_verified,
-            "institutional_grade": bool(self._last_verified and not self._unsafe),
+            "institutional_grade": bool(
+                getattr(metrics, "institutional_grade", False)
+            ),
             "real_backtest": True,
             "sharpe_ratio": float(metrics.sharpe_ratio),
             "win_rate": float(metrics.win_rate),
