@@ -22,7 +22,6 @@ import MetaTrader5 as mt5
 from core.config import get_config_from_env as _get_core_config
 from core.feature_engine import FeatureEngine
 from core.risk_manager import RiskManager
-from core.session_manager import session_state as _session_state
 from core.signal_engine import SignalEngine
 from DataFeed.btc_market_feed import MarketFeed as BtcMarketFeed
 from DataFeed.xau_market_feed import MarketFeed as XauMarketFeed
@@ -57,10 +56,7 @@ class UTCScheduler:
 
     @staticmethod
     def is_weekend() -> bool:
-        try:
-            return not bool(_session_state("XAU").is_open)
-        except Exception:
-            return UTCScheduler.now_utc().weekday() >= 5
+        return UTCScheduler.now_utc().weekday() >= 5
 
     @staticmethod
     def get_active_assets() -> Tuple[str, ...]:
@@ -78,14 +74,11 @@ class UTCScheduler:
         XAU: weekdays only (hours logic guarded elsewhere by MT5/market feed).
         """
         asset_u = str(asset or "").upper().strip()
-        try:
-            return bool(_session_state(asset_u).is_open)
-        except Exception:
-            if asset_u == "BTC":
-                return True
-            if asset_u == "XAU":
-                return UTCScheduler.now_utc().weekday() < 5
-            return False
+        if asset_u == "BTC":
+            return True
+        if asset_u == "XAU":
+            return UTCScheduler.now_utc().weekday() < 5
+        return False
 
 
 class EngineScheduleManager:
@@ -484,15 +477,15 @@ class _AssetPipeline:
         self._last_market_ok_ts = 0.0
 
     def sync_session_state(self) -> Tuple[bool, str, bool]:
-        try:
-            snapshot = _session_state(self.asset)
-            is_open = bool(snapshot.is_open)
-            reason = str(snapshot.reason or "session_unknown")
-            in_cooldown = bool(snapshot.is_post_gap_cooldown)
-        except Exception:
-            is_open = bool(UTCScheduler.market_status(self.asset))
-            reason = "session_fallback"
-            in_cooldown = False
+        """Track market session open/close transitions using UTCScheduler.
+
+        Returns (is_open, reason, in_cooldown). `in_cooldown` is kept
+        for API compatibility and always False — post-gap cooldown is
+        enforced by market feeds and the news-blackout layer instead.
+        """
+        is_open = bool(UTCScheduler.market_status(self.asset))
+        reason = "market_open" if is_open else "market_closed"
+        in_cooldown = False
 
         previous = self._session_open
         self._session_open = is_open
@@ -526,10 +519,9 @@ class _AssetPipeline:
         except Exception:
             pass
         log_health.info(
-            "SESSION_TRANSITION | asset=%s state=open reason=%s cooldown=%s",
+            "SESSION_TRANSITION | asset=%s state=open reason=%s",
             self.asset,
             reason,
-            in_cooldown,
         )
         return is_open, reason, in_cooldown
 
@@ -851,6 +843,10 @@ class _AssetPipeline:
                     reasons=("stale_data",),
                     signal_id=f"{self.asset}_STALE_{int(now)}",
                     raw_result=None,
+                    bar_key="",
+                    timeframe=str(getattr(self.signal.sp, "tf_primary", "") or ""),
+                    created_ts=float(now),
+                    source="pipeline",
                 )
 
             price_unchanged = (
@@ -940,6 +936,10 @@ class _AssetPipeline:
                     reasons=("market_closed_weekend",),
                     signal_id=f"{self.asset}_CLOSED_{int(time.time())}",
                     raw_result=None,
+                    bar_key="",
+                    timeframe=str(getattr(self.signal.sp, "tf_primary", "") or ""),
+                    created_ts=float(time.time()),
+                    source="pipeline",
                 )
 
             if "same_bar_dedup" not in reasons:
@@ -963,6 +963,10 @@ class _AssetPipeline:
                 reasons=reasons,
                 signal_id=signal_id,
                 raw_result=res,
+                bar_key=str(getattr(res, "bar_key", "") or ""),
+                timeframe=str(getattr(res, "timeframe", "") or ""),
+                created_ts=float(now),
+                source="pipeline",
             )
 
             self._last_computed_close = self.last_market_close

@@ -28,7 +28,15 @@ from ExnessAPI.order_execution import OrderResult as ExecOrderResult
 from ExnessAPI.order_execution import log_health as exec_health_log
 from mt5_client import MT5_LOCK, mt5_async_call
 
-from .models import AssetCandidate, ExecutionResult, OrderIntent, log_err, log_health
+from .models import (
+    AssetCandidate,
+    ExecutionResult,
+    OrderIntent,
+    log_err,
+    log_health,
+    signal_age_sec,
+    tf_seconds,
+)
 
 if TYPE_CHECKING:
     from .engine import MultiAssetTradingEngine
@@ -36,6 +44,39 @@ if TYPE_CHECKING:
 # =============================================================================
 # Classes
 # =============================================================================
+
+
+def _signal_max_age_sec(cfg: Any, *, source: str, timeframe: str) -> float:
+    base_cfg = float(getattr(cfg, "signal_max_age_sec", 75.0) or 75.0)
+    bridge_cfg = float(
+        getattr(cfg, "ml_bridge_max_age_sec", min(base_cfg, 30.0)) or min(base_cfg, 30.0)
+    )
+    tf_sec = float(tf_seconds(timeframe) or 0.0)
+    if tf_sec > 0.0:
+        base_cfg = max(base_cfg, tf_sec * 1.25)
+        bridge_cfg = min(base_cfg, max(bridge_cfg, tf_sec * 0.50))
+    return bridge_cfg if str(source or "").strip().lower() == "ml_bridge" else base_cfg
+
+
+def _signal_stale_reason(
+    cfg: Any,
+    *,
+    source: str,
+    bar_key: str,
+    timeframe: str,
+    created_ts: float,
+    now_ts: float,
+) -> str:
+    age_sec = signal_age_sec(bar_key, now_ts=now_ts, created_ts=created_ts)
+    if age_sec is None:
+        return ""
+    max_age_sec = _signal_max_age_sec(cfg, source=source, timeframe=timeframe)
+    if max_age_sec > 0.0 and age_sec > max_age_sec:
+        return (
+            f"stale_signal:age={age_sec:.1f}s>max={max_age_sec:.1f}s"
+            f"|tf={timeframe or '-'}|source={source or '-'}"
+        )
+    return ""
 
 
 class ExecutionWorker(threading.Thread):
@@ -193,6 +234,42 @@ class ExecutionWorker(threading.Thread):
             dispatch_lot = float(intent.lot)
             rm = intent.risk_manager
             gate_reason = "ok"
+            stale_reason = _signal_stale_reason(
+                intent.cfg,
+                source=str(getattr(intent, "source", "") or ""),
+                bar_key=str(getattr(intent, "bar_key", "") or ""),
+                timeframe=str(getattr(intent, "timeframe", "") or ""),
+                created_ts=float(getattr(intent, "created_ts", 0.0) or 0.0),
+                now_ts=sent,
+            )
+            if stale_reason:
+                if rm and hasattr(rm, "record_execution_failure"):
+                    try:
+                        rm.record_execution_failure(
+                            str(intent.order_id),
+                            float(intent.enqueue_time),
+                            sent,
+                            stale_reason,
+                        )
+                    except Exception as exc:  # DEFENSIVE CODE
+                        log_err.error(
+                            "EXEC_STALE_RECORD_FAILURE_ERROR | order_id=%s err=%s",
+                            intent.order_id,
+                            exc,
+                        )
+                return ExecutionResult(
+                    order_id=str(intent.order_id),
+                    signal_id=str(intent.signal_id),
+                    ok=False,
+                    reason=stale_reason,
+                    sent_ts=sent,
+                    fill_ts=sent,
+                    req_price=float(intent.price),
+                    exec_price=float(intent.price),
+                    volume=0.0,
+                    slippage=0.0,
+                    retcode=-4,
+                )
 
             if rm and hasattr(rm, "pre_order_gate"):
                 gate_fn = getattr(rm, "pre_order_gate", None)
@@ -552,6 +629,34 @@ class ExecutionManager:
 
     def __init__(self, engine: "MultiAssetTradingEngine") -> None:
         self._e = engine
+        self._account_cache_lock = threading.Lock()
+        self._account_cache: Dict[str, float] = {
+            "ts": 0.0,
+            "equity": 0.0,
+            "leverage": 100.0,
+        }
+
+    def _cached_account_probe(self) -> Tuple[float, float]:
+        now = time.time()
+        with self._account_cache_lock:
+            cached_ts = float(self._account_cache.get("ts", 0.0) or 0.0)
+            cached_equity = float(self._account_cache.get("equity", 0.0) or 0.0)
+            cached_leverage = float(self._account_cache.get("leverage", 100.0) or 100.0)
+        if cached_ts > 0.0 and (now - cached_ts) <= 1.5 and cached_equity > 0.0:
+            return cached_equity, max(1.0, cached_leverage)
+
+        acc_info = mt5_async_call("account_info", timeout=0.25, default=None)
+        if acc_info is not None:
+            equity = float(getattr(acc_info, "equity", 0.0) or 0.0)
+            leverage = float(getattr(acc_info, "leverage", 100.0) or 100.0)
+            if equity > 0.0:
+                with self._account_cache_lock:
+                    self._account_cache["ts"] = float(now)
+                    self._account_cache["equity"] = float(equity)
+                    self._account_cache["leverage"] = float(max(1.0, leverage))
+                return equity, max(1.0, leverage)
+
+        return cached_equity, max(1.0, cached_leverage)
 
     def enqueue_order(
         self,
@@ -635,9 +740,7 @@ class ExecutionManager:
             )
             return False, None
 
-        acc_info = mt5_async_call("account_info", timeout=0.4, default=None)
-        equity = getattr(acc_info, "equity", 0.0) if acc_info else 0.0
-        leverage = getattr(acc_info, "leverage", 100) if acc_info else 100
+        equity, leverage = self._cached_account_probe()
 
         c_size = float(getattr(cfg.symbol_params, "contract_size", 100.0))
         proposed_margin = (
@@ -645,15 +748,6 @@ class ExecutionManager:
             * float(cand.lot)
             * c_size
         ) / float(leverage or 1)
-        if proposed_margin <= 0:
-            tick_info = mt5_async_call(
-                "symbol_info_tick",
-                cand.symbol,
-                timeout=0.35,
-                default=None,
-            )
-            p = tick_info.ask if tick_info else 0.0
-            proposed_margin = (p * float(cand.lot) * c_size) / float(leverage or 1)
 
         pre_tick = mt5_async_call(
             "symbol_info_tick",
@@ -672,6 +766,10 @@ class ExecutionManager:
             if (pre_tick is not None and cand.signal == "Buy")
             else (pre_tick.bid if pre_tick is not None else 0.0)
         )
+        if proposed_margin <= 0.0 and pre_price > 0.0:
+            proposed_margin = (pre_price * float(cand.lot) * c_size) / float(
+                leverage or 1
+            )
         live_contract_size = float(getattr(pre_info, "trade_contract_size", 0.0) or 0.0)
         if live_contract_size <= 0.0:
             live_contract_size = float(
@@ -751,6 +849,30 @@ class ExecutionManager:
                     cand.signal_id,
                 )
                 e._last_log_id[cand.asset] = str(cand.signal_id)
+            return False, None
+
+        stale_reason = _signal_stale_reason(
+            cfg,
+            source=str(getattr(cand, "source", "") or ""),
+            bar_key=str(getattr(cand, "bar_key", "") or ""),
+            timeframe=str(getattr(cand, "timeframe", "") or ""),
+            created_ts=float(getattr(cand, "created_ts", 0.0) or 0.0),
+            now_ts=now,
+        )
+        if stale_reason:
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=%s signal_id=%s",
+                cand.asset,
+                stale_reason,
+                cand.signal_id,
+            )
+            return False, None
+
+        if e._live_trading_pause_reason(force=False):
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=live_evidence_pause_late",
+                cand.asset,
+            )
             return False, None
 
         tick = (
@@ -967,6 +1089,10 @@ class ExecutionManager:
             cfg=cfg,
             base_lot=float(base_lot_val),
             phase_snapshot=str(phase),
+            bar_key=str(getattr(cand, "bar_key", "") or ""),
+            timeframe=str(getattr(cand, "timeframe", "") or ""),
+            created_ts=float(getattr(cand, "created_ts", 0.0) or now),
+            source=str(getattr(cand, "source", "") or "pipeline"),
         )
 
         with e._order_state_lock:
@@ -1329,6 +1455,7 @@ class ExecutionManager:
         if e._btc:
             e._btc.reconcile_positions()
         e._last_reconcile_ts = time.time()
+        e._refresh_open_position_protection()
 
         e._update_portfolio_risk_state()
 
@@ -1807,6 +1934,280 @@ class EngineExecutionMixin:
                 self._exec_slippage_hist.append(slip)
         except Exception:
             return
+
+    @staticmethod
+    def _estimate_position_atr(risk: Any, position: Any) -> float:
+        cfg = getattr(risk, "cfg", None)
+        entry = float(getattr(position, "price_open", 0.0) or 0.0)
+        sl_price = float(getattr(position, "sl", 0.0) or 0.0)
+        tp_price = float(getattr(position, "tp", 0.0) or 0.0)
+        estimates: List[float] = []
+
+        try:
+            cached_atr = float(getattr(risk, "_cached_atr", 0.0) or 0.0)
+        except Exception:
+            cached_atr = 0.0
+        if cached_atr > 0.0:
+            estimates.append(cached_atr)
+
+        sl_mult = max(float(getattr(cfg, "atr_sl_multiplier", 0.0) or 0.0), 0.01)
+        if entry > 0.0 and sl_price > 0.0:
+            sl_dist = abs(entry - sl_price)
+            if sl_dist > 0.0:
+                estimates.append(sl_dist / sl_mult)
+
+        tp_min = float(getattr(cfg, "atr_tp_min_multiplier", 0.0) or 0.0)
+        tp_max = float(getattr(cfg, "atr_tp_max_multiplier", 0.0) or 0.0)
+        tp_candidates = [v for v in (tp_min, tp_max) if v > 0.0]
+        tp_mult = min(tp_candidates) if tp_candidates else 0.0
+        if entry > 0.0 and tp_price > 0.0 and tp_mult > 0.0:
+            tp_dist = abs(tp_price - entry)
+            if tp_dist > 0.0:
+                estimates.append(tp_dist / tp_mult)
+
+        if estimates:
+            return float(max(estimates))
+        if entry > 0.0:
+            return float(max(entry * 0.001, 0.00001))
+        return 0.0
+
+    def _refresh_open_position_protection(self) -> None:
+        if self.dry_run or mt5 is None:
+            return
+
+        active_tickets: set[int] = set()
+        for asset, pipe in (("XAU", self._xau), ("BTC", self._btc)):
+            if pipe is None:
+                continue
+            risk = getattr(pipe, "risk", None)
+            cfg = getattr(risk, "cfg", None) if risk is not None else None
+            symbol = str(getattr(pipe, "symbol", "") or "")
+            if risk is None or cfg is None or not symbol:
+                continue
+
+            try:
+                with MT5_LOCK:
+                    positions = mt5.positions_get(symbol=symbol) or []
+            except Exception as exc:
+                log_err.error(
+                    "POSITION_PROTECT_FETCH_ERROR | asset=%s symbol=%s err=%s",
+                    asset,
+                    symbol,
+                    exc,
+                )
+                continue
+
+            magic = int(getattr(cfg, "magic", 0) or 0)
+            filtered_positions = []
+            for position in positions:
+                try:
+                    if magic > 0 and int(getattr(position, "magic", 0) or 0) != magic:
+                        continue
+                    filtered_positions.append(position)
+                except Exception:
+                    continue
+
+            for position in filtered_positions:
+                ticket = 0
+                try:
+                    ticket = int(getattr(position, "ticket", 0) or 0)
+                    if ticket <= 0:
+                        continue
+                    active_tickets.add(ticket)
+                    self._maybe_update_position_protection(asset, pipe, position)
+                except Exception as exc:
+                    log_err.error(
+                        "POSITION_PROTECT_ERROR | asset=%s ticket=%s err=%s",
+                        asset,
+                        ticket,
+                        exc,
+                    )
+
+        with self._lock:
+            stale_tickets = [
+                int(ticket)
+                for ticket in self._position_protection_last_ts_by_ticket.keys()
+                if int(ticket) not in active_tickets
+            ]
+            for ticket in stale_tickets:
+                self._position_protection_last_ts_by_ticket.pop(int(ticket), None)
+                self._position_protection_last_sl_by_ticket.pop(int(ticket), None)
+
+    def _maybe_update_position_protection(
+        self,
+        asset: str,
+        pipe: Any,
+        position: Any,
+    ) -> None:
+        risk = getattr(pipe, "risk", None)
+        cfg = getattr(risk, "cfg", None) if risk is not None else None
+        if risk is None or cfg is None or mt5 is None:
+            return
+
+        ticket = int(getattr(position, "ticket", 0) or 0)
+        if ticket <= 0:
+            return
+
+        now = time.time()
+        with self._lock:
+            last_ts = float(
+                self._position_protection_last_ts_by_ticket.get(ticket, 0.0) or 0.0
+            )
+        if (now - last_ts) < self._position_protection_interval_sec:
+            return
+
+        buy_type = int(getattr(mt5, "POSITION_TYPE_BUY", 0) or 0)
+        sell_type = int(getattr(mt5, "POSITION_TYPE_SELL", 1) or 1)
+        pos_type = int(getattr(position, "type", -1) or -1)
+        if pos_type == buy_type:
+            side = "Buy"
+        elif pos_type == sell_type:
+            side = "Sell"
+        else:
+            return
+
+        symbol = str(getattr(position, "symbol", "") or getattr(pipe, "symbol", ""))
+        entry_price = float(getattr(position, "price_open", 0.0) or 0.0)
+        sl_price = float(getattr(position, "sl", 0.0) or 0.0)
+        tp_price = float(getattr(position, "tp", 0.0) or 0.0)
+        if not symbol or entry_price <= 0.0 or sl_price <= 0.0 or tp_price <= 0.0:
+            return
+
+        try:
+            with MT5_LOCK:
+                info = mt5.symbol_info(symbol)
+                tick = mt5.symbol_info_tick(symbol)
+        except Exception as exc:
+            log_err.error(
+                "POSITION_PROTECT_SNAPSHOT_ERROR | asset=%s ticket=%s err=%s",
+                asset,
+                ticket,
+                exc,
+            )
+            return
+        if info is None or tick is None:
+            return
+
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        digits = int(getattr(info, "digits", 0) or 0)
+        if point <= 0.0 and digits > 0:
+            point = 10.0 ** (-digits)
+        price_tol = max(point, abs(entry_price) * 1e-8, 1e-10)
+        min_buffer = max(
+            price_tol,
+            float(getattr(info, "trade_stops_level", 0.0) or 0.0) * max(point, 0.0),
+        )
+
+        if side == "Buy":
+            market_price = float(getattr(tick, "bid", 0.0) or 0.0)
+        else:
+            market_price = float(getattr(tick, "ask", 0.0) or 0.0)
+        if market_price <= 0.0:
+            market_price = float(getattr(position, "price_current", 0.0) or entry_price)
+        if market_price <= 0.0:
+            return
+
+        atr_est = self._estimate_position_atr(risk, position)
+        if atr_est <= 0.0:
+            return
+
+        try:
+            new_sl = risk.check_trailing_stop(
+                current_price=float(market_price),
+                entry_price=float(entry_price),
+                sl_price=float(sl_price),
+                tp_price=float(tp_price),
+                side=str(side),
+                atr=float(atr_est),
+            )
+        except Exception as exc:
+            log_err.error(
+                "POSITION_PROTECT_CALC_ERROR | asset=%s ticket=%s err=%s",
+                asset,
+                ticket,
+                exc,
+            )
+            return
+
+        if new_sl is None:
+            return
+
+        target_sl = float(new_sl)
+        if side == "Buy":
+            target_sl = min(target_sl, market_price - min_buffer)
+            if digits > 0:
+                target_sl = float(builtins.round(target_sl, digits))
+            if not (sl_price + price_tol < target_sl < market_price - price_tol):
+                return
+        else:
+            target_sl = max(target_sl, market_price + min_buffer)
+            if digits > 0:
+                target_sl = float(builtins.round(target_sl, digits))
+            if not (market_price + price_tol < target_sl < sl_price - price_tol):
+                return
+
+        with self._lock:
+            last_sent_sl = self._position_protection_last_sl_by_ticket.get(ticket)
+        if last_sent_sl is not None and abs(float(last_sent_sl) - target_sl) <= price_tol:
+            return
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": int(ticket),
+            "symbol": symbol,
+            "sl": float(target_sl),
+            "tp": float(tp_price),
+            "deviation": 50,
+            "magic": int(getattr(cfg, "magic", 0) or 0),
+            "comment": f"protect_{str(asset).lower()}",
+        }
+
+        try:
+            with MT5_LOCK:
+                result = mt5.order_send(request)
+        except Exception as exc:
+            with self._lock:
+                self._position_protection_last_ts_by_ticket[ticket] = now
+            log_err.error(
+                "POSITION_PROTECT_SEND_ERROR | asset=%s ticket=%s err=%s",
+                asset,
+                ticket,
+                exc,
+            )
+            return
+
+        retcode = int(getattr(result, "retcode", 0) or 0) if result is not None else 0
+        done = int(getattr(mt5, "TRADE_RETCODE_DONE", 10009) or 10009)
+        no_changes = int(getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025) or 10025)
+        with self._lock:
+            self._position_protection_last_ts_by_ticket[ticket] = now
+        if retcode in {done, no_changes}:
+            mode = (
+                "breakeven"
+                if abs(target_sl - entry_price) <= max(price_tol * 2.0, 1e-10)
+                else "trail"
+            )
+            with self._lock:
+                self._position_protection_last_sl_by_ticket[ticket] = float(target_sl)
+            log_health.info(
+                "POSITION_PROTECT_UPDATE | asset=%s ticket=%s mode=%s old_sl=%.5f new_sl=%.5f price=%.5f",
+                asset,
+                ticket,
+                mode,
+                sl_price,
+                target_sl,
+                market_price,
+            )
+            return
+
+        log_health.warning(
+            "POSITION_PROTECT_REJECTED | asset=%s ticket=%s retcode=%s old_sl=%.5f new_sl=%.5f",
+            asset,
+            ticket,
+            retcode,
+            sl_price,
+            target_sl,
+        )
 
     def close_all(self) -> bool:
         """Best-effort close all open positions and pending orders."""

@@ -272,42 +272,6 @@ engine.set_engine_stop_notifier(_notify_engine_stopped)
 engine.set_daily_start_notifier(_notify_daily_start)
 
 
-# ═════════════════════════════════════════════════════════════════════════
-# GUARDIAN — autonomous watchtower (heartbeats, trade alerts, disconnects)
-# ═════════════════════════════════════════════════════════════════════════
-try:
-    from Bot.guardian import install_guardian as _install_guardian
-
-    def _guardian_notify(text: str) -> None:
-        try:
-            if not ADMIN:
-                return
-            bot.send_message(int(ADMIN), text, parse_mode="HTML")
-        except Exception as _gn_exc:  # pragma: no cover — best-effort
-            log.warning("GUARDIAN_SEND_FAILED | err=%s", _gn_exc)
-
-    _guardian = _install_guardian(
-        engine_provider=lambda: engine,
-        notify=_guardian_notify,
-    )
-
-    _orig_order_notifier = _notify_order_update
-
-    def _notify_order_update_with_guardian(intent: Any, result: Any) -> None:
-        try:
-            _orig_order_notifier(intent, result)
-        except Exception:
-            pass
-        try:
-            _guardian.on_trade_result(intent, result)
-        except Exception:
-            pass
-
-    engine.set_order_notifier(_notify_order_update_with_guardian)
-except Exception as _g_exc:  # pragma: no cover — guardian is optional
-    log.warning("GUARDIAN_INSTALL_FAILED | err=%s", _g_exc)
-
-
 # =============================================================================
 # Permission Decorators
 # =============================================================================
@@ -1823,6 +1787,11 @@ def handle_trade_start(message: telebot.types.Message) -> None:
             )
             return
 
+        runtime_snapshot = {}
+        try:
+            runtime_snapshot = engine.runtime_watchdog_snapshot()
+        except Exception:
+            runtime_snapshot = {}
         _, reason = mt5_status()
         gate_reason = str(getattr(engine, "_gate_last_reason", "") or "")
         blocked_assets = sorted(set(getattr(engine, "_blocked_assets", []) or []))
@@ -1830,7 +1799,11 @@ def handle_trade_start(message: telebot.types.Message) -> None:
             getattr(engine, "_backtest_passed", False)
         )
         reason_raw = str(reason or "сабаб номаълум")
-        if (not model_ready) or blocked_assets:
+        if bool(runtime_snapshot.get("trading_ok", False)) or bool(
+            runtime_snapshot.get("starting", False)
+        ) or bool(runtime_snapshot.get("running", False)):
+            reason_s = "оғози муҳаррик аллакай дар ҷараён аст"
+        elif (not model_ready) or blocked_assets:
             reason_s = gate_reason or "санҷиши омодагии модел ноком шуд"
             if blocked_assets:
                 reason_s = (
@@ -1838,6 +1811,11 @@ def handle_trade_start(message: telebot.types.Message) -> None:
                 )
         else:
             reason_s = reason_raw
+            if str(reason_s).strip().lower() == "ok":
+                reason_s = (
+                    "оғози муҳаррик тасдиқ нашуд, аммо MT5 солим аст; "
+                    "эҳтимол start ҳамзамон аз тарафи supervisor иҷро шуд"
+                )
         if reason_s.startswith("blocked_cooldown:"):
             reason_s = reason_s.split(":", 1)[1]
         hint = ""

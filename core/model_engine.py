@@ -17,7 +17,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from log_config import get_artifact_dir
 
-from .config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
+from .config import (
+    MAX_GATE_DRAWDOWN,
+    MAX_GATE_SHARPE,
+    MIN_GATE_SHARPE,
+    MIN_GATE_WFA_PASS_RATE,
+    MIN_GATE_WIN_RATE,
+)
 
 log = logging.getLogger("core.model_engine")
 
@@ -772,6 +778,55 @@ def _asset_gate_status(
             legacy_fallback=False,
         )
 
+    # Suspicious Sharpe gate (anti-overfit / anti-leakage).
+    # Real retail FX/crypto scalping strategies do not produce Sharpe > 5 on
+    # honest out-of-sample data. A number like this is almost always a
+    # backtester bug, label leakage or an optimistic fill model — NOT alpha.
+    if sharpe > MAX_GATE_SHARPE:
+        return AssetGateStatus(
+            asset=asset_u,
+            ok=False,
+            reason=(
+                f"state_sharpe_suspicious:{sharpe:.3f}>{MAX_GATE_SHARPE:.3f}"
+                "|likely_overfit_or_leakage"
+            ),
+            state_path=str(state_p),
+            model_path="",
+            meta_path="",
+            model_version=version,
+            status=status,
+            verified=verified,
+            real_backtest=real_bt,
+            sharpe=sharpe,
+            win_rate=win_rate,
+            max_drawdown_pct=max_dd,
+            legacy_fallback=False,
+        )
+
+    # Walk-forward pass-rate gate. `wfa_passed` alone is boolean and may be
+    # True with only 60% of windows passing — that is not enough for live.
+    state_wfa_pass_rate = _safe_float(state.get("wfa_pass_rate", 1.0), 1.0)
+    if state_wfa_total > 0 and state_wfa_pass_rate < MIN_GATE_WFA_PASS_RATE:
+        return AssetGateStatus(
+            asset=asset_u,
+            ok=False,
+            reason=(
+                f"state_wfa_pass_rate_low:{state_wfa_pass_rate:.3f}"
+                f"<{MIN_GATE_WFA_PASS_RATE:.3f}"
+            ),
+            state_path=str(state_p),
+            model_path="",
+            meta_path="",
+            model_version=version,
+            status=status,
+            verified=verified,
+            real_backtest=real_bt,
+            sharpe=sharpe,
+            win_rate=win_rate,
+            max_drawdown_pct=max_dd,
+            legacy_fallback=False,
+        )
+
     if win_rate < MIN_GATE_WIN_RATE:
         return AssetGateStatus(
             asset=asset_u,
@@ -977,6 +1032,15 @@ def _asset_gate_status(
     elif meta_sharpe < MIN_GATE_SHARPE:
         reason = f"meta_sharpe_below_gate:{meta_sharpe:.3f}<{MIN_GATE_SHARPE:.3f}"
         ok = False
+    elif meta_sharpe > MAX_GATE_SHARPE or bool(meta.get("suspicious_sharpe", False)):
+        # Meta-side suspicious Sharpe rejection. Matches the state-side
+        # gate and also catches artifacts where the training pipeline
+        # flagged `suspicious_sharpe=True` explicitly.
+        reason = (
+            f"meta_sharpe_suspicious:{meta_sharpe:.3f}>{MAX_GATE_SHARPE:.3f}"
+            "|likely_overfit_or_leakage"
+        )
+        ok = False
     elif meta_wr < MIN_GATE_WIN_RATE:
         reason = f"meta_winrate_below_gate:{meta_wr:.3f}<{MIN_GATE_WIN_RATE:.3f}"
         ok = False
@@ -984,8 +1048,16 @@ def _asset_gate_status(
         reason = f"meta_drawdown_above_gate:{meta_dd:.3f}>{MAX_GATE_DRAWDOWN:.3f}"
         ok = False
     else:
-        reason = "ok"
-        ok = True
+        meta_wfa_pass_rate = _safe_float(meta.get("wfa_pass_rate", 1.0), 1.0)
+        if meta_wfa_total > 0 and meta_wfa_pass_rate < MIN_GATE_WFA_PASS_RATE:
+            reason = (
+                f"meta_wfa_pass_rate_low:{meta_wfa_pass_rate:.3f}"
+                f"<{MIN_GATE_WFA_PASS_RATE:.3f}"
+            )
+            ok = False
+        else:
+            reason = "ok"
+            ok = True
 
     return AssetGateStatus(
         asset=asset_u,

@@ -961,6 +961,58 @@ class InferenceEngine:
                 return s.replace(" ", "_")
         return str(int(time.time()))
 
+    @staticmethod
+    def _payload_primary_tf(payload: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        if isinstance(payload.get("M1"), dict):
+            return "M1"
+        if isinstance(payload.get("H1"), dict):
+            return "H1"
+        return ""
+
+    def _allow_neutral_ml_bridge(
+        self,
+        sig: MLSignal,
+        inst_candidate: AssetCandidate,
+        cfg: Any,
+    ) -> Tuple[bool, str]:
+        reasons = tuple(str(r or "").strip() for r in (inst_candidate.reasons or ()))
+        blocking_prefixes = (
+            "same_bar_dedup",
+            "TICK_REJECT",
+            "POSITION_OPEN_PAUSE",
+            "position_open_pause",
+            "stale_data",
+            "STALE_FEED",
+            "mtf_h4_veto",
+            "mtf_h1_h4_conflict",
+            "macro_conflict",
+            "macro_block",
+            "news_blackout",
+        )
+        for reason in reasons:
+            if any(reason.startswith(prefix) for prefix in blocking_prefixes):
+                return False, f"neutral_pipeline_reason:{reason}"
+
+        if bool(getattr(cfg, "ml_bridge_require_h1_alignment", True)):
+            side = str(sig.side or "").strip()
+            side_sign = 1.0 if side == "Buy" else (-1.0 if side == "Sell" else 0.0)
+            if side_sign == 0.0:
+                return False, "neutral_pipeline_bad_side"
+            h1_bias = self._payload_trend_bias(sig.intraday_payload, "H1")
+            min_bias = max(
+                0.0,
+                self._safe_float(getattr(cfg, "ml_bridge_h1_min_bias", 0.20), 0.20),
+            )
+            if (side_sign * h1_bias) < min_bias:
+                return (
+                    False,
+                    f"neutral_pipeline_h1_bias:h1={h1_bias:+.2f}<req={min_bias:.2f}",
+                )
+
+        return True, "ok"
+
     def _build_ml_bridge_candidate(
         self,
         asset: str,
@@ -977,14 +1029,27 @@ class InferenceEngine:
         allow_neutral_pipeline = bool(
             getattr(cfg, "ml_bridge_allow_neutral_pipeline", False)
         )
-        if pipeline_signal not in ("Buy", "Sell") and not allow_neutral_pipeline:
-            log_health.info(
-                "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s pipeline_signal=%s reason=indicator_veto",
-                asset,
-                sig.signal,
-                pipeline_signal or "Neutral",
+        if pipeline_signal not in ("Buy", "Sell"):
+            if not allow_neutral_pipeline:
+                log_health.info(
+                    "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s pipeline_signal=%s reason=indicator_veto",
+                    asset,
+                    sig.signal,
+                    pipeline_signal or "Neutral",
+                )
+                return None
+            neutral_ok, neutral_reason = self._allow_neutral_ml_bridge(
+                sig, inst_candidate, cfg
             )
-            return None
+            if not neutral_ok:
+                log_health.info(
+                    "FSM_ML_BRIDGE_BLOCK | asset=%s ml_signal=%s pipeline_signal=%s reason=%s",
+                    asset,
+                    sig.signal,
+                    pipeline_signal or "Neutral",
+                    neutral_reason,
+                )
+                return None
 
         sig_name = str(sig.signal or "").upper().strip()
         if sig_name not in ("STRONG BUY", "STRONG SELL"):
@@ -1074,7 +1139,8 @@ class InferenceEngine:
             f"ml_reason:{sig.reason}",
             "sniper_fsm",
         )
-        signal_id = f"MLBRIDGE_{asset}_{self._frame_bar_key(frame)}_{sig.side}"
+        bridge_bar_key = self._frame_bar_key(frame)
+        signal_id = f"MLBRIDGE_{asset}_{bridge_bar_key}_{sig.side}"
         latency_ms = max(
             self._safe_float(getattr(inst_candidate, "latency_ms", 0.0)), 0.0
         )
@@ -1109,6 +1175,14 @@ class InferenceEngine:
                 "confidence": sig.confidence,
                 "bridge_plan": dict(plan),
             },
+            bar_key=str(bridge_bar_key),
+            timeframe=(
+                self._payload_primary_tf(sig.scalp_payload)
+                or self._payload_primary_tf(sig.intraday_payload)
+                or str(getattr(inst_candidate, "timeframe", "") or "M1")
+            ),
+            created_ts=float(time.time()),
+            source="ml_bridge",
         )
 
     @staticmethod
@@ -1160,9 +1234,7 @@ class InferenceEngine:
             return None
 
         if bool(inst_candidate.blocked):
-            if allow_neutral_pipeline and self._bridge_soft_block_reasons(
-                inst_candidate.reasons
-            ):
+            if self._bridge_soft_block_reasons(inst_candidate.reasons):
                 bridge_candidate = self._build_ml_bridge_candidate(
                     asset, sig, pipe, inst_candidate
                 )
@@ -1261,6 +1333,10 @@ class InferenceEngine:
                 "reason": sig.reason,
                 "confidence": sig.confidence,
             },
+            bar_key=str(getattr(inst_candidate, "bar_key", "") or ""),
+            timeframe=str(getattr(inst_candidate, "timeframe", "") or ""),
+            created_ts=float(time.time()),
+            source=str(getattr(inst_candidate, "source", "") or "pipeline"),
         )
 
 

@@ -952,7 +952,12 @@ class RiskManager:
 
     # ─── Trade history ───────────────────────────────────────────────
 
-    def _recent_closed_trade_profits(self, limit: int) -> List[float]:
+    def _recent_closed_trade_profits(
+        self,
+        limit: int,
+        *,
+        since_ts: Optional[float] = None,
+    ) -> List[float]:
         if mt5 is None:
             with self._lock:
                 return list(self._trades_today)
@@ -960,17 +965,48 @@ class RiskManager:
             from datetime import timedelta
 
             now = datetime.now(timezone.utc)
-            start = now - timedelta(days=1)
+            if since_ts is not None and float(since_ts or 0.0) > 0.0:
+                start = datetime.fromtimestamp(float(since_ts), tz=timezone.utc)
+            else:
+                start = now - timedelta(days=1)
             with _mt5_lock():
                 deals = mt5.history_deals_get(start, now)
             if deals is None:
                 with self._lock:
                     return list(self._trades_today)
-            profits = [
-                float(d.profit)
-                for d in deals
-                if d.entry == 1 and d.symbol == self.sp.symbol
-            ]
+            close_entries = {int(getattr(mt5, "DEAL_ENTRY_OUT", 1) or 1)}
+            close_by = getattr(mt5, "DEAL_ENTRY_OUT_BY", None)
+            if close_by is not None:
+                close_entries.add(int(close_by or 0))
+
+            symbol = str(self.sp.symbol or self.sp.base or "").strip()
+            magic = int(getattr(self.cfg, "magic", 0) or 0)
+            profit_rows: List[Tuple[float, float]] = []
+            for deal in deals:
+                try:
+                    if str(getattr(deal, "symbol", "")) != symbol:
+                        continue
+                    if magic > 0 and int(getattr(deal, "magic", 0) or 0) != magic:
+                        continue
+                    entry = int(getattr(deal, "entry", -1) or -1)
+                    if entry not in close_entries:
+                        continue
+                    deal_ts = float(getattr(deal, "time", 0.0) or 0.0)
+                    if since_ts is not None and deal_ts > 0.0 and deal_ts < float(since_ts):
+                        continue
+                    net_profit = float(getattr(deal, "profit", 0.0) or 0.0)
+                    net_profit += float(getattr(deal, "commission", 0.0) or 0.0)
+                    net_profit += float(getattr(deal, "swap", 0.0) or 0.0)
+                    net_profit += float(getattr(deal, "fee", 0.0) or 0.0)
+                    profit_rows.append((deal_ts, net_profit))
+                except Exception:
+                    continue
+            profit_rows.sort(key=lambda item: item[0])
+            profits = [float(net) for _, net in profit_rows]
+            if not profits:
+                with self._lock:
+                    fallback = list(self._trades_today)
+                profits = fallback
             return profits[-limit:] if len(profits) > limit else profits
         except Exception:
             with self._lock:
@@ -1554,24 +1590,6 @@ class RiskManager:
                 os.getenv("NEWS_BLACKOUT_FAIL_OPEN_ON_EXC", "0") or "0"
             ).strip() not in ("1", "true", "True"):
                 return False, 0.0, f"news_blackout_exc:{_nb_exc}"
-
-        # ─── SESSION GAP + POST-GAP COOLDOWN ─────────────────────────
-        # Weekend / session transition protection for XAU. Prevents
-        # orders during market-closed windows and during the first
-        # N minutes after re-open (toxic spreads, extreme volatility).
-        try:
-            from core.session_manager import can_trade as _sess_can_trade
-
-            asset_hint = "BTC" if bool(getattr(self.sp, "is_24_7", False)) else "XAU"
-            ok_sess, reason_sess = _sess_can_trade(asset_hint)
-            if not ok_sess:
-                return False, 0.0, f"session_gate:{reason_sess}"
-        except Exception as _sess_exc:
-            # Fail-closed: if session logic is broken, block rather than trade.
-            if str(
-                os.getenv("SESSION_GATE_FAIL_OPEN_ON_EXC", "0") or "0"
-            ).strip() not in ("1", "true", "True"):
-                return False, 0.0, f"session_gate_exc:{_sess_exc}"
         hard_cap = float(getattr(self.sp, "hard_lot_cap", 0.0) or 0.0)
         if hard_cap > 0.0:
             tol = max(1e-8, hard_cap * 1e-6)
@@ -2261,6 +2279,28 @@ class RiskManager:
             structure_frames=structure_frames,
         )
         atr_sl, atr_tp = self._fallback_atr_sl_tp(side_n, entry, adapt)
+
+        atr_ref = float(adapt.get("atr", 0.0) or 0.0)
+        if atr_ref <= 0.0:
+            atr_pct = float(adapt.get("atr_pct", 0.0) or 0.0)
+            if atr_pct > 0.0 and entry > 0.0:
+                atr_ref = atr_pct * entry
+        if atr_ref <= 0.0:
+            sl_mult = max(float(self.cfg.atr_sl_multiplier or 0.0), 0.01)
+            atr_ref = abs(entry - atr_sl) / sl_mult if abs(entry - atr_sl) > 0.0 else 0.0
+
+        min_struct_mult = max(
+            0.0,
+            float(getattr(self.cfg, "min_structure_stop_atr_mult", 1.25) or 1.25),
+        )
+        if struct_sl is not None and atr_ref > 0.0 and min_struct_mult > 0.0:
+            min_struct_dist = max(abs(entry) * 1e-6, atr_ref * min_struct_mult)
+            struct_dist = abs(entry - struct_sl)
+            if struct_dist < min_struct_dist:
+                if side_n == "Buy":
+                    struct_sl = entry - min_struct_dist
+                else:
+                    struct_sl = entry + min_struct_dist
 
         sl = struct_sl if struct_sl is not None else atr_sl
         tp = atr_tp

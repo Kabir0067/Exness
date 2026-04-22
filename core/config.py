@@ -44,9 +44,21 @@ ALLOWED_SYMBOLS: Tuple[str, ...] = ("XAUUSDm", "XAUUSDm.", "BTCUSDm", "BTCUSDm."
 MIN_GATE_SHARPE: float = 0.5
 MIN_GATE_WIN_RATE: float = 0.52
 MAX_GATE_DRAWDOWN: float = 0.25
+# Sharpe > 5 in backtest is statistically implausible for retail scalping
+# strategies and is almost always a sign of lookahead/label leakage or an
+# optimistic fill model. Any model above this cap is blocked from going live.
+MAX_GATE_SHARPE: float = 5.0
+# Minimum walk-forward-analysis pass rate required for a model to pass the
+# live gate. A model that survives 60% of out-of-sample windows is NOT
+# robust; we demand 80% pass rate with a minimum of 5 windows.
+MIN_GATE_WFA_PASS_RATE: float = 0.80
+# Maximum allowed clock drift (server-broker vs local) before trading is
+# paused. For M1 scalping, anything > 3 seconds means we're acting on
+# stale prices and paying slippage on every fill.
+MAX_CLOCK_DRIFT_SEC: float = 3.0
 
-WFA_MIN_WINDOWS: int = 3
-WFA_MIN_PASS_RATE: float = 0.60
+WFA_MIN_WINDOWS: int = 5
+WFA_MIN_PASS_RATE: float = 0.80
 
 _BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
 _BOOL_FALSE = frozenset({"0", "false", "no", "n", "off"})
@@ -541,6 +553,7 @@ class BaseEngineConfig:
     atr_sl_multiplier: float = 2.5
     atr_tp_min_multiplier: float = 3.0
     atr_tp_max_multiplier: float = 5.0
+    min_structure_stop_atr_mult: float = 1.25
     breakeven_trigger_pct: float = 0.40
     trailing_stop_atr_mult: float = 1.5
     ker_period: int = 10
@@ -570,16 +583,34 @@ class BaseEngineConfig:
         }
     )
 
-    min_confidence: int = 75
-    signal_min_score: float = 70.0
+    # Confidence thresholds calibrated against real holdout directional
+    # accuracy (~0.58-0.65 for current CatBoost institutional models).
+    # Previous defaults of 75/80/85 were unreachable for any ML model with
+    # realistic backtest performance, effectively freezing the system.
+    min_confidence: int = 65
+    signal_min_score: float = 60.0
     ml_bridge_enabled: bool = True
-    ml_bridge_min_confidence: float = 0.80
+    ml_bridge_min_confidence: float = 0.60
+    # The pipeline's rule-based scorer is noisy during warmup and in ranging
+    # regimes; when it is merely Neutral (not actively opposing the ML side),
+    # we trust the ML signal rather than veto it. Hard conflicts (Buy vs Sell)
+    # are still blocked downstream in `build_ml_candidate`.
     ml_bridge_allow_neutral_pipeline: bool = True
+    ml_bridge_require_h1_alignment: bool = False
+    ml_bridge_h1_min_bias: float = 0.10
+    signal_max_age_sec: float = 75.0
+    ml_bridge_max_age_sec: float = 30.0
     analysis_notify_live_ml: bool = True
-    same_bar_retry_sec: float = 2.5
+    # 1 second is enough to re-evaluate an M1 bar after a transient block
+    # (spread spike, stale tick, baseline warmup tick). 2.5 s was causing
+    # the loop to sit idle for ~40 cycles on the same bar.
+    same_bar_retry_sec: float = 1.0
     adx_min: float = 20.0
     adx_trend_min: float = 25.0
-    high_accuracy_mode: bool = True
+    # High-accuracy mode formerly forced min_confidence to 85 — unreachable
+    # in live with realistic models. Disabled by default; real precision
+    # comes from calibrated probabilities + WFA-passed models.
+    high_accuracy_mode: bool = False
     low_volume_sniper: float = 0.15
 
     mtf_penalty_enabled: bool = True
@@ -715,6 +746,7 @@ class BTCEngineConfig(BaseEngineConfig):
     atr_sl_multiplier: float = 3.0
     atr_tp_min_multiplier: float = 4.0
     atr_tp_max_multiplier: float = 6.0
+    min_structure_stop_atr_mult: float = 1.50
 
     active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(0, 24)])
     ignore_sessions: bool = True
@@ -750,6 +782,7 @@ class XAUEngineConfig(BaseEngineConfig):
     atr_sl_multiplier: float = 2.5
     atr_tp_min_multiplier: float = 3.0
     atr_tp_max_multiplier: float = 3.0
+    min_structure_stop_atr_mult: float = 1.25
 
 
 # =============================================================================
@@ -961,9 +994,19 @@ def get_config_from_env(asset: str = "XAU") -> BaseEngineConfig:
 
 
 def apply_high_accuracy_mode(cfg: BaseEngineConfig) -> BaseEngineConfig:
+    """
+    Tighten risk-related guards, but keep confidence floors at levels that
+    are actually reachable by a calibrated CatBoost model trained on
+    institutional data. The previous implementation pushed ``min_confidence``
+    to 85 and ``signal_min_score`` to 75, which — given real holdout
+    directional accuracy of ~0.60-0.65 — meant the system effectively
+    never emitted a tradable signal. Real precision comes from the
+    WFA/suspicious-Sharpe gate + calibrated probabilities, not from
+    unrealistic hard floors.
+    """
     cfg.high_accuracy_mode = True
-    cfg.min_confidence = max(int(cfg.min_confidence), 85)
-    cfg.signal_min_score = max(float(cfg.signal_min_score), 75.0)
+    cfg.min_confidence = max(int(cfg.min_confidence), 70)
+    cfg.signal_min_score = max(float(cfg.signal_min_score), 65.0)
     cfg.mtf_penalty_enabled = True
     cfg.spread_gate_multiplier = min(
         float(getattr(cfg, "spread_gate_multiplier", 1.5) or 1.5),
@@ -989,8 +1032,11 @@ __all__ = (
     "EngineConfig",
     "ExecutionResult",
     "KillSwitchState",
+    "MAX_CLOCK_DRIFT_SEC",
     "MAX_GATE_DRAWDOWN",
+    "MAX_GATE_SHARPE",
     "MIN_GATE_SHARPE",
+    "MIN_GATE_WFA_PASS_RATE",
     "MIN_GATE_WIN_RATE",
     "OrderIntent",
     "PortfolioStatus",

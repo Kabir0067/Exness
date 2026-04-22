@@ -31,7 +31,7 @@ import MetaTrader5 as mt5
 from Backtest.engine import BTC_BACKTEST_CONFIG, XAU_BACKTEST_CONFIG, BacktestEngine
 from core.ml_router import MLSignal, fetch_ml_payloads
 from core.portfolio_risk import AssetExposure
-from mt5_client import MT5_LOCK, mt5_status
+from mt5_client import MT5_LOCK, mt5_dispatch_status, mt5_status
 
 from .inference import InferenceEngine
 from .models import (
@@ -336,11 +336,6 @@ class EngineFSMStageServices(IFSMEnginePorts):
         data_sync_ok = True
         data_sync_reason = ""
 
-        try:
-            from core.session_manager import session_state as _sess_state  # local import
-        except Exception:
-            _sess_state = None  # type: ignore[assignment]
-
         for asset in monitored_assets:
             self._e._touch_runtime_progress()
             pipe = self._asset_pipe(asset)
@@ -367,22 +362,6 @@ class EngineFSMStageServices(IFSMEnginePorts):
             if self._e._is_asset_blocked(asset):
                 self._e._log_blocked_asset_skip(asset, "data_sync")
                 continue
-
-            # Skip data sync for assets whose session is currently closed.
-            # This prevents spamming "no_rates" during the weekend gap and
-            # allows the engine to idle cleanly until market re-open.
-            if _sess_state is not None:
-                try:
-                    _ss = _sess_state(asset)
-                    if not _ss.is_open:
-                        data_sync_ok = False
-                        mins_left = int(_ss.seconds_until_open // 60)
-                        data_sync_reason = (
-                            f"{asset}_session_closed:{_ss.reason}:reopen_in_{mins_left}m"
-                        )
-                        continue
-                except Exception:
-                    pass
 
             market_ok, market_reason = self._refresh_market_validation(asset)
             if not market_ok:
@@ -740,15 +719,26 @@ class EngineRuntimeMixin:
 
     def _live_trade_win_rate(self) -> Tuple[float, int]:
         profits: List[float] = []
+        since_ts = float(self._loop_started_ts or 0.0) if self._loop_started_ts > 0 else None
         for pipe in (self._xau, self._btc):
             rm = getattr(pipe, "risk", None) if pipe is not None else None
             fn = getattr(rm, "_recent_closed_trade_profits", None)
             if not callable(fn):
                 continue
             try:
-                p = fn(60)
+                if since_ts is not None:
+                    p = fn(60, since_ts=since_ts)
+                else:
+                    p = fn(60)
                 if isinstance(p, list):
                     profits.extend(float(x) for x in p if x is not None)
+            except TypeError:
+                try:
+                    p = fn(60)
+                    if isinstance(p, list):
+                        profits.extend(float(x) for x in p if x is not None)
+                except Exception:
+                    continue
             except Exception:
                 continue
         if not profits:
@@ -927,10 +917,28 @@ class EngineRuntimeMixin:
                 dd_pct = max(0.0, (bal - eq) / bal)
         else:
             account_reason = ""
+        dispatch = mt5_dispatch_status()
 
         reasons: List[str] = []
         if account_reason:
             reasons.append(account_reason)
+        if not bool(dispatch.get("worker_alive", True)) and int(
+            dispatch.get("queue_depth", 0) or 0
+        ) > 0:
+            reasons.append("mt5_dispatch_worker_dead")
+        if float(dispatch.get("queue_utilization", 0.0) or 0.0) >= 0.90:
+            reasons.append(
+                "mt5_dispatch_backpressure:"
+                f"{int(dispatch.get('queue_depth', 0) or 0)}/"
+                f"{int(dispatch.get('queue_maxsize', 0) or 0)}"
+            )
+        if (
+            float(dispatch.get("oldest_age_ms", 0.0) or 0.0)
+            > float(dispatch.get("stale_threshold_sec", 0.0) or 0.0) * 1000.0
+        ):
+            reasons.append(
+                f"mt5_dispatch_stale:{float(dispatch.get('oldest_age_ms', 0.0) or 0.0):.0f}ms"
+            )
 
         with self._lock:
             open_positions_snap = dict(self._current_open_positions)
@@ -990,6 +998,7 @@ class EngineRuntimeMixin:
             "latency_samples": int(latency_samples),
             "slippage_samples": int(slippage_samples),
             "telemetry_warmup": bool(not (latency_gate_ready and slippage_gate_ready)),
+            "mt5_dispatch": dispatch,
             "wr_ci_95_lo": round(wr_ci_lo, 4),
             "wr_ci_95_hi": round(wr_ci_hi, 4),
         }
@@ -1105,10 +1114,12 @@ class EngineRuntimeMixin:
                 _DIAG_EVERY_SEC
             ):
                 self._diag_last_ts = time.time()
+                dispatch = mt5_dispatch_status()
                 payload = {
                     "ts_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "engine": st,
                     "mt5": mt5_status(),
+                    "mt5_dispatch": dispatch,
                     "live_evidence": live_evidence,
                     "runtime": self.runtime_watchdog_snapshot(),
                     "account_state": dict(self._unsafe_account_snapshot),
@@ -1386,12 +1397,14 @@ class EngineRuntimeMixin:
         heartbeat_age_sec = (
             max(0.0, now - last_activity_ts) if last_activity_ts > 0.0 else 0.0
         )
+        # Treat the pre-thread/bootstrap window as "starting" too, otherwise a
+        # concurrent caller may think the engine is stopped and trigger a false
+        # restart while startup is still in progress.
         starting = bool(
             running
-            and loop_alive
-            and last_heartbeat_ts <= 0.0
             and loop_started_ts > 0.0
             and (now - loop_started_ts) <= self._runtime_start_grace_sec
+            and ((not loop_alive) or last_heartbeat_ts <= 0.0)
         )
         bootstrapping = bool(
             running
@@ -1563,24 +1576,11 @@ class EngineRuntimeMixin:
                 "detail": str(detail or ""),
             }
 
-        # During the first ~30 seconds of boot MT5 init may still be
-        # running. Treat this as a warmup grace window rather than a
-        # false-positive disconnect alarm.
-        uptime_for_mt5 = max(0.0, now - float(self._boot_ts or now))
-        mt5_warmup_active = uptime_for_mt5 < 30.0
-        mt5_ready_or_warmup = bool(
-            self.dry_run or self._mt5_ready or mt5_warmup_active
+        _record(
+            "MT5 disconnect",
+            bool(self.dry_run or self._mt5_ready),
+            "ready" if (self.dry_run or self._mt5_ready) else "mt5_not_ready",
         )
-        mt5_detail = (
-            "ready"
-            if (self.dry_run or self._mt5_ready)
-            else (
-                f"warmup:{uptime_for_mt5:.1f}/30.0s"
-                if mt5_warmup_active
-                else "mt5_not_ready"
-            )
-        )
-        _record("MT5 disconnect", mt5_ready_or_warmup, mt5_detail)
         _record(
             "internet delay",
             _p95(self._exec_latency_ms_hist)

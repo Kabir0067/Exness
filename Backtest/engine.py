@@ -2063,26 +2063,52 @@ class InstitutionalBacktestEngine:
             )
 
         # Verification gate
-        SHARPE_SUSPICIOUS_THRESHOLD = 5.0
-        if metrics.sharpe_ratio > SHARPE_SUSPICIOUS_THRESHOLD:
+        # Pull shared thresholds from config so gate logic is defined once.
+        try:
+            from core.config import MAX_GATE_SHARPE as _MAX_GATE_SHARPE
+            from core.config import MIN_GATE_WFA_PASS_RATE as _MIN_WFA_PASS
+        except Exception:
+            _MAX_GATE_SHARPE = 5.0
+            _MIN_WFA_PASS = 0.80
+        SHARPE_SUSPICIOUS_THRESHOLD = float(_MAX_GATE_SHARPE)
+        sharpe_suspicious = metrics.sharpe_ratio > SHARPE_SUSPICIOUS_THRESHOLD
+        if sharpe_suspicious:
             log.warning(
                 "BACKTEST_SHARPE_SUSPICIOUS | asset=%s sharpe=%.2f > %.1f | "
                 "Verify backtest period length, transaction costs, and WFA window count. "
-                "Real-market Sharpe above 5.0 is statistically improbable.",
+                "Real-market Sharpe above %.1f is statistically improbable "
+                "and is treated as UNSAFE (model blocked from live gate).",
                 self.asset,
                 metrics.sharpe_ratio,
                 SHARPE_SUSPICIOUS_THRESHOLD,
+                SHARPE_SUSPICIOUS_THRESHOLD,
+            )
+        wfa_pass_rate = float(wfa.get("pass_rate", 0.0) or 0.0)
+        wfa_pass_rate_ok = wfa_pass_rate >= float(_MIN_WFA_PASS)
+        if not wfa_pass_rate_ok:
+            log.warning(
+                "BACKTEST_WFA_PASS_RATE_LOW | asset=%s pass_rate=%.3f < %.3f | "
+                "A model that survives <%.0f%% of out-of-sample WFA windows "
+                "is not robust; marked UNSAFE.",
+                self.asset,
+                wfa_pass_rate,
+                float(_MIN_WFA_PASS),
+                float(_MIN_WFA_PASS) * 100.0,
             )
         base_verified = (
             metrics.sharpe_ratio >= MIN_GATE_SHARPE
             and metrics.win_rate >= MIN_GATE_WIN_RATE
             and metrics.max_drawdown_pct <= MAX_GATE_DRAWDOWN
             and self._sample_quality_passed
+            and not sharpe_suspicious
+            and wfa_pass_rate_ok
         )
         unsafe = (
             mc_results["risk_of_ruin"] > 0.01
             or not stress["passed"]
             or not self._sample_quality_passed
+            or sharpe_suspicious
+            or not wfa_pass_rate_ok
         )
         wfa_gate_ok = bool(wfa.get("passed", False))
         # Sharpe > 8.0 blocks institutional_grade: near-certain backtest overfitting.

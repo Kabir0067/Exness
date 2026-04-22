@@ -525,12 +525,23 @@ def auto_train_models_strict() -> bool:  # noqa: C901
     )
     assets: list[str] = _resolve_training_assets(assets_env)
     assets_set = set(assets)
-    retry_hours = max(0.0, env_float("AUTO_TRAIN_RETRY_HOURS", 3.0))
+    # Retrain cadence: a model that genuinely captures market structure
+    # should stay valid for at least 7 days. Previous default of 3 hours
+    # caused the training loop to churn through noise (18+ model
+    # snapshots per 2 days observed in production), which is a symptom
+    # of overfitting, not alpha. The floor is now weekly.
+    retry_hours = max(0.0, env_float("AUTO_TRAIN_RETRY_HOURS", 168.0))
     failure_cooldown_hours = max(
-        0.0, env_float("AUTO_TRAIN_FAILURE_COOLDOWN_HOURS", max(6.0, retry_hours))
+        0.0, env_float("AUTO_TRAIN_FAILURE_COOLDOWN_HOURS", max(48.0, retry_hours / 4.0))
     )
+    # Default ON: if the live gate is failing (suspicious Sharpe, low WFA
+    # pass rate, anti-overfit, etc.) we MUST retrain even when the model
+    # state file on disk is still "fresh". Previous default of "0" meant
+    # a bad model could sit at the gate for a full week before being
+    # re-evaluated — the system would just keep logging "SKIP recent_state"
+    # while trading stayed disabled.
     force_retry_on_recent_fail = env_truthy(
-        "AUTO_TRAIN_FORCE_RETRY_WHEN_RECENT_GATE_FAIL", "0"
+        "AUTO_TRAIN_FORCE_RETRY_WHEN_RECENT_GATE_FAIL", "1"
     )
     failure_registry_path = get_artifact_path("models", "auto_train_failures.json")
 
@@ -696,8 +707,25 @@ def auto_train_models_strict() -> bool:  # noqa: C901
                     "meta_contract_missing",
                 )
             )
+            # Suspicious-Sharpe and low-WFA-pass-rate are unambiguous
+            # overfit/leakage fingerprints. Keeping such an artefact on
+            # disk until the weekly retry window is institutional malpractice
+            # — the model MUST be rebuilt from scratch immediately.
+            overfit_or_leakage_signature = r.startswith(
+                (
+                    "state_sharpe_suspicious",
+                    "meta_sharpe_suspicious",
+                    "state_wfa_pass_rate_low",
+                    "meta_wfa_pass_rate_low",
+                )
+            )
             force_retrain = bool(
-                (not gate_ok_pre) and (wfa_no_evidence or anti_overfit_or_contract)
+                (not gate_ok_pre)
+                and (
+                    wfa_no_evidence
+                    or anti_overfit_or_contract
+                    or overfit_or_leakage_signature
+                )
             )
             force_retrain_reason = r
         except Exception:
@@ -718,7 +746,21 @@ def auto_train_models_strict() -> bool:  # noqa: C901
                 os.environ[k] = v
 
         try:
+            _log.warning(
+                "Auto-train(strict) TRAIN_BEGIN | asset=%s note=institutional_backtest_may_take_5_to_15_min_in_fast_mode",
+                asset,
+            )
+            _train_start = time.time()
             metrics = run_institutional_backtest(asset)
+            _train_elapsed = time.time() - _train_start
+            _log.warning(
+                "Auto-train(strict) TRAIN_END | asset=%s elapsed=%.1fs sharpe=%.3f win_rate=%.3f max_dd=%.4f",
+                asset,
+                _train_elapsed,
+                float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+            )
             gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
             if gate_ok_asset:
                 passed_assets.append(asset)

@@ -8,9 +8,9 @@ and idempotent order submission for the live runtime.
 from __future__ import annotations
 
 import atexit
-import collections
 import concurrent.futures
 import glob
+import heapq
 import logging
 import logging.handlers
 import msvcrt
@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 
@@ -40,8 +40,81 @@ from log_config import get_log_path
 # =============================================================================
 # Global Constants & Meta Definitions
 # =============================================================================
-# Set MT5 log constraints
-_ASYNC_STALE_THRESHOLD_SEC: float = 0.5
+def _env_bool(name: str, default: str = "0") -> bool:
+    raw = str(os.getenv(name, default) or default).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    try:
+        value = float(os.getenv(name, str(default)) or default)
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return float(value)
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    try:
+        value = int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return int(value)
+
+
+# Async dispatcher pressure controls
+_ASYNC_STALE_THRESHOLD_SEC: float = _env_float(
+    "MT5_ASYNC_STALE_THRESHOLD_SEC",
+    1.5,
+    minimum=0.05,
+    maximum=30.0,
+)
+_MT5_ASYNC_QUEUE_MAXSIZE: int = _env_int(
+    "MT5_ASYNC_QUEUE_MAXSIZE",
+    256,
+    minimum=16,
+    maximum=4096,
+)
+_MT5_ASYNC_LOCK_TIMEOUT_SEC: float = _env_float(
+    "MT5_ASYNC_LOCK_TIMEOUT_SEC",
+    8.0,
+    minimum=0.25,
+    maximum=60.0,
+)
+_MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH: int = _env_int(
+    "MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH",
+    4,
+    minimum=0,
+    maximum=1024,
+)
+_MT5_ASYNC_PREEMPT_WRITES: bool = _env_bool("MT5_ASYNC_PREEMPT_WRITES", "1")
+_MT5_ASYNC_WRITE_DIRECT_FALLBACK_UNDER_LOAD: bool = _env_bool(
+    "MT5_ASYNC_WRITE_DIRECT_FALLBACK_UNDER_LOAD", "1"
+)
+
+_MT5_DISPATCH_PRIORITY_CRITICAL = 0
+_MT5_DISPATCH_PRIORITY_HIGH = 10
+_MT5_DISPATCH_PRIORITY_NORMAL = 20
+_MT5_DISPATCH_PRIORITY_LOW = 30
 
 # =============================================================================
 # Global Mutex and State Variables
@@ -74,8 +147,31 @@ _terminal_pid: Optional[int] = None
 _terminal_pid_lock = threading.Lock()
 
 # Async dispatcher State
-_mt5_deque: Deque[Optional[Tuple]] = collections.deque()
-_mt5_deque_cond = threading.Condition(threading.Lock())
+_mt5_dispatch_heap: List[Tuple[int, int, "_AsyncDispatchItem"]] = []
+_mt5_dispatch_cond = threading.Condition(threading.Lock())
+_mt5_dispatch_seq: int = 0
+_mt5_dispatch_metrics_lock = threading.Lock()
+_mt5_dispatch_metrics: Dict[str, Any] = {
+    "enqueued_total": 0,
+    "completed_total": 0,
+    "failed_total": 0,
+    "stale_total": 0,
+    "overflow_total": 0,
+    "preempted_total": 0,
+    "cancelled_total": 0,
+    "lock_timeout_total": 0,
+    "inline_total": 0,
+    "direct_fallback_total": 0,
+    "direct_fallback_blocked_total": 0,
+    "high_watermark": 0,
+    "last_queue_depth": 0,
+    "last_enqueue_ts_mono": 0.0,
+    "last_complete_ts_mono": 0.0,
+    "last_lock_wait_ms": 0.0,
+    "lock_wait_ema_ms": 0.0,
+    "last_call_ms": 0.0,
+    "call_ema_ms": 0.0,
+}
 
 _mt5_async_thread: Optional[threading.Thread] = None
 _mt5_async_stop = threading.Event()
@@ -160,6 +256,19 @@ class Health:
     reason: str
 
 
+@dataclass(frozen=True)
+class _AsyncDispatchItem:
+    """Internal MT5 dispatch item held in the bounded priority queue."""
+
+    enqueue_ts: float
+    method_name: str
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
+    fut: concurrent.futures.Future
+    priority: int
+    seq: int
+
+
 # =============================================================================
 # Logging Setup
 # =============================================================================
@@ -236,6 +345,235 @@ def _sleep_backoff(base: float, attempt: int, cap: float) -> None:
     time.sleep(delay)
 
 
+def _ema(prev: float, sample: float, alpha: float = 0.20) -> float:
+    sample_v = max(0.0, float(sample))
+    prev_v = max(0.0, float(prev))
+    if prev_v <= 0.0:
+        return sample_v
+    return (prev_v * (1.0 - alpha)) + (sample_v * alpha)
+
+
+def _mt5_dispatch_priority(method_name: str, explicit: Optional[int] = None) -> int:
+    if explicit is not None:
+        return int(explicit)
+
+    method = str(method_name or "").strip().lower()
+    if method in {"order_send", "order_check"}:
+        return _MT5_DISPATCH_PRIORITY_CRITICAL
+    if method in {
+        "positions_get",
+        "positions_total",
+        "orders_get",
+        "orders_total",
+        "account_info",
+        "symbol_info",
+        "symbol_info_tick",
+        "copy_rates_from_pos",
+        "copy_ticks_from",
+        "copy_ticks_range",
+        "copy_rates_range",
+        "copy_rates_from",
+    }:
+        return _MT5_DISPATCH_PRIORITY_HIGH
+    if method.startswith("history_"):
+        return _MT5_DISPATCH_PRIORITY_LOW
+    return _MT5_DISPATCH_PRIORITY_NORMAL
+
+
+def _mt5_dispatch_metrics_inc(name: str, inc: int = 1) -> None:
+    with _mt5_dispatch_metrics_lock:
+        _mt5_dispatch_metrics[name] = int(_mt5_dispatch_metrics.get(name, 0) or 0) + int(
+            inc
+        )
+
+
+def _mt5_dispatch_metrics_note_queue_depth(depth: int) -> None:
+    with _mt5_dispatch_metrics_lock:
+        _mt5_dispatch_metrics["last_queue_depth"] = int(depth)
+        _mt5_dispatch_metrics["high_watermark"] = max(
+            int(_mt5_dispatch_metrics.get("high_watermark", 0) or 0),
+            int(depth),
+        )
+
+
+def _mt5_dispatch_metrics_note_enqueue(depth: int) -> None:
+    now = _mono()
+    with _mt5_dispatch_metrics_lock:
+        _mt5_dispatch_metrics["enqueued_total"] = int(
+            _mt5_dispatch_metrics.get("enqueued_total", 0) or 0
+        ) + 1
+        _mt5_dispatch_metrics["last_queue_depth"] = int(depth)
+        _mt5_dispatch_metrics["high_watermark"] = max(
+            int(_mt5_dispatch_metrics.get("high_watermark", 0) or 0),
+            int(depth),
+        )
+        _mt5_dispatch_metrics["last_enqueue_ts_mono"] = float(now)
+
+
+def _mt5_dispatch_metrics_note_completion(
+    *,
+    call_ms: float,
+    lock_wait_ms: float,
+    failed: bool = False,
+) -> None:
+    now = _mono()
+    with _mt5_dispatch_metrics_lock:
+        _mt5_dispatch_metrics["completed_total"] = int(
+            _mt5_dispatch_metrics.get("completed_total", 0) or 0
+        ) + 1
+        if failed:
+            _mt5_dispatch_metrics["failed_total"] = int(
+                _mt5_dispatch_metrics.get("failed_total", 0) or 0
+            ) + 1
+        _mt5_dispatch_metrics["last_complete_ts_mono"] = float(now)
+        _mt5_dispatch_metrics["last_lock_wait_ms"] = float(lock_wait_ms)
+        _mt5_dispatch_metrics["lock_wait_ema_ms"] = _ema(
+            float(_mt5_dispatch_metrics.get("lock_wait_ema_ms", 0.0) or 0.0),
+            lock_wait_ms,
+        )
+        _mt5_dispatch_metrics["last_call_ms"] = float(call_ms)
+        _mt5_dispatch_metrics["call_ema_ms"] = _ema(
+            float(_mt5_dispatch_metrics.get("call_ema_ms", 0.0) or 0.0),
+            call_ms,
+        )
+
+
+def _mt5_dispatch_reset_runtime_state() -> None:
+    global _mt5_dispatch_seq
+    with _mt5_dispatch_cond:
+        _mt5_dispatch_heap.clear()
+        _mt5_dispatch_seq = 0
+    with _mt5_dispatch_metrics_lock:
+        _mt5_dispatch_metrics.clear()
+        _mt5_dispatch_metrics.update(
+            {
+                "enqueued_total": 0,
+                "completed_total": 0,
+                "failed_total": 0,
+                "stale_total": 0,
+                "overflow_total": 0,
+                "preempted_total": 0,
+                "cancelled_total": 0,
+                "lock_timeout_total": 0,
+                "inline_total": 0,
+                "direct_fallback_total": 0,
+                "direct_fallback_blocked_total": 0,
+                "high_watermark": 0,
+                "last_queue_depth": 0,
+                "last_enqueue_ts_mono": 0.0,
+                "last_complete_ts_mono": 0.0,
+                "last_lock_wait_ms": 0.0,
+                "lock_wait_ema_ms": 0.0,
+                "last_call_ms": 0.0,
+                "call_ema_ms": 0.0,
+            }
+        )
+
+
+def _mt5_dispatch_queue_depth() -> int:
+    with _mt5_dispatch_cond:
+        return int(len(_mt5_dispatch_heap))
+
+
+def _mt5_should_allow_direct_fallback(method_name: str, requested: bool) -> bool:
+    if not requested:
+        return False
+
+    depth = _mt5_dispatch_queue_depth()
+    if depth <= _MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH:
+        return True
+
+    priority = _mt5_dispatch_priority(method_name)
+    allow_under_load = bool(
+        priority <= _MT5_DISPATCH_PRIORITY_CRITICAL
+        and _MT5_ASYNC_WRITE_DIRECT_FALLBACK_UNDER_LOAD
+    )
+    if not allow_under_load:
+        _mt5_dispatch_metrics_inc("direct_fallback_blocked_total")
+    return allow_under_load
+
+
+def _mt5_dispatch_evict_candidate(
+    new_priority: int,
+) -> Optional[_AsyncDispatchItem]:
+    if not _mt5_dispatch_heap:
+        return None
+
+    victim_idx: Optional[int] = None
+    victim_key: Tuple[int, int] = (-1, -1)
+
+    for idx, (priority, seq, item) in enumerate(_mt5_dispatch_heap):
+        if priority <= new_priority:
+            continue
+        key = (priority, seq)
+        if key > victim_key:
+            victim_idx = idx
+            victim_key = key
+
+    if victim_idx is None:
+        return None
+
+    _, _, victim = _mt5_dispatch_heap.pop(victim_idx)
+    heapq.heapify(_mt5_dispatch_heap)
+    return victim
+
+
+def _mt5_dispatch_submit_item(
+    method_name: str,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    fut: concurrent.futures.Future,
+    *,
+    priority: Optional[int] = None,
+) -> None:
+    global _mt5_dispatch_seq
+
+    enqueue_ts = _mono()
+    dispatch_priority = _mt5_dispatch_priority(method_name, explicit=priority)
+    victim: Optional[_AsyncDispatchItem] = None
+
+    with _mt5_dispatch_cond:
+        if len(_mt5_dispatch_heap) >= _MT5_ASYNC_QUEUE_MAXSIZE:
+            if _MT5_ASYNC_PREEMPT_WRITES:
+                victim = _mt5_dispatch_evict_candidate(dispatch_priority)
+            if victim is None and len(_mt5_dispatch_heap) >= _MT5_ASYNC_QUEUE_MAXSIZE:
+                _mt5_dispatch_metrics_inc("overflow_total")
+                _mt5_dispatch_metrics_note_queue_depth(len(_mt5_dispatch_heap))
+                fut.set_exception(
+                    RuntimeError(
+                        f"mt5_async_queue_full:{method_name}:{len(_mt5_dispatch_heap)}/"
+                        f"{_MT5_ASYNC_QUEUE_MAXSIZE}"
+                    )
+                )
+                return
+
+        item = _AsyncDispatchItem(
+            enqueue_ts=enqueue_ts,
+            method_name=str(method_name),
+            args=tuple(args),
+            kwargs=dict(kwargs),
+            fut=fut,
+            priority=int(dispatch_priority),
+            seq=int(_mt5_dispatch_seq),
+        )
+        _mt5_dispatch_seq += 1
+        heapq.heappush(_mt5_dispatch_heap, (item.priority, item.seq, item))
+        depth = len(_mt5_dispatch_heap)
+        _mt5_dispatch_metrics_note_enqueue(depth)
+        _mt5_dispatch_cond.notify()
+
+    if victim is not None:
+        _mt5_dispatch_metrics_inc("preempted_total")
+        _mt5_dispatch_metrics_inc("overflow_total")
+        _set_future_exception_safe(
+            victim.fut,
+            RuntimeError(
+                f"mt5_async_queue_preempted:{victim.method_name}->{method_name}"
+            ),
+            victim.method_name,
+        )
+
+
 def _validate_cfg(cfg: MT5ClientConfig) -> None:
     if cfg is None:
         raise RuntimeError("MT5ClientConfig is None")
@@ -272,6 +610,32 @@ def _looks_like_transport_error(exc: Exception) -> bool:
             "no connection",
             "connection",
             "mt5_async_queue",
+        )
+    )
+
+
+def _should_repair_transport_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    if any(
+        noisy in msg
+        for noisy in (
+            "mt5_async_queue",
+            "mt5_async_stale",
+            "queue_preempted",
+            "queue_full",
+            "lock acquire timeout",
+            "status_lock_timeout",
+        )
+    ):
+        return False
+    return any(
+        kw in msg
+        for kw in (
+            "ipc",
+            "-10005",
+            "no connection",
+            "authorization failed",
+            "invalid account",
         )
     )
 
@@ -333,26 +697,26 @@ def _throttled_health_log(cfg: MT5ClientConfig, reason: str) -> None:
 
 
 def _cancel_pending_mt5_async(reason: str = "mt5_async_reset") -> int:
-    drained: List[Tuple] = []
-    with _mt5_deque_cond:
-        while _mt5_deque:
-            item = _mt5_deque.popleft()
-            if item is None:
-                continue
+    drained: List[_AsyncDispatchItem] = []
+    with _mt5_dispatch_cond:
+        while _mt5_dispatch_heap:
+            _, _, item = heapq.heappop(_mt5_dispatch_heap)
             drained.append(item)
+        _mt5_dispatch_metrics_note_queue_depth(0)
 
     cancelled = 0
     for item in drained:
         try:
-            if not isinstance(item, tuple) or len(item) != 5:
-                continue
-            _, method_name, _, _, fut = item
+            method_name = str(item.method_name)
+            fut = item.fut
             if fut.cancelled() or fut.done():
                 continue
             fut.set_exception(RuntimeError(f"{reason}:{method_name}"))
             cancelled += 1
         except Exception:
             continue
+    if cancelled > 0:
+        _mt5_dispatch_metrics_inc("cancelled_total", cancelled)
     return cancelled
 
 
@@ -746,28 +1110,27 @@ def _set_future_exception_safe(
 
 
 def _mt5_async_loop() -> None:
-    while not _mt5_async_stop.is_set():
-        with _mt5_deque_cond:
-            _mt5_deque_cond.wait_for(
-                lambda: bool(_mt5_deque) or _mt5_async_stop.is_set(),
+    while True:
+        with _mt5_dispatch_cond:
+            _mt5_dispatch_cond.wait_for(
+                lambda: bool(_mt5_dispatch_heap) or _mt5_async_stop.is_set(),
                 timeout=1.0,
             )
-            if _mt5_async_stop.is_set() and not _mt5_deque:
+            if _mt5_async_stop.is_set() and not _mt5_dispatch_heap:
                 break
-            try:
-                item = _mt5_deque.popleft()
-            except IndexError:
+            if not _mt5_dispatch_heap:
                 continue
+            _, _, item = heapq.heappop(_mt5_dispatch_heap)
+            _mt5_dispatch_metrics_note_queue_depth(len(_mt5_dispatch_heap))
 
-        if item is None:
-            break
+        enqueue_ts = float(item.enqueue_ts)
+        method_name = str(item.method_name)
+        args = item.args
+        kwargs = item.kwargs
+        fut = item.fut
 
-        if not isinstance(item, tuple) or len(item) != 5:
-            continue
-
-        enqueue_ts, method_name, args, kwargs, fut = item
-
-        if fut.cancelled():
+        if not fut.set_running_or_notify_cancel():
+            _mt5_dispatch_metrics_inc("cancelled_total")
             del fut
             continue
 
@@ -780,6 +1143,7 @@ def _mt5_async_loop() -> None:
                 ),
                 method_name,
             )
+            _mt5_dispatch_metrics_inc("stale_total")
             del fut
             continue
 
@@ -796,7 +1160,9 @@ def _mt5_async_loop() -> None:
             del fut
             continue
 
-        acquired = MT5_LOCK.acquire(timeout=5.0)
+        lock_wait_started = _mono()
+        acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
+        lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
         if not acquired:
             _set_future_exception_safe(
                 fut,
@@ -805,9 +1171,11 @@ def _mt5_async_loop() -> None:
                 ),
                 method_name,
             )
+            _mt5_dispatch_metrics_inc("lock_timeout_total")
             del fut
             continue
 
+        call_started = _mono()
         try:
             call_result = fn(*args, **kwargs)
             call_exc: Optional[Exception] = None
@@ -816,6 +1184,12 @@ def _mt5_async_loop() -> None:
             call_exc = exc
         finally:
             MT5_LOCK.release()
+        call_ms = (_mono() - call_started) * 1000.0
+        _mt5_dispatch_metrics_note_completion(
+            call_ms=call_ms,
+            lock_wait_ms=lock_wait_ms,
+            failed=call_exc is not None,
+        )
 
         if call_exc is not None:
             _set_future_exception_safe(fut, call_exc, method_name)
@@ -846,9 +1220,8 @@ def _stop_mt5_async_thread() -> None:
     try:
         _mt5_async_stop.set()
         _cancel_pending_mt5_async("mt5_async_stop")
-        with _mt5_deque_cond:
-            _mt5_deque.append(None)
-            _mt5_deque_cond.notify()
+        with _mt5_dispatch_cond:
+            _mt5_dispatch_cond.notify_all()
         th = _mt5_async_thread
         if th and th.is_alive():
             th.join(timeout=2.0)
@@ -863,12 +1236,27 @@ def _mt5_direct_call(method_name: str, *args, **kwargs) -> Any:
     fn = getattr(mt5, str(method_name), None)
     if not callable(fn):
         raise AttributeError(f"mt5.{method_name!r} not callable")
-    acquired = MT5_LOCK.acquire(timeout=5.0)
+    lock_wait_started = _mono()
+    acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
+    lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
     if not acquired:
+        _mt5_dispatch_metrics_inc("lock_timeout_total")
         raise TimeoutError(f"MT5_LOCK acquire timeout in direct call {method_name!r}")
+    call_started = _mono()
     try:
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        call_exc: Optional[Exception] = None
+        return result
+    except Exception as exc:
+        call_exc = exc
+        raise
     finally:
+        call_ms = (_mono() - call_started) * 1000.0
+        _mt5_dispatch_metrics_note_completion(
+            call_ms=call_ms,
+            lock_wait_ms=lock_wait_ms,
+            failed=call_exc is not None,
+        )
         MT5_LOCK.release()
 
 
@@ -1011,6 +1399,7 @@ def mt5_async_submit(
     method_name: str,
     *args,
     ensure_ready: bool = False,
+    dispatch_priority: Optional[int] = None,
     **kwargs,
 ) -> concurrent.futures.Future:
     """Queue an MT5 API call to the dedicated dispatcher thread safely."""
@@ -1033,31 +1422,47 @@ def mt5_async_submit(
             )
             return fut_inline
 
-        acquired = MT5_LOCK.acquire(timeout=5.0)
+        lock_wait_started = _mono()
+        acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
+        lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
         if not acquired:
+            _mt5_dispatch_metrics_inc("lock_timeout_total")
             fut_inline.set_exception(
                 TimeoutError(f"MT5_LOCK timeout on inline call {method_name!r}")
             )
             return fut_inline
+        call_started = _mono()
         try:
-            fut_inline.set_result(fn(*args, **kwargs))
+            result = fn(*args, **kwargs)
+            call_exc: Optional[Exception] = None
+            fut_inline.set_result(result)
         except Exception as exc:
+            call_exc = exc
             try:
                 fut_inline.set_exception(exc)
             except concurrent.futures.InvalidStateError:
                 pass
         finally:
+            call_ms = (_mono() - call_started) * 1000.0
+            _mt5_dispatch_metrics_inc("inline_total")
+            _mt5_dispatch_metrics_note_completion(
+                call_ms=call_ms,
+                lock_wait_ms=lock_wait_ms,
+                failed=call_exc is not None,
+            )
             MT5_LOCK.release()
         return fut_inline
 
     _ensure_mt5_async_thread()
 
     fut: concurrent.futures.Future = concurrent.futures.Future()
-    item = (_mono(), str(method_name), tuple(args), dict(kwargs), fut)
-
-    with _mt5_deque_cond:
-        _mt5_deque.append(item)
-        _mt5_deque_cond.notify()
+    _mt5_dispatch_submit_item(
+        method_name=str(method_name),
+        args=tuple(args),
+        kwargs=dict(kwargs),
+        fut=fut,
+        priority=dispatch_priority,
+    )
 
     return fut
 
@@ -1072,6 +1477,7 @@ def mt5_async_call(
     retries: int = 1,
     repair_on_transport_error: bool = True,
     direct_fallback: bool = True,
+    dispatch_priority: Optional[int] = None,
     **kwargs,
 ) -> Any:
     """Synchronous wait wrapper around mt5_async_submit."""
@@ -1080,31 +1486,51 @@ def mt5_async_call(
 
     for attempt in range(attempts):
         wait_s = _adaptive_transport_timeout(timeout, attempt)
+        fut: Optional[concurrent.futures.Future] = None
         try:
             fut = mt5_async_submit(
-                method_name, *args, ensure_ready=ensure_ready, **kwargs
+                method_name,
+                *args,
+                ensure_ready=ensure_ready,
+                dispatch_priority=dispatch_priority,
+                **kwargs,
             )
             result = fut.result(timeout=wait_s)
             _update_transport_health(ok=True)
             return result
         except concurrent.futures.TimeoutError as exc:
             last_exc = exc
+            cancelled = bool(fut is not None and fut.cancel())
+            if cancelled:
+                _mt5_dispatch_metrics_inc("cancelled_total")
             _update_transport_health(ok=False, exc=exc)
-            if repair_on_transport_error:
+            if repair_on_transport_error and _should_repair_transport_error(exc):
                 _repair_mt5_once()
             if attempt < attempts - 1:
+                if not cancelled:
+                    last_exc = TimeoutError(
+                        f"mt5_async_inflight_timeout:{method_name!r}:retry_blocked"
+                    )
+                    break
                 _adaptive_retry_pause(attempt)
                 continue
-            if direct_fallback:
+            if cancelled and _mt5_should_allow_direct_fallback(
+                method_name, direct_fallback
+            ):
                 try:
+                    _mt5_dispatch_metrics_inc("direct_fallback_total")
                     result = _mt5_direct_call(method_name, *args, **kwargs)
                     _update_transport_health(ok=True)
                     return result
                 except Exception as exc2:
                     last_exc = exc2
+            elif direct_fallback and not cancelled:
+                last_exc = TimeoutError(
+                    f"mt5_async_inflight_timeout:{method_name!r}:direct_fallback_blocked"
+                )
         except Exception as exc:
             last_exc = exc
-            if repair_on_transport_error and _looks_like_transport_error(exc):
+            if repair_on_transport_error and _should_repair_transport_error(exc):
                 _update_transport_health(ok=False, exc=exc)
                 _repair_mt5_once()
             elif _looks_like_transport_error(exc):
@@ -1113,8 +1539,9 @@ def mt5_async_call(
                 if _looks_like_transport_error(exc):
                     _adaptive_retry_pause(attempt)
                 continue
-            if direct_fallback:
+            if _mt5_should_allow_direct_fallback(method_name, direct_fallback):
                 try:
+                    _mt5_dispatch_metrics_inc("direct_fallback_total")
                     result = _mt5_direct_call(method_name, *args, **kwargs)
                     _update_transport_health(ok=True)
                     return result
@@ -1169,7 +1596,8 @@ def safe_order_send(
             if not is_transport:
                 raise
 
-            _repair_mt5_once(throttle_sec=min(2.5, 1.0 + (0.40 * attempt)))
+            if _should_repair_transport_error(exc):
+                _repair_mt5_once(throttle_sec=min(2.5, 1.0 + (0.40 * attempt)))
             ghost = _check_ghost_fill(idem_key_str, cfg)
             if ghost:
                 raise MT5GhostFillDetected(
@@ -1390,6 +1818,7 @@ def shutdown_mt5() -> None:
         _reset_hard_reset_probe()
         _non_retriable_block_until_mono = 0.0
         _non_retriable_block_reason = ""
+        _mt5_dispatch_reset_runtime_state()
 
     _release_single_instance_lock()
 
@@ -1403,6 +1832,96 @@ def mt5_status() -> Tuple[bool, str]:
         return bool(_initialized), str(_last_health_reason)
     finally:
         MT5_LOCK.release()
+
+
+def mt5_dispatch_status() -> Dict[str, Any]:
+    """Return bounded-dispatch health and pressure telemetry for diagnostics."""
+    with _mt5_dispatch_cond:
+        pending = [item for _, _, item in _mt5_dispatch_heap]
+
+    queue_depth = int(len(pending))
+    now_mono = _mono()
+    oldest_age_ms = max(
+        (
+            max(0.0, (now_mono - float(item.enqueue_ts)) * 1000.0)
+            for item in pending
+        ),
+        default=0.0,
+    )
+    queued_critical = sum(
+        1 for item in pending if int(item.priority) <= _MT5_DISPATCH_PRIORITY_CRITICAL
+    )
+    queued_high = sum(
+        1
+        for item in pending
+        if int(item.priority) == _MT5_DISPATCH_PRIORITY_HIGH
+    )
+    queued_normal = sum(
+        1
+        for item in pending
+        if int(item.priority) == _MT5_DISPATCH_PRIORITY_NORMAL
+    )
+    queued_low = sum(
+        1 for item in pending if int(item.priority) >= _MT5_DISPATCH_PRIORITY_LOW
+    )
+
+    with _mt5_dispatch_metrics_lock:
+        metrics = dict(_mt5_dispatch_metrics)
+    with _transport_state_lock:
+        transport_error_streak = int(_transport_error_streak)
+        transport_timeout_scale = float(_transport_timeout_scale)
+
+    utilization = (
+        float(queue_depth) / float(_MT5_ASYNC_QUEUE_MAXSIZE)
+        if _MT5_ASYNC_QUEUE_MAXSIZE > 0
+        else 0.0
+    )
+    worker_alive = bool(_mt5_async_thread and _mt5_async_thread.is_alive())
+    return {
+        "worker_alive": worker_alive,
+        "stop_requested": bool(_mt5_async_stop.is_set()),
+        "queue_depth": queue_depth,
+        "queue_maxsize": int(_MT5_ASYNC_QUEUE_MAXSIZE),
+        "queue_utilization": round(utilization, 4),
+        "pressure": (
+            "HIGH"
+            if utilization >= 0.75
+            else ("MEDIUM" if utilization >= 0.40 else "LOW")
+        ),
+        "oldest_age_ms": round(oldest_age_ms, 1),
+        "stale_threshold_sec": float(_ASYNC_STALE_THRESHOLD_SEC),
+        "lock_timeout_sec": float(_MT5_ASYNC_LOCK_TIMEOUT_SEC),
+        "direct_fallback_depth_limit": int(_MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH),
+        "queued_critical": queued_critical,
+        "queued_high": queued_high,
+        "queued_normal": queued_normal,
+        "queued_low": queued_low,
+        "transport_error_streak": transport_error_streak,
+        "transport_timeout_scale": round(transport_timeout_scale, 3),
+        "enqueued_total": int(metrics.get("enqueued_total", 0) or 0),
+        "completed_total": int(metrics.get("completed_total", 0) or 0),
+        "failed_total": int(metrics.get("failed_total", 0) or 0),
+        "stale_total": int(metrics.get("stale_total", 0) or 0),
+        "overflow_total": int(metrics.get("overflow_total", 0) or 0),
+        "preempted_total": int(metrics.get("preempted_total", 0) or 0),
+        "cancelled_total": int(metrics.get("cancelled_total", 0) or 0),
+        "lock_timeout_total": int(metrics.get("lock_timeout_total", 0) or 0),
+        "inline_total": int(metrics.get("inline_total", 0) or 0),
+        "direct_fallback_total": int(metrics.get("direct_fallback_total", 0) or 0),
+        "direct_fallback_blocked_total": int(
+            metrics.get("direct_fallback_blocked_total", 0) or 0
+        ),
+        "high_watermark": int(metrics.get("high_watermark", 0) or 0),
+        "last_queue_depth": int(metrics.get("last_queue_depth", 0) or 0),
+        "last_lock_wait_ms": round(
+            float(metrics.get("last_lock_wait_ms", 0.0) or 0.0), 3
+        ),
+        "lock_wait_ema_ms": round(
+            float(metrics.get("lock_wait_ema_ms", 0.0) or 0.0), 3
+        ),
+        "last_call_ms": round(float(metrics.get("last_call_ms", 0.0) or 0.0), 3),
+        "call_ema_ms": round(float(metrics.get("call_ema_ms", 0.0) or 0.0), 3),
+    }
 
 
 atexit.register(shutdown_mt5)
@@ -1421,6 +1940,7 @@ __all__ = [
     "mt5",
     "mt5_async_call",
     "mt5_async_submit",
+    "mt5_dispatch_status",
     "mt5_status",
     "safe_order_send",
     "shutdown_mt5",

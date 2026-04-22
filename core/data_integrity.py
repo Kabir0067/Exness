@@ -92,6 +92,25 @@ class ServerClockSync:
         self._refresh_if_stale()
         return _time.time() + self._drift
 
+    def is_drift_exceeded(self, threshold_sec: float = 3.0) -> Tuple[bool, float]:
+        """
+        Hard-gate check for trading loops.
+
+        Returns ``(exceeded, abs_drift_seconds)`` where ``exceeded`` is True
+        when the absolute drift is greater than ``threshold_sec``. A positive
+        result means the local clock and the broker are out of sync enough
+        that any order we send will execute against stale prices — the
+        calling layer MUST pause trading until drift returns to within
+        tolerance.
+        """
+        self._refresh_if_stale()
+        abs_drift = abs(float(self._drift))
+        try:
+            threshold = max(0.5, float(threshold_sec))
+        except Exception:
+            threshold = 3.0
+        return (abs_drift > threshold), abs_drift
+
     # ── Internal ────────────────────────────────────────────────
 
     def _ensure_mt5(self) -> bool:

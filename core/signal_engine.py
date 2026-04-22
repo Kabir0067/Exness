@@ -380,6 +380,27 @@ class SignalEngine:
         reasons: List[str] = []
 
         try:
+            # ── 0. Clock-drift hard gate ──
+            # If the local machine has drifted more than MAX_CLOCK_DRIFT_SEC
+            # from the broker's clock, any order we send will execute on
+            # stale prices and chronically pay slippage. We hard-block
+            # trading until drift is within tolerance.
+            try:
+                from core.config import MAX_CLOCK_DRIFT_SEC as _MAX_DRIFT
+
+                drift_exceeded, abs_drift = self._clock_sync.is_drift_exceeded(
+                    _MAX_DRIFT
+                )
+                if drift_exceeded:
+                    return self._neutral(
+                        sym,
+                        [f"clock_drift_exceeded:{abs_drift:.2f}s>{_MAX_DRIFT:.2f}s"],
+                        t0,
+                        trade_blocked=True,
+                    )
+            except Exception:
+                pass
+
             # ── 1. Fetch rates ──
             dfp = self._get_rates_df(sym, self.sp.tf_primary)
             if dfp is None or len(dfp) < 30:

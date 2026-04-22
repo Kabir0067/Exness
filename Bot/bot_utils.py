@@ -18,7 +18,7 @@ from datetime import datetime
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 from queue import Full, Queue
-from threading import Lock
+from threading import Lock, Timer
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import MetaTrader5 as mt5
@@ -35,7 +35,7 @@ from core.config import get_config_from_env
 from ExnessAPI.functions import market_is_open
 from log_config import LOG_DIR as LOG_ROOT
 from log_config import get_log_path
-from mt5_client import MT5_LOCK, mt5_status
+from mt5_client import MT5_LOCK, mt5_dispatch_status, mt5_status
 
 # =============================================================================
 # Global Constants & Meta Definitions
@@ -76,6 +76,14 @@ _NOTIFY_QUEUE: "Queue[Tuple[int, str]]" = Queue(maxsize=200)
 
 _bot_ref: Optional[Any] = None
 _orig_send_chat_action_ref: Optional[Callable[..., Any]] = None
+_pending_live_enqueued_lock = Lock()
+_pending_live_enqueued: Dict[str, Timer] = {}
+_exec_notify_latency_lock = Lock()
+_exec_notify_latency_state: Dict[str, float] = {
+    "samples": 0.0,
+    "ema_sec": 1.35,
+    "last_sec": 0.0,
+}
 
 
 # =============================================================================
@@ -717,7 +725,7 @@ def _build_order_update_message(intent: Any, result: Any) -> str:
     lot = float(getattr(intent, "lot", 0.0) or 0.0)
     sl = float(getattr(intent, "sl", 0.0) or 0.0)
     tp = float(getattr(intent, "tp", 0.0) or 0.0)
-    conf = _normalize_confidence(getattr(intent, "confidence", 0.0), cap=0.96)
+    conf = _normalize_confidence(getattr(intent, "confidence", 0.0))
     conf_pct = conf * 100.0
     direction_emoji = (
         "🟢" if str(getattr(intent, "signal", "")).lower() == "buy" else "🔴"
@@ -774,10 +782,106 @@ def _send_clean(chat_id: int, text: str, *, parse_mode: str = "HTML") -> None:
     )
 
 
+def _record_execution_notification_latency(intent: Any, result: Any) -> float:
+    enqueue_ts = float(getattr(intent, "enqueue_time", 0.0) or 0.0)
+    sent_ts = float(getattr(result, "sent_ts", 0.0) or 0.0)
+    fill_ts = float(getattr(result, "fill_ts", 0.0) or time.time())
+
+    sample_sec = 0.0
+    if enqueue_ts > 0.0 and fill_ts >= enqueue_ts:
+        sample_sec = float(fill_ts - enqueue_ts)
+    elif sent_ts > 0.0 and fill_ts >= sent_ts:
+        sample_sec = float(fill_ts - sent_ts)
+    sample_sec = max(0.05, min(15.0, float(sample_sec or 0.0)))
+
+    with _exec_notify_latency_lock:
+        prev_samples = float(_exec_notify_latency_state.get("samples", 0.0) or 0.0)
+        prev_ema = float(_exec_notify_latency_state.get("ema_sec", 1.35) or 1.35)
+        alpha = 0.18 if prev_samples >= 5.0 else 0.35
+        ema_sec = sample_sec if prev_samples <= 0.0 else (
+            (prev_ema * (1.0 - alpha)) + (sample_sec * alpha)
+        )
+        _exec_notify_latency_state["samples"] = prev_samples + 1.0
+        _exec_notify_latency_state["ema_sec"] = float(
+            max(0.10, min(10.0, ema_sec))
+        )
+        _exec_notify_latency_state["last_sec"] = float(sample_sec)
+
+    return sample_sec
+
+
+def _auto_live_enqueued_delay_sec() -> float:
+    with _exec_notify_latency_lock:
+        samples = float(_exec_notify_latency_state.get("samples", 0.0) or 0.0)
+        ema_sec = float(_exec_notify_latency_state.get("ema_sec", 1.35) or 1.35)
+        last_sec = float(_exec_notify_latency_state.get("last_sec", 0.0) or 0.0)
+
+    delay_sec = max(1.00, min(4.50, (ema_sec * 1.25) + 0.30))
+    if samples < 4.0:
+        delay_sec = max(delay_sec, 1.45)
+    if last_sec > 0.0 and last_sec > (ema_sec * 1.75):
+        delay_sec = max(delay_sec, min(4.50, (last_sec * 0.90) + 0.20))
+
+    try:
+        dispatch = mt5_dispatch_status()
+        queue_depth = int(dispatch.get("queue_depth", 0) or 0)
+        oldest_age_ms = float(dispatch.get("oldest_age_ms", 0.0) or 0.0)
+        if queue_depth > 0:
+            delay_sec = max(delay_sec, min(4.50, 0.90 + (oldest_age_ms / 1000.0)))
+    except Exception:
+        pass
+
+    return float(max(1.00, min(4.50, delay_sec)))
+
+
+def _cancel_pending_live_enqueued(order_id: Any) -> bool:
+    order_key = str(order_id or "").strip()
+    if not order_key:
+        return False
+    with _pending_live_enqueued_lock:
+        timer = _pending_live_enqueued.pop(order_key, None)
+    if timer is None:
+        return False
+    try:
+        timer.cancel()
+    except Exception:
+        pass
+    return True
+
+
+def _schedule_live_enqueued_notification(order_id: Any, msg: str) -> bool:
+    order_key = str(order_id or "").strip()
+    if not order_key:
+        return False
+    delay_sec = _auto_live_enqueued_delay_sec()
+
+    def _emit() -> None:
+        with _pending_live_enqueued_lock:
+            timer = _pending_live_enqueued.pop(order_key, None)
+        if timer is None:
+            return
+        notify_async(ADMIN, msg)
+
+    timer = Timer(delay_sec, _emit)
+    timer.daemon = True
+    with _pending_live_enqueued_lock:
+        prev = _pending_live_enqueued.pop(order_key, None)
+        _pending_live_enqueued[order_key] = timer
+    if prev is not None:
+        try:
+            prev.cancel()
+        except Exception:
+            pass
+    timer.start()
+    return True
+
+
 def _notify_order_update(intent: Any, result: Any) -> None:
     try:
         if not is_admin_chat(ADMIN):
             return
+        _record_execution_notification_latency(intent, result)
+        _cancel_pending_live_enqueued(getattr(intent, "order_id", ""))
         msg = _build_order_update_message(intent, result)
         if msg:
             notify_async(ADMIN, msg)
@@ -844,15 +948,41 @@ def _notify_signal(asset: str, result: Any) -> None:
     try:
         if not is_admin_chat(ADMIN):
             return
+        event_type = ""
         signal_id = ""
         signal_value = ""
+        order_id = ""
+        blocked = False
+        phase = ""
+        analysis_only = False
         if isinstance(result, dict):
+            event_type = str(result.get("type", "") or "").strip().upper()
             signal_id = str(result.get("signal_id", "") or "").strip()
             signal_value = _normalize_signal_value(result.get("signal", ""))
+            order_id = str(result.get("order_id", "") or "").strip()
+            blocked = bool(result.get("blocked", False))
+            phase = str(result.get("phase", "") or "").strip().upper()
+            analysis_only = bool(result.get("analysis_only", False)) or (
+                event_type == "ML_SIGNAL"
+            )
         else:
+            event_type = str(getattr(result, "type", "") or "").strip().upper()
             signal_id = str(getattr(result, "signal_id", "") or "").strip()
             signal_value = _normalize_signal_value(getattr(result, "signal", ""))
+            order_id = str(getattr(result, "order_id", "") or "").strip()
+            blocked = bool(getattr(result, "blocked", False))
+            phase = str(getattr(result, "phase", "") or "").strip().upper()
+            analysis_only = bool(getattr(result, "analysis_only", False)) or (
+                event_type == "ML_SIGNAL"
+            )
         if signal_value not in ("Buy", "Sell"):
+            return
+        if (
+            analysis_only
+            and event_type == "ML_SIGNAL"
+            and not blocked
+            and phase != "MONITORING"
+        ):
             return
         if signal_id:
             cache_key = f"signal_notify:{signal_id}"
@@ -861,6 +991,12 @@ def _notify_signal(asset: str, result: Any) -> None:
             _notify_skip_cache.set(cache_key, True)
         msg = _build_signal_message(asset, result)
         if msg:
+            if (
+                event_type == "LIVE_ENQUEUED"
+                and order_id
+                and _schedule_live_enqueued_notification(order_id, msg)
+            ):
+                return
             notify_async(ADMIN, msg)
     except Exception:
         return

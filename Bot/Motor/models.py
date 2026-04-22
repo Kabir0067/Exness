@@ -192,6 +192,10 @@ class AssetCandidate:
     reasons: Tuple[str, ...]
     signal_id: str
     raw_result: Any
+    bar_key: str = ""
+    timeframe: str = ""
+    created_ts: float = 0.0
+    source: str = "pipeline"
 
 
 @dataclass(frozen=True)
@@ -237,6 +241,10 @@ class OrderIntent:
     cfg: Any
     base_lot: float = 0.0
     phase_snapshot: str = ""
+    bar_key: str = ""
+    timeframe: str = ""
+    created_ts: float = 0.0
+    source: str = "pipeline"
 
 
 @dataclass(frozen=True)
@@ -420,6 +428,27 @@ def parse_bar_key(bar_key: str) -> Optional[datetime]:
     return None
 
 
+def signal_age_sec(
+    bar_key: str,
+    *,
+    now_ts: Optional[float] = None,
+    created_ts: float = 0.0,
+) -> Optional[float]:
+    parsed = parse_bar_key(bar_key)
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        now_dt = (
+            datetime.now(timezone.utc)
+            if now_ts is None
+            else datetime.fromtimestamp(float(now_ts), tz=timezone.utc)
+        )
+        return float((now_dt - parsed).total_seconds())
+    if float(created_ts or 0.0) > 0.0 and now_ts is not None:
+        return float(now_ts) - float(created_ts)
+    return None
+
+
 def best_effort_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     try:
         return fn(*args, **kwargs)
@@ -466,5 +495,6 @@ __all__ = [
     "partial_gate_enabled",
     "required_gate_assets",
     "safe_json_dumps",
+    "signal_age_sec",
     "tf_seconds",
 ]

@@ -2859,8 +2859,19 @@ def _build_training_audit_report(
         stale_age_hours = cadence_hours * 2.0
 
     feature_leakage_detected = bool(suspicious_feature_names)
+    # Any single feature that correlates >= 25% with the 1-bar forward
+    # return is almost certainly a shifted-forward leakage artefact
+    # (rolling stats that accidentally include the current bar's close,
+    # future-smoothed EMAs, or a label copy). A benign indicator rarely
+    # breaks 10-15% correlation on M1 data. The previous threshold of
+    # 0.995 only caught direct `feature = target` bugs — we observed
+    # corr_max = 0.33 / 0.37 on XAU/BTC in production, producing
+    # overfit Sharpe > 9.
+    feature_target_corr_limit = float(
+        os.environ.get("BACKTEST_FEATURE_TARGET_CORR_LIMIT", "0.25") or 0.25
+    )
     target_leakage_detected = bool(
-        (not chronology_ok) or feature_target_corr_max >= 0.995
+        (not chronology_ok) or feature_target_corr_max >= feature_target_corr_limit
     )
     overfitting_detected = bool(
         (train_dir_acc - hold_dir_acc) > 0.12

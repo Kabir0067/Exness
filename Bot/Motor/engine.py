@@ -313,6 +313,12 @@ class MultiAssetTradingEngine(
         }
         self._signal_emit_ts_global: Deque[float] = deque(maxlen=1024)
         self._current_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
+        self._position_protection_interval_sec: float = max(
+            0.75,
+            float(os.getenv("POSITION_PROTECTION_INTERVAL_SEC", "2.0") or 2.0),
+        )
+        self._position_protection_last_ts_by_ticket: Dict[int, float] = {}
+        self._position_protection_last_sl_by_ticket: Dict[int, float] = {}
         self._last_account_snapshot: Dict[str, float] = {
             "balance": 0.0,
             "equity": 0.0,
