@@ -158,6 +158,60 @@ class NullNotifier:
             pass
 
 
+def _start_monitoring_runtime_for_blocked_gate(
+    engine: Any,
+    notifier: NotifierLike,
+    *,
+    gate_reason: str,
+    notified: bool,
+) -> bool:
+    """
+    Bring MT5/pipelines/health online even when the model gate blocks trading.
+
+    ``engine.start()`` already converts failed model health into system
+    monitoring mode, so this path opens/initializes MT5 without allowing orders.
+    """
+    if bool(getattr(engine, "_user_manual_stop", False)):
+        return notified
+
+    try:
+        snap_fn = getattr(engine, "runtime_watchdog_snapshot", None)
+        snap = snap_fn() if callable(snap_fn) else {}
+        if isinstance(snap, dict) and (
+            bool(snap.get("trading_ok", False)) or bool(snap.get("starting", False))
+        ):
+            return notified
+    except Exception:
+        pass
+
+    try:
+        stop_fn = getattr(engine, "request_system_monitoring_stop", None)
+        if callable(stop_fn):
+            stop_fn(f"gate_blocked:{gate_reason}")
+    except Exception:
+        pass
+
+    log.warning(
+        "GATE_BLOCKED_MONITORING_RUNTIME_START | reason=%s action=mt5_bootstrap_no_trading",
+        str(gate_reason or "unknown"),
+    )
+    try:
+        started = bool(engine.start())
+    except Exception as exc:
+        log.error("GATE_BLOCKED_MONITORING_RUNTIME_START_FAILED | err=%s", exc)
+        return notified
+
+    if started and not notified:
+        try:
+            notifier.notify(
+                "MT5 runtime started in monitoring mode; trading remains blocked by model gate."
+            )
+        except Exception:
+            pass
+        return True
+    return notified
+
+
 # =============================================================================
 # Global Functions
 # =============================================================================
@@ -170,6 +224,7 @@ def run_engine_supervisor(
     restart_guard = RateLimiter(20.0)
     manual_stop_rl = RateLimiter(60.0)
     gate_block_rl = RateLimiter(30.0)
+    monitoring_start_rl = RateLimiter(30.0)
 
     runtime_recover_after = max(6.0, env_float("ENGINE_RUNTIME_RECOVER_SEC", 12.0))
 
@@ -201,10 +256,20 @@ def run_engine_supervisor(
     last_retrain_check = (
         0.0 if env_truthy("AUTO_RETRAIN_ON_SUPERVISOR_STARTUP", "0") else time.time()
     )
-    last_gate_retrain_ts = 0.0 if gate_ok_start else time.time()
+    initial_gate_delay = max(
+        0.0,
+        env_float("GATE_RETRAIN_INITIAL_DELAY_SEC", GATE_RETRAIN_COOLDOWN),
+    )
+    if gate_ok_start:
+        last_gate_retrain_ts = 0.0
+    else:
+        last_gate_retrain_ts = time.time() - max(
+            0.0, GATE_RETRAIN_COOLDOWN - initial_gate_delay
+        )
 
     retraining = False
     started_once = False
+    monitoring_runtime_notified = False
     attempt = 0
 
     notifier.notify("🧠 Нозири мотор оғоз шуд.")
@@ -216,6 +281,13 @@ def run_engine_supervisor(
 
     if not gate_ok_start:
         log.warning("Engine gate initially blocked | reason=%s", gate_reason_start)
+        monitoring_runtime_notified = _start_monitoring_runtime_for_blocked_gate(
+            engine,
+            notifier,
+            gate_reason=gate_reason_start,
+            notified=monitoring_runtime_notified,
+        )
+        monitoring_start_rl.allow("gate_monitoring_start")
 
     def _read_engine_status() -> tuple[bool, bool, bool, dict[str, Any]]:
         try:
@@ -239,6 +311,7 @@ def run_engine_supervisor(
 
     while not stop_event.is_set():
         connected, trading, manual_stop, snap = _read_engine_status()
+        user_manual_stop = bool(getattr(engine, "_user_manual_stop", False))
 
         # ---- Age-based retraining ------------------------------------------
         try:
@@ -302,17 +375,31 @@ def run_engine_supervisor(
             sleep_interruptible(stop_event, 1.0)
             continue
 
-        # ---- Gate retraining -----------------------------------------------
+        # ---- Gate / monitoring runtime -------------------------------------
         try:
-            if (
-                auto_retrain
-                and not trading
-                and not retraining
-                and not dry_run
-                and not manual_stop
-            ):
+            if dry_run:
+                gate_ok, gate_reason, _ = True, "dry_run_bypass", []
+            else:
                 gate_ok, gate_reason, _ = model_gate_ready_effective()
-                if not gate_ok:
+
+            if not gate_ok and not user_manual_stop:
+                if trading and not manual_stop:
+                    stop_fn = getattr(engine, "request_system_monitoring_stop", None)
+                    if callable(stop_fn):
+                        stop_fn(f"gate_blocked:{gate_reason}")
+
+                if not trading and monitoring_start_rl.allow("gate_monitoring_start"):
+                    monitoring_runtime_notified = (
+                        _start_monitoring_runtime_for_blocked_gate(
+                            engine,
+                            notifier,
+                            gate_reason=gate_reason,
+                            notified=monitoring_runtime_notified,
+                        )
+                    )
+                    connected, trading, manual_stop, snap = _read_engine_status()
+
+                if auto_retrain and not retraining and not mon_only:
                     elapsed = time.time() - last_gate_retrain_ts
                     if elapsed >= GATE_RETRAIN_COOLDOWN:
                         last_gate_retrain_ts = time.time()
@@ -327,12 +414,23 @@ def run_engine_supervisor(
                             )
                         finally:
                             retraining = False
+                        connected, trading, manual_stop, snap = _read_engine_status()
                     else:
                         remain = max(1.0, GATE_RETRAIN_COOLDOWN - elapsed)
                         if gate_block_rl.allow("gate_wait"):
                             log.warning("Gate blocked | retry in %.0fs", remain)
                         sleep_interruptible(stop_event, min(5.0, remain))
                         continue
+                else:
+                    if gate_block_rl.allow("gate_wait"):
+                        log.warning(
+                            "Gate blocked | reason=%s auto_retrain=%s monitoring_only=%s",
+                            gate_reason,
+                            auto_retrain,
+                            mon_only,
+                        )
+                    sleep_interruptible(stop_event, 5.0)
+                    continue
         except Exception as exc:
             log.error("Gate block handler error: %s", exc)
 

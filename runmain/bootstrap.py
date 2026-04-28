@@ -352,6 +352,23 @@ class LogMonitor:
 
 def _setup_exception_hooks() -> None:
     def _handle_exception(exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type in (KeyboardInterrupt, SystemExit):
+            try:
+                logging.getLogger("main").warning(
+                    "PROCESS_EXIT_SIGNAL | type=%s code=%s",
+                    getattr(exc_type, "__name__", str(exc_type)),
+                    getattr(exc, "code", ""),
+                )
+            except Exception:
+                pass
+            cur_stderr = sys.stderr
+            try:
+                sys.stderr = _REAL_STDERR
+                sys.__excepthook__(exc_type, exc, tb)
+            finally:
+                sys.stderr = cur_stderr
+            return
+
         try:
             tb_txt = "".join(traceback.format_tb(tb)) if tb else ""
             logging.getLogger("main").error(

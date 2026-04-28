@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import talib
@@ -149,6 +150,67 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def resolve_mt5_symbol(
+    symbol: str,
+    *,
+    mt5_module: Any,
+    alias_map: Optional[Dict[str, str]] = None,
+    extra_candidates: Optional[List[str]] = None,
+) -> str:
+    """Resolve the best broker symbol for a canonical MT5 asset name."""
+    base = str(symbol).upper().strip()
+    if base in ("BTC", "BTCUSD", "BTCUSDM"):
+        base = "BTCUSD"
+    elif base in ("XAU", "XAUUSD", "XAUUSDM"):
+        base = "XAUUSD"
+
+    broker_suffix = str(os.getenv("MT5_BROKER_SYMBOL_SUFFIX", "") or "").strip()
+    candidates: List[str] = []
+    if broker_suffix:
+        candidates.append(f"{base}{broker_suffix}")
+    if extra_candidates:
+        candidates.extend(str(sym).strip() for sym in extra_candidates if str(sym).strip())
+    if alias_map:
+        mapped = str(alias_map.get(base, "") or "").strip()
+        if mapped:
+            candidates.append(mapped)
+    candidates.extend([f"{base}m", base])
+
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for sym in candidates:
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        uniq.append(sym)
+
+    for sym in uniq:
+        try:
+            if mt5_module.symbol_info(sym) is not None:
+                return sym
+        except Exception:
+            continue
+
+    try:
+        symbols = mt5_module.symbols_get()
+    except Exception:
+        symbols = None
+    if symbols:
+        base_u = base.upper()
+        names = [str(s.name) for s in symbols if hasattr(s, "name")]
+        exact = [n for n in names if n.upper() == base_u]
+        if exact:
+            return exact[0]
+        starts = [n for n in names if n.upper().startswith(base_u)]
+        if starts:
+            return starts[0]
+        contains = [n for n in names if base_u in n.upper()]
+        if contains:
+            return contains[0]
+
+    return uniq[0] if uniq else base
 
 
 # =============================================================================

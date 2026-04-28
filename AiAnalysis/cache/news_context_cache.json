@@ -1,0 +1,18 @@
+{
+  "gold::scalping": {
+    "saved_ts": 1777387625.4364662,
+    "ttl_sec": 3600.0,
+    "data": {
+      "status": "live",
+      "asset": "gold",
+      "trade_style": "scalping",
+      "bias": "neutral",
+      "avg_sentiment": 0.0,
+      "headline_count": 0,
+      "high_impact_count": 0,
+      "window_hours": 4,
+      "headlines": [],
+      "summary_text": "NEWS_OVERLAY=SCALPING | STATUS=LIVE | SOURCE=MARKETAUX | ASSET=GOLD | WINDOW_HOURS=4 | ARTICLES=0 | AVG_SENTIMENT=+0.00 | BIAS=NEUTRAL | HIGH_IMPACT=0 | RULE=risk_filter_only"
+    }
+  }
+}

@@ -41,6 +41,8 @@ from runmain.supervisors import (
     run_telegram_supervisor,
 )
 
+STARTUP_AUTO_TRAIN_ENABLED = True
+
 
 # =============================================================================
 # Classes
@@ -90,7 +92,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     """Parse CLI arguments using real stdio to avoid redirected streams."""
     p = _SafeArgumentParser(
-        description="XAUUSDm Institutional Scalping System — Production Runner"
+        description="XAUUSDm/BTCUSDm Institutional Trading System — Production Runner"
     )
 
     # Use real stdio while parsing CLI help and errors.
@@ -205,6 +207,14 @@ def _run_startup_model_checks() -> None:
 
     if not ready:
         log.warning("MODELS_MISSING | reason=%s", reason)
+        if not STARTUP_AUTO_TRAIN_ENABLED:
+            log.warning(
+                "STARTUP_AUTO_TRAIN_DISABLED | reason=%s",
+                reason,
+            )
+            prime_engine_model_health()
+            return
+
         ok = auto_train_models_strict()
 
         if ok:
@@ -405,3 +415,4 @@ def _main_inner(args: argparse.Namespace) -> int:
 # =============================================================================
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+

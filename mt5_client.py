@@ -45,6 +45,11 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _env_str(name: str, default: str = "") -> str:
+    raw = str(os.getenv(name, default) or default).strip()
+    return _normalize_env_str(raw)
+
+
 def _env_float(
     name: str,
     default: float,
@@ -791,7 +796,7 @@ def _is_terminal_running_windows() -> bool:
         try:
             for proc in psutil.process_iter(["name", "pid"]):
                 pname = (proc.info.get("name") or "").lower()
-                if "terminal64" in pname:
+                if "terminal64" in pname or pname == "terminal.exe":
                     _terminal_pid = proc.info["pid"]
                     return True
         except Exception:
@@ -814,6 +819,12 @@ def _taskkill_terminal_windows() -> None:
     try:
         subprocess.run(
             ["taskkill", "/F", "/T", "/IM", "terminal64.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", "terminal.exe"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -843,7 +854,12 @@ def _start_terminal_windows(mt5_path: str, portable: bool) -> None:
 
 def _resolve_mt5_path_windows(mt5_path: Optional[str]) -> str:
     if mt5_path and os.path.exists(mt5_path):
-        return mt5_path
+        return str(mt5_path)
+    if mt5_path:
+        try:
+            logger.warning("MT5_CONFIG_PATH_NOT_FOUND | path=%r", str(mt5_path))
+        except Exception:
+            pass
 
     candidates: List[str] = []
     for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
@@ -863,7 +879,7 @@ def _resolve_mt5_path_windows(mt5_path: Optional[str]) -> str:
 
     for candidate in candidates:
         if candidate and os.path.exists(candidate):
-            return candidate
+            return str(candidate)
     return ""
 
 
@@ -1355,27 +1371,89 @@ def _default_config_from_env() -> MT5ClientConfig:
         password=_normalize_env_str(str(getattr(cfg_src, "password", "") or "")),
         server=_normalize_env_str(str(getattr(cfg_src, "server", "") or "")),
     )
+    cfg_path = _env_str(
+        "MT5_PATH",
+        _env_str(
+            "MT5_TERMINAL_PATH",
+            _env_str(
+                "EXNESS_MT5_PATH",
+                str(getattr(cfg_src, "mt5_path", "") or ""),
+            ),
+        ),
+    )
+    cfg_portable_default = "1" if bool(getattr(cfg_src, "mt5_portable", False)) else "0"
+    cfg_autostart_default = "1" if bool(getattr(cfg_src, "mt5_autostart", True)) else "0"
+    cfg_taskkill_default = (
+        "1" if bool(getattr(cfg_src, "mt5_taskkill_on_ipc_timeout", True)) else "0"
+    )
+    cfg_single_lock_default = (
+        "1" if bool(getattr(cfg_src, "mt5_single_instance_lock", True)) else "0"
+    )
 
     return MT5ClientConfig(
         creds=creds,
-        mt5_path=getattr(cfg_src, "mt5_path", None),
-        portable=bool(getattr(cfg_src, "mt5_portable", False)),
-        autostart=bool(getattr(cfg_src, "mt5_autostart", True)),
-        timeout_ms=int(getattr(cfg_src, "mt5_timeout_ms", 300_000) or 300_000),
+        mt5_path=cfg_path or None,
+        portable=_env_bool("MT5_PORTABLE", cfg_portable_default),
+        autostart=_env_bool("MT5_AUTOSTART", cfg_autostart_default),
+        single_instance_lock=_env_bool(
+            "MT5_SINGLE_INSTANCE_LOCK", cfg_single_lock_default
+        ),
+        taskkill_on_ipc_timeout=_env_bool(
+            "MT5_TASKKILL_ON_IPC_TIMEOUT", cfg_taskkill_default
+        ),
+        timeout_ms=_env_int(
+            "MT5_TIMEOUT_MS",
+            int(getattr(cfg_src, "mt5_timeout_ms", 300_000) or 300_000),
+            minimum=1_000,
+            maximum=900_000,
+        ),
+        start_wait_sec=_env_float(
+            "MT5_START_WAIT_SEC",
+            float(getattr(cfg_src, "mt5_start_wait_sec", 5.0) or 5.0),
+            minimum=0.0,
+            maximum=60.0,
+        ),
+        max_retries=_env_int(
+            "MT5_MAX_RETRIES",
+            int(getattr(cfg_src, "mt5_max_retries", 6) or 6),
+            minimum=1,
+            maximum=30,
+        ),
+        retry_backoff_base_sec=_env_float(
+            "MT5_RETRY_BACKOFF_BASE_SEC",
+            float(getattr(cfg_src, "mt5_retry_backoff_base_sec", 1.2) or 1.2),
+            minimum=0.1,
+            maximum=30.0,
+        ),
+        backoff_cap_sec=_env_float(
+            "MT5_BACKOFF_CAP_SEC",
+            float(getattr(cfg_src, "mt5_backoff_cap_sec", 12.0) or 12.0),
+            minimum=0.1,
+            maximum=120.0,
+        ),
         auth_fail_cooldown_sec=float(
             getattr(cfg_src, "mt5_auth_cooldown_sec", 600.0) or 600.0
         ),
         non_retriable_cooldown_sec=float(
             getattr(cfg_src, "mt5_non_retriable_cooldown_sec", 20.0) or 20.0
         ),
-        ready_timeout_sec=float(
-            getattr(cfg_src, "mt5_ready_timeout_sec", 120.0) or 120.0
+        ready_timeout_sec=_env_float(
+            "MT5_READY_TIMEOUT_SEC",
+            float(getattr(cfg_src, "mt5_ready_timeout_sec", 120.0) or 120.0),
+            minimum=1.0,
+            maximum=600.0,
         ),
-        hard_reset_after_failures=int(
-            getattr(cfg_src, "mt5_hard_reset_after_failures", 2) or 2
+        hard_reset_after_failures=_env_int(
+            "MT5_HARD_RESET_AFTER_FAILURES",
+            int(getattr(cfg_src, "mt5_hard_reset_after_failures", 2) or 2),
+            minimum=1,
+            maximum=20,
         ),
-        hard_reset_debounce_sec=float(
-            getattr(cfg_src, "mt5_hard_reset_debounce_sec", 8.0) or 8.0
+        hard_reset_debounce_sec=_env_float(
+            "MT5_HARD_RESET_DEBOUNCE_SEC",
+            float(getattr(cfg_src, "mt5_hard_reset_debounce_sec", 8.0) or 8.0),
+            minimum=0.0,
+            maximum=120.0,
         ),
     )
 
@@ -1724,10 +1802,14 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
         for attempt in range(int(cfg.max_retries)):
             try:
                 if cfg.autostart:
-                    if not _is_terminal_running_windows():
+                    if mt5_path and not _is_terminal_running_windows():
                         _start_terminal_windows(mt5_path, portable=cfg.portable)
                         if float(cfg.start_wait_sec) > 0:
                             time.sleep(float(cfg.start_wait_sec))
+                    elif not mt5_path and attempt == 0:
+                        logger.warning(
+                            "MT5_PATH_UNRESOLVED | action=initialize_without_explicit_path"
+                        )
                     elif attempt == 0 and float(cfg.start_wait_sec) > 0:
                         time.sleep(min(0.75, float(cfg.start_wait_sec)))
 
@@ -1763,7 +1845,7 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
                     _stop_mt5_async_thread()
                     _mt5_shutdown_silent()
                     _taskkill_terminal_windows()
-                    if cfg.autostart:
+                    if cfg.autostart and mt5_path:
                         try:
                             _start_terminal_windows(mt5_path, portable=cfg.portable)
                             if float(cfg.start_wait_sec) > 0:

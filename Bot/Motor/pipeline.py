@@ -8,6 +8,7 @@ feed checks used by the engine loop.
 from __future__ import annotations
 
 import os
+import heapq
 import time
 import traceback
 from collections import deque
@@ -38,6 +39,10 @@ if TYPE_CHECKING:
 # =============================================================================
 # CRITICAL: Stale Data Guard - Reject signals when data is too old
 STALE_DATA_THRESHOLD_SEC = 2.0  # STRICT: Reject signals if data is older than 2 seconds
+XAU_DAILY_CLOSE_UTC_MIN = 1260
+XAU_DAILY_REOPEN_UTC_MIN = 1380
+XAU_SUNDAY_OPEN_UTC_MIN = 1320
+XAU_FRIDAY_CLOSE_UTC_MIN = 1260
 
 
 # =============================================================================
@@ -71,13 +76,29 @@ class UTCScheduler:
         """Internal market open check.
 
         BTC: always open (24/7).
-        XAU: weekdays only (hours logic guarded elsewhere by MT5/market feed).
+        XAU: weekday session with the daily futures/CFD maintenance gap gated in UTC.
         """
         asset_u = str(asset or "").upper().strip()
         if asset_u == "BTC":
             return True
         if asset_u == "XAU":
-            return UTCScheduler.now_utc().weekday() < 5
+            now = UTCScheduler.now_utc()
+            weekday = now.weekday()  # Monday=0, Sunday=6
+            minute = int(now.hour) * 60 + int(now.minute)
+            xau_close_min = XAU_DAILY_CLOSE_UTC_MIN
+            xau_reopen_min = XAU_DAILY_REOPEN_UTC_MIN
+            sunday_open_min = XAU_SUNDAY_OPEN_UTC_MIN
+            friday_close_min = XAU_FRIDAY_CLOSE_UTC_MIN
+
+            if weekday == 5:
+                return False
+            if weekday == 6:
+                return minute >= sunday_open_min
+            if weekday == 4 and minute >= friday_close_min:
+                return False
+            if xau_close_min <= minute < xau_reopen_min:
+                return False
+            return weekday < 5
         return False
 
 
@@ -264,6 +285,24 @@ class EngineScheduleManager:
                 e._seen_index.pop((a, sid), None)
             cleaned += 1
 
+        max_seen_entries = max(
+            1024, int(float(os.getenv("SEEN_INDEX_MAX_ENTRIES", "4096") or 4096))
+        )
+        if len(e._seen_index) > max_seen_entries:
+            target_size = max(512, int(max_seen_entries * 0.75))
+            stale_items = sorted(
+                e._seen_index.items(), key=lambda item: float(item[1][0])
+            )
+            for old_key, _ in stale_items[: max(0, len(e._seen_index) - target_size)]:
+                e._seen_index.pop(old_key, None)
+            e._seen = deque(
+                (
+                    (a, sid, ts)
+                    for a, sid, ts in e._seen
+                    if (a, sid) in e._seen_index
+                )
+            )
+
     @staticmethod
     def prune_signal_window(
         window: Deque[float], now_ts: float, lookback_sec: float = 86_400.0
@@ -276,14 +315,16 @@ class EngineScheduleManager:
         seq = [float(v) for v in values if float(v) >= 0.0]
         if len(seq) < 3:
             return 0.0
-        seq.sort()
+        k = max(1, int(round(len(seq) * 0.05)))
+        tail = heapq.nlargest(k, seq)
+        tail.sort()
         idx = int(round((len(seq) - 1) * 0.95))
-        idx = max(0, min(len(seq) - 1, idx))
-        return float(seq[idx])
+        tail_start = len(seq) - len(tail)
+        return float(tail[max(0, min(len(tail) - 1, idx - tail_start))])
 
     @staticmethod
     def utc_day_progress() -> float:
-        now = datetime.utcnow()
+        now = UTCScheduler.now_utc()
         sec = (now.hour * 3600) + (now.minute * 60) + now.second
         return max(0.0, min(1.0, float(sec) / 86400.0))
 
@@ -730,8 +771,8 @@ class _AssetPipeline:
 
             if last_ts_epoch is not None:
                 try:
-                    self.last_market_ts = datetime.utcfromtimestamp(
-                        float(last_ts_epoch)
+                    self.last_market_ts = datetime.fromtimestamp(
+                        float(last_ts_epoch), tz=timezone.utc
                     ).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     self.last_market_ts = "-"
@@ -922,7 +963,9 @@ class _AssetPipeline:
                     ",".join(reasons) if reasons else "-",
                 )
 
-            if self.asset == "XAU" and not market_is_open("XAU"):
+            if self.asset == "XAU" and (
+                not UTCScheduler.market_status("XAU") or not market_is_open("XAU")
+            ):
                 return AssetCandidate(
                     asset=self.asset,
                     symbol=self.symbol,
@@ -933,7 +976,7 @@ class _AssetPipeline:
                     tp=0.0,
                     latency_ms=0.0,
                     blocked=True,
-                    reasons=("market_closed_weekend",),
+                    reasons=("market_closed",),
                     signal_id=f"{self.asset}_CLOSED_{int(time.time())}",
                     raw_result=None,
                     bar_key="",
@@ -1522,6 +1565,7 @@ def get_btc_config():
 # Aliases
 xau_apply_high_accuracy_mode = _apply_high_accuracy_mode
 btc_apply_high_accuracy_mode = _apply_high_accuracy_mode
+
 XauFeatureEngine = FeatureEngine
 BtcFeatureEngine = FeatureEngine
 XauRiskManager = RiskManager

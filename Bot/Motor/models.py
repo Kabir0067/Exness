@@ -7,9 +7,11 @@ used across the trading motor.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import pickle
 import re
 import sys
 import traceback
@@ -41,12 +43,16 @@ from core.ml_router import MLSignal
 
 try:
     from log_config import LOG_DIR as LOG_ROOT
+    from log_config import get_artifact_path
     from log_config import get_log_path
 except ImportError:
     LOG_ROOT = "/tmp/portfolio_logs"
 
     def get_log_path(filename: str) -> str:
         return os.path.join(LOG_ROOT, filename)
+
+    def get_artifact_path(*parts: str) -> _Path_type:
+        return _Path_type(LOG_ROOT).joinpath("Artifacts", *parts)
 
 
 # =============================================================================
@@ -59,29 +65,60 @@ _DIAG_EVERY_SEC: float = 60.0
 
 _FMT = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-_TF_SECONDS_MAP = {
-    getattr(mt5, "TIMEFRAME_M1", -1): 60,
-    getattr(mt5, "TIMEFRAME_M2", -1): 120,
-    getattr(mt5, "TIMEFRAME_M3", -1): 180,
-    getattr(mt5, "TIMEFRAME_M4", -1): 240,
-    getattr(mt5, "TIMEFRAME_M5", -1): 300,
-    getattr(mt5, "TIMEFRAME_M6", -1): 360,
-    getattr(mt5, "TIMEFRAME_M10", -1): 600,
-    getattr(mt5, "TIMEFRAME_M12", -1): 720,
-    getattr(mt5, "TIMEFRAME_M15", -1): 900,
-    getattr(mt5, "TIMEFRAME_M20", -1): 1200,
-    getattr(mt5, "TIMEFRAME_M30", -1): 1800,
-    getattr(mt5, "TIMEFRAME_H1", -1): 3600,
-    getattr(mt5, "TIMEFRAME_H2", -1): 7200,
-    getattr(mt5, "TIMEFRAME_H3", -1): 10800,
-    getattr(mt5, "TIMEFRAME_H4", -1): 14400,
-    getattr(mt5, "TIMEFRAME_H6", -1): 21600,
-    getattr(mt5, "TIMEFRAME_H8", -1): 28800,
-    getattr(mt5, "TIMEFRAME_H12", -1): 43200,
-    getattr(mt5, "TIMEFRAME_D1", -1): 86400,
-    getattr(mt5, "TIMEFRAME_W1", -1): 604800,
-    getattr(mt5, "TIMEFRAME_MN1", -1): 2592000,
-}
+MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
+RECOVERABLE_HALT_REASONS = frozenset({"mt5_unhealthy", "mt5_disconnected"})
+MONITORING_ONLY_HALT_REASONS = frozenset(
+    {
+        "manual_stop",
+        "manual_stop_active",
+        "manual_stop_triggered",
+    }
+)
+
+_MT5_TIMEFRAME_SECONDS = (
+    ("TIMEFRAME_M1", 60),
+    ("TIMEFRAME_M2", 120),
+    ("TIMEFRAME_M3", 180),
+    ("TIMEFRAME_M4", 240),
+    ("TIMEFRAME_M5", 300),
+    ("TIMEFRAME_M6", 360),
+    ("TIMEFRAME_M10", 600),
+    ("TIMEFRAME_M12", 720),
+    ("TIMEFRAME_M15", 900),
+    ("TIMEFRAME_M20", 1200),
+    ("TIMEFRAME_M30", 1800),
+    ("TIMEFRAME_H1", 3600),
+    ("TIMEFRAME_H2", 7200),
+    ("TIMEFRAME_H3", 10800),
+    ("TIMEFRAME_H4", 14400),
+    ("TIMEFRAME_H6", 21600),
+    ("TIMEFRAME_H8", 28800),
+    ("TIMEFRAME_H12", 43200),
+    ("TIMEFRAME_D1", 86400),
+    ("TIMEFRAME_W1", 604800),
+    ("TIMEFRAME_MN1", 2592000),
+)
+
+
+def _build_tf_seconds_map() -> Dict[int, int]:
+    out: Dict[int, int] = {}
+    if mt5 is None:
+        return out
+    for attr_name, seconds in _MT5_TIMEFRAME_SECONDS:
+        value = getattr(mt5, attr_name, None)
+        if value is None:
+            continue
+        try:
+            key = int(value)
+        except Exception:
+            continue
+        if key < 0 or key in out:
+            continue
+        out[key] = int(seconds)
+    return out
+
+
+_TF_SECONDS_MAP = _build_tf_seconds_map()
 
 _TF_REGEX = re.compile(r"([MHDW])\s*(\d+)")
 
@@ -90,6 +127,7 @@ _TF_REGEX = re.compile(r"([MHDW])\s*(\d+)")
 # =============================================================================
 log_health = logging.getLogger("portfolio.engine.health")
 log_err = logging.getLogger("portfolio.engine.err")
+log_alert = logging.getLogger("portfolio.engine.alert")
 log_diag = logging.getLogger("portfolio.engine.diag")
 log_core_risk = logging.getLogger("core.risk_engine")
 log_core_feature = logging.getLogger("core.data_engine")
@@ -98,6 +136,7 @@ log_core_risk_engine = logging.getLogger("core.risk_engine")
 
 log_health.setLevel(logging.INFO)
 log_err.setLevel(logging.ERROR)
+log_alert.setLevel(logging.CRITICAL)
 log_diag.setLevel(logging.INFO)
 log_core_risk.setLevel(logging.INFO)
 log_core_feature.setLevel(logging.ERROR)
@@ -106,6 +145,7 @@ log_core_risk_engine.setLevel(logging.ERROR)
 
 log_health.propagate = False
 log_err.propagate = False
+log_alert.propagate = False
 log_diag.propagate = False
 log_core_risk.propagate = False
 log_core_feature.propagate = False
@@ -150,6 +190,7 @@ def _add_handler(logger: logging.Logger, filename: str, level: int) -> None:
 
 _add_handler(log_health, "portfolio_engine_health.log", logging.INFO)
 _add_handler(log_err, "portfolio_engine_error.log", logging.ERROR)
+_add_handler(log_alert, "portfolio_engine_alert.log", logging.CRITICAL)
 _add_handler(log_core_risk, "portfolio_engine_health.log", logging.INFO)
 _add_handler(log_core_feature, "portfolio_engine_error.log", logging.ERROR)
 _add_handler(log_core_signal, "portfolio_engine_error.log", logging.ERROR)
@@ -291,7 +332,9 @@ def env_truthy(name: str, default: str = "0") -> bool:
 
 
 def monitoring_only_mode() -> bool:
-    return False
+    return env_truthy("MONITORING_ONLY_MODE", "0") or env_truthy(
+        "ENGINE_MONITORING_ONLY", "0"
+    ) or env_truthy("TRADING_DISABLED", "0")
 
 
 def required_gate_assets() -> tuple[str, ...]:
@@ -324,34 +367,77 @@ _required_gate_assets = required_gate_assets
 _partial_gate_enabled = partial_gate_enabled
 
 
+_RESTRICTED_PICKLE_BUILTINS = frozenset(
+    {
+        "dict",
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "str",
+        "bytes",
+        "bytearray",
+        "int",
+        "float",
+        "bool",
+        "complex",
+        "slice",
+    }
+)
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    """Unpickler that rejects arbitrary globals/classes."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "builtins" and name in _RESTRICTED_PICKLE_BUILTINS:
+            return getattr(__import__(module), name)
+        raise pickle.UnpicklingError(f"unsafe pickle global: {module}.{name}")
+
+
+def load_restricted_pickle(path: Any) -> Any:
+    """Load a pickle artifact without permitting arbitrary code globals."""
+    with open(path, "rb") as file_handle:
+        payload = file_handle.read()
+    return RestrictedUnpickler(io.BytesIO(payload)).load()
+
+
+def _json_default_debug(stage: str, exc: Exception) -> None:
+    try:
+        if log_diag.isEnabledFor(logging.DEBUG):
+            log_diag.debug("JSON_DEFAULT_CONVERSION_SKIP | stage=%s err=%s", stage, exc)
+    except Exception:
+        pass
+
+
 def json_default(obj: object) -> Any:
     try:
         if is_dataclass(obj):
             return asdict(obj)
-    except Exception:
-        pass
+    except Exception as exc:
+        _json_default_debug("dataclass", exc)
     try:
         if isinstance(obj, set):
             return list(obj)
         if isinstance(obj, bytes):
             return obj.decode("utf-8", errors="ignore")
-    except Exception:
-        pass
+    except Exception as exc:
+        _json_default_debug("set_bytes", exc)
     try:
         if isinstance(obj, (_dt_type, _date_type)):
             return obj.isoformat()
-    except Exception:
-        pass
+    except Exception as exc:
+        _json_default_debug("datetime", exc)
     try:
         if isinstance(obj, _Path_type):
             return str(obj)
-    except Exception:
-        pass
+    except Exception as exc:
+        _json_default_debug("path", exc)
     try:
         if _NUMPY_TYPES and isinstance(obj, _NUMPY_TYPES):
             return obj.item()
-    except Exception:
-        pass
+    except Exception as exc:
+        _json_default_debug("numpy", exc)
     try:
         return str(obj)
     except Exception:

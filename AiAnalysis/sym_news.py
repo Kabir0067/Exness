@@ -23,13 +23,11 @@ from urllib.request import Request, urlopen
 from log_config import build_logger
 
 try:
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
-    load_dotenv = None
+    from core.config import load_strict_dotenv
 
-
-if load_dotenv is not None:
-    load_dotenv()
+    load_strict_dotenv()
+except Exception:
+    pass
 
 
 log = build_logger("ai.sym_news", "sym_news.log")
@@ -40,9 +38,7 @@ log = build_logger("ai.sym_news", "sym_news.log")
 # ─────────────────────────────────────────────────────────────────────────────
 
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1"
-MARKETAUX_API_KEY = (
-    os.getenv("MARKETAUX_API_KEY") or os.getenv("MARKETAUX") or ""
-).strip()
+MARKETAUX_API_KEY = (os.getenv("MARKETAUX") or "").strip()
 
 GOLD_SEARCH_QUERY = (
     '"gold" OR xau OR bullion OR "gold price" OR "Federal Reserve" '
@@ -397,9 +393,7 @@ def _ai_news_fallback(
             )
             return data
 
-    api_key = (
-        os.getenv("GEMINI_AI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-    ).strip()
+    api_key = (os.getenv("GEMINI_AI_API_KEY") or "").strip()
     if not api_key:
         # Try Groq as second fallback
         return _ai_news_groq_fallback(asset, trade_style, preset)

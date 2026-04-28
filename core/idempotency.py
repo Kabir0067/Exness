@@ -218,6 +218,73 @@ class OrderJournal:
         self._append(entry)
         return entry
 
+    def _should_send_locked(self, key: str) -> Tuple[bool, str]:
+        if not self._enabled:
+            return True, "disabled"
+
+        previous_entry = self._index.get(str(key))
+        if previous_entry is None:
+            return True, "new"
+
+        if (
+            previous_entry.status in _TERMINAL_STATUSES
+            and previous_entry.status == STATUS_CONFIRMED
+        ):
+            return False, (
+                f"already_confirmed:ticket={previous_entry.position_ticket}"
+            )
+
+        if previous_entry.status == STATUS_FAILED:
+            return True, "previous_failed_retry_allowed"
+
+        if previous_entry.status in (STATUS_PENDING, STATUS_SENT):
+            age_seconds = time.time() - float(previous_entry.ts or 0.0)
+            if age_seconds < _RECONCILE_TTL_SEC:
+                return False, (
+                    f"in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
+                )
+
+            return False, (
+                f"stale_in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
+            )
+
+        return True, "unknown_status"
+
+    def reserve_pending(
+        self,
+        key: str,
+        *,
+        symbol: str,
+        side: str,
+        volume: float,
+        price: float,
+        sl: float,
+        tp: float,
+        magic: int,
+    ) -> Tuple[bool, str, Optional[WALEntry]]:
+        """Atomically check eligibility and mark an order key as PENDING."""
+        with self._lock:
+            ok_to_send, reason = self._should_send_locked(key)
+            if not ok_to_send:
+                return False, reason, None
+            if not self._enabled:
+                return True, reason, None
+
+            entry = WALEntry(
+                key=str(key),
+                status=STATUS_PENDING,
+                ts=time.time(),
+                symbol=symbol,
+                side=side,
+                volume=float(volume),
+                price=float(price),
+                sl=float(sl),
+                tp=float(tp),
+                magic=int(magic),
+            )
+            self._append(entry)
+            return True, reason, entry
+
     def record_sent(
         self,
         key: str,
@@ -316,36 +383,8 @@ class OrderJournal:
 
     def should_send(self, key: str) -> Tuple[bool, str]:
         """Return whether the order key is eligible to be sent."""
-        if not self._enabled:
-            return True, "disabled"
-
-        previous_entry = self.get(key)
-        if previous_entry is None:
-            return True, "new"
-
-        if (
-            previous_entry.status in _TERMINAL_STATUSES
-            and previous_entry.status == STATUS_CONFIRMED
-        ):
-            return False, (
-                f"already_confirmed:ticket={previous_entry.position_ticket}"
-            )
-
-        if previous_entry.status == STATUS_FAILED:
-            return True, "previous_failed_retry_allowed"
-
-        if previous_entry.status in (STATUS_PENDING, STATUS_SENT):
-            age_seconds = time.time() - float(previous_entry.ts or 0.0)
-            if age_seconds < _RECONCILE_TTL_SEC:
-                return False, (
-                    f"in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
-                )
-
-            return False, (
-                f"stale_in_flight:{previous_entry.status}:age={age_seconds:.1f}s"
-            )
-
-        return True, "unknown_status"
+        with self._lock:
+            return self._should_send_locked(key)
 
     def pending_keys(self) -> Iterable[WALEntry]:
         """Return active WAL entries."""
@@ -486,7 +525,16 @@ def safe_order_send(
 ) -> Tuple[bool, Any, str]:
     """Wrap an order-send call with WAL-backed idempotency."""
     active_journal = journal if journal is not None else get_default_journal()
-    ok_to_send, reason = active_journal.should_send(key)
+    ok_to_send, reason, _entry = active_journal.reserve_pending(
+        key,
+        symbol=symbol,
+        side=side,
+        volume=volume,
+        price=price,
+        sl=sl,
+        tp=tp,
+        magic=magic,
+    )
 
     if not ok_to_send:
         try:
@@ -502,17 +550,6 @@ def safe_order_send(
             pass
 
         return False, None, f"idempotency_refuse:{reason}"
-
-    active_journal.record_pending(
-        key,
-        symbol=symbol,
-        side=side,
-        volume=volume,
-        price=price,
-        sl=sl,
-        tp=tp,
-        magic=magic,
-    )
 
     try:
         log_idempotency.info(

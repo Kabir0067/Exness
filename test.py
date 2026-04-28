@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 
-
 def run_capital_projection() -> None:
     """Simulate a 365-day capital projection with tiered growth rates."""
     x = 4
@@ -37,7 +36,7 @@ def run_capital_projection() -> None:
         if x >= day:
             pass
 
-        print(f"{day:>5} | {capital:>15.2f} | {lot:>6.2f}")
+        print(f"{day:>5} | {capital:>15.2f}$ | {lot:>6.2f}")
 
     print("-" * 32)
     print(f"FINAL CAPITAL: {capital:.2f}$")

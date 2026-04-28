@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
@@ -26,6 +26,12 @@ from ExnessAPI.functions import close_all_position
 from ExnessAPI.order_execution import OrderExecutor, OrderRequest
 from ExnessAPI.order_execution import OrderResult as ExecOrderResult
 from ExnessAPI.order_execution import log_health as exec_health_log
+from core.idempotency import (
+    STATUS_PENDING,
+    get_default_journal,
+    idem_key_to_comment,
+)
+from core.stability_monitor import get_default_governor
 from mt5_client import MT5_LOCK, mt5_async_call
 
 from .models import (
@@ -69,7 +75,12 @@ def _signal_stale_reason(
 ) -> str:
     age_sec = signal_age_sec(bar_key, now_ts=now_ts, created_ts=created_ts)
     if age_sec is None:
-        return ""
+        allow_missing = bool(getattr(cfg, "allow_missing_signal_timing", False)) or str(
+            os.getenv("ALLOW_SIGNAL_WITHOUT_TIMING", "0") or "0"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if allow_missing:
+            return ""
+        return f"no_timing_data|tf={timeframe or '-'}|source={source or '-'}"
     max_age_sec = _signal_max_age_sec(cfg, source=source, timeframe=timeframe)
     if max_age_sec > 0.0 and age_sec > max_age_sec:
         return (
@@ -183,8 +194,10 @@ class ExecutionWorker(threading.Thread):
 
             if deal_ticket > 0:
                 try:
-                    start_dt = datetime.fromtimestamp(max(0.0, float(sent_ts) - 10.0))
-                    end_dt = datetime.fromtimestamp(time.time() + 2.0)
+                    start_dt = datetime.fromtimestamp(
+                        max(0.0, float(sent_ts) - 10.0), tz=timezone.utc
+                    )
+                    end_dt = datetime.fromtimestamp(time.time() + 2.0, tz=timezone.utc)
                     with MT5_LOCK:
                         deals = mt5.history_deals_get(start_dt, end_dt) or []
                     for deal in deals:
@@ -230,6 +243,14 @@ class ExecutionWorker(threading.Thread):
 
     def _process(self, intent: OrderIntent) -> ExecutionResult:
         sent = time.time()
+        _idem_key = str(getattr(intent, "idempotency_key", "") or intent.order_id)
+
+        def _record_wal_failed(reason: str) -> None:
+            try:
+                get_default_journal().record_failed(_idem_key, reason=str(reason))
+            except Exception:
+                pass
+
         try:
             dispatch_lot = float(intent.lot)
             rm = intent.risk_manager
@@ -257,6 +278,7 @@ class ExecutionWorker(threading.Thread):
                             intent.order_id,
                             exc,
                         )
+                _record_wal_failed(stale_reason)
                 return ExecutionResult(
                     order_id=str(intent.order_id),
                     signal_id=str(intent.signal_id),
@@ -316,6 +338,7 @@ class ExecutionWorker(threading.Thread):
                                     intent.order_id,
                                     exc,
                                 )
+                        _record_wal_failed(reason)
                         return ExecutionResult(
                             order_id=str(intent.order_id),
                             signal_id=str(intent.signal_id),
@@ -339,8 +362,6 @@ class ExecutionWorker(threading.Thread):
                     # enforces. Defensive: any failure leaves dispatch_lot
                     # untouched.
                     try:
-                        from core.stability_monitor import get_default_governor
-
                         _gov_state = get_default_governor().snapshot()
                         _gov_mult = float(
                             getattr(_gov_state, "last_multiplier", 1.0) or 1.0
@@ -368,6 +389,7 @@ class ExecutionWorker(threading.Thread):
                         )
 
                     if dispatch_lot <= 0.0:
+                        _record_wal_failed("dispatch_gate:lot_nonpositive")
                         return ExecutionResult(
                             order_id=str(intent.order_id),
                             signal_id=str(intent.signal_id),
@@ -388,27 +410,27 @@ class ExecutionWorker(threading.Thread):
             # the broker comment so that reconciliation after a crash can
             # match history deals back to this logical order.
             _idem_journal = None
-            _idem_key = str(
-                getattr(intent, "idempotency_key", "") or intent.order_id
-            )
             _comment_base = str(
                 getattr(intent.cfg, "comment", "portfolio") or "portfolio"
             )
             _order_comment = _comment_base
             try:
-                from core.idempotency import (
-                    STATUS_PENDING,
-                    get_default_journal,
-                    idem_key_to_comment,
-                )
-
                 _idem_journal = get_default_journal()
                 _existing = _idem_journal.get(_idem_key)
                 _queue_owned_pending = bool(
                     _existing is not None and _existing.status == STATUS_PENDING
                 )
                 if not _queue_owned_pending:
-                    _ok_to_send, _idem_reason = _idem_journal.should_send(_idem_key)
+                    _ok_to_send, _idem_reason, _ = _idem_journal.reserve_pending(
+                        _idem_key,
+                        symbol=str(intent.symbol),
+                        side=str(intent.signal),
+                        volume=float(dispatch_lot),
+                        price=float(intent.price),
+                        sl=float(intent.sl),
+                        tp=float(intent.tp),
+                        magic=int(getattr(intent.cfg, "magic", 777001) or 777001),
+                    )
                     if not _ok_to_send:
                         return ExecutionResult(
                             order_id=str(intent.order_id),
@@ -517,6 +539,7 @@ class ExecutionWorker(threading.Thread):
             log_err.error(
                 "execution worker error: %s | tb=%s", exc, traceback.format_exc()
             )
+            _record_wal_failed(f"exception:{type(exc).__name__}:{exc}")
             return ExecutionResult(
                 order_id=str(intent.order_id),
                 signal_id=str(intent.signal_id),
@@ -526,7 +549,7 @@ class ExecutionWorker(threading.Thread):
                 fill_ts=sent,
                 req_price=float(intent.price),
                 exec_price=float(intent.price),
-                volume=float(intent.lot),
+                volume=0.0,
                 slippage=0.0,
                 retcode=-1,
                 order_ticket=0,
@@ -560,8 +583,16 @@ class ExecutionWorker(threading.Thread):
                 # Try to publish result to engine
                 published = False
                 try:
-                    self.result_queue.put(res, timeout=0.25)
+                    self.result_queue.put_nowait(res)
                     published = True
+                except queue.Full as exc:  # DEFENSIVE CODE
+                    published = False
+                    log_err.error(
+                        "EXEC_RESULT_QUEUE_FULL | order_id=%s worker=%s err=%s",
+                        res.order_id,
+                        self.worker_label,
+                        exc,
+                    )
                 except Exception as exc:  # DEFENSIVE CODE
                     published = False
                     log_err.error(
@@ -727,17 +758,6 @@ class ExecutionManager:
                     e._trade_cooldown_sec - time_since_close,
                     e._cooldown_blocked_count[cand.asset],
                 )
-            return False, None
-
-        open_positions = e._asset_open_positions(cand.asset)
-        max_positions = e._asset_max_positions(cand.asset)
-        if max_positions > 0 and open_positions >= max_positions:
-            log_health.info(
-                "ENQUEUE_SKIP | asset=%s reason=max_positions open=%d max=%d",
-                cand.asset,
-                open_positions,
-                max_positions,
-            )
             return False, None
 
         equity, leverage = self._cached_account_probe()
@@ -920,10 +940,14 @@ class ExecutionManager:
             max_spread_pts = 2500.0 if cand.asset == "BTC" else 350.0
 
         if current_spread_points > max_spread_pts:
-            sp_key = f"_spread_skip_ts_{cand.asset}"
-            sp_last = getattr(e, sp_key, 0.0)
+            spread_skip_ts = getattr(e, "_spread_skip_ts", None)
+            if not isinstance(spread_skip_ts, dict):
+                spread_skip_ts = {}
+                setattr(e, "_spread_skip_ts", spread_skip_ts)
+            asset_key = str(cand.asset or "").upper().strip()
+            sp_last = float(spread_skip_ts.get(asset_key, 0.0) or 0.0)
             if (now - sp_last) >= 30.0:
-                setattr(e, sp_key, now)
+                spread_skip_ts[asset_key] = now
                 log_health.info(
                     "ENQUEUE_SKIP | asset=%s reason=spread_too_high spread=%s > max=%s",
                     cand.asset,
@@ -1032,29 +1056,23 @@ class ExecutionManager:
                     return False, None
 
         order_id = e._next_order_id(cand.asset)
-        # Build a globally-unique idempotency key (UUID-suffixed) and register
+        # Build a deterministic idempotency key and register
         # a PENDING entry in the write-ahead log BEFORE enqueueing. This is
         # the institutional guarantee that NO duplicate order can be sent
         # under any retry / crash / restart scenario.
+        _idem_journal = None
         try:
-            from core.idempotency import (
-                new_idempotency_key,
-                get_default_journal,
-            )
-
             _idem_journal = get_default_journal()
-            idem = new_idempotency_key(
-                cand.symbol, str(cand.signal_id), str(cand.signal)
-            )
-            _ok_to_send, _idem_reason = _idem_journal.should_send(idem)
-            if not _ok_to_send:
-                log_health.info(
-                    "ENQUEUE_SKIP | asset=%s reason=idempotency_refuse:%s",
-                    cand.asset,
-                    _idem_reason,
+            idem = ":".join(
+                (
+                    str(cand.symbol or "").upper().strip(),
+                    str(cand.signal_id or "").strip(),
+                    str(cand.signal or "").strip(),
+                    f"part={int(order_index) + 1}/{max(1, int(order_count))}",
                 )
-                return False, None
-            _idem_journal.record_pending(
+            )
+            _magic = int(getattr(cfg, "magic", 777001) or 777001)
+            _ok_to_send, _idem_reason, _ = _idem_journal.reserve_pending(
                 idem,
                 symbol=str(cand.symbol),
                 side=str(cand.signal),
@@ -1062,8 +1080,15 @@ class ExecutionManager:
                 price=float(price),
                 sl=float(sl_val),
                 tp=float(tp_val),
-                magic=0,
+                magic=int(_magic),
             )
+            if not _ok_to_send:
+                log_health.info(
+                    "ENQUEUE_SKIP | asset=%s reason=idempotency_refuse:%s",
+                    cand.asset,
+                    _idem_reason,
+                )
+                return False, None
         except Exception as _idem_exc:  # defensive: never break enqueue
             idem = f"{cand.symbol}:{cand.signal_id}:{cand.signal}"
             log_health.warning(
@@ -1095,6 +1120,24 @@ class ExecutionManager:
             source=str(getattr(cand, "source", "") or "pipeline"),
         )
 
+        reserved_slot = False
+        slot_ok, slot_reason = self.reserve_position_slot(cand.asset)
+        if not slot_ok:
+            if _idem_journal is not None:
+                try:
+                    _idem_journal.record_failed(
+                        str(idem), reason=f"position_reservation_refused:{slot_reason}"
+                    )
+                except Exception:
+                    pass
+            log_health.info(
+                "ENQUEUE_SKIP | asset=%s reason=position_reservation_refused:%s",
+                cand.asset,
+                slot_reason,
+            )
+            return False, None
+        reserved_slot = True
+
         with e._order_state_lock:
             e._order_rm_by_id[str(order_id)] = risk
         e._register_pending_order(intent)
@@ -1105,6 +1148,13 @@ class ExecutionManager:
             with e._order_state_lock:
                 e._order_rm_by_id.pop(str(order_id), None)
             e._clear_pending_order(str(order_id))
+            if reserved_slot:
+                self.release_position_slot(cand.asset)
+            if _idem_journal is not None:
+                try:
+                    _idem_journal.record_failed(str(idem), reason="queue_full_drop")
+                except Exception:
+                    pass
             if risk and hasattr(risk, "record_execution_failure"):
                 try:
                     risk.record_execution_failure(
@@ -1174,8 +1224,15 @@ class ExecutionManager:
         cfg = e._xau_cfg if c.asset == "XAU" else e._btc_cfg
         base = float(getattr(cfg, "min_confidence_signal", 0.55) or 0.55)
 
-        env_global: float = 0.50
-        env_asset: float = float(env_global)
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        env_global: float = _env_float("MIN_CONFIDENCE_FLOOR", 0.50)
+        asset_key = str(c.asset or "").upper().strip()
+        env_asset: float = _env_float(f"MIN_CONFIDENCE_FLOOR_{asset_key}", env_global)
         floor = max(0.35, min(0.90, env_asset))
 
         effective_min = max(floor, base)
@@ -1237,6 +1294,35 @@ class ExecutionManager:
         e = self._e
         asset_u = str(asset or "").upper().strip()
         return max(1, int(e._max_open_positions.get(asset_u, 1) or 1))
+
+    def reserve_position_slot(self, asset: str) -> Tuple[bool, str]:
+        e = self._e
+        asset_u = str(asset or "").upper().strip()
+        with e._order_state_lock:
+            reserved = getattr(e, "_reserved_open_positions", None)
+            if not isinstance(reserved, dict):
+                reserved = {"XAU": 0, "BTC": 0}
+                setattr(e, "_reserved_open_positions", reserved)
+            open_positions = self.asset_open_positions(asset_u)
+            pending_positions = int(reserved.get(asset_u, 0) or 0)
+            max_positions = self.asset_max_positions(asset_u)
+            if max_positions > 0 and (open_positions + pending_positions) >= max_positions:
+                return (
+                    False,
+                    f"max_positions open={open_positions} reserved={pending_positions} max={max_positions}",
+                )
+            reserved[asset_u] = pending_positions + 1
+            return True, "reserved"
+
+    def release_position_slot(self, asset: str) -> None:
+        e = self._e
+        asset_u = str(asset or "").upper().strip()
+        with e._order_state_lock:
+            reserved = getattr(e, "_reserved_open_positions", None)
+            if not isinstance(reserved, dict):
+                return
+            current = int(reserved.get(asset_u, 0) or 0)
+            reserved[asset_u] = max(0, current - 1)
 
     def asset_lot_cap(self, asset: str) -> float:
         e = self._e
@@ -1307,9 +1393,7 @@ class ExecutionManager:
         min_lot = self.min_lot(risk)
         split_enabled = bool(getattr(cfg, "multi_order_split_lot", True))
         if not split_enabled:
-            if min_lot <= 0 or lot < min_lot:
-                return [lot]
-            return [lot for _ in range(int(parts))]
+            return [lot]
 
         if min_lot <= 0 or (lot / float(parts)) < min_lot:
             return [lot]
@@ -1335,17 +1419,6 @@ class ExecutionManager:
             if e._manual_stop:
                 log_health.info(
                     "FSM_ORDER_SKIP | reason=manual_stop asset=%s", selected.asset
-                )
-                continue
-
-            open_positions = self.asset_open_positions(selected.asset)
-            max_positions = self.asset_max_positions(selected.asset)
-            if max_positions > 0 and open_positions >= max_positions:
-                log_health.info(
-                    "FSM_ORDER_SKIP | asset=%s reason=max_positions open=%d max=%d",
-                    selected.asset,
-                    open_positions,
-                    max_positions,
                 )
                 continue
 
@@ -1550,6 +1623,13 @@ class OrderSyncManager:
         with e._order_state_lock:
             rm = e._order_rm_by_id.pop(order_id, None)
             meta = e._pending_order_meta.pop(order_id, None)
+            if isinstance(meta, dict):
+                asset_release = str(meta.get("asset", "") or "").upper().strip()
+                reserved = getattr(e, "_reserved_open_positions", None)
+                if asset_release and isinstance(reserved, dict):
+                    reserved[asset_release] = max(
+                        0, int(reserved.get(asset_release, 0) or 0) - 1
+                    )
         if rm is None and isinstance(meta, dict):
             rm = meta.get("risk")
         if rm is None:
@@ -1649,8 +1729,10 @@ class OrderSyncManager:
             if (now_ts - enqueue_ts) < e._order_sync_timeout_sec:
                 return None
 
-            start_dt = datetime.fromtimestamp(max(0.0, enqueue_ts - 5.0))
-            end_dt = datetime.fromtimestamp(now_ts + 1.0)
+            start_dt = datetime.fromtimestamp(
+                max(0.0, enqueue_ts - 5.0), tz=timezone.utc
+            )
+            end_dt = datetime.fromtimestamp(now_ts + 1.0, tz=timezone.utc)
             deals = self._call_mt5("history_deals_get", start_dt, end_dt) or []
             entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0) or 0)
             best: Optional[Tuple[float, float, float, int]] = None
@@ -1852,7 +1934,7 @@ class EngineExecutionMixin:
         with self._lock:
             self._order_counter += 1
             counter = self._order_counter
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         return f"PORD_{asset}_{ts}_{counter}_{os.getpid()}"
 
     def _effective_min_conf(self, c: AssetCandidate) -> float:

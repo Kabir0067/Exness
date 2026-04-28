@@ -103,6 +103,9 @@ class InstitutionalBacktestMetrics:
     mc_confidence_95_percentile: float = 0.0
     mc_worst_case: float = 0.0
     mc_best_case: float = 0.0
+    mc_max_drawdown_median: float = 0.0
+    mc_max_drawdown_95pct: float = 0.0
+    mc_max_drawdown_worst: float = 0.0
 
     wfa_passed: bool = False
     wfa_total_windows: int = 0
@@ -164,6 +167,7 @@ def compute_institutional_metrics(
     commission_costs: float = 0.0,
     trade_durations_min: Optional[List[float]] = None,
     trade_details: Optional[List[Dict]] = None,
+    asset_returns: Optional[List[float]] = None,
 ) -> InstitutionalBacktestMetrics:
     """
     Compute comprehensive institutional-grade performance metrics.
@@ -258,6 +262,10 @@ def compute_institutional_metrics(
         m.max_consecutive_losses = streaks["max_losses"]
         m.avg_consecutive_wins = streaks["avg_wins"]
         m.avg_consecutive_losses = streaks["avg_losses"]
+        if int(streaks.get("breakeven_count", 0) or 0) > 0:
+            m.metric_notes.append(
+                f"streaks_excluded_breakeven:{int(streaks['breakeven_count'])}"
+            )
 
     # ──────────────────────────────────────────────────────────
     # 3. Equity curve & returns
@@ -286,7 +294,7 @@ def compute_institutional_metrics(
         data_days = max(1.0, m.total_trades / max(periods_per_year, 1.0) * 365.25)
 
     years = data_days / 365.25
-    daily_periods = 252.0  # Standard trading calendar
+    daily_periods = 365.0 if str(symbol or "").upper().startswith("BTC") else 252.0
 
     # CAGR — uses real calendar years (FIXED)
     if years > 0 and m.final_capital > 0 and initial_capital > 0:
@@ -319,9 +327,39 @@ def compute_institutional_metrics(
                 else:
                     pnl_vals.append(float(t.get("pnl", 0.0) or 0.0))
             if ts_vals and len(ts_vals) == len(pnl_vals):
-                s = pd.Series(pnl_vals, index=pd.DatetimeIndex(ts_vals))
-                grouped = s.groupby(s.index.date).sum()
+                ts_index = pd.DatetimeIndex(ts_vals)
+                if ts_index.tz is not None:
+                    day_index = ts_index.tz_convert("UTC").tz_localize(None).normalize()
+                else:
+                    day_index = ts_index.normalize()
+
+                s = pd.Series(pnl_vals, index=day_index)
+                grouped = s.groupby(level=0).sum().sort_index()
                 if grouped.size > 0:
+                    full_start = grouped.index.min()
+                    full_end = grouped.index.max()
+                    try:
+                        if start_date:
+                            full_start = min(
+                                full_start,
+                                pd.Timestamp(str(start_date))
+                                .tz_localize(None)
+                                .normalize(),
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        if end_date:
+                            full_end = max(
+                                full_end,
+                                pd.Timestamp(str(end_date))
+                                .tz_localize(None)
+                                .normalize(),
+                            )
+                    except Exception:
+                        pass
+                    full_index = pd.date_range(full_start, full_end, freq="D")
+                    grouped = grouped.reindex(full_index, fill_value=0.0)
                     daily_pnls = grouped.to_numpy(dtype=np.float64)
                     built_from_trade_timestamps = True
         except Exception:
@@ -370,7 +408,7 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     # 7. Annualised return & volatility
     # ──────────────────────────────────────────────────────────
-    m.annualized_return_pct = daily_mean * daily_periods
+    m.annualized_return_pct = m.cagr
     m.volatility_annualized = daily_std * math.sqrt(daily_periods)
 
     # ──────────────────────────────────────────────────────────
@@ -420,16 +458,40 @@ def compute_institutional_metrics(
         else 0.0
     )
 
-    # Drawdown duration (in trade-bars, not calendar days)
+    # Drawdown duration in calendar days when timestamps are available.
     in_dd = drawdown > 0
     if np.any(in_dd):
         dd_runs = np.diff(np.concatenate(([0], in_dd.astype(int), [0])))
         dd_starts = np.where(dd_runs == 1)[0]
         dd_ends = np.where(dd_runs == -1)[0]
         if dd_starts.size > 0 and dd_ends.size > 0:
-            m.max_drawdown_duration_days = float(
-                max(e - s for s, e in zip(dd_starts, dd_ends))
-            )
+            max_duration = 0.0
+            used_calendar_days = False
+            if trade_details:
+                for s, e in zip(dd_starts, dd_ends):
+                    try:
+                        if s <= 0 or e <= 0:
+                            continue
+                        start_trade = trade_details[min(s - 1, len(trade_details) - 1)]
+                        end_trade = trade_details[min(e - 1, len(trade_details) - 1)]
+                        start_ts = pd.Timestamp(
+                            str(start_trade.get("exit_time") or start_trade.get("entry_time"))
+                        )
+                        end_ts = pd.Timestamp(
+                            str(end_trade.get("exit_time") or end_trade.get("entry_time"))
+                        )
+                        if pd.notna(start_ts) and pd.notna(end_ts):
+                            duration = max(
+                                0.0, (end_ts - start_ts).total_seconds() / 86_400.0
+                            )
+                            max_duration = max(max_duration, float(duration))
+                            used_calendar_days = True
+                    except Exception:
+                        continue
+            if not used_calendar_days:
+                max_duration = float(max(e - s for s, e in zip(dd_starts, dd_ends)))
+                m.metric_notes.append("max_drawdown_duration_days_approx_bars")
+            m.max_drawdown_duration_days = float(max_duration)
 
     # ──────────────────────────────────────────────────────────
     # 11. Calmar Ratio
@@ -451,14 +513,16 @@ def compute_institutional_metrics(
     # ──────────────────────────────────────────────────────────
     # 13. VaR & CVaR — per-trade returns
     # ──────────────────────────────────────────────────────────
-    per_trade_returns = pnls / initial_capital
+    running_equity = np.cumsum(pnls, dtype=np.float64) + float(initial_capital)
+    prev_equity = np.concatenate(([float(initial_capital)], running_equity[:-1]))
+    safe_prev_equity = np.where(prev_equity > 0.0, prev_equity, float(initial_capital))
+    per_trade_returns = pnls / safe_prev_equity
     if per_trade_returns.size > 0:
         var_threshold = float(np.percentile(per_trade_returns, 5))
-        m.var_95 = var_threshold * initial_capital
+        capital_scale = float(np.median(safe_prev_equity))
+        m.var_95 = var_threshold * capital_scale
         tail = per_trade_returns[per_trade_returns <= var_threshold]
-        m.cvar_95 = (
-            float(np.mean(tail)) * initial_capital if tail.size > 0 else m.var_95
-        )
+        m.cvar_95 = float(np.mean(tail)) * capital_scale if tail.size > 0 else m.var_95
 
     # ──────────────────────────────────────────────────────────
     # 14. Information Ratio vs buy-and-hold (FIXED — was always 0.0 in v1)
@@ -466,7 +530,14 @@ def compute_institutional_metrics(
     # Construct a naive buy-and-hold daily return series of equal magnitude
     # as a proxy benchmark and compute IR = mean(active - bench) / std(active - bench).
     try:
-        bh_daily = np.full(daily_returns.size, m.cagr / daily_periods)
+        if asset_returns is not None and len(asset_returns) > 0:
+            bh_daily = np.asarray(asset_returns, dtype=np.float64)
+            if bh_daily.size < daily_returns.size:
+                pad = np.full(daily_returns.size - bh_daily.size, risk_free_rate / daily_periods)
+                bh_daily = np.concatenate([bh_daily, pad])
+            bh_daily = bh_daily[: len(daily_returns)]
+        else:
+            bh_daily = np.full(daily_returns.size, risk_free_rate / daily_periods)
         active_excess = daily_returns - bh_daily
         ae_std = float(np.std(active_excess, ddof=1)) if active_excess.size > 1 else 0.0
         m.information_ratio = (
@@ -530,23 +601,34 @@ def _calculate_streaks_vectorised(pnls: np.ndarray) -> Dict[str, Any]:
 
     Replaces the Python for-loop in v1 with pure numpy operations.
     """
-    is_win = (pnls > 0).astype(np.int8)
-    # Pad boundary so diff always captures first/last run transitions
-    padded = np.concatenate(([is_win[0] ^ 1], is_win, [is_win[-1] ^ 1]))
-    changes = np.diff(padded.astype(np.int16))
+    arr = np.asarray(pnls, dtype=np.float64)
+    breakeven_count = int(np.sum(np.isfinite(arr) & (arr == 0.0)))
+    signs = np.sign(arr)
+    signs = signs[np.isfinite(signs) & (signs != 0.0)]
+    if signs.size == 0:
+        return {
+            "max_wins": 0,
+            "max_losses": 0,
+            "avg_wins": 0.0,
+            "avg_losses": 0.0,
+            "breakeven_count": breakeven_count,
+        }
 
-    run_starts = np.where(changes != 0)[0]
-    run_lengths = np.diff(np.append(run_starts, len(padded) - 1))
-    run_values = padded[run_starts]  # 0 = loss run, 1 = win run
+    change_points = np.flatnonzero(np.diff(signs)) + 1
+    run_starts = np.concatenate(([0], change_points))
+    run_ends = np.concatenate((change_points, [signs.size]))
+    run_lengths = run_ends - run_starts
+    run_values = signs[run_starts]
 
-    win_lengths = run_lengths[run_values == 1]
-    loss_lengths = run_lengths[run_values == 0]
+    win_lengths = run_lengths[run_values > 0.0]
+    loss_lengths = run_lengths[run_values < 0.0]
 
     return {
         "max_wins": int(np.max(win_lengths)) if win_lengths.size > 0 else 0,
         "max_losses": int(np.max(loss_lengths)) if loss_lengths.size > 0 else 0,
         "avg_wins": float(np.mean(win_lengths)) if win_lengths.size > 0 else 0.0,
         "avg_losses": float(np.mean(loss_lengths)) if loss_lengths.size > 0 else 0.0,
+        "breakeven_count": breakeven_count,
     }
 
 
@@ -600,7 +682,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
         "  ──────────────────────────────────────────────────────────────────────────",
         f"    Max Drawdown:           {m.max_drawdown_pct:.2%}  {'✅' if m.max_drawdown_pct <= 0.20 else '❌'} (Max: 20%)",
         f"    Average Drawdown:       {m.avg_drawdown_pct:.2%}",
-        f"    DD Duration (bars):     {m.max_drawdown_duration_days:.0f}",
+        f"    DD Duration (days):     {m.max_drawdown_duration_days:.0f}",
         f"    Recovery Factor:        {m.recovery_factor:.2f}",
         f"    Annualized Vol:         {m.volatility_annualized:.2%}",
         f"    Downside Deviation:     {m.downside_deviation:.2%}",
@@ -615,6 +697,9 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
         f"    MC 95% Confidence:      ${m.mc_confidence_95_percentile:,.2f}",
         f"    MC Worst Case:          ${m.mc_worst_case:,.2f}",
         f"    MC Best Case:           ${m.mc_best_case:,.2f}",
+        f"    MC Max DD Median:       {m.mc_max_drawdown_median:.2%}",
+        f"    MC Max DD 95pct:        {m.mc_max_drawdown_95pct:.2%}",
+        f"    MC Max DD Worst:        {m.mc_max_drawdown_worst:.2%}",
         "",
         f"    Walk-Forward:           {'✅ PASS' if m.wfa_passed else '❌ FAIL'} "
         f"({m.wfa_failed_windows}/{m.wfa_total_windows} windows failed)",
@@ -686,7 +771,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
             "",
             "=" * 80,
             "",
-            f"  {'🏛️  INSTITUTIONAL GRADE VERIFIED ✅' if m.sharpe_ratio >= 2.0 and m.win_rate >= 0.58 and m.risk_of_ruin <= 0.01 and m.wfa_passed and m.stress_test_passed else '❌ DOES NOT MEET INSTITUTIONAL STANDARDS'}",
+            f"  {'🏛️  INSTITUTIONAL GRADE VERIFIED ✅' if m.institutional_grade else '❌ DOES NOT MEET INSTITUTIONAL STANDARDS'}",
             "",
             "=" * 80,
         ]
@@ -751,6 +836,7 @@ def compute_metrics(
     commission_costs: float = 0.0,
     trade_durations_min: Optional[List[float]] = None,
     trade_details: Optional[List[Dict]] = None,
+    asset_returns: Optional[List[float]] = None,
 ) -> InstitutionalBacktestMetrics:
     """Compatibility alias: delegates to compute_institutional_metrics."""
     return compute_institutional_metrics(
@@ -768,4 +854,5 @@ def compute_metrics(
         commission_costs=commission_costs,
         trade_durations_min=trade_durations_min,
         trade_details=trade_details,
+        asset_returns=asset_returns,
     )

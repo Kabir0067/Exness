@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math as _math
 import os
+import heapq
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -40,8 +41,11 @@ from .models import (
     AssetCandidate,
     EngineCycleContext,
     EngineState,
+    MONITORING_ONLY_HALT_REASONS,
     PortfolioStatus,
+    RECOVERABLE_HALT_REASONS,
     StepDecision,
+    log_alert,
     log_diag,
     log_err,
     log_health,
@@ -149,6 +153,14 @@ class DeterministicFSMRunner:
                     skip_sleep = True
                 else:
                     decision = handler(state, ctx)
+                    reset_exception_retry = getattr(
+                        self._ports, "reset_exception_retry", None
+                    )
+                    if callable(reset_exception_retry):
+                        try:
+                            reset_exception_retry(state)
+                        except Exception:
+                            pass
                     state, ctx, skip_sleep = (
                         decision.next_state,
                         decision.ctx,
@@ -192,11 +204,27 @@ class EngineFSMStageServices(IFSMEnginePorts):
     def __init__(self, engine: "MultiAssetTradingEngine") -> None:
         self._e = engine
         self._asset_priority = ("XAU", "BTC")
+        self._asset_priority_set = set(self._asset_priority)
+        self._last_monitoring_cycle_log_ts = 0.0
+        self._monitoring_cycle_log_ttl_sec = max(
+            10.0,
+            float(os.getenv("FSM_MONITORING_LOG_TTL_SEC", "30.0") or 30.0),
+        )
+        self._monitoring_cycle_floor_sec = max(
+            1.0,
+            float(os.getenv("FSM_MONITORING_CYCLE_SEC", "2.0") or 2.0),
+        )
         self._ml_signal_log_ttl_sec = max(
             5.0,
             float(os.getenv("FSM_SIGNAL_LOG_TTL_SEC", "30.0") or 30.0),
         )
         self._ml_signal_log_cache: Dict[str, Tuple[str, float]] = {}
+        self._exception_retry_counts: Dict[str, int] = {}
+        self._exception_retry_lock = threading.RLock()
+        self._transient_exception_limit = max(
+            1,
+            int(float(os.getenv("FSM_TRANSIENT_EXCEPTION_LIMIT", "3") or 3)),
+        )
 
     def _asset_pipe(self, asset: str) -> Any:
         asset_u = str(asset or "").upper().strip()
@@ -264,10 +292,28 @@ class EngineFSMStageServices(IFSMEnginePorts):
         return bool(self._e._run.is_set())
 
     def cycle_floor_sec(self) -> float:
-        return max(float(self._e._poll_fast), float(self._e._min_cycle_sec))
+        base = max(float(self._e._poll_fast), float(self._e._min_cycle_sec))
+        try:
+            if self._e.manual_stop_active():
+                return max(base, float(self._monitoring_cycle_floor_sec))
+        except Exception:
+            pass
+        return base
 
     def report_cycle_latency_ms(self, latency_ms: float) -> None:
         self._e._report_cycle_latency_ms(float(latency_ms))
+
+    def _log_monitoring_cycle_once(self, reason: str) -> None:
+        now = time.time()
+        if (now - self._last_monitoring_cycle_log_ts) < float(
+            self._monitoring_cycle_log_ttl_sec
+        ):
+            return
+        self._last_monitoring_cycle_log_ts = now
+        log_health.info(
+            "FSM_MONITORING_CYCLE | reason=%s execution_disabled=True",
+            str(reason or "monitoring"),
+        )
 
     def step_boot(self, state: EngineState, ctx: EngineCycleContext) -> StepDecision:
         self._e._touch_runtime_progress()
@@ -305,9 +351,7 @@ class EngineFSMStageServices(IFSMEnginePorts):
         self._e._check_hard_stop_file()
 
         if self._e.manual_stop_active():
-            log_health.info(
-                "FSM_MONITORING_CYCLE | reason=manual_stop_active execution_disabled=True"
-            )
+            self._log_monitoring_cycle_once("manual_stop_active")
 
         # --- risk halt check (extracted) ---
         halt_reason = ""
@@ -671,33 +715,52 @@ class EngineFSMStageServices(IFSMEnginePorts):
         ctx: EngineCycleContext,
         exc: Exception,
     ) -> StepDecision:
+        state_key = str(getattr(state, "value", state))
+        transient_states = {
+            EngineState.DATA_SYNC,
+            EngineState.ML_INFERENCE,
+            EngineState.EXECUTION_QUEUE,
+            EngineState.VERIFICATION,
+        }
+        with self._exception_retry_lock:
+            count = int(self._exception_retry_counts.get(state_key, 0) or 0) + 1
+            self._exception_retry_counts[state_key] = count
+
         log_err.error(
-            "FSM_LOOP_EXCEPTION | err=%s | tb=%s", exc, traceback.format_exc()
+            "FSM_LOOP_EXCEPTION | state=%s attempt=%d err=%s | tb=%s",
+            state_key,
+            count,
+            exc,
+            traceback.format_exc(),
         )
+        if state in transient_states and count <= self._transient_exception_limit:
+            log_health.warning(
+                "FSM_TRANSIENT_EXCEPTION_RETRY | state=%s attempt=%d/%d err=%s",
+                state_key,
+                count,
+                self._transient_exception_limit,
+                exc,
+            )
+            return StepDecision(next_state=state, ctx=ctx, skip_sleep=False)
+
         ctx.halt_reason = f"fsm_exception:{exc}"
         return StepDecision(next_state=EngineState.HALT, ctx=ctx, skip_sleep=True)
+
+    def reset_exception_retry(self, state: EngineState) -> None:
+        state_key = str(getattr(state, "value", state))
+        with self._exception_retry_lock:
+            self._exception_retry_counts.pop(state_key, None)
 
     def _ordered_active_assets(self, assets: List[str]) -> List[str]:
         """Return active assets in deterministic execution order."""
         unique = {str(a).strip().upper() for a in assets if str(a).strip()}
         ordered: List[str] = [a for a in self._asset_priority if a in unique]
-        remaining = sorted(a for a in unique if a not in set(self._asset_priority))
+        remaining = sorted(a for a in unique if a not in self._asset_priority_set)
         ordered.extend(remaining)
         return ordered
 
 
 # --- Engine mixin extracted from engine.py --------------------------------
-
-
-RECOVERABLE_HALT_REASONS = frozenset({"mt5_unhealthy", "mt5_disconnected"})
-
-MONITORING_ONLY_HALT_REASONS = frozenset(
-    {
-        "manual_stop",
-        "manual_stop_active",
-        "manual_stop_triggered",
-    }
-)
 
 
 class EngineRuntimeMixin:
@@ -719,7 +782,9 @@ class EngineRuntimeMixin:
 
     def _live_trade_win_rate(self) -> Tuple[float, int]:
         profits: List[float] = []
-        since_ts = float(self._loop_started_ts or 0.0) if self._loop_started_ts > 0 else None
+        since_ts = (
+            float(self._loop_started_ts or 0.0) if self._loop_started_ts > 0 else None
+        )
         for pipe in (self._xau, self._btc):
             rm = getattr(pipe, "risk", None) if pipe is not None else None
             fn = getattr(rm, "_recent_closed_trade_profits", None)
@@ -733,6 +798,14 @@ class EngineRuntimeMixin:
                 if isinstance(p, list):
                     profits.extend(float(x) for x in p if x is not None)
             except TypeError:
+                if since_ts is not None:
+                    if not bool(getattr(self, "_live_wr_signature_warned", False)):
+                        self._live_wr_signature_warned = True
+                        log_health.warning(
+                            "LIVE_WIN_RATE_SINCE_UNSUPPORTED | risk=%s action=skip_all_time_fallback",
+                            type(rm).__name__ if rm is not None else "None",
+                        )
+                    continue
                 try:
                     p = fn(60)
                     if isinstance(p, list):
@@ -764,10 +837,20 @@ class EngineRuntimeMixin:
         if prev_ts > 0.0 and prev_bal > 0.0:
             bal_jump = max((bal / prev_bal), (prev_bal / bal))
             if bal_jump >= factor:
+                self._last_account_snapshot = {
+                    "balance": bal,
+                    "equity": eq,
+                    "updated_ts": float(now),
+                }
                 return f"balance_jump:{prev_bal:.2f}->{bal:.2f}"
         if prev_ts > 0.0 and prev_eq > 0.0:
             eq_jump = max((eq / prev_eq), (prev_eq / eq))
             if eq_jump >= factor:
+                self._last_account_snapshot = {
+                    "balance": bal,
+                    "equity": eq,
+                    "updated_ts": float(now),
+                }
                 return f"equity_jump:{prev_eq:.2f}->{eq:.2f}"
         self._last_account_snapshot = {
             "balance": bal,
@@ -1116,7 +1199,7 @@ class EngineRuntimeMixin:
                 self._diag_last_ts = time.time()
                 dispatch = mt5_dispatch_status()
                 payload = {
-                    "ts_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "engine": st,
                     "mt5": mt5_status(),
                     "mt5_dispatch": dispatch,
@@ -1221,7 +1304,7 @@ class EngineRuntimeMixin:
             if not acc:
                 return
             equity = float(getattr(acc, "equity", 0.0))
-            date_str = datetime.utcnow().strftime("%Y-%m-%d")
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             account_state = self._inspect_live_account_positions(positions)
             unsafe_reason = str(account_state.get("reason", "") or "")
             should_quarantine = False
@@ -1949,21 +2032,28 @@ class EngineRuntimeMixin:
             float(os.getenv("FSM_TRANSITION_LOG_TTL_SEC", "15.0") or 15.0),
         )
         signature = f"{current.value}->{nxt.value}:{reason}"
-        cache = dict(getattr(self, "_fsm_transition_log_cache", {}) or {})
-        last_ts = float(cache.get(signature, 0.0) or 0.0)
-        if last_ts <= 0.0 or (now - last_ts) >= ttl:
-            log_health.info(
-                "FSM_TRANSITION | %s -> %s | reason=%s",
-                current.value,
-                nxt.value,
-                reason,
-            )
-            cache[signature] = now
-            if len(cache) > 32:
-                oldest = sorted(cache.items(), key=lambda item: item[1])[:8]
-                for old_key, _ in oldest:
-                    cache.pop(old_key, None)
-            self._fsm_transition_log_cache = cache
+        lock = getattr(self, "_fsm_transition_log_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._fsm_transition_log_lock = lock
+        with lock:
+            cache = getattr(self, "_fsm_transition_log_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._fsm_transition_log_cache = cache
+            last_ts = float(cache.get(signature, 0.0) or 0.0)
+            if last_ts <= 0.0 or (now - last_ts) >= ttl:
+                log_health.info(
+                    "FSM_TRANSITION | %s -> %s | reason=%s",
+                    current.value,
+                    nxt.value,
+                    reason,
+                )
+                cache[signature] = now
+                if len(cache) > 32:
+                    oldest = sorted(cache.items(), key=lambda item: item[1])[:8]
+                    for old_key, _ in oldest:
+                        cache.pop(old_key, None)
         return nxt
 
     def _resolve_halt_reason(self, reason: str) -> str:
@@ -1994,6 +2084,7 @@ class EngineRuntimeMixin:
         if monitoring_only:
             log_health.warning("FSM_HALT | reason=%s | mode=monitoring_only", reason_s)
         else:
+            log_alert.critical("FSM_HALT | reason=%s", reason_s)
             log_err.critical("FSM_HALT | reason=%s", reason_s)
         with self._lock:
             if not (recoverable or monitoring_only):
@@ -2004,15 +2095,19 @@ class EngineRuntimeMixin:
         with self._order_state_lock:
             self._order_rm_by_id.clear()
             self._pending_order_meta.clear()
+            self._reserved_open_positions = {"XAU": 0, "BTC": 0}
         if recoverable:
             log_health.warning(
                 "FSM_HALT_RECOVERABLE | reason=%s | attempting_auto_restart", reason_s
             )
 
             def _auto_restart():
-                _MAX_RESTART_ATTEMPTS = 3
+                _MAX_RESTART_ATTEMPTS = max(
+                    1, int(float(os.getenv("FSM_AUTO_RESTART_ATTEMPTS", "5") or 5))
+                )
                 for attempt in range(1, _MAX_RESTART_ATTEMPTS + 1):
-                    delay = 10.0 * attempt
+                    base_delay = min(60.0, 5.0 * (2 ** (attempt - 1)))
+                    delay = base_delay
                     log_health.info(
                         "FSM_AUTO_RESTART_ATTEMPT | reason=%s attempt=%d/%d delay=%.0fs",
                         reason_s,
@@ -2147,11 +2242,15 @@ class EngineRuntimeMixin:
 
     def _p95(self, values: Deque[float]) -> float:
         """# SAFE IMPROVEMENT: Private helper extracted from run_chaos_audit (used internally)."""
-        arr = sorted(float(v) for v in values if float(v) >= 0.0)
+        arr = [float(v) for v in values if float(v) >= 0.0]
         if not arr:
             return 0.0
+        k = max(1, int(round(len(arr) * 0.05)))
+        tail = heapq.nlargest(k, arr)
+        tail.sort()
         idx = min(len(arr) - 1, max(0, int(round(0.95 * (len(arr) - 1)))))
-        return float(arr[idx])
+        tail_start = len(arr) - len(tail)
+        return float(tail[max(0, min(len(tail) - 1, idx - tail_start))])
 
 
 # =============================================================================

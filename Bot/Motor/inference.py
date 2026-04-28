@@ -7,7 +7,6 @@ for the engine decision pipeline.
 
 from __future__ import annotations
 
-import pickle
 import time
 import traceback
 from collections import deque
@@ -25,14 +24,15 @@ from Backtest.engine import run_backtest
 from core.config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
 from core.ml_router import MLSignal, validate_payload_schema
 from core.model_engine import gate_details, model_manager
-from log_config import get_artifact_path
 from mt5_client import mt5_async_call
 
 from .models import (
     AssetCandidate,
+    MODEL_STATE_PATH,
     _env_truthy,
     _partial_gate_enabled,
     _required_gate_assets,
+    load_restricted_pickle,
     log_err,
     log_health,
     parse_bar_key,
@@ -42,11 +42,6 @@ from .pipeline import UTCScheduler
 
 if TYPE_CHECKING:
     from .engine import MultiAssetTradingEngine
-
-# =============================================================================
-# Global Constants
-# =============================================================================
-MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 
 # =============================================================================
 # Classes / Mixins
@@ -101,9 +96,6 @@ class InferenceEngine:
 
         try:
             c = np.asarray(df["Close"].values, dtype=np.float64)
-            if len(c) < 200:
-                return indicators
-
             rsi_arr = talib.RSI(c, timeperiod=14)
             ema20_arr = talib.EMA(c, timeperiod=20)
             ema50_arr = talib.EMA(c, timeperiod=50)
@@ -151,7 +143,7 @@ class InferenceEngine:
         bear = 0.0
         if close > ema20 > ema50 > ema200 > 0.0:
             bull += 0.75
-        elif close < ema20 < ema50 < ema200 and ema200 > 0.0:
+        elif close < ema20 and 0.0 < ema20 < ema50 < ema200:
             bear += 0.75
 
         if rsi >= 57.5:
@@ -218,9 +210,7 @@ class InferenceEngine:
 
             if last_close > last_ema20 > last_ema50 > last_ema200 > 0.0:
                 bull += 0.55
-            elif (
-                last_close < last_ema20 < last_ema50 < last_ema200 and last_ema200 > 0.0
-            ):
+            elif last_close < last_ema20 and 0.0 < last_ema20 < last_ema50 < last_ema200:
                 bear += 0.55
 
             di_gap = abs(last_plus_di - last_minus_di)
@@ -233,16 +223,26 @@ class InferenceEngine:
             if slope_window >= 8:
                 y = c[-slope_window:]
                 x = np.arange(slope_window, dtype=np.float64)
-                slope = float(np.polyfit(x, y, 1)[0])
-                slope_norm = float(
-                    np.clip((slope * slope_window) / max(last_atr, 1e-6), -3.0, 3.0)
-                    / 3.0
-                )
-                metrics["slope"] = slope_norm
-                if slope_norm > 0.0:
-                    bull += 0.20 * abs(slope_norm)
-                elif slope_norm < 0.0:
-                    bear += 0.20 * abs(slope_norm)
+                finite_mask = np.isfinite(y)
+                y = y[finite_mask]
+                x = x[finite_mask]
+                if len(y) >= 8:
+                    slope = float(np.polyfit(x, y, 1)[0])
+                    if np.isfinite(slope):
+                        slope_norm = float(
+                            np.clip(
+                                (slope * slope_window) / max(last_atr, 1e-6),
+                                -3.0,
+                                3.0,
+                            )
+                            / 3.0
+                        )
+                        if np.isfinite(slope_norm):
+                            metrics["slope"] = slope_norm
+                            if slope_norm > 0.0:
+                                bull += 0.20 * abs(slope_norm)
+                            elif slope_norm < 0.0:
+                                bear += 0.20 * abs(slope_norm)
 
             raw_bias = bull - bear
             if last_adx >= adx_trend_min:
@@ -354,9 +354,30 @@ class InferenceEngine:
         if not payload:
             return None
         cache = getattr(e, "_catboost_signal_cache", None)
+        cache_lock = getattr(e, "_catboost_signal_cache_lock", None)
         if not isinstance(cache, dict):
             cache = {}
-            setattr(e, "_catboost_signal_cache", cache)
+            if cache_lock is not None:
+                with cache_lock:
+                    setattr(e, "_catboost_signal_cache", cache)
+            else:
+                setattr(e, "_catboost_signal_cache", cache)
+
+        def _get_cached_signal() -> Any:
+            if cache_lock is not None:
+                with cache_lock:
+                    return cache.get(asset)
+            return cache.get(asset)
+
+        def _store_cached_signal(signal: MLSignal) -> None:
+            if payload_ts_bar <= 0:
+                return
+            if cache_lock is not None:
+                with cache_lock:
+                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": signal}
+                return
+            cache[asset] = {"ts_bar": payload_ts_bar, "signal": signal}
+
         payload_frame = self.extract_payload_frame(
             (payloads or {}).get("scalp") if isinstance(payloads, dict) else None
         )
@@ -367,7 +388,7 @@ class InferenceEngine:
         # SAFE IMPROVEMENT: use private helper (was duplicated try/except)
         payload_ts_bar = self._safe_int(payload_frame.get("ts_bar"))
 
-        cached = cache.get(asset)
+        cached = _get_cached_signal()
         if (
             payload_ts_bar > 0
             and isinstance(cached, dict)
@@ -475,6 +496,11 @@ class InferenceEngine:
             except Exception:
                 model_threshold = 0.0
                 model_quantile = 0.0
+            calibrated_threshold = (
+                float(model_threshold)
+                if np.isfinite(model_threshold) and float(model_threshold) > 0.0
+                else float(static_threshold)
+            )
 
             if asset not in e._catboost_pred_history:
                 e._catboost_pred_history[asset] = deque(maxlen=200)
@@ -501,7 +527,7 @@ class InferenceEngine:
             )
             if len(hist) >= int(e._catboost_hist_min):
                 threshold = max(
-                    static_threshold, model_threshold, model_q_thr, hist_q, 1e-12
+                    calibrated_threshold, model_q_thr, hist_q, 1e-12
                 ) * float(density_mult)
                 hist_mu = float(np.mean(hist_arr))
                 hist_sigma = float(np.std(hist_arr))
@@ -513,7 +539,7 @@ class InferenceEngine:
                 p95_mag = max(float(np.percentile(hist_arr, 95)), threshold * 1.10)
                 conf_ref = max(p95_mag - threshold, threshold * 0.15, 1e-12)
             else:
-                threshold = max(static_threshold, model_threshold, 1e-12) * float(
+                threshold = max(calibrated_threshold, 1e-12) * float(
                     density_mult
                 )
                 z_mag = 0.0
@@ -614,8 +640,7 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
-                if payload_ts_bar > 0:
-                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                _store_cached_signal(out)
                 return out
             if len(hist) >= int(e._catboost_hist_min) and z_mag < float(
                 density_min_zscore
@@ -644,8 +669,7 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
-                if payload_ts_bar > 0:
-                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                _store_cached_signal(out)
                 return out
             if (pred_val * flow_confirm) < -float(density_min_flow):
                 out = MLSignal(
@@ -672,8 +696,7 @@ class InferenceEngine:
                     },
                     intraday_payload=None,
                 )
-                if payload_ts_bar > 0:
-                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                _store_cached_signal(out)
                 return out
 
             scalp_payload = (
@@ -726,8 +749,7 @@ class InferenceEngine:
                     scalp_payload=scalp_payload,
                     intraday_payload=intraday_payload,
                 )
-                if payload_ts_bar > 0:
-                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                _store_cached_signal(out)
                 return out
 
             regime_filter_reason = self._model_regime_filter_reason(
@@ -752,8 +774,7 @@ class InferenceEngine:
                     scalp_payload=scalp_payload,
                     intraday_payload=intraday_payload,
                 )
-                if payload_ts_bar > 0:
-                    cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+                _store_cached_signal(out)
                 return out
 
             signal = "STRONG BUY" if pred_val > 0 else "STRONG SELL"
@@ -787,8 +808,7 @@ class InferenceEngine:
                 scalp_payload=scalp_payload or {"M1": frame},
                 intraday_payload=intraday_payload or {"H1": frame},
             )
-            if payload_ts_bar > 0:
-                cache[asset] = {"ts_bar": payload_ts_bar, "signal": out}
+            _store_cached_signal(out)
             return out
         except Exception as exc:
             log_err.error(
@@ -1349,8 +1369,7 @@ class EngineModelMixin:
         try:
             if not MODEL_STATE_PATH.exists():
                 return None
-            with open(MODEL_STATE_PATH, "rb") as f:
-                state = pickle.load(f)
+            state = load_restricted_pickle(MODEL_STATE_PATH)
             if not isinstance(state, dict):
                 return None
             return state
@@ -1604,7 +1623,11 @@ class EngineModelMixin:
         if not gate_ok:
             if should_log_gate:
                 log_health.warning("MODEL_GATE_SKIP | reason=%s", gate_reason)
-                log_err.error("GATE_BLOCK_REASON | reason=%s", gate_reason)
+                # Gate block during startup/runtime is an operational state,
+                # not a portfolio-engine crash. Keep it out of the error log
+                # so `portfolio_engine_error.log` reflects actionable code/runtime
+                # failures rather than expected risk controls.
+                log_health.warning("GATE_BLOCKED | reason=%s", gate_reason)
             self._model_loaded = False
             self._backtest_passed = False
             self._model_version = "N/A"

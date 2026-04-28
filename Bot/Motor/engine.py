@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import threading
 import time
+import traceback
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from core.config import (
@@ -25,7 +28,6 @@ from core.feature_engine import FeatureEngine
 from core.portfolio_risk import PortfolioRiskManager
 from core.risk_manager import RiskManager
 from core.signal_engine import SignalEngine
-from log_config import get_artifact_path
 
 from .execution import (
     EngineExecutionMixin,
@@ -38,7 +40,11 @@ from .inference import EngineModelMixin, InferenceEngine
 from .models import (
     AssetCandidate,
     ExecutionResult,
+    MODEL_STATE_PATH,
+    MONITORING_ONLY_HALT_REASONS,
     OrderIntent,
+    RECOVERABLE_HALT_REASONS,
+    _monitoring_only_mode,
     log_err,
     log_health,
 )
@@ -59,40 +65,13 @@ def get_btc_config():
     return _get_core_config("BTC")
 
 
-def _env_truthy(name: str, default: str = "0") -> bool:
-    raw = str(os.getenv(name, default) or "").strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
-def _monitoring_only_mode() -> bool:
-    return False
-
-
-def _required_gate_assets() -> tuple[str, ...]:
-    raw = str(os.getenv("REQUIRED_GATE_ASSETS", "XAU,BTC") or "XAU,BTC")
-    out: List[str] = []
-    seen: set[str] = set()
-    for item in raw.split(","):
-        asset = str(item or "").upper().strip()
-        if not asset or asset in seen:
-            continue
-        seen.add(asset)
-        out.append(asset)
-    return tuple(out or ["XAU", "BTC"])
-
-
-def _partial_gate_enabled(required_assets: Optional[tuple[str, ...]] = None) -> bool:
-    assets = tuple(required_assets or _required_gate_assets())
-    if not _env_truthy("PARTIAL_GATE_MODE", "0"):
-        return False
-    if len(assets) > 1 and _env_truthy("STRICT_DUAL_ASSET_MODE", "0"):
-        return False
-    return True
-
-
 def _apply_high_accuracy_mode(cfg, enable=True):
-    """Stub: high accuracy params already baked into unified config."""
-    pass
+    """Mark configs so downstream code can detect high-accuracy profile use."""
+    try:
+        setattr(cfg, "high_accuracy_mode", bool(enable))
+    except Exception:
+        pass
+    return cfg
 
 
 xau_apply_high_accuracy_mode = _apply_high_accuracy_mode
@@ -106,17 +85,8 @@ BtcRiskManager = RiskManager
 XauSignalEngine = SignalEngine
 BtcSignalEngine = SignalEngine
 
-MODEL_STATE_PATH = get_artifact_path("models", "model_state.pkl")
 MIN_BACKTEST_SHARPE = MIN_GATE_SHARPE
 MIN_BACKTEST_WIN_RATE = MIN_GATE_WIN_RATE
-RECOVERABLE_HALT_REASONS = frozenset({"mt5_unhealthy", "mt5_disconnected"})
-MONITORING_ONLY_HALT_REASONS = frozenset(
-    {
-        "manual_stop",
-        "manual_stop_active",
-        "manual_stop_triggered",
-    }
-)
 
 
 class MultiAssetTradingEngine(
@@ -140,6 +110,7 @@ class MultiAssetTradingEngine(
         self._catboost_signal_cache: Dict[str, Dict[str, Any]] = (
             {}
         )  # asset -> {"ts_bar": int, "signal": MLSignal}
+        self._catboost_signal_cache_lock = threading.RLock()
         self._blocked_assets: List[str] = []
         self._model_sharpe: float = 0.0
         self._model_win_rate: float = 0.0
@@ -167,6 +138,8 @@ class MultiAssetTradingEngine(
         self._run = threading.Event()
         self._lock = threading.Lock()
         self._order_state_lock = threading.RLock()
+        self._fsm_transition_log_lock = threading.RLock()
+        self._fsm_transition_log_cache: Dict[str, float] = {}
         self._build_pipelines_lock = (
             threading.Lock()
         )  # serializes _build_pipelines calls
@@ -313,6 +286,7 @@ class MultiAssetTradingEngine(
         }
         self._signal_emit_ts_global: Deque[float] = deque(maxlen=1024)
         self._current_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
+        self._reserved_open_positions: Dict[str, int] = {"XAU": 0, "BTC": 0}
         self._position_protection_interval_sec: float = max(
             0.75,
             float(os.getenv("POSITION_PROTECTION_INTERVAL_SEC", "2.0") or 2.0),
@@ -383,6 +357,7 @@ class MultiAssetTradingEngine(
         self._last_skip_log_ts: dict[str, float] = (
             {}
         )  # Anti-spam throttle for blocked notifications
+        self._spread_skip_ts: Dict[str, float] = {}
         self._gate_status_log_ttl: float = 60.0
         self._last_gate_status_sig: str = ""
         self._last_gate_status_ts: float = 0.0
@@ -514,12 +489,19 @@ class MultiAssetTradingEngine(
     def print_startup_matrix(self) -> None:
         model_loaded = "YES" if self._model_loaded else "NO"
         bt_status = "PASSED" if self._backtest_passed else "FAILED"
+        gate_ready = bool(self._model_loaded and self._backtest_passed)
+        if self.dry_run:
+            mode_text = "DRY-RUN (Simulated)"
+        elif not gate_ready:
+            mode_text = "MONITORING ONLY (Live MT5, trading disabled by model gate)"
+        elif self.manual_stop_active():
+            mode_text = "MONITORING ONLY (Live MT5, manual/system stop active)"
+        else:
+            mode_text = "LIVE TRADING (Real Money)"
         print("\n" + "=" * 60)
         print("QUANTUM TRADING SYSTEM - MATRIX RELOADED")
         print("=" * 60)
-        print(
-            f"Mode: {'DRY-RUN (Simulated)' if self.dry_run else 'LIVE TRADING (Real Money)'}"
-        )
+        print(f"Mode: {mode_text}")
         print("Risk Engine: OK")
         print(f"Model Loaded: {model_loaded} (v{self._model_version})")
         print(f"Backtest Status: {bt_status} (Sharpe >= {MIN_BACKTEST_SHARPE:.1f})")
@@ -528,7 +510,10 @@ class MultiAssetTradingEngine(
         _display_floor = max(
             int(getattr(self._xau_cfg, "min_confidence", 75) or 75), 70
         )
-        print(f"Signals: SNIPER MODE (Conf >= {_display_floor}%)")
+        if gate_ready and not self.manual_stop_active():
+            print(f"Signals: SNIPER MODE (Conf >= {_display_floor}%)")
+        else:
+            print("Signals: DISABLED until model gate and stop guards clear")
         print("=" * 60 + "\n")
 
     @staticmethod
@@ -561,6 +546,7 @@ class MultiAssetTradingEngine(
                 with self._order_state_lock:
                     self._order_rm_by_id.clear()
                     self._pending_order_meta.clear()
+                    self._reserved_open_positions = {"XAU": 0, "BTC": 0}
                 self._emergency_flatten("stop_lock")
                 # Optional: Send emergency notification
                 if self._engine_stop_notifier:
@@ -702,12 +688,10 @@ class MultiAssetTradingEngine(
 
                 def _history_getter(frm: float, to: float):
                     try:
-                        from datetime import datetime
-
                         return (
                             _mt5.history_deals_get(
-                                datetime.fromtimestamp(frm),
-                                datetime.fromtimestamp(to),
+                                datetime.fromtimestamp(frm, tz=timezone.utc),
+                                datetime.fromtimestamp(to, tz=timezone.utc),
                             )
                             or []
                         )
@@ -752,9 +736,19 @@ class MultiAssetTradingEngine(
                 return True
             self._starting = True
             self._loop_thread = t
-        t.start()
-        with self._lock:
-            self._starting = False
+        try:
+            t.start()
+        except Exception:
+            with self._lock:
+                self._starting = False
+                if self._loop_thread is t:
+                    self._loop_thread = None
+                self._run.clear()
+            log_err.error("ENGINE_START_THREAD_FAIL | err=%s", traceback.format_exc())
+            raise
+        finally:
+            with self._lock:
+                self._starting = False
         return True
 
     def stop(self) -> bool:
@@ -779,6 +773,7 @@ class MultiAssetTradingEngine(
         with self._order_state_lock:
             self._order_rm_by_id.clear()
             self._pending_order_meta.clear()
+            self._reserved_open_positions = {"XAU": 0, "BTC": 0}
         log_health.info("PORTFOLIO_ENGINE_STOP")
         return True
 
@@ -788,6 +783,17 @@ class MultiAssetTradingEngine(
             self._user_manual_stop = True
             log_health.info(
                 "MANUAL_STOP_REQUESTED | Switching to MONITORING mode (Trading Disabled)"
+            )
+        return True
+
+    def request_system_monitoring_stop(self, reason: str = "") -> bool:
+        """Disable trading without marking the pause as a user/manual stop."""
+        with self._lock:
+            self._manual_stop = True
+            self._user_manual_stop = False
+            log_health.warning(
+                "SYSTEM_MONITORING_STOP_REQUESTED | trading_disabled=True reason=%s",
+                str(reason or "system_guard"),
             )
         return True
 
@@ -886,11 +892,47 @@ _engine_instance_lock = threading.Lock()
 
 def get_engine(dry_run: bool = False) -> MultiAssetTradingEngine:
     global _engine_instance
-    if _engine_instance is None:
-        with _engine_instance_lock:
-            if _engine_instance is None:
-                _engine_instance = MultiAssetTradingEngine(dry_run=dry_run)
+    requested_dry_run = bool(dry_run)
+    with _engine_instance_lock:
+        if _engine_instance is None:
+            _engine_instance = MultiAssetTradingEngine(dry_run=requested_dry_run)
+        elif bool(getattr(_engine_instance, "dry_run", False)) != requested_dry_run:
+            raise ValueError(
+                "get_engine(dry_run=...) mismatch: existing instance has "
+                f"dry_run={bool(getattr(_engine_instance, 'dry_run', False))}, "
+                f"requested dry_run={requested_dry_run}"
+            )
     return _engine_instance
+
+
+_signal_handlers_installed = False
+
+
+def install_graceful_shutdown_handlers() -> bool:
+    """Install process-level shutdown hooks for live daemon runtimes."""
+    global _signal_handlers_installed
+    if _signal_handlers_installed:
+        return True
+    if threading.current_thread() is not threading.main_thread():
+        return False
+
+    def _handle_shutdown(signum: int, _frame: Any) -> None:
+        try:
+            inst = _engine_instance
+            if inst is not None:
+                log_health.warning("ENGINE_SIGNAL_SHUTDOWN | signal=%s", signum)
+                inst.stop()
+        except Exception as exc:
+            log_err.error("ENGINE_SIGNAL_SHUTDOWN_ERROR | signal=%s err=%s", signum, exc)
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
+        _signal_handlers_installed = True
+        return True
+    except Exception as exc:
+        log_err.error("ENGINE_SIGNAL_HANDLER_INSTALL_ERROR | err=%s", exc)
+        return False
 
 
 class _EngineProxy:
@@ -905,6 +947,7 @@ class _EngineProxy:
 
 
 # Import-compatible lazy instance
+install_graceful_shutdown_handlers()
 engine = _EngineProxy()
 
 
@@ -927,5 +970,6 @@ __all__ = [
     "btc_apply_high_accuracy_mode",
     "engine",
     "get_engine",
+    "install_graceful_shutdown_handlers",
     "xau_apply_high_accuracy_mode",
 ]

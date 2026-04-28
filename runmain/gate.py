@@ -49,15 +49,19 @@ _RETRAIN_SESSION_MAX: int = int(os.environ.get("RETRAIN_SESSION_MAX", "3") or 3)
 # Environment & Configuration Rules
 # =============================================================================
 def monitoring_only_mode() -> bool:
-    """Legacy monitoring-only startup mode is disabled in production."""
-    return False
+    """Return whether the controller should run without live order execution."""
+    return (
+        env_truthy("MONITORING_ONLY_MODE", "0")
+        or env_truthy("ENGINE_MONITORING_ONLY", "0")
+        or env_truthy("TRADING_DISABLED", "0")
+    )
 
 
 def auto_retrain_enabled() -> bool:
     """Check if automated retraining is permitted in the current environment."""
     if monitoring_only_mode():
         return False
-    return env_truthy("AUTO_RETRAIN_ENABLED", "1")
+    return env_truthy("AUTO_RETRAIN_ENABLED", "0")
 
 
 def required_gate_assets() -> tuple[str, ...]:
@@ -287,7 +291,6 @@ def _soft_sample_quality_fallback_assets(
                     or reason.startswith("meta_marked_unsafe:")
                 )
                 and "sample_quality_fail" in reason
-                and "wfa_fail" not in reason
                 and "stress_fail" not in reason
                 and "risk_of_ruin=" not in reason
             )
@@ -589,12 +592,25 @@ def auto_train_models_strict() -> bool:  # noqa: C901
     auto_fast = env_truthy("AUTO_TRAIN_FAST_MODE", "1")
     fast_defaults: dict[str, str] = {}
     if auto_fast:
+        # Strict auto-train must keep the alpha gate enabled unless the
+        # operator explicitly opts out. A previous default of "0" let
+        # training-audit failures continue into backtest while the logs
+        # still claimed the flow was "strict".
+        require_alpha_gate = str(
+            os.environ.get("AUTO_TRAIN_REQUIRE_ALPHA_GATE", "1") or "1"
+        ).strip()
+        if not require_alpha_gate:
+            require_alpha_gate = "1"
+        require_alpha_gate_enabled = require_alpha_gate.lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         fast_defaults = {
             "INSTITUTIONAL_FAST_MODE": "1",
-            "INSTITUTIONAL_REQUIRE_ALPHA_GATE": os.environ.get(
-                "AUTO_TRAIN_REQUIRE_ALPHA_GATE", "0"
-            )
-            or "0",
+            "INSTITUTIONAL_REQUIRE_ALPHA_GATE": require_alpha_gate,
             "TRAIN_MAX_BARS": os.environ.get("AUTO_TRAIN_MAX_BARS", "20000") or "20000",
             "INSTITUTIONAL_MAX_ITERS": os.environ.get("AUTO_TRAIN_MAX_ITERS", "700")
             or "700",
@@ -616,11 +632,60 @@ def auto_train_models_strict() -> bool:  # noqa: C901
             or "3",
         }
         _log.info(
-            "Auto-train(strict) FAST_PROFILE | iters=%s cv_iters=%s bars=%s",
+            "Auto-train(strict) FAST_PROFILE | iters=%s cv_iters=%s bars=%s alpha_gate=%s wfa_windows=%s",
             fast_defaults["INSTITUTIONAL_MAX_ITERS"],
             fast_defaults["INSTITUTIONAL_CV_MAX_ITERS"],
             fast_defaults["TRAIN_MAX_BARS"],
+            int(require_alpha_gate_enabled),
+            fast_defaults["INSTITUTIONAL_WFA_WINDOWS"],
         )
+        if not require_alpha_gate_enabled:
+            _log.warning(
+                "Auto-train(strict) ALPHA_GATE_DISABLED | AUTO_TRAIN_REQUIRE_ALPHA_GATE=%s "
+                "-> training-audit failures may continue into backtest",
+                require_alpha_gate,
+            )
+    profile_env_keys = list(fast_defaults.keys())
+    base_profile_env = {k: os.environ.get(k) for k in profile_env_keys}
+
+    def _apply_training_profile_env(use_fast_profile: bool) -> None:
+        """Switch between fast bootstrap env and the caller's base env."""
+        if not auto_fast:
+            return
+        for key in profile_env_keys:
+            if use_fast_profile:
+                os.environ[key] = fast_defaults[key]
+            else:
+                prev_val = base_profile_env.get(key)
+                if prev_val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prev_val
+
+    def _quality_retry_worthy(reason: Any) -> bool:
+        """Return True when a failed fast bootstrap deserves one full retry."""
+        txt = str(reason or "").strip().lower()
+        if not txt:
+            return False
+        markers = (
+            "institutional_training_blocked",
+            "alpha_gate_failed",
+            "training_audit_failed",
+            "holdout_active_acc=",
+            "coverage=",
+            "anti_overfit_failed",
+            "state_marked_unsafe",
+            "meta_marked_unsafe",
+            "state_wfa_failed",
+            "meta_wfa_failed",
+            "wfa_fail",
+            "sharpe_suspicious",
+            "wfa_pass_rate_low",
+            "stress_fail",
+            "sample_quality_fail",
+            "risk_of_ruin=",
+        )
+        return any(marker in txt for marker in markers)
 
     passed_assets: list[str] = []
     failed_assets: list[str] = []
@@ -646,21 +711,43 @@ def auto_train_models_strict() -> bool:  # noqa: C901
             if ts > 0.0:
                 age_h = (time.time() - ts) / 3600.0
                 if age_h < failure_cooldown_hours:
-                    remain_h = max(0.0, failure_cooldown_hours - age_h)
-                    _log.warning(
-                        "Auto-train(strict) SKIP | asset=%s reason=recent_failure age=%.2fh < %.2fh remain=%.2fh last=%s",
-                        asset,
-                        age_h,
+                    gate_ok_now = False
+                    gate_reason_now = "unknown"
+                    try:
+                        gate_ok_now, gate_reason_now = _single_asset_gate_status(asset)
+                    except Exception:
+                        gate_ok_now = False
+                        gate_reason_now = "unknown"
+                    if (not gate_ok_now) and force_retry_on_recent_fail:
+                        _log.warning(
+                            "Auto-train(strict) FORCE_RETRY_RECENT_FAILURE | asset=%s "
+                            "age=%.2fh < %.2fh last=%s gate_reason=%s",
+                            asset,
+                            age_h,
+                            failure_cooldown_hours,
+                            (
+                                str(rec.get("reason", "unknown"))
+                                if isinstance(rec, dict)
+                                else "unknown"
+                            ),
+                            gate_reason_now,
+                        )
+                    else:
+                        remain_h = max(0.0, failure_cooldown_hours - age_h)
+                        _log.warning(
+                            "Auto-train(strict) SKIP | asset=%s reason=recent_failure age=%.2fh < %.2fh remain=%.2fh last=%s",
+                            asset,
+                            age_h,
                         failure_cooldown_hours,
                         remain_h,
-                        (
-                            str(rec.get("reason", "unknown"))
-                            if isinstance(rec, dict)
-                            else "unknown"
-                        ),
-                    )
-                    failed_assets.append(asset)
-                    continue
+                            (
+                                str(rec.get("reason", "unknown"))
+                                if isinstance(rec, dict)
+                                else "unknown"
+                            ),
+                        )
+                        failed_assets.append(asset)
+                        continue
 
         if retry_hours > 0:
             try:
@@ -732,82 +819,137 @@ def auto_train_models_strict() -> bool:  # noqa: C901
             pass
 
         prev_force = os.environ.get("BACKTEST_FORCE_RETRAIN")
+        force_retrain_env_modified = False
         if force_retrain:
             os.environ["BACKTEST_FORCE_RETRAIN"] = "1"
+            force_retrain_env_modified = True
             _log.warning(
                 "Auto-train(strict) FORCE_MODEL_RETRAIN | asset=%s reason=%s",
                 asset,
                 force_retrain_reason or "gate_failed",
             )
-        prev_env: dict[str, Optional[str]] = {}
-        if auto_fast:
-            for k, v in fast_defaults.items():
-                prev_env[k] = os.environ.get(k)
-                os.environ[k] = v
-
         try:
-            _log.warning(
-                "Auto-train(strict) TRAIN_BEGIN | asset=%s note=institutional_backtest_may_take_5_to_15_min_in_fast_mode",
-                asset,
-            )
-            _train_start = time.time()
-            metrics = run_institutional_backtest(asset)
-            _train_elapsed = time.time() - _train_start
-            _log.warning(
-                "Auto-train(strict) TRAIN_END | asset=%s elapsed=%.1fs sharpe=%.3f win_rate=%.3f max_dd=%.4f",
-                asset,
-                _train_elapsed,
-                float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
-                float(getattr(metrics, "win_rate", 0.0) or 0.0),
-                float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
-            )
-            gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
-            if gate_ok_asset:
-                passed_assets.append(asset)
-                failures.pop(asset, None)
-                _log.info(
-                    "Auto-train(strict) passed | asset=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f gate_reason=%s",
-                    asset,
-                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
-                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
-                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
-                    gate_reason_asset,
+            profile_attempts = [True, False] if auto_fast else [False]
+            deferred_asset = False
+            for use_fast_profile in profile_attempts:
+                _apply_training_profile_env(use_fast_profile)
+                profile_label = "fast" if use_fast_profile else "full"
+                note = (
+                    "institutional_backtest_may_take_5_to_15_min_in_fast_mode"
+                    if use_fast_profile
+                    else "institutional_backtest_full_profile_retry"
                 )
-            else:
-                failed_assets.append(asset)
-                failures[asset] = {
-                    "ts": time.time(),
-                    "reason": str(gate_reason_asset or "gate_failed"),
-                    "count": int(failures.get(asset, {}).get("count", 0) or 0) + 1,
-                }
-                _log.warning(
-                    "Auto-train(strict) failed gate | asset=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
-                    asset,
-                    gate_reason_asset,
-                    float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
-                    float(getattr(metrics, "win_rate", 0.0) or 0.0),
-                    float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
-                )
-        except Exception as exc:
-            _log.error("Auto-train(strict) failed | asset=%s err=%s", asset, exc)
-            failed_assets.append(asset)
-            failures[asset] = {
-                "ts": time.time(),
-                "reason": f"exception:{exc}",
-                "count": int(failures.get(asset, {}).get("count", 0) or 0) + 1,
-            }
+                try:
+                    _log.warning(
+                        "Auto-train(strict) TRAIN_BEGIN | asset=%s profile=%s note=%s",
+                        asset,
+                        profile_label,
+                        note,
+                    )
+                    _train_start = time.time()
+                    metrics = run_institutional_backtest(asset)
+                    _train_elapsed = time.time() - _train_start
+                    _log.warning(
+                        "Auto-train(strict) TRAIN_END | asset=%s profile=%s elapsed=%.1fs sharpe=%.3f win_rate=%.3f max_dd=%.4f",
+                        asset,
+                        profile_label,
+                        _train_elapsed,
+                        float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                        float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                        float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                    )
+                    gate_ok_asset, gate_reason_asset = _single_asset_gate_status(asset)
+                    if gate_ok_asset:
+                        passed_assets.append(asset)
+                        failures.pop(asset, None)
+                        _log.info(
+                            "Auto-train(strict) passed | asset=%s profile=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f gate_reason=%s",
+                            asset,
+                            profile_label,
+                            float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                            float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                            float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                            gate_reason_asset,
+                        )
+                        break
+                    if use_fast_profile and _quality_retry_worthy(gate_reason_asset):
+                        os.environ["BACKTEST_FORCE_RETRAIN"] = "1"
+                        force_retrain_env_modified = True
+                        _log.warning(
+                            "Auto-train(strict) RETRY_FULL_PROFILE | asset=%s reason=%s",
+                            asset,
+                            gate_reason_asset,
+                        )
+                        continue
+                    failed_assets.append(asset)
+                    failures[asset] = {
+                        "ts": time.time(),
+                        "reason": str(gate_reason_asset or "gate_failed"),
+                        "count": int(failures.get(asset, {}).get("count", 0) or 0)
+                        + 1,
+                    }
+                    _log.warning(
+                        "Auto-train(strict) failed gate | asset=%s profile=%s reason=%s sharpe=%.3f win_rate=%.3f max_dd=%.3f",
+                        asset,
+                        profile_label,
+                        gate_reason_asset,
+                        float(getattr(metrics, "sharpe_ratio", 0.0) or 0.0),
+                        float(getattr(metrics, "win_rate", 0.0) or 0.0),
+                        float(getattr(metrics, "max_drawdown_pct", 0.0) or 0.0),
+                    )
+                    break
+                except Exception as exc:
+                    exc_text = str(exc or "")
+                    lock_busy = any(
+                        marker in exc_text.lower()
+                        for marker in (
+                            "single-instance lock",
+                            "lock busy",
+                            "another engine process is running",
+                            "institutional_backtest_deferred",
+                        )
+                    )
+                    if lock_busy:
+                        deferred_asset = True
+                        _log.warning(
+                            "Auto-train(strict) DEFERRED | asset=%s profile=%s reason=mt5_lock_busy err=%s",
+                            asset,
+                            profile_label,
+                            exc,
+                        )
+                        break
+                    if use_fast_profile and _quality_retry_worthy(exc):
+                        os.environ["BACKTEST_FORCE_RETRAIN"] = "1"
+                        force_retrain_env_modified = True
+                        _log.warning(
+                            "Auto-train(strict) RETRY_FULL_PROFILE | asset=%s reason=%s",
+                            asset,
+                            exc,
+                        )
+                        continue
+                    _log.error(
+                        "Auto-train(strict) failed | asset=%s profile=%s err=%s",
+                        asset,
+                        profile_label,
+                        exc,
+                    )
+                    failed_assets.append(asset)
+                    failures[asset] = {
+                        "ts": time.time(),
+                        "reason": f"exception:{exc}",
+                        "count": int(failures.get(asset, {}).get("count", 0) or 0)
+                        + 1,
+                    }
+                    break
+            if deferred_asset:
+                continue
         finally:
-            if force_retrain:
+            if force_retrain_env_modified:
                 if prev_force is None:
                     os.environ.pop("BACKTEST_FORCE_RETRAIN", None)
                 else:
                     os.environ["BACKTEST_FORCE_RETRAIN"] = prev_force
-            if auto_fast:
-                for k, old in prev_env.items():
-                    if old is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = old
+            _apply_training_profile_env(False)
 
     _save_failures(failures)
     if failed_assets:

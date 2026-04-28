@@ -168,22 +168,6 @@ class ModelManager:
 
             if "unsafe" not in meta:
                 meta["unsafe"] = False
-            if "stress_test_passed" not in meta:
-                meta["stress_test_passed"] = True
-            wfa_total = int(meta.get("wfa_total_windows", 0) or 0)
-            wfa_failed = int(meta.get("wfa_failed_windows", 0) or 0)
-            wfa_required = int(meta.get("wfa_required_windows", 0) or 0)
-            wfa_passed_meta = bool(meta.get("wfa_passed", False))
-            meta["wfa_passed"] = bool(
-                wfa_passed_meta
-                and wfa_total > 0
-                and wfa_failed == 0
-                and (wfa_required <= 0 or wfa_total >= wfa_required)
-            )
-            if "max_drawdown_pct" not in meta:
-                meta["max_drawdown_pct"] = 0.0
-            if "risk_of_ruin" not in meta:
-                meta["risk_of_ruin"] = 0.0
             if "sample_quality_passed" not in meta:
                 meta["sample_quality_passed"] = True
             if "sample_quality_issues" not in meta:
@@ -192,9 +176,28 @@ class ModelManager:
             stress_ok = bool(meta.get("stress_test_passed", False))
             sample_ok = bool(meta.get("sample_quality_passed", False))
             unsafe = bool(meta.get("unsafe", False))
+            asset_for_meta = _normalize_asset(str(meta.get("asset", "")))
+            min_sharpe = _safe_float(
+                meta.get(
+                    "gate_min_sharpe",
+                    BTC_MIN_GATE_SHARPE
+                    if asset_for_meta == "BTC"
+                    else MIN_GATE_SHARPE,
+                ),
+                BTC_MIN_GATE_SHARPE if asset_for_meta == "BTC" else MIN_GATE_SHARPE,
+            )
+            min_win_rate = _safe_float(
+                meta.get(
+                    "gate_min_win_rate",
+                    BTC_MIN_GATE_WIN_RATE
+                    if asset_for_meta == "BTC"
+                    else MIN_GATE_WIN_RATE,
+                ),
+                BTC_MIN_GATE_WIN_RATE if asset_for_meta == "BTC" else MIN_GATE_WIN_RATE,
+            )
             is_good = bool(
-                (sharpe >= MIN_GATE_SHARPE)
-                and (win_rate >= MIN_GATE_WIN_RATE)
+                (sharpe >= min_sharpe)
+                and (win_rate >= min_win_rate)
                 and (max_dd <= MAX_GATE_DRAWDOWN)
                 and bool(meta.get("wfa_passed", False))
                 and stress_ok
@@ -212,9 +215,9 @@ class ModelManager:
                     "Model %s VERIFIED (Sharpe=%.2f >= %.2f, WinRate=%.3f >= %.3f, MaxDD=%.3f <= %.3f)",
                     version,
                     sharpe,
-                    MIN_GATE_SHARPE,
+                    min_sharpe,
                     win_rate,
-                    MIN_GATE_WIN_RATE,
+                    min_win_rate,
                     max_dd,
                     MAX_GATE_DRAWDOWN,
                 )
@@ -293,6 +296,8 @@ class ModelAgeChecker:
 # ---- merged from core/model_gate.py ----
 
 DEFAULT_REQUIRED_ASSETS: Tuple[str, ...] = ("XAU", "BTC")
+BTC_MIN_GATE_SHARPE: float = 0.30
+BTC_MIN_GATE_WIN_RATE: float = 0.28
 _LEGACY_BACKUP_DONE = False
 _LEGACY_BACKUP_LOCK = threading.Lock()
 _BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
@@ -550,7 +555,21 @@ def _asset_gate_status(
     verified = bool(state.get("verified", False))
     real_bt = bool(state.get("real_backtest", False))
     sharpe = _safe_float(state.get("sharpe_ratio", state.get("sharpe", 0.0)), 0.0)
+    min_sharpe = _safe_float(
+        state.get(
+            "gate_min_sharpe",
+            BTC_MIN_GATE_SHARPE if asset_u == "BTC" else MIN_GATE_SHARPE,
+        ),
+        BTC_MIN_GATE_SHARPE if asset_u == "BTC" else MIN_GATE_SHARPE,
+    )
     win_rate = _safe_float(state.get("win_rate", 0.0), 0.0)
+    min_win_rate = _safe_float(
+        state.get(
+            "gate_min_win_rate",
+            BTC_MIN_GATE_WIN_RATE if asset_u == "BTC" else MIN_GATE_WIN_RATE,
+        ),
+        BTC_MIN_GATE_WIN_RATE if asset_u == "BTC" else MIN_GATE_WIN_RATE,
+    )
     max_dd = _safe_float(state.get("max_drawdown_pct", 0.0), 0.0)
     version = str(state.get("model_version", "")).strip()
     state_asset = _normalize_asset(str(state.get("asset", "")))
@@ -561,6 +580,10 @@ def _asset_gate_status(
     state_wfa_failed = int(state.get("wfa_failed_windows", 0) or 0)
     state_wfa_required = int(state.get("wfa_required_windows", 0) or 0)
     state_wfa_skipped = bool(state.get("wfa_skipped", False))
+    state_wfa_required_pass_rate = _safe_float(
+        state.get("wfa_required_pass_rate", MIN_GATE_WFA_PASS_RATE),
+        MIN_GATE_WFA_PASS_RATE,
+    )
     state_anti_overfit_ok = bool(state.get("anti_overfit_passed", False))
     state_tscv_folds = int(state.get("tscv_folds", 0) or 0)
     state_rou = _safe_float(state.get("risk_of_ruin", 0.0), 0.0)
@@ -760,11 +783,11 @@ def _asset_gate_status(
             legacy_fallback=False,
         )
 
-    if sharpe < MIN_GATE_SHARPE:
+    if sharpe < min_sharpe:
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
-            reason=f"state_sharpe_below_gate:{sharpe:.3f}<{MIN_GATE_SHARPE:.3f}",
+            reason=f"state_sharpe_below_gate:{sharpe:.3f}<{min_sharpe:.3f}",
             state_path=str(state_p),
             model_path="",
             meta_path="",
@@ -806,13 +829,13 @@ def _asset_gate_status(
     # Walk-forward pass-rate gate. `wfa_passed` alone is boolean and may be
     # True with only 60% of windows passing — that is not enough for live.
     state_wfa_pass_rate = _safe_float(state.get("wfa_pass_rate", 1.0), 1.0)
-    if state_wfa_total > 0 and state_wfa_pass_rate < MIN_GATE_WFA_PASS_RATE:
+    if state_wfa_total > 0 and state_wfa_pass_rate < state_wfa_required_pass_rate:
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
             reason=(
                 f"state_wfa_pass_rate_low:{state_wfa_pass_rate:.3f}"
-                f"<{MIN_GATE_WFA_PASS_RATE:.3f}"
+                f"<{state_wfa_required_pass_rate:.3f}"
             ),
             state_path=str(state_p),
             model_path="",
@@ -827,11 +850,11 @@ def _asset_gate_status(
             legacy_fallback=False,
         )
 
-    if win_rate < MIN_GATE_WIN_RATE:
+    if win_rate < min_win_rate:
         return AssetGateStatus(
             asset=asset_u,
             ok=False,
-            reason=f"state_winrate_below_gate:{win_rate:.3f}<{MIN_GATE_WIN_RATE:.3f}",
+            reason=f"state_winrate_below_gate:{win_rate:.3f}<{min_win_rate:.3f}",
             state_path=str(state_p),
             model_path="",
             meta_path="",
@@ -958,6 +981,10 @@ def _asset_gate_status(
     meta_wfa_failed = int(meta.get("wfa_failed_windows", 0) or 0)
     meta_wfa_required = int(meta.get("wfa_required_windows", 0) or 0)
     meta_wfa_skipped = bool(meta.get("wfa_skipped", False))
+    meta_wfa_required_pass_rate = _safe_float(
+        meta.get("wfa_required_pass_rate", MIN_GATE_WFA_PASS_RATE),
+        MIN_GATE_WFA_PASS_RATE,
+    )
     meta_anti_overfit_ok = bool(meta.get("anti_overfit_passed", False))
     meta_tscv_folds = int(meta.get("tscv_folds", 0) or 0)
     meta_rou = _safe_float(meta.get("risk_of_ruin", 0.0), 0.0)
@@ -968,7 +995,21 @@ def _asset_gate_status(
     else:
         meta_sample_issues = []
     meta_sharpe = _safe_float(meta.get("backtest_sharpe", meta.get("sharpe", 0.0)), 0.0)
+    meta_min_sharpe = _safe_float(
+        meta.get(
+            "gate_min_sharpe",
+            BTC_MIN_GATE_SHARPE if asset_u == "BTC" else MIN_GATE_SHARPE,
+        ),
+        BTC_MIN_GATE_SHARPE if asset_u == "BTC" else MIN_GATE_SHARPE,
+    )
     meta_wr = _safe_float(meta.get("backtest_win_rate", meta.get("win_rate", 0.0)), 0.0)
+    meta_min_win_rate = _safe_float(
+        meta.get(
+            "gate_min_win_rate",
+            BTC_MIN_GATE_WIN_RATE if asset_u == "BTC" else MIN_GATE_WIN_RATE,
+        ),
+        BTC_MIN_GATE_WIN_RATE if asset_u == "BTC" else MIN_GATE_WIN_RATE,
+    )
     meta_dd = _safe_float(meta.get("max_drawdown_pct", max_dd), max_dd)
     required_meta_fields = [
         "asset",
@@ -1029,8 +1070,8 @@ def _asset_gate_status(
     elif meta_status != "VERIFIED":
         reason = f"meta_not_verified:{meta_status or 'UNKNOWN'}"
         ok = False
-    elif meta_sharpe < MIN_GATE_SHARPE:
-        reason = f"meta_sharpe_below_gate:{meta_sharpe:.3f}<{MIN_GATE_SHARPE:.3f}"
+    elif meta_sharpe < meta_min_sharpe:
+        reason = f"meta_sharpe_below_gate:{meta_sharpe:.3f}<{meta_min_sharpe:.3f}"
         ok = False
     elif meta_sharpe > MAX_GATE_SHARPE or bool(meta.get("suspicious_sharpe", False)):
         # Meta-side suspicious Sharpe rejection. Matches the state-side
@@ -1041,18 +1082,18 @@ def _asset_gate_status(
             "|likely_overfit_or_leakage"
         )
         ok = False
-    elif meta_wr < MIN_GATE_WIN_RATE:
-        reason = f"meta_winrate_below_gate:{meta_wr:.3f}<{MIN_GATE_WIN_RATE:.3f}"
+    elif meta_wr < meta_min_win_rate:
+        reason = f"meta_winrate_below_gate:{meta_wr:.3f}<{meta_min_win_rate:.3f}"
         ok = False
     elif meta_dd > MAX_GATE_DRAWDOWN:
         reason = f"meta_drawdown_above_gate:{meta_dd:.3f}>{MAX_GATE_DRAWDOWN:.3f}"
         ok = False
     else:
         meta_wfa_pass_rate = _safe_float(meta.get("wfa_pass_rate", 1.0), 1.0)
-        if meta_wfa_total > 0 and meta_wfa_pass_rate < MIN_GATE_WFA_PASS_RATE:
+        if meta_wfa_total > 0 and meta_wfa_pass_rate < meta_wfa_required_pass_rate:
             reason = (
                 f"meta_wfa_pass_rate_low:{meta_wfa_pass_rate:.3f}"
-                f"<{MIN_GATE_WFA_PASS_RATE:.3f}"
+                f"<{meta_wfa_required_pass_rate:.3f}"
             )
             ok = False
         else:

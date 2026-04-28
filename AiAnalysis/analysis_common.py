@@ -19,13 +19,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from log_config import build_logger
 
 try:
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
-    load_dotenv = None
+    from core.config import load_strict_dotenv
 
-
-if load_dotenv is not None:
-    load_dotenv()
+    load_strict_dotenv()
+except Exception:
+    pass
 
 
 log = build_logger("ai.analysis_common", "analysis_common.log")
@@ -325,7 +323,7 @@ def _parse_openai_compatible_response(raw: str) -> Optional[Dict[str, Any]]:
 def _invoke_gemini(
     prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]
 ) -> Dict[str, Any]:
-    api_key = _env_first("GEMINI_AI_API_KEY", "GOOGLE_API_KEY")
+    api_key = _env_first("GEMINI_AI_API_KEY")
     if not api_key:
         log.warning("gemini_missing_api_key")
         return {"ok": False, "error": "missing_api_key"}
@@ -380,7 +378,7 @@ def _invoke_gemini(
 def _invoke_openrouter(
     prompt: str, model: str, timeout: int, max_retries: int, close: Optional[float]
 ) -> Dict[str, Any]:
-    api_key = _env_first("OPENROUTER_API_KEY", "OPEN_ROUTER")
+    api_key = _env_first("OPEN_ROUTER")
     if not api_key:
         log.warning("openrouter_missing_api_key")
         return {"ok": False, "error": "missing_api_key"}
