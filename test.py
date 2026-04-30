@@ -44,3 +44,5 @@ def run_capital_projection() -> None:
 
 if __name__ == "__main__":
     run_capital_projection()
+
+

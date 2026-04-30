@@ -91,9 +91,9 @@ _exec_notify_latency_state: Dict[str, float] = {
 # =============================================================================
 @dataclass(frozen=True)
 class Backoff:
-    base: float = 1.0
-    factor: float = 2.0
-    max_delay: float = 60.0
+    base: float = 0.5  # Faster initial retry
+    factor: float = 1.5  # Gentler backoff
+    max_delay: float = 30.0  # Shorter max delay for stability
 
     def delay(self, attempt: int) -> float:
         return min(self.max_delay, self.base * (self.factor ** max(0, attempt - 1)))
@@ -262,10 +262,10 @@ def _is_message_not_modified(exc: Exception) -> bool:
     return False
 
 
-def tg_call(
+def _telegram_retry_wrapper(
     fn: Callable[..., Any],
     *args: Any,
-    max_retries: int = 6,
+    max_retries: int = 8,  # Increased retries for stability
     backoff: Backoff = Backoff(),
     on_permanent_failure: Optional[Callable[[Exception], bool]] = None,
     **kwargs: Any,
@@ -334,6 +334,22 @@ def tg_call(
                 )
             time.sleep(d)
     return None
+
+
+# Global telegram call wrapper with retry logic
+def tg_call(
+    fn: Callable[..., Any],
+    *args: Any,
+    max_retries: int = 8,
+    backoff: Backoff = Backoff(),
+    on_permanent_failure: Optional[Callable[[Exception], bool]] = None,
+    **kwargs: Any,
+) -> Any:
+    """Global telegram call wrapper with institutional retry logic."""
+    return _telegram_retry_wrapper(
+        fn, *args, max_retries=max_retries, backoff=backoff, 
+        on_permanent_failure=on_permanent_failure, **kwargs
+    )
 
 
 def _maybe_send_typing(chat_id: Optional[Any]) -> None:

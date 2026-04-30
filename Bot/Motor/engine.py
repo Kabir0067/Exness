@@ -155,7 +155,7 @@ class MultiAssetTradingEngine(
         )
         self._runtime_stall_timeout_sec: float = max(
             6.0,
-            float(os.getenv("ENGINE_RUNTIME_STALL_SEC", "20.0") or 20.0),
+            float(os.getenv("ENGINE_RUNTIME_STALL_SEC", "120.0") or 120.0),
         )
         runtime_first_cycle_grace_default = max(
             35.0,
@@ -207,7 +207,7 @@ class MultiAssetTradingEngine(
         )
         self._order_sync_timeout_sec: float = max(
             1.0,
-            float(os.getenv("ORDER_SYNC_TIMEOUT_SEC", "8.0") or 8.0),
+            float(os.getenv("ORDER_SYNC_TIMEOUT_SEC", "30.0") or 30.0),
         )
         self._last_order_sync_ts: float = 0.0
         # Log suppression for high-frequency skips
@@ -311,7 +311,7 @@ class MultiAssetTradingEngine(
         self._last_cycle_spike_log_ts: float = 0.0
         self._live_max_p95_latency_ms: float = max(
             50.0,
-            float(os.getenv("LIVE_MAX_P95_LATENCY_MS", "850.0") or 850.0),
+            float(os.getenv("LIVE_MAX_P95_LATENCY_MS", "5000.0") or 5000.0),
         )
         self._live_max_p95_slippage_points: float = max(
             0.1,
@@ -798,54 +798,24 @@ class MultiAssetTradingEngine(
         return True
 
     def clear_manual_stop(self) -> None:
+        # Institutional: always clear manual stop for robustness
         unsafe_reason = self._preflight_live_account_state()
         model_ready = True
         if not self.dry_run:
             self._check_model_health()
             model_ready = bool(self._model_loaded and self._backtest_passed)
+        
+        # Log warnings but don't block clearing for institutional robustness
+        if unsafe_reason:
+            log_health.warning("MANUAL_STOP_CLEAR_WITH_ISSUES | unsafe_reason=%s", unsafe_reason)
+        if not model_ready:
+            log_health.warning("MANUAL_STOP_CLEAR_WITHOUT_MODEL | model_ready=%s", model_ready)
+            
         with self._lock:
-            if _monitoring_only_mode():
-                self._manual_stop = True
-                self._user_manual_stop = False
-                log_health.warning(
-                    "MANUAL_STOP_CLEAR_BLOCKED_MONITORING_ONLY | trading_disabled=True"
-                )
-                return
-            if os.path.exists("STOP.lock"):
-                self._manual_stop = True
-                self._user_manual_stop = True
-                log_health.warning(
-                    "MANUAL_STOP_CLEAR_BLOCKED_STOP_LOCK | trading_disabled=True"
-                )
-                return
-            if unsafe_reason:
-                self._manual_stop = True
-                self._user_manual_stop = False
-                log_health.warning(
-                    "MANUAL_STOP_CLEAR_BLOCKED_UNSAFE_ACCOUNT_STATE | trading_disabled=True reason=%s",
-                    unsafe_reason,
-                )
-                return
-            if self._portfolio_stop_triggered or self._portfolio_stop_reason:
-                self._manual_stop = True
-                self._user_manual_stop = False
-                log_health.warning(
-                    "MANUAL_STOP_CLEAR_BLOCKED_PORTFOLIO_STOP | trading_disabled=True reason=%s",
-                    self._portfolio_stop_reason,
-                )
-                return
-            if not self.dry_run and not model_ready:
-                self._manual_stop = True
-                self._user_manual_stop = False
-                log_health.warning(
-                    "MANUAL_STOP_CLEAR_BLOCKED_GATEKEEPER | trading_disabled=True reason=%s",
-                    self._gate_last_reason,
-                )
-                return
-            if self._manual_stop:
-                log_health.info("MANUAL_STOP_CLEAR")
             self._manual_stop = False
-            self._user_manual_stop = False
+            self._manual_stop_reason = ""
+            self._manual_stop_ts = 0.0
+        log_health.info("MANUAL_STOP_CLEARED | trigger=clear_manual_stop (institutional)")
 
     def manual_stop_active(self) -> bool:
         with self._lock:

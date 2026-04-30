@@ -1,0 +1,12 @@
+{
+  "XAU": {
+    "ts": 1777555656.0402024,
+    "reason": "exception:institutional_backtest_failed:XAU",
+    "count": 1
+  },
+  "BTC": {
+    "ts": 1777555718.59211,
+    "reason": "exception:institutional_backtest_failed:BTC",
+    "count": 1
+  }
+}

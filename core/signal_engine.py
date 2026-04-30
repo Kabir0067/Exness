@@ -862,6 +862,26 @@ class SignalEngine:
                     regime=market_regime,
                 )
 
+            # ─── INSTITUTIONAL OPPORTUNITY DETECTION ───────────────────────────────────
+            # Enhanced opportunity detection for maximum profit capture
+            opportunity_score = self._calculate_opportunity_score(
+                conf, indp, market_regime, spread_pct, signal_dir
+            )
+            
+            # Boost confidence for high-probability setups
+            if opportunity_score >= 80:  # Elite opportunity threshold
+                conf = min(95, conf + 10)  # Boost confidence by 10 points
+                log.info(
+                    "ELITE_OPPORTUNITY | symbol=%s score=%.1f conf_boosted=%.1f",
+                    sym, opportunity_score, conf
+                )
+            elif opportunity_score >= 65:  # High-probability setup
+                conf = min(90, conf + 5)   # Boost confidence by 5 points
+                log.info(
+                    "HIGH_PROBABILITY | symbol=%s score=%.1f conf_boosted=%.1f",
+                    sym, opportunity_score, conf
+                )
+            
             # Can emit?
             can_emit, emit_reason = self._rm.can_emit_signal(conf, side=signal_dir)
             if not can_emit:
@@ -2576,6 +2596,73 @@ class SignalEngine:
         return self._remember_bar_outcome(result)
 
     # ─── Position context ────────────────────────────────────────────
+
+    def _calculate_opportunity_score(
+        self,
+        confidence: float,
+        independence: float,
+        regime: str,
+        spread_pct: float,
+        signal_dir: str,
+    ) -> float:
+        """
+        Calculate institutional-grade opportunity score for enhanced trade selection.
+        
+        Scoring factors:
+        - Base confidence (0-40 points)
+        - Independence strength (0-20 points) 
+        - Market regime alignment (0-15 points)
+        - Spread efficiency (0-15 points)
+        - Signal consistency (0-10 points)
+        
+        Returns:
+            Opportunity score (0-100)
+        """
+        score = 0.0
+        
+        # Base confidence (40% of score)
+        score += min(40, confidence * 0.4)
+        
+        # Independence strength (20% of score)
+        if independence >= 80:
+            score += 20
+        elif independence >= 60:
+            score += 15
+        elif independence >= 40:
+            score += 10
+        else:
+            score += 5
+        
+        # Market regime alignment (15% of score)
+        regime_bonus = {
+            "trending": 15,
+            "normal": 12,
+            "volatile": 8,
+            "compressed": 5,
+            "quiet": 3,
+        }.get(regime.lower(), 5)
+        score += regime_bonus
+        
+        # Spread efficiency (15% of score)
+        if spread_pct <= 0.0005:  # Very tight spread
+            score += 15
+        elif spread_pct <= 0.001:  # Tight spread
+            score += 12
+        elif spread_pct <= 0.002:  # Normal spread
+            score += 8
+        else:  # Wide spread
+            score += 3
+        
+        # Signal consistency (10% of score)
+        if hasattr(self, '_last_signal_direction'):
+            if signal_dir == self._last_signal_direction:
+                score += 10  # Consistent direction
+            else:
+                score += 5   # Direction change (still valid)
+        else:
+            score += 8  # First signal
+        
+        return min(100, score)
 
     def _position_context(self, sym: str) -> Dict[str, Any]:
         """Get current position info for the symbol."""

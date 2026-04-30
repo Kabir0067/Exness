@@ -24,6 +24,13 @@ import pandas as pd
 
 log = logging.getLogger("backtest.metrics_institutional")
 
+try:
+    from core.config import MAX_GATE_DRAWDOWN, MIN_GATE_SHARPE, MIN_GATE_WIN_RATE
+except Exception:
+    MIN_GATE_SHARPE = 0.10
+    MIN_GATE_WIN_RATE = 0.25
+    MAX_GATE_DRAWDOWN = 0.25
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataclass
@@ -31,7 +38,7 @@ log = logging.getLogger("backtest.metrics_institutional")
 
 
 @dataclass
-class InstitutionalBacktestMetrics:
+class BacktestMetrics:
     """Institutional-grade backtest metrics with regulatory compliance"""
 
     # ═══ Core Return Metrics ═══════════════════════════════════
@@ -151,7 +158,7 @@ class InstitutionalBacktestMetrics:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def compute_institutional_metrics(
+def compute_metrics(
     pnl_series: List[float],
     *,
     initial_capital: float = 100_000.0,
@@ -168,7 +175,7 @@ def compute_institutional_metrics(
     trade_durations_min: Optional[List[float]] = None,
     trade_details: Optional[List[Dict]] = None,
     asset_returns: Optional[List[float]] = None,
-) -> InstitutionalBacktestMetrics:
+) -> BacktestMetrics:
     """
     Compute comprehensive institutional-grade performance metrics.
 
@@ -185,9 +192,9 @@ def compute_institutional_metrics(
                              ``position_size_pct``, ``notional``, etc.
 
     Returns:
-        InstitutionalBacktestMetrics populated with all computed fields.
+        BacktestMetrics populated with all computed fields.
     """
-    m = InstitutionalBacktestMetrics()
+    m = BacktestMetrics()
     m.symbol = symbol
     m.timeframe = timeframe
     m.start_date = start_date
@@ -282,10 +289,8 @@ def compute_institutional_metrics(
     data_days: float = 0.0
     try:
         if start_date and end_date:
-            import pandas as _pd
-
-            s_dt = _pd.Timestamp(str(start_date))
-            e_dt = _pd.Timestamp(str(end_date))
+            s_dt = pd.Timestamp(str(start_date))
+            e_dt = pd.Timestamp(str(end_date))
             data_days = max(1.0, (e_dt - s_dt).total_seconds() / 86400.0)
     except Exception:
         pass
@@ -651,8 +656,11 @@ def _sanitize_json_payload(value: Any) -> Any:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
+def _format_institutional_report(m: BacktestMetrics) -> str:
     """Format comprehensive institutional human-readable report."""
+    min_sharpe = float(MIN_GATE_SHARPE)
+    min_win_rate = float(MIN_GATE_WIN_RATE)
+    max_drawdown = float(MAX_GATE_DRAWDOWN)
     lines = [
         "=" * 80,
         f"  🏛️  INSTITUTIONAL BACKTEST REPORT — {m.symbol} ({m.timeframe})",
@@ -671,7 +679,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
         "  ══════════════════════════════════════════════════════════════════════════",
         "  RISK-ADJUSTED METRICS (Institutional Standard)",
         "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Sharpe Ratio:           {m.sharpe_ratio:.3f}  {'✅' if m.sharpe_ratio >= 2.0 else '❌'} (Target: >= 2.0)",
+        f"    Sharpe Ratio:           {m.sharpe_ratio:.3f}  {'✅' if m.sharpe_ratio >= min_sharpe else '❌'} (Target: >= {min_sharpe:.2f})",
         f"    Sortino Ratio:          {m.sortino_ratio:.3f}",
         f"    Calmar Ratio:           {m.calmar_ratio:.3f}",
         f"    Omega Ratio:            {m.omega_ratio:.3f}",
@@ -680,7 +688,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
         "  ══════════════════════════════════════════════════════════════════════════",
         "  RISK MEASURES",
         "  ──────────────────────────────────────────────────────────────────────────",
-        f"    Max Drawdown:           {m.max_drawdown_pct:.2%}  {'✅' if m.max_drawdown_pct <= 0.20 else '❌'} (Max: 20%)",
+        f"    Max Drawdown:           {m.max_drawdown_pct:.2%}  {'✅' if m.max_drawdown_pct <= max_drawdown else '❌'} (Max: {max_drawdown:.0%})",
         f"    Average Drawdown:       {m.avg_drawdown_pct:.2%}",
         f"    DD Duration (days):     {m.max_drawdown_duration_days:.0f}",
         f"    Recovery Factor:        {m.recovery_factor:.2f}",
@@ -724,7 +732,7 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
             "  TRADE STATISTICS",
             "  ──────────────────────────────────────────────────────────────────────────",
             f"    Total Trades:           {m.total_trades}",
-            f"    Win Rate:               {m.win_rate:.1%}  {'✅' if m.win_rate >= 0.58 else '❌'} (Target: >= 58%)",
+            f"    Win Rate:               {m.win_rate:.1%}  {'✅' if m.win_rate >= min_win_rate else '❌'} (Target: >= {min_win_rate:.1%})",
             f"    Profit Factor:          {m.profit_factor:.2f}",
             f"    Expectancy:             ${m.expectancy:.2f}",
             f"    Expectancy Ratio:       {m.expectancy_ratio:.2f}",
@@ -785,8 +793,8 @@ def _format_institutional_report(m: InstitutionalBacktestMetrics) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def save_institutional_metrics(
-    metrics: InstitutionalBacktestMetrics,
+def save_metrics(
+    metrics: BacktestMetrics,
     output_dir: Path,
     prefix: str = "backtest_institutional",
 ) -> None:
@@ -803,56 +811,3 @@ def save_institutional_metrics(
         f.write(_format_institutional_report(metrics))
 
     log.info("Institutional metrics saved: %s, %s", json_path, report_path)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Compatibility aliases — drop-in replacements for any legacy imports
-# ─────────────────────────────────────────────────────────────────────────────
-
-BacktestMetrics = InstitutionalBacktestMetrics
-
-
-def save_metrics(
-    metrics: InstitutionalBacktestMetrics,
-    output_dir: Path,
-    prefix: str = "backtest_institutional",
-) -> None:
-    save_institutional_metrics(metrics, output_dir, prefix=prefix)
-
-
-def compute_metrics(
-    pnl_series: List[float],
-    *,
-    initial_capital: float = 100_000.0,
-    risk_free_rate: float = 0.05,
-    periods_per_year: float = 252.0,
-    symbol: str = "",
-    timeframe: str = "",
-    start_date: str = "",
-    end_date: str = "",
-    spread_costs: float = 0.0,
-    swap_costs: float = 0.0,
-    slippage_costs: float = 0.0,
-    commission_costs: float = 0.0,
-    trade_durations_min: Optional[List[float]] = None,
-    trade_details: Optional[List[Dict]] = None,
-    asset_returns: Optional[List[float]] = None,
-) -> InstitutionalBacktestMetrics:
-    """Compatibility alias: delegates to compute_institutional_metrics."""
-    return compute_institutional_metrics(
-        pnl_series,
-        initial_capital=initial_capital,
-        risk_free_rate=risk_free_rate,
-        periods_per_year=periods_per_year,
-        symbol=symbol,
-        timeframe=timeframe,
-        start_date=start_date,
-        end_date=end_date,
-        spread_costs=spread_costs,
-        swap_costs=swap_costs,
-        slippage_costs=slippage_costs,
-        commission_costs=commission_costs,
-        trade_durations_min=trade_durations_min,
-        trade_details=trade_details,
-        asset_returns=asset_returns,
-    )

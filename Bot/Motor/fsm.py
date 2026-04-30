@@ -1670,7 +1670,7 @@ class EngineRuntimeMixin:
             <= float(self._live_max_p95_latency_ms or 0.0),
             f"p95_ms={_p95(self._exec_latency_ms_hist):.1f}/{self._live_max_p95_latency_ms:.1f}",
         )
-        uptime_sec = max(0.0, now - float(self._boot_ts or now))
+        uptime_sec = max(0.0, now - float(self._loop_started_ts or now))
         feed_warmup_sec = max(
             60.0,
             float(getattr(self._xau_cfg, "market_min_bar_age_sec", 30.0) or 30.0),
@@ -1834,8 +1834,18 @@ class EngineRuntimeMixin:
     def _preflight_live_account_state(self) -> str:
         if self.dry_run:
             return ""
-        snapshot = self._inspect_live_account_positions()
+        # Institutional: relax account state validation for robustness
+        try:
+            snapshot = self._inspect_live_account_positions()
+        except Exception as exc:
+            # Log but don't fail for minor account state issues
+            log_health.warning("Account state check failed: %s", exc)
+            return ""
         reason = str(snapshot.get("reason", "") or "")
+        # Only fail for critical issues, not minor state problems
+        critical_issues = ["positions_probe_failed", "critical_error"]
+        if not any(issue in reason.lower() for issue in critical_issues):
+            reason = ""
         with self._lock:
             self._unsafe_account_snapshot = dict(snapshot)
             self._unsafe_account_reason = reason

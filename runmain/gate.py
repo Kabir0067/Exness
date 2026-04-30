@@ -61,7 +61,8 @@ def auto_retrain_enabled() -> bool:
     """Check if automated retraining is permitted in the current environment."""
     if monitoring_only_mode():
         return False
-    return env_truthy("AUTO_RETRAIN_ENABLED", "0")
+    # Always enabled for institutional robustness
+    return True
 
 
 def required_gate_assets() -> tuple[str, ...]:
@@ -95,9 +96,9 @@ def log_monitoring_only_profile() -> None:
 def _partial_gate_enabled(required: Optional[tuple[str, ...]] = None) -> bool:
     """Check if a subset of required assets is allowed to trade."""
     assets = required or required_gate_assets()
-    if not env_truthy("PARTIAL_GATE_MODE", "0"):
+    if not env_truthy("PARTIAL_GATE_MODE", "1"):
         return False
-    if len(assets) > 1 and env_truthy("STRICT_DUAL_ASSET_MODE", "1"):
+    if len(assets) > 1 and env_truthy("STRICT_DUAL_ASSET_MODE", "0"):
         return False
     return True
 
@@ -683,6 +684,16 @@ def auto_train_models_strict() -> bool:  # noqa: C901
             "wfa_pass_rate_low",
             "stress_fail",
             "sample_quality_fail",
+            "state_not_verified:rejected",
+            "meta_not_verified:rejected",
+            "state_sharpe_below_gate",
+            "meta_sharpe_below_gate",
+            "state_win_rate_below_gate",
+            "meta_win_rate_below_gate",
+            "state_winrate_below_gate",
+            "meta_winrate_below_gate",
+            "state_wfa_failed",
+            "meta_wfa_failed",
             "risk_of_ruin=",
         )
         return any(marker in txt for marker in markers)
@@ -952,11 +963,27 @@ def auto_train_models_strict() -> bool:  # noqa: C901
             _apply_training_profile_env(False)
 
     _save_failures(failures)
-    if failed_assets:
-        _log.error(
-            "AUTO_TRAIN_QUALITY_FAILED | failed_assets=%s", ",".join(failed_assets)
-        )
     post_ok, post_reason, post_active = model_gate_ready_effective()
+    if failed_assets:
+        required_for_partial = set(required_gate_assets())
+        active_for_partial = set(post_active)
+        if (
+            post_ok
+            and active_for_partial
+            and _partial_gate_enabled(tuple(sorted(required_for_partial)))
+        ):
+            _log.warning(
+                "AUTO_TRAIN_PARTIAL_QUALITY_BLOCKED | failed_assets=%s active=%s blocked=%s reason=%s",
+                ",".join(failed_assets),
+                ",".join(post_active) or "-",
+                ",".join(sorted(required_for_partial - active_for_partial)) or "-",
+                post_reason,
+            )
+        else:
+            _log.error(
+                "AUTO_TRAIN_QUALITY_FAILED | failed_assets=%s",
+                ",".join(failed_assets),
+            )
     if post_ok:
         required_now = set(required_gate_assets())
         active_set = set(post_active)

@@ -73,6 +73,9 @@ class ServerClockSync:
         self._mt5_lock = None  # lazy
         self._initialized = False
         self._probe_failures: int = 0
+        self._last_raw_drift: Optional[float] = None
+        self._last_raw_delta: float = 0.0
+        self._last_probe_extreme: bool = False
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -104,12 +107,16 @@ class ServerClockSync:
         tolerance.
         """
         self._refresh_if_stale()
-        abs_drift = abs(float(self._drift))
         try:
             threshold = max(0.5, float(threshold_sec))
         except Exception:
             threshold = 3.0
-        return (abs_drift > threshold), abs_drift
+        if self._probe_failures >= 3:
+            return True, float("inf")
+        if self._last_probe_extreme:
+            return True, abs(float(self._drift))
+        jitter = abs(float(self._last_raw_delta))
+        return (jitter > threshold), jitter
 
     # ── Internal ────────────────────────────────────────────────
 
@@ -128,7 +135,6 @@ class ServerClockSync:
             self._mt5_lock = MT5_LOCK
         except ImportError:
             self._mt5_lock = threading.RLock()
-        self._initialized = True
         return True
 
     def _refresh_if_stale(self) -> None:
@@ -190,7 +196,9 @@ class ServerClockSync:
         raw_drift = server_epoch - local_at_probe
 
         # Sanity: reject insane drifts (> max_drift_sec)
+        self._last_probe_extreme = False
         if abs(raw_drift) > self._max_drift_sec:
+            self._last_probe_extreme = True
             _log_sync.warning(
                 "CLOCK_SYNC_DRIFT_EXTREME | raw=%.3fs max=%.1fs — clamping",
                 raw_drift,
@@ -198,8 +206,12 @@ class ServerClockSync:
             )
             raw_drift = max(-self._max_drift_sec, min(self._max_drift_sec, raw_drift))
 
+        prev_raw = self._last_raw_drift
+        self._last_raw_drift = float(raw_drift)
+        self._last_raw_delta = 0.0 if prev_raw is None else float(raw_drift - prev_raw)
+
         # EWMA smoothing
-        if abs(self._drift) < 0.001 and not self._initialized:
+        if not self._initialized:
             self._drift = raw_drift  # seed
         else:
             alpha = self._EWMA_ALPHA
@@ -207,9 +219,10 @@ class ServerClockSync:
         self._initialized = True
 
         _log_sync.info(
-            "CLOCK_SYNC_OK | drift=%.3fs raw=%.3fs symbol=%s",
+            "CLOCK_SYNC_OK | drift=%.3fs raw=%.3fs jitter=%.3fs symbol=%s",
             self._drift,
             raw_drift,
+            self._last_raw_delta,
             self._probe_symbol,
         )
 

@@ -370,6 +370,51 @@ def dynamic_position_size(
 
 
 # =============================================================================
+# Position Sizing — High-Performance Balance-Based (Institutional)
+# =============================================================================
+def institutional_balance_position_size(
+    equity: float,
+    lot_step: float = 0.01,
+    lot_min: float = 0.01,
+    lot_max: float = 8.0,
+) -> float:
+    """
+    High-performance balance-based position sizing for maximum profitability.
+    
+    Formula: lot = math.floor((equity / 10000) / 0.01) * 0.01
+    
+    This formula scales position size linearly with account balance:
+    - $10,000 → 1.00 lot
+    - $20,000 → 2.00 lot  
+    - $50,000 → 5.00 lot
+    - $80,000 → 8.00 lot (max cap)
+    
+    Args:
+        equity: Account equity in USD.
+        lot_step: Broker's lot step (typically 0.01).
+        lot_min: Broker's minimum lot.
+        lot_max: Maximum lot cap (default 8.0 for high balances).
+        
+    Returns:
+        Normalized lot size with maximum cap of 8.0.
+    """
+    if not _is_finite(equity):
+        return lot_min
+    if equity <= 0:
+        return lot_min
+    
+    # Core formula: lot = math.floor((equity / 10000) / 0.01) * 0.01
+    raw_lot = math.floor((equity / 10000) / 0.01) * 0.01
+    
+    # Apply lot step normalization
+    if lot_step > 0:
+        raw_lot = math.floor(raw_lot / lot_step) * lot_step
+    
+    # Apply min/max bounds with institutional cap of 8.0
+    return max(lot_min, min(lot_max, round(raw_lot, 8)))
+
+
+# =============================================================================
 # Lot Ladder (legacy balance-based — kept for backward compatibility)
 # =============================================================================
 def lot_and_tp_usd(balance: float) -> Tuple[float, float]:

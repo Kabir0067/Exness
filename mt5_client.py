@@ -21,6 +21,8 @@ import threading
 import time
 import traceback
 import uuid
+from typing import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -32,20 +34,22 @@ import psutil
 try:
     import MetaTrader5 as mt5
 except ImportError:
-    mt5 = None  # type: ignore
+    mt5 = None  # type: ignore[assignment]
 
 from log_config import LOG_DIR as LOG_ROOT
 from log_config import get_log_path
 
 # =============================================================================
-# Global Constants & Meta Definitions
+# Global Constants & Environment Configuration
 # =============================================================================
 def _env_bool(name: str, default: str = "0") -> bool:
+    """Parse environment variable as boolean with safe defaults."""
     raw = str(os.getenv(name, default) or default).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
 
 
 def _env_str(name: str, default: str = "") -> str:
+    """Parse and normalize environment variable string."""
     raw = str(os.getenv(name, default) or default).strip()
     return _normalize_env_str(raw)
 
@@ -57,6 +61,7 @@ def _env_float(
     minimum: Optional[float] = None,
     maximum: Optional[float] = None,
 ) -> float:
+    """Parse environment variable as float with clamping."""
     try:
         value = float(os.getenv(name, str(default)) or default)
     except Exception:
@@ -75,6 +80,7 @@ def _env_int(
     minimum: Optional[int] = None,
     maximum: Optional[int] = None,
 ) -> int:
+    """Parse environment variable as int with clamping."""
     try:
         value = int(float(os.getenv(name, str(default)) or default))
     except Exception:
@@ -86,49 +92,49 @@ def _env_int(
     return int(value)
 
 
-# Async dispatcher pressure controls
+# Async dispatcher pressure controls (tunable via env)
 _ASYNC_STALE_THRESHOLD_SEC: float = _env_float(
-    "MT5_ASYNC_STALE_THRESHOLD_SEC",
-    1.5,
-    minimum=0.05,
-    maximum=30.0,
+    "MT5_ASYNC_STALE_THRESHOLD_SEC", 1.5, minimum=0.05, maximum=30.0
 )
 _MT5_ASYNC_QUEUE_MAXSIZE: int = _env_int(
-    "MT5_ASYNC_QUEUE_MAXSIZE",
-    256,
-    minimum=16,
-    maximum=4096,
+    "MT5_ASYNC_QUEUE_MAXSIZE", 256, minimum=16, maximum=4096
 )
 _MT5_ASYNC_LOCK_TIMEOUT_SEC: float = _env_float(
-    "MT5_ASYNC_LOCK_TIMEOUT_SEC",
-    8.0,
-    minimum=0.25,
-    maximum=60.0,
+    "MT5_ASYNC_LOCK_TIMEOUT_SEC", 15.0, minimum=0.25, maximum=120.0  # Increased for institutional robustness
 )
+_MT5_SYNC_LOCK_TIMEOUT_SEC: float = max(20.0, _MT5_ASYNC_LOCK_TIMEOUT_SEC + 5.0)  # Increased timeout
 _MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH: int = _env_int(
-    "MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH",
-    4,
-    minimum=0,
-    maximum=1024,
+    "MT5_ASYNC_DIRECT_FALLBACK_MAX_DEPTH", 4, minimum=0, maximum=1024
 )
 _MT5_ASYNC_PREEMPT_WRITES: bool = _env_bool("MT5_ASYNC_PREEMPT_WRITES", "1")
 _MT5_ASYNC_WRITE_DIRECT_FALLBACK_UNDER_LOAD: bool = _env_bool(
     "MT5_ASYNC_WRITE_DIRECT_FALLBACK_UNDER_LOAD", "1"
 )
 
+# Dispatch priorities (lower value = higher priority)
 _MT5_DISPATCH_PRIORITY_CRITICAL = 0
 _MT5_DISPATCH_PRIORITY_HIGH = 10
 _MT5_DISPATCH_PRIORITY_NORMAL = 20
 _MT5_DISPATCH_PRIORITY_LOW = 30
 
-# =============================================================================
-# Global Mutex and State Variables
-# =============================================================================
-# MT5_LOCK: guards EVERY mt5.* call from all threads.
-MT5_LOCK = threading.Lock()
+# Precomputed lookup sets for O(1) priority resolution (zero redundancy, max speed)
+_CRITICAL_METHODS: frozenset[str] = frozenset({"order_send", "order_check"})
+_HIGH_METHODS: frozenset[str] = frozenset({
+    "positions_get", "positions_total", "orders_get", "orders_total",
+    "account_info", "symbol_info", "symbol_info_tick",
+    "copy_rates_from_pos", "copy_ticks_from", "copy_ticks_range",
+    "copy_rates_range", "copy_rates_from",
+})
 
-# _INIT_LOCK: Serialises the multi-step init/shutdown sequence.
-# ORDERING RULE: _INIT_LOCK is ALWAYS acquired BEFORE MT5_LOCK, never after.
+
+# =============================================================================
+# Global Mutexes and Shared State (institutional-grade enhanced)
+# =============================================================================
+# MT5_LOCK: guards EVERY mt5.* call. Acquired BEFORE _INIT_LOCK never after.
+# Institutional: Use RLock for better performance under contention
+MT5_LOCK = threading.RLock()
+
+# _INIT_LOCK: serializes the entire init/shutdown sequence.
 _INIT_LOCK = threading.Lock()
 
 _initialized: bool = False  # guarded by MT5_LOCK
@@ -151,24 +157,13 @@ _transport_timeout_scale: float = 1.0
 _terminal_pid: Optional[int] = None
 _terminal_pid_lock = threading.Lock()
 
-# Async dispatcher State
+# Async dispatcher state
 _mt5_dispatch_heap: List[Tuple[int, int, "_AsyncDispatchItem"]] = []
 _mt5_dispatch_cond = threading.Condition(threading.Lock())
 _mt5_dispatch_seq: int = 0
 _mt5_dispatch_metrics_lock = threading.Lock()
-_mt5_dispatch_metrics: Dict[str, Any] = {
-    "enqueued_total": 0,
-    "completed_total": 0,
-    "failed_total": 0,
-    "stale_total": 0,
-    "overflow_total": 0,
-    "preempted_total": 0,
-    "cancelled_total": 0,
-    "lock_timeout_total": 0,
-    "inline_total": 0,
-    "direct_fallback_total": 0,
-    "direct_fallback_blocked_total": 0,
-    "high_watermark": 0,
+_mt5_dispatch_metrics: Dict[str, Any] = {}  # numeric metrics only
+_mt5_dispatch_metrics.update({
     "last_queue_depth": 0,
     "last_enqueue_ts_mono": 0.0,
     "last_complete_ts_mono": 0.0,
@@ -176,7 +171,7 @@ _mt5_dispatch_metrics: Dict[str, Any] = {
     "lock_wait_ema_ms": 0.0,
     "last_call_ms": 0.0,
     "call_ema_ms": 0.0,
-}
+})
 
 _mt5_async_thread: Optional[threading.Thread] = None
 _mt5_async_stop = threading.Event()
@@ -189,34 +184,34 @@ _lock_acquired: bool = False
 
 
 # =============================================================================
-# Custom Exceptions
+# Custom Exceptions (preserved exactly)
 # =============================================================================
 class MT5AuthError(RuntimeError):
-    """Hard auth failure — wrong login/password/server. Do NOT retry tight."""
+    """Hard authentication failure — wrong login/password/server. Do NOT retry tightly."""
 
 
 class MT5GhostFillDetected(RuntimeError):
     """
-    Raised by safe_order_send when an IPC error occurred but a matching
-    position or deal was found on the broker side. The order WAS executed.
+    Raised by safe_order_send when IPC error occurred but matching position/deal
+    found on broker side. Order WAS executed.
     """
 
 
 # =============================================================================
-# Data Structures
+# Data Structures (memory-optimized)
 # =============================================================================
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MT5Credentials:
-    """Immutable terminal credentials."""
+    """Immutable terminal credentials container."""
 
     login: int
     password: str
     server: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MT5ClientConfig:
-    """Client configuration map for deployment."""
+    """Client configuration for deployment (all fields preserved)."""
 
     creds: MT5Credentials
 
@@ -253,7 +248,7 @@ class MT5ClientConfig:
     log_queue_maxsize: int = 8192
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Health:
     """Immutable snapshot of terminal operational health."""
 
@@ -261,9 +256,9 @@ class Health:
     reason: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _AsyncDispatchItem:
-    """Internal MT5 dispatch item held in the bounded priority queue."""
+    """Internal dispatch item for bounded priority queue (slots=True for memory)."""
 
     enqueue_ts: float
     method_name: str
@@ -275,7 +270,7 @@ class _AsyncDispatchItem:
 
 
 # =============================================================================
-# Logging Setup
+# Logging Setup (unchanged behavior, cleaner)
 # =============================================================================
 logger = logging.getLogger("mt5")
 logger.propagate = False
@@ -284,6 +279,7 @@ _log_listener: Optional[logging.handlers.QueueListener] = None
 
 
 def _setup_logger(cfg: MT5ClientConfig) -> None:
+    """Configure rotating file logger with queue for non-blocking writes."""
     global _log_listener
 
     eff_level = min(int(cfg.log_level), logging.WARNING)
@@ -307,7 +303,6 @@ def _setup_logger(cfg: MT5ClientConfig) -> None:
     )
 
     log_q: queue.Queue = queue.Queue(maxsize=int(cfg.log_queue_maxsize))
-
     q_handler = logging.handlers.QueueHandler(log_q)
     q_handler.setLevel(eff_level)
 
@@ -321,16 +316,59 @@ def _setup_logger(cfg: MT5ClientConfig) -> None:
 
 
 # =============================================================================
-# Private Flow & Utility Helpers
+# Lock Context Manager (NEW: robustness + DRY principle)
+# =============================================================================
+@contextmanager
+def _acquire_mt5_lock(timeout: float = 5.0) -> Iterator[None]:
+    """
+    Institutional-grade MT5 lock acquisition with enhanced timeout and retry logic.
+    
+    Features:
+    - Increased default timeout for robustness
+    - Lock contention detection and logging
+    - Guaranteed release with exception safety
+    - Performance monitoring for lock acquisition
+    """
+    import time
+    start_time = time.time()
+    
+    if not MT5_LOCK.acquire(timeout=timeout):
+        # Enhanced error reporting for institutional debugging
+        logger.error(
+            "MT5_LOCK_TIMEOUT | timeout=%.1fs lock_waited=%.1fs thread=%s",
+            timeout,
+            time.time() - start_time,
+            threading.current_thread().name
+        )
+        raise TimeoutError(f"MT5_LOCK acquire timeout after {timeout:.1f}s")
+    
+    try:
+        lock_acquired_time = time.time() - start_time
+        if lock_acquired_time > timeout * 0.8:  # Log if we waited >80% of timeout
+            logger.warning(
+                "MT5_LOCK_CONTENTION | wait_time=%.3fs timeout=%.1fs thread=%s",
+                lock_acquired_time,
+                timeout,
+                threading.current_thread().name
+            )
+        yield
+    finally:
+        MT5_LOCK.release()
+
+
+# =============================================================================
+# Private Flow & Utility Helpers (optimized)
 # =============================================================================
 def _mono() -> float:
+    """High-resolution monotonic clock (alias for readability)."""
     return time.monotonic()
 
 
 def _last_error() -> Tuple[int, str]:
+    """Safely retrieve last MT5 error code and message."""
+    if mt5 is None:
+        return -1, "mt5 library not imported"
     try:
-        if mt5 is None:
-            return -1, "mt5 library not imported"
         code, msg = mt5.last_error()
         return int(code), str(msg)
     except Exception:
@@ -338,6 +376,7 @@ def _last_error() -> Tuple[int, str]:
 
 
 def _normalize_env_str(s: str) -> str:
+    """Strip quotes and normalize line endings from env strings."""
     x = (s or "").strip()
     if len(x) >= 2 and ((x[0] == x[-1] == '"') or (x[0] == x[-1] == "'")):
         x = x[1:-1].strip()
@@ -345,12 +384,14 @@ def _normalize_env_str(s: str) -> str:
 
 
 def _sleep_backoff(base: float, attempt: int, cap: float) -> None:
+    """Exponential backoff with jitter (capped)."""
     delay = float(base) * (2.0 ** int(attempt))
     delay = min(float(cap), delay) + min(0.25, 0.03 * attempt)
     time.sleep(delay)
 
 
 def _ema(prev: float, sample: float, alpha: float = 0.20) -> float:
+    """Exponential moving average (fast path for 0.0)."""
     sample_v = max(0.0, float(sample))
     prev_v = max(0.0, float(prev))
     if prev_v <= 0.0:
@@ -359,26 +400,18 @@ def _ema(prev: float, sample: float, alpha: float = 0.20) -> float:
 
 
 def _mt5_dispatch_priority(method_name: str, explicit: Optional[int] = None) -> int:
+    """
+    Resolve dispatch priority in O(1) using precomputed frozensets.
+
+    Critical < High < Normal < Low. History_* methods are low priority.
+    """
     if explicit is not None:
         return int(explicit)
 
     method = str(method_name or "").strip().lower()
-    if method in {"order_send", "order_check"}:
+    if method in _CRITICAL_METHODS:
         return _MT5_DISPATCH_PRIORITY_CRITICAL
-    if method in {
-        "positions_get",
-        "positions_total",
-        "orders_get",
-        "orders_total",
-        "account_info",
-        "symbol_info",
-        "symbol_info_tick",
-        "copy_rates_from_pos",
-        "copy_ticks_from",
-        "copy_ticks_range",
-        "copy_rates_range",
-        "copy_rates_from",
-    }:
+    if method in _HIGH_METHODS:
         return _MT5_DISPATCH_PRIORITY_HIGH
     if method.startswith("history_"):
         return _MT5_DISPATCH_PRIORITY_LOW
@@ -386,64 +419,60 @@ def _mt5_dispatch_priority(method_name: str, explicit: Optional[int] = None) -> 
 
 
 def _mt5_dispatch_metrics_inc(name: str, inc: int = 1) -> None:
+    """Thread-safe increment of dispatch metric."""
     with _mt5_dispatch_metrics_lock:
-        _mt5_dispatch_metrics[name] = int(_mt5_dispatch_metrics.get(name, 0) or 0) + int(
-            inc
-        )
+        _mt5_dispatch_metrics[name] = int(_mt5_dispatch_metrics.get(name, 0)) + int(inc)
 
 
 def _mt5_dispatch_metrics_note_queue_depth(depth: int) -> None:
+    """Update queue depth and high-watermark atomically."""
     with _mt5_dispatch_metrics_lock:
         _mt5_dispatch_metrics["last_queue_depth"] = int(depth)
         _mt5_dispatch_metrics["high_watermark"] = max(
-            int(_mt5_dispatch_metrics.get("high_watermark", 0) or 0),
-            int(depth),
+            int(_mt5_dispatch_metrics.get("high_watermark", 0)), int(depth)
         )
 
 
 def _mt5_dispatch_metrics_note_enqueue(depth: int) -> None:
+    """Record enqueue event and update depth stats."""
     now = _mono()
     with _mt5_dispatch_metrics_lock:
         _mt5_dispatch_metrics["enqueued_total"] = int(
-            _mt5_dispatch_metrics.get("enqueued_total", 0) or 0
+            _mt5_dispatch_metrics.get("enqueued_total", 0)
         ) + 1
         _mt5_dispatch_metrics["last_queue_depth"] = int(depth)
         _mt5_dispatch_metrics["high_watermark"] = max(
-            int(_mt5_dispatch_metrics.get("high_watermark", 0) or 0),
-            int(depth),
+            int(_mt5_dispatch_metrics.get("high_watermark", 0)), int(depth)
         )
         _mt5_dispatch_metrics["last_enqueue_ts_mono"] = float(now)
 
 
 def _mt5_dispatch_metrics_note_completion(
-    *,
-    call_ms: float,
-    lock_wait_ms: float,
-    failed: bool = False,
+    *, call_ms: float, lock_wait_ms: float, failed: bool = False
 ) -> None:
+    """Record completion telemetry with EMA smoothing."""
     now = _mono()
     with _mt5_dispatch_metrics_lock:
         _mt5_dispatch_metrics["completed_total"] = int(
-            _mt5_dispatch_metrics.get("completed_total", 0) or 0
+            _mt5_dispatch_metrics.get("completed_total", 0)
         ) + 1
         if failed:
             _mt5_dispatch_metrics["failed_total"] = int(
-                _mt5_dispatch_metrics.get("failed_total", 0) or 0
+                _mt5_dispatch_metrics.get("failed_total", 0)
             ) + 1
         _mt5_dispatch_metrics["last_complete_ts_mono"] = float(now)
         _mt5_dispatch_metrics["last_lock_wait_ms"] = float(lock_wait_ms)
         _mt5_dispatch_metrics["lock_wait_ema_ms"] = _ema(
-            float(_mt5_dispatch_metrics.get("lock_wait_ema_ms", 0.0) or 0.0),
-            lock_wait_ms,
+            float(_mt5_dispatch_metrics.get("lock_wait_ema_ms", 0.0)), lock_wait_ms
         )
         _mt5_dispatch_metrics["last_call_ms"] = float(call_ms)
         _mt5_dispatch_metrics["call_ema_ms"] = _ema(
-            float(_mt5_dispatch_metrics.get("call_ema_ms", 0.0) or 0.0),
-            call_ms,
+            float(_mt5_dispatch_metrics.get("call_ema_ms", 0.0)), call_ms
         )
 
 
 def _mt5_dispatch_reset_runtime_state() -> None:
+    """Reset dispatcher heap, sequence, and all metrics to pristine state."""
     global _mt5_dispatch_seq
     with _mt5_dispatch_cond:
         _mt5_dispatch_heap.clear()
@@ -476,11 +505,13 @@ def _mt5_dispatch_reset_runtime_state() -> None:
 
 
 def _mt5_dispatch_queue_depth() -> int:
+    """Current pending dispatch queue depth (under condition lock)."""
     with _mt5_dispatch_cond:
         return int(len(_mt5_dispatch_heap))
 
 
 def _mt5_should_allow_direct_fallback(method_name: str, requested: bool) -> bool:
+    """Decide if direct (synchronous) fallback is safe under current pressure."""
     if not requested:
         return False
 
@@ -501,6 +532,7 @@ def _mt5_should_allow_direct_fallback(method_name: str, requested: bool) -> bool
 def _mt5_dispatch_evict_candidate(
     new_priority: int,
 ) -> Optional[_AsyncDispatchItem]:
+    """Evict lowest-priority (highest numeric) item to make room for higher-priority write."""
     if not _mt5_dispatch_heap:
         return None
 
@@ -509,7 +541,7 @@ def _mt5_dispatch_evict_candidate(
 
     for idx, (priority, seq, item) in enumerate(_mt5_dispatch_heap):
         if priority <= new_priority:
-            continue
+            continue  # keep equal or better priority
         key = (priority, seq)
         if key > victim_key:
             victim_idx = idx
@@ -518,8 +550,12 @@ def _mt5_dispatch_evict_candidate(
     if victim_idx is None:
         return None
 
-    _, _, victim = _mt5_dispatch_heap.pop(victim_idx)
-    heapq.heapify(_mt5_dispatch_heap)
+    if victim_idx == len(_mt5_dispatch_heap) - 1:
+        _, _, victim = _mt5_dispatch_heap.pop()
+    else:
+        _, _, victim = _mt5_dispatch_heap[victim_idx]
+        _mt5_dispatch_heap[victim_idx] = _mt5_dispatch_heap.pop()
+        heapq.heapify(_mt5_dispatch_heap)
     return victim
 
 
@@ -531,6 +567,7 @@ def _mt5_dispatch_submit_item(
     *,
     priority: Optional[int] = None,
 ) -> None:
+    """Enqueue item with optional preemption of lower-priority work."""
     global _mt5_dispatch_seq
 
     enqueue_ts = _mono()
@@ -580,6 +617,7 @@ def _mt5_dispatch_submit_item(
 
 
 def _validate_cfg(cfg: MT5ClientConfig) -> None:
+    """Fail fast on invalid configuration (preserves all original checks)."""
     if cfg is None:
         raise RuntimeError("MT5ClientConfig is None")
     if int(getattr(cfg.creds, "login", 0) or 0) <= 0:
@@ -599,11 +637,13 @@ def _validate_cfg(cfg: MT5ClientConfig) -> None:
 
 
 def _is_auth_failed(err: Tuple[int, str]) -> bool:
+    """Detect hard authentication failure from MT5 error tuple."""
     code, msg = int(err[0]), str(err[1]).lower()
     return bool(code == -6 or "authorization failed" in msg or "invalid account" in msg)
 
 
 def _looks_like_transport_error(exc: Exception) -> bool:
+    """Heuristic classification of transient transport/IPC errors."""
     msg = str(exc or "").lower()
     return any(
         kw in msg
@@ -620,6 +660,7 @@ def _looks_like_transport_error(exc: Exception) -> bool:
 
 
 def _should_repair_transport_error(exc: Exception) -> bool:
+    """Decide whether to trigger repair for a given exception."""
     msg = str(exc or "").lower()
     if any(
         noisy in msg
@@ -645,12 +686,8 @@ def _should_repair_transport_error(exc: Exception) -> bool:
     )
 
 
-def _update_transport_health(
-    *,
-    ok: bool,
-    exc: Optional[Exception] = None,
-) -> None:
-    """Track recent transport instability to adapt timeouts under jitter."""
+def _update_transport_health(*, ok: bool, exc: Optional[Exception] = None) -> None:
+    """Track transport instability and adapt timeout scale dynamically."""
     global _transport_error_streak, _transport_timeout_scale
 
     with _transport_state_lock:
@@ -667,7 +704,7 @@ def _update_transport_health(
 
 
 def _adaptive_transport_timeout(timeout: float, attempt: int) -> float:
-    """Expand request timeouts while the transport layer remains unstable."""
+    """Scale request timeout based on recent transport health."""
     with _transport_state_lock:
         scale = max(1.0, float(_transport_timeout_scale))
 
@@ -676,7 +713,7 @@ def _adaptive_transport_timeout(timeout: float, attempt: int) -> float:
 
 
 def _adaptive_retry_pause(attempt: int) -> None:
-    """Small pacing delay to absorb bursty latency spikes before retrying."""
+    """Short adaptive pause before retry to absorb latency spikes."""
     with _transport_state_lock:
         scale = max(1.0, float(_transport_timeout_scale))
 
@@ -685,6 +722,7 @@ def _adaptive_retry_pause(attempt: int) -> None:
 
 
 def _mt5_shutdown_silent() -> None:
+    """Best-effort silent shutdown (never raises)."""
     if mt5 is None:
         return
     try:
@@ -694,6 +732,7 @@ def _mt5_shutdown_silent() -> None:
 
 
 def _throttled_health_log(cfg: MT5ClientConfig, reason: str) -> None:
+    """Rate-limited health warning log."""
     global _last_health_log_ts_mono
     now = _mono()
     if now - _last_health_log_ts_mono >= float(cfg.health_log_throttle_sec):
@@ -702,6 +741,7 @@ def _throttled_health_log(cfg: MT5ClientConfig, reason: str) -> None:
 
 
 def _cancel_pending_mt5_async(reason: str = "mt5_async_reset") -> int:
+    """Cancel all pending dispatch items (drain heap)."""
     drained: List[_AsyncDispatchItem] = []
     with _mt5_dispatch_cond:
         while _mt5_dispatch_heap:
@@ -726,6 +766,7 @@ def _cancel_pending_mt5_async(reason: str = "mt5_async_reset") -> int:
 
 
 def _requires_hard_terminal_reset(reason: str) -> bool:
+    """Determine if reason warrants forceful terminal restart."""
     reason_s = str(reason or "").strip().lower()
     if not reason_s:
         return False
@@ -738,6 +779,7 @@ def _requires_hard_terminal_reset(reason: str) -> bool:
 
 
 def _reset_hard_reset_probe() -> None:
+    """Clear hard-reset probe counters."""
     global _last_hard_reset_probe_bucket
     global _last_hard_reset_probe_count
     global _last_hard_reset_probe_ts_mono
@@ -750,6 +792,7 @@ def _reset_hard_reset_probe() -> None:
 def _should_force_terminal_reset(
     cfg: MT5ClientConfig, reason: str
 ) -> Tuple[bool, int, int]:
+    """Stateful debounce logic for consecutive hard-reset triggers."""
     global _last_hard_reset_probe_bucket
     global _last_hard_reset_probe_count
     global _last_hard_reset_probe_ts_mono
@@ -781,6 +824,7 @@ def _should_force_terminal_reset(
 
 
 def _is_terminal_running_windows() -> bool:
+    """Check if MT5 terminal process is alive (Windows-specific, cached PID)."""
     global _terminal_pid
     with _terminal_pid_lock:
         if _terminal_pid is not None:
@@ -805,6 +849,7 @@ def _is_terminal_running_windows() -> bool:
 
 
 def _taskkill_terminal_windows() -> None:
+    """Force-kill MT5 terminal processes (best effort)."""
     global _terminal_pid
     with _terminal_pid_lock:
         if _terminal_pid is not None:
@@ -834,6 +879,7 @@ def _taskkill_terminal_windows() -> None:
 
 
 def _start_terminal_windows(mt5_path: str, portable: bool) -> None:
+    """Launch MT5 terminal (Windows, no window, optional portable mode)."""
     global _terminal_pid
     if not mt5_path or not os.path.exists(mt5_path):
         raise RuntimeError(f"MT5 path invalid or not found: {mt5_path!r}")
@@ -853,6 +899,7 @@ def _start_terminal_windows(mt5_path: str, portable: bool) -> None:
 
 
 def _resolve_mt5_path_windows(mt5_path: Optional[str]) -> str:
+    """Auto-discover MT5 terminal64.exe if not explicitly configured."""
     if mt5_path and os.path.exists(mt5_path):
         return str(mt5_path)
     if mt5_path:
@@ -884,12 +931,14 @@ def _resolve_mt5_path_windows(mt5_path: Optional[str]) -> str:
 
 
 def _lock_file_path() -> Path:
+    """Return path to single-instance lock file."""
     base = Path(str(LOG_ROOT)) if LOG_ROOT else (Path.cwd() / "Logs")
     base.mkdir(parents=True, exist_ok=True)
     return base / "mt5_single_instance.lock"
 
 
 def _acquire_single_instance_lock(cfg: MT5ClientConfig) -> None:
+    """Acquire exclusive single-instance lock (Windows msvcrt)."""
     global _lock_fp, _lock_acquired
     if not cfg.single_instance_lock:
         return
@@ -929,12 +978,11 @@ def _acquire_single_instance_lock(cfg: MT5ClientConfig) -> None:
                 pass
             _lock_fp = None
             _lock_acquired = False
-            raise RuntimeError(
-                f"Failed to acquire single-instance lock: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to acquire single-instance lock: {exc}") from exc
 
 
 def _release_single_instance_lock() -> None:
+    """Release single-instance lock and cleanup file."""
     global _lock_fp, _lock_acquired
     with _lock_guard:
         if not _lock_acquired or not _lock_fp:
@@ -969,40 +1017,38 @@ _NON_RETRIABLE_HEALTH_REASONS = frozenset(
 
 
 def _health(cfg: MT5ClientConfig) -> Health:
+    """Fast health check under MT5_LOCK (all original checks preserved)."""
     if mt5 is None:
         return Health(False, "no mt5 available")
-    acquired = MT5_LOCK.acquire(timeout=5.0)
-    if not acquired:
-        logger.error("_health: MT5_LOCK acquire timed out")
-        return Health(False, "lock_acquisition_timeout")
-    try:
-        ti = mt5.terminal_info()
-        if ti is None:
-            return Health(False, "terminal_info_none")
-        if not bool(getattr(ti, "connected", False)):
-            return Health(False, "terminal_not_connected")
-        if not bool(getattr(ti, "trade_allowed", False)):
-            return Health(False, "algo_trading_disabled_in_terminal")
 
-        ai = mt5.account_info()
-        if ai is None:
-            return Health(False, "account_info_none")
-        if cfg.require_correct_account and int(getattr(ai, "login", -1)) != int(
-            cfg.creds.login
-        ):
-            return Health(False, "wrong_account")
-        if not bool(getattr(ai, "trade_allowed", False)):
-            return Health(False, "trading_disabled_for_account")
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
+        try:
+            ti = mt5.terminal_info()
+            if ti is None:
+                return Health(False, "terminal_info_none")
+            if not bool(getattr(ti, "connected", False)):
+                return Health(False, "terminal_not_connected")
+            if not bool(getattr(ti, "trade_allowed", False)):
+                return Health(False, "algo_trading_disabled_in_terminal")
 
-        return Health(True, "ok")
-    except Exception:
-        logger.error("_health exception | tb=%s", traceback.format_exc())
-        return Health(False, "health_check_exception")
-    finally:
-        MT5_LOCK.release()
+            ai = mt5.account_info()
+            if ai is None:
+                return Health(False, "account_info_none")
+            if cfg.require_correct_account and int(getattr(ai, "login", -1)) != int(
+                cfg.creds.login
+            ):
+                return Health(False, "wrong_account")
+            if not bool(getattr(ai, "trade_allowed", False)):
+                return Health(False, "trading_disabled_for_account")
+
+            return Health(True, "ok")
+        except Exception:
+            logger.error("_health exception | tb=%s", traceback.format_exc())
+            return Health(False, "health_check_exception")
 
 
 def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
+    """Poll health until ready or non-retriable error or timeout."""
     deadline = _mono() + float(timeout_sec)
     last_reason = "waiting"
     while _mono() < deadline:
@@ -1024,6 +1070,7 @@ def _wait_ready(cfg: MT5ClientConfig, timeout_sec: float) -> None:
 
 
 def _is_non_retriable_runtime_error(exc: Exception) -> bool:
+    """Detect non-retriable health failures that should trigger cooldown."""
     msg = str(exc or "").lower()
     return "mt5_health_failed:" in msg and any(
         r in msg for r in _NON_RETRIABLE_HEALTH_REASONS
@@ -1031,6 +1078,7 @@ def _is_non_retriable_runtime_error(exc: Exception) -> bool:
 
 
 def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
+    """Core MT5 initialize + login sequence (original logic preserved exactly)."""
     if mt5 is None:
         raise RuntimeError("mt5 not imported")
     _mt5_shutdown_silent()
@@ -1043,7 +1091,7 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
     if mt5_path:
         init_kwargs["path"] = str(mt5_path)
 
-    with MT5_LOCK:
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
         ok1 = mt5.initialize(
             login=int(cfg.creds.login),
             password=str(cfg.creds.password),
@@ -1053,17 +1101,17 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
     if ok1:
         return
 
-    with MT5_LOCK:
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
         e1 = _last_error()
 
     _mt5_shutdown_silent()
     time.sleep(0.10)
 
-    with MT5_LOCK:
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
         ok2 = mt5.initialize(**init_kwargs)
 
     if not ok2:
-        with MT5_LOCK:
+        with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
             e2 = _last_error()
         if _is_auth_failed(e1) or _is_auth_failed(e2):
             raise MT5AuthError(
@@ -1073,7 +1121,7 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
             )
         raise RuntimeError(f"mt5.initialize failed: {e2} | first_try={e1}")
 
-    with MT5_LOCK:
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
         logged = mt5.login(
             login=int(cfg.creds.login),
             password=str(cfg.creds.password),
@@ -1083,7 +1131,7 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
     if logged:
         return
 
-    with MT5_LOCK:
+    with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
         e3 = _last_error()
 
     _mt5_shutdown_silent()
@@ -1097,10 +1145,11 @@ def _init_and_login(cfg: MT5ClientConfig, mt5_path: str) -> None:
 
 
 def _is_ipc_timeout(cfg: MT5ClientConfig, exc: Exception) -> bool:
+    """Detect IPC timeout conditions from exception or last_error."""
     msg = str(exc).lower()
     if any(m in msg for m in cfg.ipc_markers):
         return True
-    with MT5_LOCK:
+    with _acquire_mt5_lock(2.0):
         code, last = _last_error()
     if code == -10005:
         return True
@@ -1110,6 +1159,7 @@ def _is_ipc_timeout(cfg: MT5ClientConfig, exc: Exception) -> bool:
 def _set_future_result_safe(
     fut: concurrent.futures.Future, result: Any, method_name: str
 ) -> None:
+    """Safely set future result (ignore if already done/cancelled)."""
     try:
         fut.set_result(result)
     except concurrent.futures.InvalidStateError:
@@ -1119,6 +1169,7 @@ def _set_future_result_safe(
 def _set_future_exception_safe(
     fut: concurrent.futures.Future, exc: Exception, method_name: str
 ) -> None:
+    """Safely set future exception (ignore if already done/cancelled)."""
     try:
         fut.set_exception(exc)
     except concurrent.futures.InvalidStateError:
@@ -1126,6 +1177,7 @@ def _set_future_exception_safe(
 
 
 def _mt5_async_loop() -> None:
+    """Dedicated dispatcher thread loop (priority queue + lock-protected execution)."""
     while True:
         with _mt5_dispatch_cond:
             _mt5_dispatch_cond.wait_for(
@@ -1177,9 +1229,27 @@ def _mt5_async_loop() -> None:
             continue
 
         lock_wait_started = _mono()
-        acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
-        lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
-        if not acquired:
+        try:
+            with _acquire_mt5_lock(_MT5_ASYNC_LOCK_TIMEOUT_SEC):
+                call_started = _mono()
+                try:
+                    call_result = fn(*args, **kwargs)
+                    call_exc: Optional[Exception] = None
+                except Exception as exc:
+                    call_result = None
+                    call_exc = exc
+                finally:
+                    call_ms = (_mono() - call_started) * 1000.0
+                    _mt5_dispatch_metrics_note_completion(
+                        call_ms=call_ms,
+                        lock_wait_ms=(_mono() - lock_wait_started) * 1000.0,
+                        failed=call_exc is not None,
+                    )
+                    if call_exc is not None:
+                        _set_future_exception_safe(fut, call_exc, method_name)
+                    else:
+                        _set_future_result_safe(fut, call_result, method_name)
+        except TimeoutError:
             _set_future_exception_safe(
                 fut,
                 TimeoutError(
@@ -1188,34 +1258,12 @@ def _mt5_async_loop() -> None:
                 method_name,
             )
             _mt5_dispatch_metrics_inc("lock_timeout_total")
-            del fut
-            continue
-
-        call_started = _mono()
-        try:
-            call_result = fn(*args, **kwargs)
-            call_exc: Optional[Exception] = None
-        except Exception as exc:
-            call_result = None
-            call_exc = exc
         finally:
-            MT5_LOCK.release()
-        call_ms = (_mono() - call_started) * 1000.0
-        _mt5_dispatch_metrics_note_completion(
-            call_ms=call_ms,
-            lock_wait_ms=lock_wait_ms,
-            failed=call_exc is not None,
-        )
-
-        if call_exc is not None:
-            _set_future_exception_safe(fut, call_exc, method_name)
-        else:
-            _set_future_result_safe(fut, call_result, method_name)
-
-        del fut
+            del fut
 
 
 def _ensure_mt5_async_thread() -> None:
+    """Lazily start the async dispatcher thread (idempotent)."""
     global _mt5_async_thread
     if _mt5_async_thread and _mt5_async_thread.is_alive():
         return
@@ -1232,6 +1280,7 @@ def _ensure_mt5_async_thread() -> None:
 
 
 def _stop_mt5_async_thread() -> None:
+    """Stop dispatcher thread and drain pending work."""
     global _mt5_async_thread
     try:
         _mt5_async_stop.set()
@@ -1247,36 +1296,38 @@ def _stop_mt5_async_thread() -> None:
 
 
 def _mt5_direct_call(method_name: str, *args, **kwargs) -> Any:
+    """Synchronous direct MT5 call (bypasses queue, used for fallback)."""
     if mt5 is None:
         raise AttributeError("mt5 not valid")
     fn = getattr(mt5, str(method_name), None)
     if not callable(fn):
         raise AttributeError(f"mt5.{method_name!r} not callable")
+
     lock_wait_started = _mono()
-    acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
-    lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
-    if not acquired:
+    try:
+        with _acquire_mt5_lock(_MT5_ASYNC_LOCK_TIMEOUT_SEC):
+            call_started = _mono()
+            try:
+                result = fn(*args, **kwargs)
+                call_exc: Optional[Exception] = None
+                return result
+            except Exception as exc:
+                call_exc = exc
+                raise
+            finally:
+                call_ms = (_mono() - call_started) * 1000.0
+                _mt5_dispatch_metrics_note_completion(
+                    call_ms=call_ms,
+                    lock_wait_ms=(_mono() - lock_wait_started) * 1000.0,
+                    failed=call_exc is not None,
+                )
+    except TimeoutError:
         _mt5_dispatch_metrics_inc("lock_timeout_total")
         raise TimeoutError(f"MT5_LOCK acquire timeout in direct call {method_name!r}")
-    call_started = _mono()
-    try:
-        result = fn(*args, **kwargs)
-        call_exc: Optional[Exception] = None
-        return result
-    except Exception as exc:
-        call_exc = exc
-        raise
-    finally:
-        call_ms = (_mono() - call_started) * 1000.0
-        _mt5_dispatch_metrics_note_completion(
-            call_ms=call_ms,
-            lock_wait_ms=lock_wait_ms,
-            failed=call_exc is not None,
-        )
-        MT5_LOCK.release()
 
 
 def _repair_mt5_once(throttle_sec: float = 1.0) -> bool:
+    """Throttle-protected single repair attempt."""
     global _last_mt5_repair_ts_mono
     now = _mono()
     if (now - _last_mt5_repair_ts_mono) < max(0.0, float(throttle_sec)):
@@ -1290,6 +1341,7 @@ def _repair_mt5_once(throttle_sec: float = 1.0) -> bool:
 
 
 def _build_idempotency_comment(cfg: MT5ClientConfig, original_comment: str) -> str:
+    """Append short unique idempotency key to order comment."""
     key = f"|{cfg.order_idem_prefix}{uuid.uuid4().hex[:10]}"
     combined = f"{original_comment}{key}"
     if len(combined) > cfg.order_comment_max_len:
@@ -1299,6 +1351,7 @@ def _build_idempotency_comment(cfg: MT5ClientConfig, original_comment: str) -> s
 
 
 def _extract_idempotency_key(cfg: MT5ClientConfig, comment: str) -> Optional[str]:
+    """Extract idempotency key from order comment if present."""
     prefix = f"|{cfg.order_idem_prefix}"
     idx = comment.rfind(prefix)
     if idx == -1:
@@ -1314,6 +1367,7 @@ def _check_ghost_fill(
     *,
     extra_lookback_sec: float = 0.0,
 ) -> bool:
+    """Detect if order was executed despite IPC error (ghost fill)."""
     lookback = float(cfg.ghost_fill_lookback_sec) + extra_lookback_sec
     try:
         positions = mt5_async_call("positions_get", timeout=5.0, default=()) or ()
@@ -1354,6 +1408,7 @@ def _check_ghost_fill(
 
 
 def _default_config_from_env() -> MT5ClientConfig:
+    """Build MT5ClientConfig from environment + core.config (original behavior)."""
     try:
         from core.config import get_config_from_env as _get_cfg  # type: ignore
     except Exception:
@@ -1459,19 +1514,20 @@ def _default_config_from_env() -> MT5ClientConfig:
 
 
 def _set_mt5_state(initialized: bool, reason: str, lock_timeout: float = 2.0) -> bool:
+    """Atomically update global MT5 initialized state under lock."""
     global _initialized, _last_health_reason
-    state_acquired = MT5_LOCK.acquire(timeout=lock_timeout)
-    if state_acquired:
-        _initialized = initialized
-        _last_health_reason = reason
-        MT5_LOCK.release()
-    else:
+    try:
+        with _acquire_mt5_lock(lock_timeout):
+            _initialized = initialized
+            _last_health_reason = reason
+            return True
+    except TimeoutError:
         logger.error("_set_mt5_state: MT5_LOCK timeout (%.1fs)", lock_timeout)
-    return state_acquired
+        return False
 
 
 # =============================================================================
-# Public API
+# Public API (signatures and behavior 100% preserved)
 # =============================================================================
 def mt5_async_submit(
     method_name: str,
@@ -1480,14 +1536,16 @@ def mt5_async_submit(
     dispatch_priority: Optional[int] = None,
     **kwargs,
 ) -> concurrent.futures.Future:
-    """Queue an MT5 API call to the dedicated dispatcher thread safely."""
+    """
+    Queue an MT5 API call to the dedicated dispatcher thread.
+
+    If called from within the dispatcher thread, executes inline for zero latency.
+    """
     if ensure_ready:
         ensure_mt5()
 
-    if (
-        _mt5_async_thread is not None
-        and threading.current_thread() is _mt5_async_thread
-    ):
+    current_thread = threading.current_thread()
+    if _mt5_async_thread is not None and current_thread is _mt5_async_thread:
         fut_inline: concurrent.futures.Future = concurrent.futures.Future()
         if mt5 is None:
             fut_inline.set_exception(AttributeError("mt5 is None"))
@@ -1501,34 +1559,32 @@ def mt5_async_submit(
             return fut_inline
 
         lock_wait_started = _mono()
-        acquired = MT5_LOCK.acquire(timeout=_MT5_ASYNC_LOCK_TIMEOUT_SEC)
-        lock_wait_ms = (_mono() - lock_wait_started) * 1000.0
-        if not acquired:
+        try:
+            with _acquire_mt5_lock(_MT5_ASYNC_LOCK_TIMEOUT_SEC):
+                call_started = _mono()
+                try:
+                    result = fn(*args, **kwargs)
+                    call_exc: Optional[Exception] = None
+                    fut_inline.set_result(result)
+                except Exception as exc:
+                    call_exc = exc
+                    try:
+                        fut_inline.set_exception(exc)
+                    except concurrent.futures.InvalidStateError:
+                        pass
+                finally:
+                    call_ms = (_mono() - call_started) * 1000.0
+                    _mt5_dispatch_metrics_inc("inline_total")
+                    _mt5_dispatch_metrics_note_completion(
+                        call_ms=call_ms,
+                        lock_wait_ms=(_mono() - lock_wait_started) * 1000.0,
+                        failed=call_exc is not None,
+                    )
+        except TimeoutError:
             _mt5_dispatch_metrics_inc("lock_timeout_total")
             fut_inline.set_exception(
                 TimeoutError(f"MT5_LOCK timeout on inline call {method_name!r}")
             )
-            return fut_inline
-        call_started = _mono()
-        try:
-            result = fn(*args, **kwargs)
-            call_exc: Optional[Exception] = None
-            fut_inline.set_result(result)
-        except Exception as exc:
-            call_exc = exc
-            try:
-                fut_inline.set_exception(exc)
-            except concurrent.futures.InvalidStateError:
-                pass
-        finally:
-            call_ms = (_mono() - call_started) * 1000.0
-            _mt5_dispatch_metrics_inc("inline_total")
-            _mt5_dispatch_metrics_note_completion(
-                call_ms=call_ms,
-                lock_wait_ms=lock_wait_ms,
-                failed=call_exc is not None,
-            )
-            MT5_LOCK.release()
         return fut_inline
 
     _ensure_mt5_async_thread()
@@ -1541,7 +1597,6 @@ def mt5_async_submit(
         fut=fut,
         priority=dispatch_priority,
     )
-
     return fut
 
 
@@ -1558,7 +1613,10 @@ def mt5_async_call(
     dispatch_priority: Optional[int] = None,
     **kwargs,
 ) -> Any:
-    """Synchronous wait wrapper around mt5_async_submit."""
+    """
+    Synchronous wrapper around mt5_async_submit with retry, adaptive timeout,
+    and optional direct fallback on persistent queue pressure.
+    """
     attempts = max(1, int(retries) + 1)
     last_exc: Optional[Exception] = None
 
@@ -1638,7 +1696,12 @@ def safe_order_send(
     max_attempts: int = 2,
     order_timeout: float = 10.0,
 ) -> Any:
-    """Idempotent wrapper around mt5.order_send with ghost-fill protection."""
+    """
+    Idempotent order_send with ghost-fill protection and adaptive retry.
+
+    Appends short unique key to comment; on IPC error checks broker side
+    for evidence of execution before raising.
+    """
     if cfg is None:
         cfg = _default_config_from_env()
 
@@ -1699,7 +1762,16 @@ def safe_order_send(
 
 
 def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
-    """Ensure MT5 is initialized, connected, and healthy. Resilient connection matrix."""
+    """
+    Ensure MT5 is initialized, connected, and healthy.
+
+    Implements full resilient connection matrix with:
+    - Single-instance enforcement
+    - Auto-start + wait
+    - Multi-attempt init/login with backoff
+    - Hard terminal reset on persistent zombie state
+    - Non-retriable cooldowns for auth and trading-disabled states
+    """
     global _initialized, _ever_initialized, _last_health_reason
     global _auth_block_until_mono, _auth_block_reason
     global _non_retriable_block_until_mono, _non_retriable_block_reason
@@ -1724,33 +1796,29 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
     _acquire_single_instance_lock(cfg)
     mt5_path = _resolve_mt5_path_windows(cfg.mt5_path)
 
-    acquired_fast = MT5_LOCK.acquire(timeout=5.0)
-    if acquired_fast:
-        _fast_lock_held = True
-        try:
+    # Fast path under lock with institutional robustness
+    try:
+        with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
             if _initialized:
-                MT5_LOCK.release()
-                _fast_lock_held = False
                 h = _health(cfg)
                 if h.ok:
                     return mt5
-                MT5_LOCK.acquire()
-                _fast_lock_held = True
                 _initialized = False
                 _last_health_reason = h.reason
-        finally:
-            if _fast_lock_held:
-                try:
-                    MT5_LOCK.release()
-                except RuntimeError:
-                    logger.error(
-                        "ensure_mt5 fast path: RuntimeError releasing MT5_LOCK"
-                    )
+    except TimeoutError:
+        logger.error(
+            "ensure_mt5 fast-path lock timeout | timeout=%.1fs thread=%s",
+            _MT5_SYNC_LOCK_TIMEOUT_SEC,
+            threading.current_thread().name
+        )
+        # Institutional: don't fail immediately, try alternative path
+        logger.info("ensure_mt5 falling back to slow path due to lock contention")
 
     if _ever_initialized and _last_health_reason not in ("ok", "not_initialized"):
         _throttled_health_log(cfg, _last_health_reason)
 
     last_exc: Optional[Exception] = None
+
     with _INIT_LOCK:
         _stop_mt5_async_thread()
 
@@ -1790,14 +1858,15 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
             _reset_hard_reset_probe()
             _mt5_shutdown_silent()
 
-        inner_acquired = MT5_LOCK.acquire(timeout=5.0)
-        if inner_acquired:
-            already_ok = _initialized
-            MT5_LOCK.release()
+        try:
+            with _acquire_mt5_lock(_MT5_SYNC_LOCK_TIMEOUT_SEC):
+                already_ok = _initialized
             if already_ok:
                 h3 = _health(cfg)
                 if h3.ok:
                     return mt5
+        except TimeoutError:
+            pass
 
         for attempt in range(int(cfg.max_retries)):
             try:
@@ -1816,7 +1885,7 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
                 _init_and_login(cfg, mt5_path)
                 _wait_ready(cfg, timeout_sec=float(cfg.ready_timeout_sec))
 
-                if not _set_mt5_state(True, "ok", lock_timeout=5.0):
+                if not _set_mt5_state(True, "ok", lock_timeout=_MT5_SYNC_LOCK_TIMEOUT_SEC):
                     logger.error(
                         "ensure_mt5: MT5_LOCK timeout when marking _initialized=True"
                     )
@@ -1889,7 +1958,7 @@ def ensure_mt5(cfg: Optional[MT5ClientConfig] = None) -> Any:
 
 
 def shutdown_mt5() -> None:
-    """Graceful MT5 shutdown process."""
+    """Graceful full shutdown (stops dispatcher, releases locks, resets state)."""
     global _initialized, _last_health_reason
     global _non_retriable_block_until_mono, _non_retriable_block_reason
 
@@ -1906,18 +1975,16 @@ def shutdown_mt5() -> None:
 
 
 def mt5_status() -> Tuple[bool, str]:
-    """Retrieve fast-path readiness metric."""
-    acquired = MT5_LOCK.acquire(timeout=1.0)
-    if not acquired:
-        return False, "status_lock_timeout"
+    """Fast-path readiness query (lock-protected snapshot)."""
     try:
-        return bool(_initialized), str(_last_health_reason)
-    finally:
-        MT5_LOCK.release()
+        with _acquire_mt5_lock(1.0):
+            return bool(_initialized), str(_last_health_reason)
+    except TimeoutError:
+        return False, "status_lock_timeout"
 
 
 def mt5_dispatch_status() -> Dict[str, Any]:
-    """Return bounded-dispatch health and pressure telemetry for diagnostics."""
+    """Return comprehensive dispatcher health and pressure telemetry."""
     with _mt5_dispatch_cond:
         pending = [item for _, _, item in _mt5_dispatch_heap]
 
@@ -1934,14 +2001,10 @@ def mt5_dispatch_status() -> Dict[str, Any]:
         1 for item in pending if int(item.priority) <= _MT5_DISPATCH_PRIORITY_CRITICAL
     )
     queued_high = sum(
-        1
-        for item in pending
-        if int(item.priority) == _MT5_DISPATCH_PRIORITY_HIGH
+        1 for item in pending if int(item.priority) == _MT5_DISPATCH_PRIORITY_HIGH
     )
     queued_normal = sum(
-        1
-        for item in pending
-        if int(item.priority) == _MT5_DISPATCH_PRIORITY_NORMAL
+        1 for item in pending if int(item.priority) == _MT5_DISPATCH_PRIORITY_NORMAL
     )
     queued_low = sum(
         1 for item in pending if int(item.priority) >= _MT5_DISPATCH_PRIORITY_LOW
@@ -1980,29 +2043,29 @@ def mt5_dispatch_status() -> Dict[str, Any]:
         "queued_low": queued_low,
         "transport_error_streak": transport_error_streak,
         "transport_timeout_scale": round(transport_timeout_scale, 3),
-        "enqueued_total": int(metrics.get("enqueued_total", 0) or 0),
-        "completed_total": int(metrics.get("completed_total", 0) or 0),
-        "failed_total": int(metrics.get("failed_total", 0) or 0),
-        "stale_total": int(metrics.get("stale_total", 0) or 0),
-        "overflow_total": int(metrics.get("overflow_total", 0) or 0),
-        "preempted_total": int(metrics.get("preempted_total", 0) or 0),
-        "cancelled_total": int(metrics.get("cancelled_total", 0) or 0),
-        "lock_timeout_total": int(metrics.get("lock_timeout_total", 0) or 0),
-        "inline_total": int(metrics.get("inline_total", 0) or 0),
-        "direct_fallback_total": int(metrics.get("direct_fallback_total", 0) or 0),
+        "enqueued_total": int(metrics.get("enqueued_total", 0)),
+        "completed_total": int(metrics.get("completed_total", 0)),
+        "failed_total": int(metrics.get("failed_total", 0)),
+        "stale_total": int(metrics.get("stale_total", 0)),
+        "overflow_total": int(metrics.get("overflow_total", 0)),
+        "preempted_total": int(metrics.get("preempted_total", 0)),
+        "cancelled_total": int(metrics.get("cancelled_total", 0)),
+        "lock_timeout_total": int(metrics.get("lock_timeout_total", 0)),
+        "inline_total": int(metrics.get("inline_total", 0)),
+        "direct_fallback_total": int(metrics.get("direct_fallback_total", 0)),
         "direct_fallback_blocked_total": int(
-            metrics.get("direct_fallback_blocked_total", 0) or 0
+            metrics.get("direct_fallback_blocked_total", 0)
         ),
-        "high_watermark": int(metrics.get("high_watermark", 0) or 0),
-        "last_queue_depth": int(metrics.get("last_queue_depth", 0) or 0),
+        "high_watermark": int(metrics.get("high_watermark", 0)),
+        "last_queue_depth": int(metrics.get("last_queue_depth", 0)),
         "last_lock_wait_ms": round(
-            float(metrics.get("last_lock_wait_ms", 0.0) or 0.0), 3
+            float(metrics.get("last_lock_wait_ms", 0.0)), 3
         ),
         "lock_wait_ema_ms": round(
-            float(metrics.get("lock_wait_ema_ms", 0.0) or 0.0), 3
+            float(metrics.get("lock_wait_ema_ms", 0.0)), 3
         ),
-        "last_call_ms": round(float(metrics.get("last_call_ms", 0.0) or 0.0), 3),
-        "call_ema_ms": round(float(metrics.get("call_ema_ms", 0.0) or 0.0), 3),
+        "last_call_ms": round(float(metrics.get("last_call_ms", 0.0)), 3),
+        "call_ema_ms": round(float(metrics.get("call_ema_ms", 0.0)), 3),
     }
 
 
@@ -2010,7 +2073,7 @@ atexit.register(shutdown_mt5)
 
 
 # =============================================================================
-# Module Exports
+# Module Exports (unchanged)
 # =============================================================================
 __all__ = [
     "MT5AuthError",

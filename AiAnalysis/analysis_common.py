@@ -325,8 +325,8 @@ def _invoke_gemini(
 ) -> Dict[str, Any]:
     api_key = _env_first("GEMINI_AI_API_KEY")
     if not api_key:
-        log.warning("gemini_missing_api_key")
-        return {"ok": False, "error": "missing_api_key"}
+        log.info("gemini_missing_api_key - using fallback mode")
+        return {"ok": False, "error": "missing_api_key", "fallback_mode": True}
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     body = {
@@ -380,8 +380,8 @@ def _invoke_openrouter(
 ) -> Dict[str, Any]:
     api_key = _env_first("OPEN_ROUTER")
     if not api_key:
-        log.warning("openrouter_missing_api_key")
-        return {"ok": False, "error": "missing_api_key"}
+        log.info("openrouter_missing_api_key - using fallback mode")
+        return {"ok": False, "error": "missing_api_key", "fallback_mode": True}
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     body = {
@@ -427,8 +427,8 @@ def _invoke_groq(
 ) -> Dict[str, Any]:
     api_key = _env_first("GROQ_AI_API_KEY")
     if not api_key:
-        log.warning("groq_missing_api_key")
-        return {"ok": False, "error": "missing_api_key"}
+        log.info("groq_missing_api_key - using fallback mode")
+        return {"ok": False, "error": "missing_api_key", "fallback_mode": True}
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -491,8 +491,8 @@ def _invoke_cerebras(
 ) -> Dict[str, Any]:
     api_key = _env_first("CEREBRAS_AI_API_KEY")
     if not api_key:
-        log.warning("cerebras_missing_api_key")
-        return {"ok": False, "error": "missing_api_key"}
+        log.info("cerebras_missing_api_key - using fallback mode")
+        return {"ok": False, "error": "missing_api_key", "fallback_mode": True}
 
     url = "https://api.cerebras.ai/v1/chat/completions"
     headers = {

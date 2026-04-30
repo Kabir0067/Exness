@@ -1,0 +1,99 @@
+{
+    "version": "1.0_xau_institutional",
+    "timestamp": "2026-04-30T13:27:34.934017",
+    "sharpe": 0.0,
+    "win_rate": 0.0,
+    "author": "quantum_trainer",
+    "status": "PENDING",
+    "backtest_sharpe": 0.0,
+    "backtest_win_rate": 0.0,
+    "max_drawdown_pct": 0.0,
+    "real_backtest": false,
+    "training_features": [
+        "mtf_h1_slope",
+        "mtf_h4_slope",
+        "mtf_h1_flow_proxy",
+        "mtf_h4_flow_proxy",
+        "ob_touch_proximity",
+        "xau_dxy_corr_rolling",
+        "ma21",
+        "macd_signal",
+        "macd_hist",
+        "rsi21",
+        "ppo27_7",
+        "bbands_width",
+        "historical_vol_20",
+        "adi",
+        "obv",
+        "volume_sma_20"
+    ],
+    "source": "Backtest.model_train_institutional",
+    "anti_overfit_passed": true,
+    "tscv_folds": 3,
+    "tscv_mean_active_direction_accuracy": 0.5628733490436784,
+    "wfa_passed": false,
+    "wfa_total_windows": 3,
+    "wfa_failed_windows": 2,
+    "training_audit": {
+        "passed": true,
+        "feature_leakage": {
+            "detected": false,
+            "suspicious_features": []
+        },
+        "target_leakage": {
+            "detected": false,
+            "chronology_ok": true,
+            "feature_target_corr_max": 0.06271852962963462
+        },
+        "class_imbalance": {
+            "positive": 1031,
+            "negative": 963,
+            "flat": 0,
+            "dominant_ratio": 0.5170511534603811,
+            "imbalanced": false
+        },
+        "overfitting": {
+            "detected": false,
+            "train_direction_accuracy": 0.5901831256794047,
+            "holdout_direction_accuracy": 0.5205616850551655,
+            "gap": 0.06962144062423914
+        },
+        "regime_dependency": {
+            "low_vol_accuracy": 0.4849699398797595,
+            "high_vol_accuracy": 0.5370741482965932,
+            "dependency_delta": 0.052104208416833664,
+            "dependent": false
+        },
+        "asset_specific_quality": {
+            "passed": true,
+            "target_active_accuracy": 0.25,
+            "holdout_active_accuracy": 0.6,
+            "holdout_active_coverage": 0.010030090270812437
+        },
+        "calibration_quality": {
+            "passed": true,
+            "val_active_accuracy": 0.6333333333333333,
+            "holdout_active_accuracy": 0.6,
+            "gap": 0.033333333333333326
+        },
+        "threshold_stability": {
+            "passed": true,
+            "validation_threshold": 0.00028724511413688776,
+            "holdout_threshold": 0.00037214320281088296,
+            "ratio": 1.2955597310300522
+        },
+        "retraining_cadence": {
+            "recommended_hours": 336.0,
+            "stale_age_hours": 0.2597038936111111
+        },
+        "stale_model_detection": {
+            "detected": false,
+            "stale_age_hours": 0.2597038936111111,
+            "limit_hours": 336.0
+        },
+        "out_of_sample_degradation": {
+            "detected": false,
+            "gap": 0.06962144062423914
+        }
+    }
+}

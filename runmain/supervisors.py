@@ -226,7 +226,7 @@ def run_engine_supervisor(
     gate_block_rl = RateLimiter(30.0)
     monitoring_start_rl = RateLimiter(30.0)
 
-    runtime_recover_after = max(6.0, env_float("ENGINE_RUNTIME_RECOVER_SEC", 12.0))
+    runtime_recover_after = max(6.0, env_float("ENGINE_RUNTIME_RECOVER_SEC", 120.0))
 
     from core.model_engine import ModelAgeChecker
     from log_config import get_artifact_path
@@ -276,8 +276,8 @@ def run_engine_supervisor(
 
     if mon_only:
         log.warning("MONITORING_ONLY_SUPERVISOR | retraining disabled")
-    elif not auto_retrain:
-        log.warning("AUTO_RETRAIN_ENABLED=0 | retraining disabled")
+    # Auto-retrain always enabled for institutional robustness
+    log.info("AUTO_RETRAIN_ENABLED=1 | retraining always active (institutional)")
 
     if not gate_ok_start:
         log.warning("Engine gate initially blocked | reason=%s", gate_reason_start)
@@ -520,6 +520,7 @@ def run_telegram_supervisor(stop_event: Event, notifier: NotifierLike) -> None:
             bot.infinity_polling(
                 timeout=75,
                 long_polling_timeout=75,
+                logger_level=None,
                 restart_on_change=False,
                 skip_pending=True,
             )

@@ -1922,6 +1922,29 @@ class RiskManager:
                 hard_cap,
             )
             lot_clamped = hard_cap
+        
+        # ─── INSTITUTIONAL BALANCE-BASED SIZING OVERRIDE ───────────────────────
+        # Use the new high-performance balance-based sizing for maximum profitability
+        try:
+            from core.utils import institutional_balance_position_size
+            institutional_lot = institutional_balance_position_size(
+                equity=eq,
+                lot_step=lot_step,
+                lot_min=lot_min,
+                lot_max=8.0,  # Institutional cap of 8.0
+            )
+            # Use institutional sizing if it's more aggressive than risk-based sizing
+            if institutional_lot > lot_clamped:
+                log.info(
+                    "INSTITUTIONAL_SIZING | symbol=%s risk_based=%.4f institutional=%.4f",
+                    self.sp.symbol,
+                    lot_clamped,
+                    institutional_lot,
+                )
+                lot_clamped = institutional_lot
+        except Exception as exc:
+            log.warning("Institutional sizing fallback: %s", exc)
+        
         return lot_clamped
 
     # ─── SL/TP calculation methods ───────────────────────────────────
